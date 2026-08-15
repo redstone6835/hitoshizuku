@@ -12,6 +12,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use sched::{Task, WaitQueue};
 
 use crate::dev::char::*;
+use crate::dev::dt_provider::{
+    self, DtbProviderError, DtbResourceLease, DtbResourceReply, DtbResourceRequest,
+};
 use crate::dev::function::{CharFunction, FunctionProjectionNameAllocator};
 use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
 use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqRegistrationError};
@@ -58,6 +61,53 @@ const TX_SW_BUFFER_SIZE: usize = 32 * 1024;
 const TX_SPIN_RETRY_LIMIT: usize = 10_000_000;
 /// break 保持时间换算。
 const NS_PER_MS: u64 = 1_000_000;
+
+const UART_CLOCK_PROPERTY: &str = "clocks";
+const UART_BAUD_CLOCK_NAME: &str = "baud";
+
+fn uart_divisor(clock_hz: u32, baud: u32) -> Option<u16> {
+    let denominator = baud.checked_mul(UART_DIVISOR_OVERSAMPLE)?;
+    let divisor = clock_hz.checked_div(denominator)?;
+    (divisor != 0 && divisor <= u32::from(u16::MAX)).then_some(divisor as u16)
+}
+
+fn uart_provider_clock(
+    info: &PlatformDeviceInfo,
+) -> Result<Option<(u32, DtbResourceLease)>, PnpError> {
+    let reference = info
+        .dtb_reference_by_name(UART_CLOCK_PROPERTY, UART_BAUD_CLOCK_NAME)
+        .or_else(|| info.dtb_references(UART_CLOCK_PROPERTY).next());
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    let lease =
+        dt_provider::acquire_reference(reference).map_err(DtbProviderError::into_pnp_error)?;
+    let rate = match lease
+        .control(DtbResourceRequest::GetRate)
+        .map_err(DtbProviderError::into_pnp_error)?
+    {
+        DtbResourceReply::Value(rate) => rate,
+        _ => {
+            return Err(PnpError::malformed(
+                PnpResourceKind::Other("clock"),
+                "uart clock provider returned a non-rate reply",
+            ));
+        }
+    };
+    let rate = u32::try_from(rate).map_err(|_| {
+        PnpError::malformed(
+            PnpResourceKind::Other("clock"),
+            "uart clock rate does not fit the binding's 32-bit frequency",
+        )
+    })?;
+    if rate == 0 {
+        return Err(PnpError::malformed(
+            PnpResourceKind::Other("clock"),
+            "uart clock provider returned zero Hz",
+        ));
+    }
+    Ok(Some((rate, lease)))
+}
 
 struct UartTxState {
     buf: [u8; TX_SW_BUFFER_SIZE],
@@ -139,12 +189,217 @@ impl Drop for UartRxGuard<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UartRegisterWidth {
+    U8,
+    U16,
+    U32,
+}
+
+impl UartRegisterWidth {
+    const fn bytes(self) -> usize {
+        match self {
+            Self::U8 => 1,
+            Self::U16 => 2,
+            Self::U32 => 4,
+        }
+    }
+
+    const fn from_bytes(bytes: u32) -> Option<Self> {
+        match bytes {
+            1 => Some(Self::U8),
+            2 => Some(Self::U16),
+            4 => Some(Self::U32),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UartRegisterEndian {
+    Little,
+    Big,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UartRegisterConfigError {
+    InvalidProperty,
+    ConflictingEndian,
+    InvalidShift,
+    InvalidWidth,
+    Misaligned,
+    WindowTooSmall,
+    AddressOverflow,
+}
+
+/// 已按 8250 DT binding 校验的寄存器访问布局。
+#[derive(Clone, Copy)]
+struct UartRegisterAccess {
+    base: usize,
+    reg_offset: usize,
+    reg_shift: u32,
+    width: UartRegisterWidth,
+    endian: UartRegisterEndian,
+}
+
+impl UartRegisterAccess {
+    fn from_platform(
+        info: &PlatformDeviceInfo,
+        base: usize,
+        window_size: usize,
+    ) -> Result<Self, UartRegisterConfigError> {
+        let reg_offset = optional_u32_property(info, "reg-offset")?.unwrap_or(0) as usize;
+        let reg_shift = optional_u32_property(info, "reg-shift")?.unwrap_or(0);
+        if reg_shift >= usize::BITS {
+            return Err(UartRegisterConfigError::InvalidShift);
+        }
+        let width = UartRegisterWidth::from_bytes(
+            optional_u32_property(info, "reg-io-width")?.unwrap_or(1),
+        )
+        .ok_or(UartRegisterConfigError::InvalidWidth)?;
+        let endian = uart_register_endian(info)?;
+        let stride = 1usize
+            .checked_shl(reg_shift)
+            .ok_or(UartRegisterConfigError::AddressOverflow)?;
+        if stride < width.bytes() {
+            return Err(UartRegisterConfigError::Misaligned);
+        }
+        let first = base
+            .checked_add(reg_offset)
+            .ok_or(UartRegisterConfigError::AddressOverflow)?;
+        if !first.is_multiple_of(width.bytes()) {
+            return Err(UartRegisterConfigError::Misaligned);
+        }
+        let last_offset = REG_LSR
+            .checked_mul(stride)
+            .and_then(|offset| reg_offset.checked_add(offset))
+            .ok_or(UartRegisterConfigError::AddressOverflow)?;
+        let span = last_offset
+            .checked_add(width.bytes())
+            .ok_or(UartRegisterConfigError::AddressOverflow)?;
+        base.checked_add(span)
+            .ok_or(UartRegisterConfigError::AddressOverflow)?;
+        if window_size != 0 && span > window_size {
+            return Err(UartRegisterConfigError::WindowTooSmall);
+        }
+        Ok(Self {
+            base,
+            reg_offset,
+            reg_shift,
+            width,
+            endian,
+        })
+    }
+
+    fn address(self, register: usize) -> usize {
+        let offset = register
+            .checked_shl(self.reg_shift)
+            .and_then(|offset| self.reg_offset.checked_add(offset))
+            .expect("validated UART register layout must remain representable");
+        self.base
+            .checked_add(offset)
+            .expect("validated UART register address must remain representable")
+    }
+
+    fn read(self, register: usize) -> u8 {
+        let address = self.address(register);
+        // Safety: probe 已按 DT reg 窗口、reg-offset、reg-shift、访问宽度和对齐完整
+        // 校验该地址；这里只执行对应宽度的易失 MMIO 读取并取 16550 低 8 位。
+        unsafe {
+            match self.width {
+                UartRegisterWidth::U8 => core::ptr::read_volatile(address as *const u8),
+                UartRegisterWidth::U16 => {
+                    let raw = core::ptr::read_volatile(address as *const u16);
+                    match self.endian {
+                        UartRegisterEndian::Little => u16::from_le(raw) as u8,
+                        UartRegisterEndian::Big => u16::from_be(raw) as u8,
+                    }
+                }
+                UartRegisterWidth::U32 => {
+                    let raw = core::ptr::read_volatile(address as *const u32);
+                    match self.endian {
+                        UartRegisterEndian::Little => u32::from_le(raw) as u8,
+                        UartRegisterEndian::Big => u32::from_be(raw) as u8,
+                    }
+                }
+            }
+        }
+    }
+
+    fn write(self, register: usize, value: u8) {
+        let address = self.address(register);
+        // Safety: 安全条件与 `read` 相同；目标是 16550 寄存器，写值按 binding
+        // 声明的 MMIO 宽度与端序扩展。
+        unsafe {
+            match self.width {
+                UartRegisterWidth::U8 => core::ptr::write_volatile(address as *mut u8, value),
+                UartRegisterWidth::U16 => {
+                    let value = match self.endian {
+                        UartRegisterEndian::Little => u16::from(value).to_le(),
+                        UartRegisterEndian::Big => u16::from(value).to_be(),
+                    };
+                    core::ptr::write_volatile(address as *mut u16, value);
+                }
+                UartRegisterWidth::U32 => {
+                    let value = match self.endian {
+                        UartRegisterEndian::Little => u32::from(value).to_le(),
+                        UartRegisterEndian::Big => u32::from(value).to_be(),
+                    };
+                    core::ptr::write_volatile(address as *mut u32, value);
+                }
+            }
+        }
+    }
+}
+
+fn optional_u32_property(
+    info: &PlatformDeviceInfo,
+    name: &str,
+) -> Result<Option<u32>, UartRegisterConfigError> {
+    let Some(raw) = info.bytes_property(name) else {
+        return Ok(None);
+    };
+    let bytes: [u8; 4] = raw
+        .try_into()
+        .map_err(|_| UartRegisterConfigError::InvalidProperty)?;
+    Ok(Some(u32::from_be_bytes(bytes)))
+}
+
+fn strict_bool_property(
+    info: &PlatformDeviceInfo,
+    name: &str,
+) -> Result<bool, UartRegisterConfigError> {
+    match info.bytes_property(name) {
+        None => Ok(false),
+        Some([]) => Ok(true),
+        Some(_) => Err(UartRegisterConfigError::InvalidProperty),
+    }
+}
+
+fn uart_register_endian(
+    info: &PlatformDeviceInfo,
+) -> Result<UartRegisterEndian, UartRegisterConfigError> {
+    let big = strict_bool_property(info, "big-endian")?;
+    let little = strict_bool_property(info, "little-endian")?;
+    let native = strict_bool_property(info, "native-endian")?;
+    if usize::from(big) + usize::from(little) + usize::from(native) > 1 {
+        return Err(UartRegisterConfigError::ConflictingEndian);
+    }
+    if big {
+        Ok(UartRegisterEndian::Big)
+    } else if native && cfg!(target_endian = "big") {
+        Ok(UartRegisterEndian::Big)
+    } else {
+        Ok(UartRegisterEndian::Little)
+    }
+}
+
 // ─────────────────────────── Uart16550 ────────────────────────────────────
 
 /// NS16550A 兼容 UART 驱动（内存映射 I/O）。
 pub struct Uart16550 {
-    /// UART 寄存器组的虚拟基地址。
-    base: usize,
+    /// UART 寄存器组的已校验访问布局。
+    registers: UartRegisterAccess,
     /// UART 输入时钟；固件预配置路径可能没有稳定来源。
     clock_hz: Option<u32>,
     /// 软件发送缓冲区。日志路径先入队，再由轮询/flush 持续排空到 UART FIFO。
@@ -172,16 +427,17 @@ impl Uart16550 {
     /// - `virt_base`: UART 寄存器的基地址。
     /// - `clock_hz`: UART 输入时钟频率（Hz）。
     /// - `baud`: 目标波特率（如 `115_200`）。
-    pub fn new(virt_base: usize, clock_hz: u32, baud: u32) -> Self {
+    fn new(registers: UartRegisterAccess, clock_hz: u32, baud: u32) -> Result<Self, UartError> {
+        let divisor = uart_divisor(clock_hz, baud).ok_or(UartError::InvalidBaudRate)?;
         let uart = Self {
-            base: virt_base,
+            registers,
             clock_hz: Some(clock_hz),
             tx: UartTxBuffer::new(),
             rx_wait: WaitQueue::new(),
             rx_lock: AtomicUsize::new(0),
         };
-        uart.init(clock_hz, baud);
-        uart
+        uart.init(divisor);
+        Ok(uart)
     }
 
     /// 接管固件已经初始化过的 UART，不重新编程 divisor。
@@ -189,9 +445,9 @@ impl Uart16550 {
     /// ACPI SPCR 允许固件描述一个已经用于 console redirection 的串口，但旧版
     /// SPCR 不一定提供 UART 输入时钟。此路径只关闭中断并启用 FIFO/握手，避免
     /// 引入平台默认时钟 fallback。
-    pub fn new_preconfigured(virt_base: usize) -> Self {
+    fn new_preconfigured(registers: UartRegisterAccess) -> Self {
         let uart = Self {
-            base: virt_base,
+            registers,
             clock_hz: None,
             tx: UartTxBuffer::new(),
             rx_wait: WaitQueue::new(),
@@ -204,25 +460,17 @@ impl Uart16550 {
     /// 返回 UART 寄存器组的虚拟基地址。
     #[inline]
     pub fn base(&self) -> usize {
-        self.base
-    }
-
-    #[inline]
-    fn reg(&self, offset: usize) -> *mut u8 {
-        (self.base + offset) as *mut u8
+        self.registers.base
     }
 
     #[inline]
     fn read_reg(&self, offset: usize) -> u8 {
-        // Safety: 实例只由 PnP probe 在固件声明并映射的 UART MMIO 窗口上构造；
-        // 本模块传入的偏移均位于 16550 寄存器窗口内，并使用单字节易失访问。
-        unsafe { core::ptr::read_volatile(self.reg(offset)) }
+        self.registers.read(offset)
     }
 
     #[inline]
     fn write_reg(&self, offset: usize, value: u8) {
-        // Safety: 安全条件与 `read_reg` 相同，目标寄存器允许单字节 MMIO 写入。
-        unsafe { core::ptr::write_volatile(self.reg(offset), value) }
+        self.registers.write(offset, value)
     }
 
     #[inline]
@@ -258,12 +506,7 @@ impl Uart16550 {
         self.line_status() & LSR_TEMT != 0
     }
 
-    fn init(&self, clock_hz: u32, baud: u32) {
-        let divisor = if baud == 0 {
-            1u16
-        } else {
-            (clock_hz / (UART_DIVISOR_OVERSAMPLE * baud)) as u16
-        };
+    fn init(&self, divisor: u16) {
         let dll = (divisor & 0xff) as u8;
         let dlm = (divisor >> 8) as u8;
 
@@ -621,6 +864,17 @@ fn first_irq_dependency(info: &PlatformDeviceInfo) -> PnpDependency {
         .unwrap_or(PnpDependency::DefaultIrqDomain)
 }
 
+fn map_uart_register_config_error(error: UartRegisterConfigError) -> PnpError {
+    log::warning!(
+        "[platform-uart16550] rejected DT register layout: {:?}",
+        error
+    );
+    PnpError::malformed(
+        PnpResourceKind::Mmio,
+        "invalid 8250 register layout or endianness",
+    )
+}
+
 fn register_uart_irq(
     info: &PlatformDeviceInfo,
     uart: Arc<Uart16550>,
@@ -682,6 +936,7 @@ pub enum UartError {
 
 fn map_uart_char_error(err: CharIoError) -> ControlError {
     match err {
+        CharIoError::NoSpace => ControlError::Invalid,
         CharIoError::HardwareError => ControlError::Io,
         CharIoError::Unavailable => ControlError::NoDevice,
         CharIoError::Interrupted => ControlError::Busy,
@@ -703,11 +958,8 @@ impl DriverControl for Uart16550 {
     fn control(&self, req: UartRequest) -> Result<UartResponse, UartError> {
         match req {
             UartRequest::SetBaudRate { clock_hz, baud } => {
-                if baud == 0 {
-                    return Err(UartError::InvalidBaudRate);
-                }
+                let divisor = uart_divisor(clock_hz, baud).ok_or(UartError::InvalidBaudRate)?;
                 let _ = self.flush();
-                let divisor = (clock_hz / (UART_DIVISOR_OVERSAMPLE * baud)) as u16;
                 let dll = (divisor & 0xff) as u8;
                 let dlm = (divisor >> 8) as u8;
                 while !self.transmitter_empty() {
@@ -781,19 +1033,40 @@ impl PnpDriver for Uart16550PlatformDriver {
             .as_any()
             .downcast_ref::<PlatformDeviceInfo>()
             .ok_or(PnpError::InvalidState)?;
-        let Some((phys, _size)) = info.first_mmio() else {
+        let Some((phys, size)) = info.first_mmio() else {
             return Err(PnpError::missing(PnpResourceKind::Mmio, "uart reg missing"));
         };
         let virt_base = (self.device_mmio_to_virt)(phys);
-        let uart = if let Some(clock_hz) = info.properties.clock_hz {
-            Arc::new(Uart16550::new(
-                virt_base,
-                clock_hz,
-                info.properties.baud.unwrap_or(UART_DEFAULT_BAUD),
-            ))
+        let registers = UartRegisterAccess::from_platform(info, virt_base, size)
+            .map_err(map_uart_register_config_error)?;
+        let provider_clock = uart_provider_clock(info)?;
+        let clock_hz = provider_clock
+            .as_ref()
+            .map(|(rate, _)| *rate)
+            .or(info.properties.clock_hz);
+        let uart = if let Some(clock_hz) = clock_hz {
+            Arc::new(
+                Uart16550::new(
+                    registers,
+                    clock_hz,
+                    info.properties.baud.unwrap_or(UART_DEFAULT_BAUD),
+                )
+                .map_err(|_| {
+                    PnpError::malformed(
+                        PnpResourceKind::Other("clock"),
+                        "uart clock and baud produce an invalid divisor",
+                    )
+                })?,
+            )
         } else {
-            Arc::new(Uart16550::new_preconfigured(virt_base))
+            Arc::new(Uart16550::new_preconfigured(registers))
         };
+        if let Some((_, lease)) = provider_clock {
+            dev.own_resource(dt_provider::lease_pnp_resource(
+                lease,
+                "platform-uart16550-clock",
+            ))?;
+        }
 
         let dev_name = self
             .projection_names
@@ -824,9 +1097,13 @@ impl PnpDriver for Uart16550PlatformDriver {
             uart: Arc::clone(&uart),
         }));
         log::printk!(
-            "[platform-uart16550] bound {} phys={:#x} -> /dev/{}",
+            "[platform-uart16550] bound {} phys={:#x} reg-offset={:#x} reg-shift={} reg-io-width={} endian={:?} -> /dev/{}",
             dev.id,
             phys,
+            registers.reg_offset,
+            registers.reg_shift,
+            registers.width.bytes(),
+            registers.endian,
             dev_name
         );
         Ok(())

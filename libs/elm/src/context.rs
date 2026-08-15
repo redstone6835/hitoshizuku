@@ -39,6 +39,10 @@ pub struct ElmCurrentContextOps {
     pub enter: fn(ElmCurrentContext) -> Option<u64>,
     /// 使用 `enter` 返回的 token 按栈顺序退出上下文。
     pub leave: fn(u64),
+    /// 压入一个“暂时没有 ELM owner”的边界，并返回恢复 token。
+    pub suspend: fn() -> Option<u64>,
+    /// 使用 `suspend` 返回的 token 按栈顺序恢复外层上下文。
+    pub resume: fn(u64),
     /// 返回当前任务最内层 ELM 上下文；任务不在 ELM 中时返回 `None`。
     pub current: fn() -> Option<ElmCurrentContext>,
 }
@@ -240,6 +244,20 @@ pub struct ElmCurrentContextGuard {
     task_backed: bool,
 }
 
+#[derive(Debug)]
+/// 暂停当前 ELM owner 的 RAII guard。
+///
+/// guard 存活期间 [`current_context`] 返回 `None`，但外层上下文仍保留在栈中；
+/// guard drop 后按 LIFO 顺序恢复。该边界供常驻 provider 在动态 consumer 回调中
+/// 创建自身运行期资源，避免资源被错误归属给 consumer。
+#[must_use = "必须持有 guard 直到常驻 provider 回调结束"]
+pub struct ElmCurrentContextSuspensionGuard {
+    cpu_id: usize,
+    depth: usize,
+    backend_token: u64,
+    task_backed: bool,
+}
+
 impl Drop for ElmCurrentContextGuard {
     fn drop(&mut self) {
         if self.task_backed {
@@ -250,6 +268,28 @@ impl Drop for ElmCurrentContextGuard {
         }
         let current = CURRENT_DEPTH[self.cpu_id].load(Ordering::Acquire);
         debug_assert_eq!(current, self.depth + 1, "ELM 当前上下文必须按栈顺序退出");
+        if current != self.depth + 1 {
+            return;
+        }
+        clear_context_slot(context_slot(self.cpu_id, self.depth));
+        CURRENT_DEPTH[self.cpu_id].store(self.depth, Ordering::Release);
+    }
+}
+
+impl Drop for ElmCurrentContextSuspensionGuard {
+    fn drop(&mut self) {
+        if self.task_backed {
+            if let Some(ops) = current_context_ops() {
+                (ops.resume)(self.backend_token);
+            }
+            return;
+        }
+        let current = CURRENT_DEPTH[self.cpu_id].load(Ordering::Acquire);
+        debug_assert_eq!(
+            current,
+            self.depth + 1,
+            "ELM 当前上下文暂停边界必须按栈顺序退出"
+        );
         if current != self.depth + 1 {
             return;
         }
@@ -291,6 +331,36 @@ pub fn try_enter_current_context(context: &ElmContext) -> Option<ElmCurrentConte
     );
     CURRENT_DEPTH[cpu_id].store(depth + 1, Ordering::Release);
     Some(ElmCurrentContextGuard {
+        cpu_id,
+        depth,
+        backend_token: 0,
+        task_backed: false,
+    })
+}
+
+/// 暂时隐藏当前 ELM owner，并在 guard drop 时恢复。
+///
+/// 已注册任务级后端时，暂停标记跟随当前任务迁移；否则使用按 CPU 固定栈。实现只
+/// 压入一个空标记，不分配内存，也不会丢弃外层上下文。暂停边界内仍可通过
+/// [`enter_current_context`] 进入一个显式 provider 上下文。
+pub fn suspend_current_context() -> Option<ElmCurrentContextSuspensionGuard> {
+    if let Some(ops) = current_context_ops() {
+        let backend_token = (ops.suspend)()?;
+        return Some(ElmCurrentContextSuspensionGuard {
+            cpu_id: 0,
+            depth: 0,
+            backend_token,
+            task_backed: true,
+        });
+    }
+    let cpu_id = current_cpu_id();
+    let depth = CURRENT_DEPTH[cpu_id].load(Ordering::Acquire);
+    if depth >= ELM_CONTEXT_MAX_DEPTH {
+        return None;
+    }
+    clear_context_slot(context_slot(cpu_id, depth));
+    CURRENT_DEPTH[cpu_id].store(depth + 1, Ordering::Release);
+    Some(ElmCurrentContextSuspensionGuard {
         cpu_id,
         depth,
         backend_token: 0,

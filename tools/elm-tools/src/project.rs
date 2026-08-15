@@ -174,7 +174,14 @@ impl ElmProjectManifest {
 
         reject_unknown_keys(
             &elm,
-            &["name", "version", "kind", "source", "mode", "integrated_phase"],
+            &[
+                "name",
+                "version",
+                "kind",
+                "source",
+                "mode",
+                "integrated_phase",
+            ],
             "[elm]",
         )?;
         reject_unknown_keys(&menu, &["label", "description", "route"], "[menu]")?;
@@ -857,9 +864,8 @@ pub fn cargo_build_integrated(
         "--cfg=elm_integrated_phase=\"{}\"",
         project_manifest.integrated_phase.as_str()
     ));
-    rustflags.push(
-        "--check-cfg=cfg(elm_integrated_phase,values(\"device\",\"runtime\"))".to_string(),
-    );
+    rustflags
+        .push("--check-cfg=cfg(elm_integrated_phase,values(\"device\",\"runtime\"))".to_string());
     let mut command = Command::new("cargo");
     command
         .current_dir(&project)
@@ -2791,7 +2797,12 @@ uri = "forbidden"
                 .join(".elm/framework/vfs/Cargo.toml")
                 .is_file()
         );
-        assert!(service.path().join(".elm/framework/net/Cargo.toml").is_file());
+        assert!(
+            service
+                .path()
+                .join(".elm/framework/net/Cargo.toml")
+                .is_file()
+        );
         assert!(service.path().join(".elm/framework/Cargo.toml").is_file());
         assert!(!service.path().join(".elm/framework/elmmgr").exists());
 

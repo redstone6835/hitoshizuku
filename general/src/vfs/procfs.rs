@@ -3131,6 +3131,7 @@ fn proc_pnp_dependency_render_len(dependency: PnpDependency) -> usize {
         PnpDependency::FirmwareBus => "firmware-bus".len(),
         PnpDependency::PciHostBridge(_) => "pci-host-bridge:".len() + 5,
         PnpDependency::Dma => "dma".len(),
+        PnpDependency::DtbProvider { .. } => "dt-provider::".len() + 5 + 10,
         PnpDependency::Other(name) => name.len(),
     }
 }
@@ -3183,6 +3184,9 @@ fn write_proc_pnp_dependency(out: &mut String, dependency: PnpDependency) {
             let _ = write!(out, "pci-host-bridge:{domain}");
         }
         PnpDependency::Dma => out.push_str("dma"),
+        PnpDependency::DtbProvider { kind, phandle } => {
+            let _ = write!(out, "dt-provider:{kind}:{phandle}");
+        }
         PnpDependency::Other(name) => out.push_str(name),
     }
 }

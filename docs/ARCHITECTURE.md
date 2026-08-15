@@ -84,12 +84,26 @@ ISA 专属汇编和 CSR/寄存器操作必须留在 `arch`。通用状态机、�
 `libs` 中的 crate 按实际子系统关系互相依赖，但不得依赖 `kernel`。其中：
 
 - `allocator`、`sched`、`vfs`、`socket`、`net` 等提供可直接由内核和 ELM 使用的 Rust API；
+- `fdt` 提供独立 `no_std` Flattened Devicetree 解析器：默认层只借用并完整校验
+  blob，`alloc` feature 额外提供稳定 `NodeId`、路径、alias、phandle、status 与普通
+  `reg/ranges` 地址翻译；
 - `kernel-symbols` 为审核后的 API 生成稳定导出描述符和 Mixin 站点；
 - `elm` 与 `elm-loader` 定义运行时模型、EBI 和装载协议；
 - `socket` 提供 AF_UNIX，`net` 提供 IP/TCP/UDP 协议栈与 `NetDriver` 设备契约；
 - `mygo-smoltcp` 是 `net` 的内部协议引擎，不作为独立 Kernel API 暴露。
 
 跨 crate 依赖必须保持无环。全局能力需要后端时，优先使用明确的注册接口、trait 或函数指针，不允许通过依赖 `kernel` 获取实现。
+
+### 2.5.1 Device Tree 分层
+
+Device Tree 处理分为三层，禁止重复建立路径、alias、phandle 或普通总线地址索引：
+
+1. `libs/fdt` 处理 FDT 头、块布局、token、字符串表、reservation map 和通用树语义。属性值始终保留原始大端字节，调用方依据 binding 显式选择字符串、cell 或布尔解码器；`alloc` 层额外提供无损 `u128` 内存 bank、chosen usable-range 和带 path/phandle/purpose/flags 的 reserved-memory 请求。
+2. `general::firmware::dtb` 复用 `fdt::Tree`，解释 CPU、串口、IRQ、PCI host、syscon 电源等内核 binding，并在本机位宽边界落实内存布局。所有静态保留区先于动态 `size/alignment/alloc-ranges` 请求处理，内核镜像和 initramfs 同样参与选址避让；解析后的 reserved-memory 身份与 concrete 范围安装为只读运行期快照。`general::dtb` 仅保留兼容重导出，新代码不得在其中恢复解析实现。
+3. `kernel::dtb` 决定启动协议策略：UEFI GetMemoryMap 存在时忽略 `/memory`，直接启动才使用 DT memory bank；两条路径都应用 `linux,usable-memory-range` 和 DT 保留约束。`no-map` 通过启动上下文中的显式架构能力在 buddy 初始化前登记：RISC-V 正式直映按页挖洞；LoongArch 与 Linux 的 DMW 模型一致，按页从物理 allocator 排除并显式记录固定别名限制；完全不支持保留语义的架构必须 fail-closed。
+4. `general::vfs::sysfs` 发布 Linux ABI 兼容的 `/sys/firmware/fdt` 与 `/sys/firmware/devicetree/base`。投影保留属性原始内容和节点身份，同时按 Linux 规则合成 `name`、保护 `security-*`，并在公开前移除已经消费的 `rng-seed` 与 `kaslr-seed`。
+
+架构加载器只负责验证固件指针可读、复制 blob 到内核拥有的稳定缓冲区，并把 `fdt::Fdt<'static>` 放入启动上下文；不得在架构目录重新实现完整树遍历或 binding 解析。
 
 ### 2.6 `drivers`
 

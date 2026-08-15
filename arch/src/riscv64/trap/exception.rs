@@ -370,6 +370,7 @@ fn handle_interrupt(tf_ptr: usize, cause: usize, code: usize, from_user: bool) -
         // Timer 必须先重装 compare，否则 sret 后会立刻再次陷入。
         sched::deadline_timer_fired();
         let now_ticks = time::rearm_periodic_timer();
+        crate::riscv64::aia::sync_current_cpu();
         general::dev::irq::record_timer_interrupt();
         let now_ns = time::stable_counter_to_ns(now_ticks);
         #[cfg(feature = "performance-profile")]

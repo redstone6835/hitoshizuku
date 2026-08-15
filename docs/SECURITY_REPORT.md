@@ -61,7 +61,10 @@
 
 #### static mut POWER_CONTROLS 无锁读-改-写竞争
 
-- **文件**：`general/src/firmware/power.rs:119-209`
+- **状态**：已于 2026-08-05 修复。电源入口改为 `Spinlock` 保护的注册表；启动
+  固件控制作为常驻 fallback，动态 ELM handler 使用单调 handle 登记并由 PnP
+  consumer 资源持有，卸载后原子恢复前一个 handler 或固件 fallback。
+- **文件**：`general/src/firmware/power.rs`
 - **根因**：`install_one` 函数执行「读取 `static mut POWER_CONTROLS` → 修改字段 → 写回」序列，无互斥锁保护。在 SMP 环境下，两个 CPU 同时调用 `install_one`（分别来自 ACPI 和 DTB 初始化路径）会产生经典的 TOCTOU 竞争——后完成的写入会静默覆盖先完成的安装。
 - **触发条件**：多核启动，ACPI 与 DTB 电源控制初始化路径并行执行。
 

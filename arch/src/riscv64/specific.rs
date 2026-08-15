@@ -7,6 +7,17 @@
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, Ordering};
 
+/// 对普通内存、DMA 访问与设备 MMIO 执行一次保守的全顺序屏障。
+///
+/// 驱动在发布 DMA descriptor 后敲 doorbell，或观察到设备完成标志后读取 DMA
+/// 数据时使用该入口；ISA 细节留在 arch 层，ELM 驱动不嵌入目标专属汇编。
+#[inline]
+pub fn device_io_barrier() {
+    // Safety: `fence iorw, iorw` 只约束当前 hart 的访存/设备访问顺序，不访问
+    // 任意地址，也不改变寄存器或特权状态。
+    unsafe { core::arch::asm!("fence iorw, iorw", options(nostack)) };
+}
+
 // 子模块重导出
 pub use crate::riscv64::addr::*;
 pub use crate::riscv64::csr::*;
@@ -322,8 +333,23 @@ use core::sync::atomic::{AtomicBool, AtomicUsize};
 /// 硬件是否支持 Zicboz（cbo.zero 指令）。由 loader DTB 解析设置。
 pub(crate) static HAS_ZICBOZ: AtomicBool = AtomicBool::new(false);
 
-/// cbo.zero 操作的 cache block 大小（字节）；0 表示尚未完成全 hart 校验。
-pub(crate) static CBO_BLOCK_SIZE: AtomicUsize = AtomicUsize::new(0);
+/// 硬件是否在所有可用 hart 上支持 Zicbom。
+pub static HAS_ZICBOM: AtomicBool = AtomicBool::new(false);
+
+/// 硬件是否在所有可用 hart 上支持 Zicbop。
+pub static HAS_ZICBOP: AtomicBool = AtomicBool::new(false);
+
+/// `cbo.zero` 操作的 cache block 大小（字节）。
+///
+/// 只有 [`HAS_ZICBOZ`] 发布为 `true` 后该值才可消费；loader 会在
+/// 发布前校验 DT 中所有 hart 的块大小一致且可安全用于页清零。
+pub static CBO_BLOCK_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+/// `cbo.clean/flush/inval` 的 cache block 大小（字节）。
+pub static CBOM_BLOCK_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+/// `prefetch.*` 的 cache block 大小（字节）。
+pub static CBOP_BLOCK_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 /// 使用 Zicboz 连续清零 16 个 cache block，并返回下一块地址。
 ///

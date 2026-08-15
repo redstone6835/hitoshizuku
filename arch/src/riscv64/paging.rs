@@ -1,8 +1,9 @@
-//! RISC-V64 Sv48 分页实现。
+//! RISC-V64 Sv39/Sv48 运行时分页实现。
 //!
-//! `general::PagingArch` 的 RISC-V64 后端。Sv48 四级页表，支持 4KiB / 2MiB / 1GiB 页。
+//! 启动期先使用 Sv39，最终模式冻结后由同一后端按三层或四层几何工作。
 
-use crate::riscv64::specific::*;
+use crate::riscv64::paging_geometry::{PagingModeState, RiscvPagingMode};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use general::{PagingArch, PhysPageTableRoot, VirtAddr};
 
 // ── PTE 位域 ──────────────────────────────────────────────────────────────────
@@ -20,27 +21,66 @@ const PTE_D: usize = 1 << 7;
 
 /// 页内偏移位数（4KiB = 2^12）。
 pub const PAGE_SHIFT: usize = 12;
-/// Sv48 页表层数。
-pub const SV48_LEVELS: usize = 4;
-const VPN_MASK: usize = 0x1FF;
+/// 支持模式中的最大页表层数。
+pub const MAX_LEVELS: usize = 4;
 const PPN_BITS: usize = 44;
 const PPN_FIELD_MASK: usize = (1 << PPN_BITS) - 1;
 const ASID_BITS: usize = 16;
 const ASID_MASK: usize = (1 << ASID_BITS) - 1;
 
-/// 支持的叶 PTE 层级（level 1 = 1GiB, level 2 = 2MiB, level 3 = 4KiB）。
-pub const SUPPORTED_LEAF_LEVELS: [usize; 3] = [1, 2, 3];
+const SV39_LEAF_LEVELS: [usize; 3] = [0, 1, 2];
+const SV48_LEAF_LEVELS: [usize; 3] = [1, 2, 3];
+
+static PAGING_MODE_STATE: AtomicU8 = AtomicU8::new(PagingModeState::EarlySv39 as u8);
+/// AP 裸入口读取的最终 satp.MODE 数值；启动阶段默认是 Sv39。
+pub(crate) static ACTIVE_SATP_MODE: AtomicUsize = AtomicUsize::new(8);
+
+fn decode_mode_state(raw: u8) -> PagingModeState {
+    match raw {
+        value if value == PagingModeState::EarlySv39 as u8 => PagingModeState::EarlySv39,
+        value if value == PagingModeState::FinalSv39 as u8 => PagingModeState::FinalSv39,
+        value if value == PagingModeState::FinalSv48 as u8 => PagingModeState::FinalSv48,
+        _ => panic!("[arch][paging] invalid paging mode state {}", raw),
+    }
+}
+
+pub(crate) fn paging_mode_state() -> PagingModeState {
+    decode_mode_state(PAGING_MODE_STATE.load(Ordering::Acquire))
+}
+
+pub(crate) fn active_paging_mode() -> RiscvPagingMode {
+    paging_mode_state().mode()
+}
+
+pub(crate) fn paging_mode_is_final() -> bool {
+    paging_mode_state().is_final()
+}
+
+pub(crate) fn finalize_paging_mode(mode: RiscvPagingMode) {
+    let next = PagingModeState::EarlySv39
+        .finalize(mode)
+        .expect("[arch][paging] invalid final paging mode");
+    ACTIVE_SATP_MODE.store(mode.satp_mode() >> 60, Ordering::Release);
+    PAGING_MODE_STATE
+        .compare_exchange(
+            PagingModeState::EarlySv39 as u8,
+            next as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .expect("[arch][paging] paging mode already finalized");
+}
 
 // ── 类型 ──────────────────────────────────────────────────────────────────────
 
-/// Sv48 页表项原始位表示。
+/// Sv39/Sv48 共用的页表项原始位表示。
 ///
 /// 透明包装 `usize`，保留底层位级布局，在 trait 边界上提供类型安全。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct Riscv64Pte(pub usize);
 
-/// Sv48 PTE 权限位字段（低 10 位）。
+/// Sv39/Sv48 共用的 PTE 权限位字段（低 10 位）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct Riscv64Flags(pub usize);
@@ -61,20 +101,13 @@ impl Riscv64Pte {
 
 // ── Riscv64Paging ─────────────────────────────────────────────────────────────
 
-/// RISC-V64 Sv48 分页实现体。
+/// RISC-V64 运行时分页实现体。
 pub struct Riscv64Paging;
 
 impl Riscv64Paging {
-    const fn level_page_shift(level: usize) -> usize {
-        PAGE_SHIFT + 9 * (SV48_LEVELS - 1 - level)
-    }
-
     #[inline]
     fn level_page_size(level: usize) -> Option<usize> {
-        if !SUPPORTED_LEAF_LEVELS.contains(&level) || level >= SV48_LEVELS {
-            return None;
-        }
-        Some(1usize << Self::level_page_shift(level))
+        active_paging_mode().leaf_page_size(level)
     }
 
     const fn make_ppn(paddr: usize) -> usize {
@@ -124,8 +157,10 @@ impl Riscv64Paging {
     }
 
     #[inline]
-    pub(crate) const fn satp_value(root: PhysPageTableRoot, asid: usize) -> usize {
-        SATP_MODE_SV48 | ((asid & ASID_MASK) << PPN_BITS) | Self::make_ppn(root.as_usize())
+    pub(crate) fn satp_value(root: PhysPageTableRoot, asid: usize) -> usize {
+        active_paging_mode().satp_mode()
+            | ((asid & ASID_MASK) << PPN_BITS)
+            | Self::make_ppn(root.as_usize())
     }
 
     #[inline]
@@ -146,7 +181,7 @@ impl Riscv64Paging {
     /// # Safety
     ///
     /// 调用者必须保证：
-    /// - `root` 指向有效且完整的 Sv48 根页表物理页
+    /// - `root` 指向符合当前最终模式的完整根页表物理页
     /// - `asid` 与目标地址空间匹配
     /// - 调用发生在上下文切换临界区（中断已关闭或不会被抢占）
     pub unsafe fn activate_with_asid(
@@ -154,6 +189,10 @@ impl Riscv64Paging {
         asid: usize,
         needs_page_table_fence: bool,
     ) {
+        assert!(
+            paging_mode_is_final(),
+            "[arch][paging] page table mode is not finalized"
+        );
         let current = Self::current_satp();
         unsafe {
             Self::activate_with_asid_from_current(root, asid, needs_page_table_fence, current)
@@ -334,25 +373,22 @@ impl PagingArch for Riscv64Paging {
     type Flags = Riscv64Flags;
 
     const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
-    const LEVELS: usize = SV48_LEVELS;
+    const LEVELS: usize = MAX_LEVELS;
     const ENTRIES_PER_TABLE: usize = 512;
 
-    /// Sv48 规范地址检查。
-    ///
-    /// bit[47] 必须符号扩展到 bit[63:48]：
-    /// - 低半：bit[47]=0 → bit[63:48] 全 0
-    /// - 高半：bit[47]=1 → bit[63:48] 全 1
+    fn active_levels() -> usize {
+        active_paging_mode().levels()
+    }
+
     fn is_canonical_vaddr(vaddr: usize) -> bool {
-        let sign = (vaddr >> 47) & 1;
-        let upper = vaddr >> 48;
-        (upper == 0 && sign == 0) || (upper == 0xFFFF && sign == 1)
+        active_paging_mode().is_canonical(vaddr)
     }
 
     #[inline]
     fn level_index(vaddr: usize, level: usize) -> usize {
-        let va48 = vaddr & ((1usize << 48) - 1);
-        let shift = PAGE_SHIFT + 9 * (Self::LEVELS - 1 - level);
-        (va48 >> shift) & VPN_MASK
+        active_paging_mode()
+            .level_index(vaddr, level)
+            .expect("[arch][paging] page-table level exceeds active geometry")
     }
 
     #[inline]
@@ -422,7 +458,10 @@ impl PagingArch for Riscv64Paging {
 
     #[inline]
     fn supported_leaf_levels() -> &'static [usize] {
-        &SUPPORTED_LEAF_LEVELS
+        match active_paging_mode() {
+            RiscvPagingMode::Sv39 => &SV39_LEAF_LEVELS,
+            RiscvPagingMode::Sv48 => &SV48_LEAF_LEVELS,
+        }
     }
     #[inline]
     fn leaf_page_size(level: usize) -> Option<usize> {

@@ -6,30 +6,28 @@ use alloc::vec::Vec;
 
 use spin::mutex::Mutex;
 
-use general::dev::dma::{
-    DmaContext, DmaDirection, new_netbuf_pool, new_shared_netbuf_pool,
-};
+use general::dev::dma::{DmaContext, DmaDirection, new_netbuf_pool, new_shared_netbuf_pool};
 use net::QueuePairId;
 use net::buf::{
     CompletionBatch, NetBufLease, NetBufPoolOwner, PacketBatch, PacketChain, PacketLayout,
     PacketMetadata, RxRefillBatch, TxBatch, TxChecksum, TxPacket,
 };
+#[cfg(not(feature = "elm-integrated"))]
+use net::device::PinnedNetQueueEndpoint;
 use net::device::{
     NET_QUEUE_CALL_STATUS_INVALID, NET_QUEUE_CALL_STATUS_OK, NET_QUEUE_OP_HAS_PENDING,
     NET_QUEUE_OP_POLL_RX, NET_QUEUE_OP_QUIESCE, NET_QUEUE_OP_RECLAIM_TX, NET_QUEUE_OP_REFILL_RX,
     NET_QUEUE_OP_SUBMIT_TX, NetDeviceHandle, NetDeviceRegisterErrorKind, NetDeviceRegistration,
     NetDeviceRemoveError, NetQueueEndpoint, NetQueueRegistration, QueueIrqControl,
 };
-#[cfg(not(feature = "elm-integrated"))]
-use net::device::PinnedNetQueueEndpoint;
 use net::queue::{
     NetQueueCaps, NetQueuePair, QueueFatalError, RxBudget, RxPollResult, RxRefillResult,
     TxReclaimResult, TxSubmitResult,
 };
 use virtio::virtio_mmio::VirtioMmioTransport;
 use virtio::{
-    SplitVirtQueue, VIRTQ_AVAIL_F_NO_INTERRUPT, VIRTQ_DESC_F_WRITE, VIRTQ_USED_F_NO_NOTIFY,
-    VirtioPciTransport, VirtqDescUpdate, virtq_need_event,
+    SplitVirtQueue, VIRTIO_PCI_RESET_SPIN_LIMIT, VIRTQ_AVAIL_F_NO_INTERRUPT, VIRTQ_DESC_F_WRITE,
+    VIRTQ_USED_F_NO_NOTIFY, VirtioPciTransport, VirtqDescUpdate, virtq_need_event,
 };
 
 const VIRTIO_NET_HEADER_LEN: u16 = 12;
@@ -99,10 +97,19 @@ impl VirtioNetTransport {
         }
     }
 
-    fn reset(&self) {
+    fn reset_wait(&self) -> bool {
         match self {
-            Self::Mmio(transport) => transport.write_status(0),
-            Self::Pci { transport, .. } => transport.set_status(0),
+            Self::Mmio(transport) => {
+                transport.write_status(0);
+                for _ in 0..VIRTIO_PCI_RESET_SPIN_LIMIT {
+                    if transport.read_status() == 0 {
+                        return true;
+                    }
+                    core::hint::spin_loop();
+                }
+                transport.read_status() == 0
+            }
+            Self::Pci { transport, .. } => transport.reset_wait(VIRTIO_PCI_RESET_SPIN_LIMIT),
         }
     }
 }
@@ -198,7 +205,9 @@ impl VirtioNetQueue {
 
 impl Drop for VirtioNetQueue {
     fn drop(&mut self) {
-        self.transport.reset();
+        if !self.transport.reset_wait() {
+            panic!("virtio-net: device reset timed out before queue DMA teardown");
+        }
         self.clear_pending();
     }
 }
@@ -510,11 +519,9 @@ impl NetQueuePair for VirtioNetQueue {
             {
                 break;
             }
-            let Ok(mut header) = header_pool.lease(
-                0,
-                VIRTIO_NET_HEADER_LEN,
-                PacketMetadata::default(),
-            ) else {
+            let Ok(mut header) =
+                header_pool.lease(0, VIRTIO_NET_HEADER_LEN, PacketMetadata::default())
+            else {
                 break;
             };
             let header_bytes = header
@@ -644,7 +651,9 @@ impl NetQueuePair for VirtioNetQueue {
         self.quiesced = true;
         self.rx.set_avail_flags(VIRTQ_AVAIL_F_NO_INTERRUPT);
         self.tx.set_avail_flags(VIRTQ_AVAIL_F_NO_INTERRUPT);
-        self.transport.reset();
+        if !self.transport.reset_wait() {
+            return Err(QueueFatalError::DeviceReset);
+        }
         // reset 后设备不再访问 descriptor，必须在常驻 pool 释放前归还全部 lease。
         self.clear_pending();
         Ok(())
@@ -702,13 +711,13 @@ struct ActiveDevice {
 static ACTIVE_DEVICE: Mutex<Option<ActiveDevice>> = Mutex::new(None);
 
 fn dma_pool(
-    context: DmaContext,
+    context: &DmaContext,
     count: usize,
     size: usize,
     align: usize,
     direction: DmaDirection,
 ) -> Result<NetBufPoolOwner, NetDeviceRegisterErrorKind> {
-    new_netbuf_pool(context, count, size, align, direction)
+    new_netbuf_pool(context.clone(), count, size, align, direction)
         .map_err(|_| NetDeviceRegisterErrorKind::ResourceExhausted)
 }
 
@@ -719,13 +728,7 @@ pub(crate) fn install_active(
     mac_address: [u8; 6],
     mtu: u32,
 ) -> Result<NetDeviceHandle, NetDeviceRegisterErrorKind> {
-    install_active_queues(
-        alloc::vec![(queue, irq)],
-        None,
-        context,
-        mac_address,
-        mtu,
-    )
+    install_active_queues(alloc::vec![(queue, irq)], None, context, mac_address, mtu)
 }
 
 pub(crate) fn install_active_queues(
@@ -756,21 +759,21 @@ pub(crate) fn install_active_queues(
         let queue_size = usize::from(queue.rx.queue_size());
         let queue = Arc::new(Mutex::new(queue));
         let rx_pool = dma_pool(
-            context,
+            &context,
             queue_size,
             DMA_PAGE_SIZE,
             DMA_PAGE_SIZE,
             DmaDirection::FromDevice,
         )?;
         let tx_header_pool = dma_pool(
-            context,
+            &context,
             queue_size,
             TX_HEADER_SIZE,
             64,
             DmaDirection::ToDevice,
         )?;
         let tx_payload_pool = new_shared_netbuf_pool(
-            context,
+            context.clone(),
             queue_size,
             DMA_PAGE_SIZE,
             DMA_PAGE_SIZE,
@@ -778,7 +781,7 @@ pub(crate) fn install_active_queues(
         )
         .map_err(|_| NetDeviceRegisterErrorKind::ResourceExhausted)?;
         let socket_tx_pool = new_shared_netbuf_pool(
-            context,
+            context.clone(),
             queue_size.saturating_mul(net::tuning::SOCKET_TX_POOL_DEPTH_MULTIPLIER),
             DMA_PAGE_SIZE,
             DMA_PAGE_SIZE,
@@ -863,7 +866,10 @@ pub(crate) fn quiesce_active() -> Result<(), NetDeviceRemoveError> {
 }
 
 pub(crate) fn detach_active() -> Result<(), NetDeviceRemoveError> {
-    let handle = ACTIVE_DEVICE.lock().as_ref().and_then(|active| active.handle);
+    let handle = ACTIVE_DEVICE
+        .lock()
+        .as_ref()
+        .and_then(|active| active.handle);
     let Some(handle) = handle else {
         return Ok(());
     };
@@ -882,11 +888,11 @@ pub(crate) fn destroy_active() {
     let _ = ACTIVE_DEVICE.lock().take();
 }
 
-pub(crate) fn remove_active_from_pnp() {
-    let _ = quiesce_active();
-    if let Err(error) = detach_active() {
-        log::error!("[virtio-net] PnP remove 无法排空网络设备: {:?}", error);
-    }
+pub(crate) fn remove_active_from_pnp() -> Result<(), NetDeviceRemoveError> {
+    quiesce_active()?;
+    detach_active()?;
+    destroy_active();
+    Ok(())
 }
 
 #[elm::export(

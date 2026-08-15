@@ -14,10 +14,10 @@ use kernel_symbols::{
 };
 use quote::{ToTokens, quote};
 use syn::parse::{Parse, ParseStream};
-use syn::{Expr, Ident, Item, LitInt, LitStr, ReturnType, Signature, Token, Type};
+use syn::{Expr, Ident, Item, LitInt, LitStr, Meta, ReturnType, Signature, Token, Type};
 
 const INTERFACE_MAGIC: &str = "ELM-KERNEL-INTERFACE-V1";
-const KERNEL_API_PROFILE_DOMAIN: &[u8] = b"ELM-KERNEL-API-PROFILE-V1\0";
+const KERNEL_API_PROFILE_DOMAIN: &[u8] = b"ELM-KERNEL-API-PROFILE-V2\0";
 const FRAMEWORK_DISTRIBUTION_DOMAIN: &[u8] = b"ELM-FRAMEWORK-DISTRIBUTION-V1\0";
 pub(crate) const KERNEL_API_BRIDGE_ABI_V1: u16 = 1;
 pub(crate) const KERNEL_API_MODE_EXACT_RUST: &str = "exact-rust";
@@ -280,7 +280,7 @@ impl KernelInterfaceManifest {
                 self.profile
             ));
         }
-        if kernel_api_profile_hash(&self.target, &self.profile, &self.symbols)
+        if kernel_api_profile_hash(&self.target, &self.profile, self.source_hash, &self.symbols)
             != self.interface_hash
         {
             return Err("内核 API Profile 摘要与符号清单不一致".to_string());
@@ -477,7 +477,7 @@ pub fn export_kernel_interface(
         .map_err(|error| format!("读取内核镜像 {} 失败: {error}", kernel.display()))?;
     let (source_hash, source_file_count) = repository_interface_hash(repository)?;
     let framework_hash = framework_distribution_hash(repository)?;
-    let mut symbols = scan_repository_exports(repository, [0; 32])?;
+    let mut symbols = scan_repository_exports(repository, target, [0; 32])?;
 
     let target_root = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
@@ -506,12 +506,12 @@ pub fn export_kernel_interface(
     let metadata_rlibs = exact_dependency_rlibs(&deps, &root_refs, &interface_rlibs)?;
     let public_api_abis = scan_repository_api_abis(repository, &symbols)?;
     populate_link_aliases(target, &interface_rlibs, &public_api_abis, &mut symbols)?;
-    let interface_hash = kernel_api_profile_hash(target, profile, &symbols);
+    let interface_hash = kernel_api_profile_hash(target, profile, source_hash, &symbols);
     for symbol in &mut symbols {
         symbol.interface_hash = interface_hash;
         symbol.rust_abi_hash = sha256(symbol.rust_abi.as_bytes());
     }
-    let mixin_sites = scan_repository_mixin_sites(repository, source_hash, &symbols)?;
+    let mixin_sites = scan_repository_mixin_sites(repository, target, source_hash, &symbols)?;
 
     let manifest = KernelInterfaceManifest {
         target: target.to_string(),
@@ -760,8 +760,10 @@ fn collect_rust_sources(
 
 fn scan_repository_exports(
     repository: &Path,
+    target: &str,
     interface_hash: [u8; 32],
 ) -> Result<Vec<KernelInterfaceSymbol>, String> {
+    let target_arch = target_arch_cfg(target)?;
     let sources = collect_kernel_api_sources(repository)?;
     let mut symbols = Vec::new();
     for (path, module_path) in sources {
@@ -775,6 +777,9 @@ fn scan_repository_exports(
         for item in syntax.items {
             match item {
                 Item::Fn(function) => {
+                    if !item_enabled_for_target(&function.attrs, target_arch)? {
+                        continue;
+                    }
                     let Some(args) = export_args(&function.attrs)? else {
                         continue;
                     };
@@ -804,6 +809,9 @@ fn scan_repository_exports(
                     )?);
                 }
                 Item::Static(item) => {
+                    if !item_enabled_for_target(&item.attrs, target_arch)? {
+                        continue;
+                    }
                     let Some(args) = export_args(&item.attrs)? else {
                         continue;
                     };
@@ -822,12 +830,18 @@ fn scan_repository_exports(
                     )?);
                 }
                 Item::Impl(item) => {
+                    if !item_enabled_for_target(&item.attrs, target_arch)? {
+                        continue;
+                    }
                     let self_ty = item.self_ty.as_ref();
                     let trait_path = item.trait_.as_ref().map(|(_, path, _)| path);
                     for implementation_item in item.items {
                         let syn::ImplItem::Fn(method) = implementation_item else {
                             continue;
                         };
+                        if !item_enabled_for_target(&method.attrs, target_arch)? {
+                            continue;
+                        }
                         let Some(args) = export_args(&method.attrs)? else {
                             continue;
                         };
@@ -883,9 +897,11 @@ fn scan_repository_exports(
 
 fn scan_repository_mixin_sites(
     repository: &Path,
+    target: &str,
     source_hash: [u8; 32],
     symbols: &[KernelInterfaceSymbol],
 ) -> Result<Vec<KernelInterfaceMixinSite>, String> {
+    let target_arch = target_arch_cfg(target)?;
     let sources = collect_kernel_api_sources(repository)?
         .into_iter()
         .map(|(path, _)| path)
@@ -907,6 +923,9 @@ fn scan_repository_mixin_sites(
         for item in syntax.items {
             match item {
                 Item::Fn(function) => {
+                    if !item_enabled_for_target(&function.attrs, target_arch)? {
+                        continue;
+                    }
                     let Some(args) = export_args(&function.attrs)? else {
                         continue;
                     };
@@ -924,10 +943,16 @@ fn scan_repository_mixin_sites(
                     );
                 }
                 Item::Impl(implementation) => {
+                    if !item_enabled_for_target(&implementation.attrs, target_arch)? {
+                        continue;
+                    }
                     for item in implementation.items {
                         let syn::ImplItem::Fn(method) = item else {
                             continue;
                         };
+                        if !item_enabled_for_target(&method.attrs, target_arch)? {
+                            continue;
+                        }
                         let Some(args) = export_args(&method.attrs)? else {
                             continue;
                         };
@@ -1115,6 +1140,112 @@ fn rust_module_path(crate_name: &str, relative: &Path) -> Result<String, String>
     Ok(module)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetCfgMatch {
+    Matches,
+    Mismatches,
+    Unknown,
+}
+
+impl TargetCfgMatch {
+    fn not(self) -> Self {
+        match self {
+            Self::Matches => Self::Mismatches,
+            Self::Mismatches => Self::Matches,
+            Self::Unknown => Self::Unknown,
+        }
+    }
+}
+
+struct CfgPredicates(syn::punctuated::Punctuated<Meta, Token![,]>);
+
+impl Parse for CfgPredicates {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        Ok(Self(syn::punctuated::Punctuated::parse_terminated(input)?))
+    }
+}
+
+fn target_arch_cfg(target: &str) -> Result<&'static str, String> {
+    if target.starts_with("riscv64") {
+        Ok("riscv64")
+    } else if target.starts_with("loongarch64") {
+        Ok("loongarch64")
+    } else {
+        Err(format!("不支持为目标 {target} 计算 Rust target_arch cfg"))
+    }
+}
+
+fn item_enabled_for_target(
+    attributes: &[syn::Attribute],
+    target_arch: &str,
+) -> Result<bool, String> {
+    for attribute in attributes
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("cfg"))
+    {
+        let predicate = attribute
+            .parse_args::<Meta>()
+            .map_err(|error| format!("解析目标 cfg 失败: {error}"))?;
+        if target_cfg_match(&predicate, target_arch)? == TargetCfgMatch::Mismatches {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn target_cfg_match(predicate: &Meta, target_arch: &str) -> Result<TargetCfgMatch, String> {
+    match predicate {
+        Meta::NameValue(value) if value.path.is_ident("target_arch") => {
+            let Expr::Lit(literal) = &value.value else {
+                return Err("target_arch cfg 必须使用字符串字面量".to_string());
+            };
+            let syn::Lit::Str(architecture) = &literal.lit else {
+                return Err("target_arch cfg 必须使用字符串字面量".to_string());
+            };
+            Ok(if architecture.value() == target_arch {
+                TargetCfgMatch::Matches
+            } else {
+                TargetCfgMatch::Mismatches
+            })
+        }
+        Meta::NameValue(_) | Meta::Path(_) => Ok(TargetCfgMatch::Unknown),
+        Meta::List(list) if list.path.is_ident("not") => {
+            let predicates = syn::parse2::<CfgPredicates>(list.tokens.clone())
+                .map_err(|error| format!("解析目标 cfg 失败: {error}"))?
+                .0;
+            if predicates.len() != 1 {
+                return Err("not cfg 必须恰好包含一个条件".to_string());
+            }
+            target_cfg_match(&predicates[0], target_arch).map(TargetCfgMatch::not)
+        }
+        Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
+            let predicates = syn::parse2::<CfgPredicates>(list.tokens.clone())
+                .map_err(|error| format!("解析目标 cfg 失败: {error}"))?
+                .0;
+            let matches = predicates
+                .iter()
+                .map(|predicate| target_cfg_match(predicate, target_arch))
+                .collect::<Result<Vec<_>, _>>()?;
+            if list.path.is_ident("all") {
+                if matches.contains(&TargetCfgMatch::Mismatches) {
+                    Ok(TargetCfgMatch::Mismatches)
+                } else if matches.contains(&TargetCfgMatch::Unknown) {
+                    Ok(TargetCfgMatch::Unknown)
+                } else {
+                    Ok(TargetCfgMatch::Matches)
+                }
+            } else if matches.contains(&TargetCfgMatch::Matches) {
+                Ok(TargetCfgMatch::Matches)
+            } else if matches.contains(&TargetCfgMatch::Unknown) {
+                Ok(TargetCfgMatch::Unknown)
+            } else {
+                Ok(TargetCfgMatch::Mismatches)
+            }
+        }
+        Meta::List(_) => Ok(TargetCfgMatch::Unknown),
+    }
+}
+
 struct SourceExportArgs {
     name: LitStr,
     contract: LitStr,
@@ -1248,6 +1379,7 @@ fn eval_u64(expression: &Expr) -> Result<u64, String> {
 fn kernel_api_profile_hash(
     _target: &str,
     _profile: &str,
+    source_hash: [u8; 32],
     symbols: &[KernelInterfaceSymbol],
 ) -> [u8; 32] {
     let mut ordered = symbols.iter().collect::<Vec<_>>();
@@ -1260,6 +1392,7 @@ fn kernel_api_profile_hash(
     let mut hash = Sha256::new();
     hash.update(KERNEL_API_PROFILE_DOMAIN);
     hash.update(&KERNEL_API_BRIDGE_ABI_V1.to_le_bytes());
+    hash.update(&source_hash);
     hash.update(&(ordered.len() as u64).to_le_bytes());
     for symbol in ordered {
         hash.update(&[symbol.kind]);
@@ -2888,7 +3021,8 @@ mod tests {
             .join("../..")
             .canonicalize()
             .unwrap();
-        let symbols = scan_repository_exports(&repository, [0; 32]).unwrap();
+        let symbols =
+            scan_repository_exports(&repository, "riscv64gc-unknown-none-elf", [0; 32]).unwrap();
         for prefix in [
             "acpi.",
             "allocator.",
@@ -2913,13 +3047,17 @@ mod tests {
                 "缺少 {prefix} 子系统导出"
             );
         }
-        assert!(symbols
-            .iter()
-            .all(|symbol| !forbidden_protocol_engine_reference(symbol)));
+        assert!(
+            symbols
+                .iter()
+                .all(|symbol| !forbidden_protocol_engine_reference(symbol))
+        );
         assert!(kernel_api_crates().iter().any(|spec| spec.name == "net"));
         assert!(kernel_api_crates().iter().any(|spec| spec.name == "socket"));
         for required in [
             "elf.parse",
+            "general.dev.dma.DmaAddressMapping.drop",
+            "general.dev.pnp.PnpProviderContextGuard.drop",
             "sched.operation.spawn_user_process",
             "sched.task.Task.pid_root",
             "socket.Socket.new_unix",
@@ -2986,6 +3124,53 @@ mod tests {
     }
 
     #[test]
+    fn repository_exports_follow_target_arch_cfg() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let riscv =
+            scan_repository_exports(&repository, "riscv64gc-unknown-none-elf", [0; 32]).unwrap();
+        let loongarch =
+            scan_repository_exports(&repository, "loongarch64-unknown-none", [0; 32]).unwrap();
+
+        for api_path in [
+            "hal.interrupt.riscv_imsic_install",
+            "hal.interrupt.riscv_imsic_uninstall",
+            "hal.interrupt.riscv_imsic_set_identity_enabled",
+            "hal.interrupt.riscv_imsic_clear_identity",
+            "hal.interrupt.riscv_imsic_sync_current",
+            "hal.interrupt.riscv_imsic_claim",
+        ] {
+            assert!(riscv.iter().any(|symbol| symbol.api_path == api_path));
+            assert!(loongarch.iter().all(|symbol| symbol.api_path != api_path));
+        }
+        assert_eq!(riscv.len(), loongarch.len() + 6);
+    }
+
+    #[test]
+    fn target_cfg_evaluation_is_conservative_for_unknown_predicates() {
+        let direct: syn::ItemFn = syn::parse_quote! {
+            #[cfg(target_arch = "riscv64")]
+            fn direct() {}
+        };
+        let nested: syn::ItemFn = syn::parse_quote! {
+            #[cfg(all(feature = "aia", not(target_arch = "loongarch64")))]
+            fn nested() {}
+        };
+        let unknown: syn::ItemFn = syn::parse_quote! {
+            #[cfg(any(feature = "optional", target_arch = "riscv64"))]
+            fn unknown() {}
+        };
+
+        assert!(item_enabled_for_target(&direct.attrs, "riscv64").unwrap());
+        assert!(!item_enabled_for_target(&direct.attrs, "loongarch64").unwrap());
+        assert!(item_enabled_for_target(&nested.attrs, "riscv64").unwrap());
+        assert!(!item_enabled_for_target(&nested.attrs, "loongarch64").unwrap());
+        assert!(item_enabled_for_target(&unknown.attrs, "loongarch64").unwrap());
+    }
+
+    #[test]
     fn tool_and_kernel_use_the_same_interface_source_identity() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -2994,6 +3179,16 @@ mod tests {
         let (digest, files) = repository_interface_hash(&repository).unwrap();
         assert_eq!(digest, kernel_symbols::KERNEL_INTERFACE_SOURCE_SHA256);
         assert_eq!(files, kernel_symbols::KERNEL_INTERFACE_SOURCE_FILE_COUNT);
+    }
+
+    #[test]
+    fn kernel_api_profile_binds_exact_interface_source() {
+        let old_profile =
+            kernel_api_profile_hash("riscv64gc-unknown-none-elf", "release", [0x11; 32], &[]);
+        let changed_layout_profile =
+            kernel_api_profile_hash("riscv64gc-unknown-none-elf", "release", [0x22; 32], &[]);
+
+        assert_ne!(old_profile, changed_layout_profile);
     }
 
     #[test]

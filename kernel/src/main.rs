@@ -15,6 +15,7 @@ mod acpi;
     feature = "allocator-bench"
 ))]
 mod bench;
+mod boot_root;
 mod device_init;
 mod dtb;
 mod elm;
@@ -137,6 +138,7 @@ fn main() -> ! {
         profiling::install_external_event_counter(external_profile_counter);
     }
     let secondary_cpus = hal::sched::start_secondary_cpus();
+    sched::install_firmware_topology();
     log::info!(
         "[smp] CPU startup complete: detected={} started={} failed={} online_mask={:#x} active_mask={:#x}",
         secondary_cpus.detected,
@@ -237,7 +239,6 @@ pub unsafe extern "C" fn __kernel_start_init(context: *const general::StartConte
     context
         .validate()
         .unwrap_or_else(|err| panic!("[main] invalid StartContext: {}", err));
-    #[cfg(target_arch = "riscv64")]
     general::set_start_cmdline(context.boot.command_line);
     match context.firmware_source() {
         general::StartFirmwareSource::Acpi => acpi::kernel_start_init(context),

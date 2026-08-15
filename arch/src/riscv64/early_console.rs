@@ -1,155 +1,261 @@
-//! RISC-V64 早期串口输出。
+//! RISC-V64 最早期 16550 控制台。
 //!
-//! 在正式设备模型和 logger 尚未建立之前提供最小输出能力，使启动路径上的关键阶段
-//! 能够尽早打印诊断信息。直接轮询 NS16550 UART MMIO 寄存器，不依赖内存分配、
-//! 正式页表、设备注册框架或上层 console 抽象。
-//!
-//! 启动初期通过 identity mapping 以物理地址 `0x1000_0000` 访问 UART。
-//! 内核页表初始化后需调用 [`switch_to_virtual`] 切换到 MMIO 虚拟地址，
-//! 否则 identity mapping 被拆除后输出将不可用。
-//!
-//! ```text
-//! NS16550A 寄存器（byte 宽度，基地址 + offset）：
-//!
-//!   Offset | DLAB=0 读      | DLAB=0 写      | DLAB=1
-//!   ───────┼────────────────┼────────────────┼───────────
-//!     0    | RBR (接收)     | THR (发送)     | DLL (除数低)
-//!     1    | IER (中断使能) | IER            | DLM (除数高)
-//!     2    | IIR (中断 ID)  | FCR (FIFO 控制)|
-//!     3    | LCR (线路控制) | LCR            |
-//!     4    | MCR (Modem)    | MCR            |
-//!     5    | LSR (线路状态) | —              |
-//! ```
+//! 在正式设备模型建立前直接轮询 UART。启动时先使用 QEMU virt 兜底配置；DTB
+//! 可用后原子切换为 `/chosen/stdout-path` 的完整寄存器布局，正式 MMIO 页表发布后
+//! 再从低地址 identity mapping 切到高半区窗口。
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::fmt::Write;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-// ── NS16550A 常量 ─────────────────────────────────────────────────────────────
+use fdt::Fdt;
 
-/// UART 物理地址 fallback（QEMU virt 平台 NS16550A）。
-const UART_PHYS_FALLBACK: usize = 0x1000_0000;
-/// 当前启动 identity MMIO leaf 只覆盖 PA 0..1 GiB。
+use crate::early_console_config::{
+    EarlyUartConfig, EarlyUartConfigError, RegisterEndian, RegisterIoWidth,
+    early_uart_config_from_cmdline, early_uart_config_from_fdt,
+};
+
 const EARLY_MMIO_PHYS_END: usize = 0x4000_0000;
 
-// NS16550 寄存器偏移
-const THR: usize = 0; // Transmit Holding Register
-const IER: usize = 1; // Interrupt Enable Register
-const FCR: usize = 2; // FIFO Control Register
-const LCR: usize = 3; // Line Control Register
-const MCR: usize = 4; // Modem Control Register
-const LSR: usize = 5; // Line Status Register
+const REG_THR: usize = 0;
+const REG_IER: usize = 1;
+const REG_FCR: usize = 2;
+const REG_LCR: usize = 3;
+const REG_MCR: usize = 4;
+const REG_LSR: usize = 5;
 
-const LSR_THRE: u8 = 1 << 5; // TX holding register empty
-const LCR_DLAB: u8 = 1 << 7; // Divisor Latch Access Bit
-const LCR_8N1: u8 = 0x03; // 8 data bits, no parity, 1 stop
-const FCR_ENABLE_CLEAR: u8 = 0x07; // FIFO enable + clear RX/TX
-const MCR_DTR_RTS: u8 = 0x03; // DTR + RTS asserted
+const UART_LSR_THRE: u8 = 1 << 5;
+const UART_LCR_DLAB: u8 = 1 << 7;
+const UART_LCR_8N1: u8 = 0x03;
+const UART_FCR_ENABLE_CLEAR: u8 = 0x07;
+const UART_MCR_DTR_RTS: u8 = 0x03;
 
-// 波特率 115200 @ 1.8432 MHz 参考时钟（QEMU 不关心实际值）
-const DLL: u8 = 1;
-const DLM: u8 = 0;
+const UART_STATE_UNINITIALIZED: usize = 0;
+const UART_STATE_INITIALIZING: usize = 1;
+const UART_STATE_READY: usize = 2;
 
-// ── 运行时状态 ────────────────────────────────────────────────────────────────
+const FALLBACK_EARLY_UART_CONFIG: EarlyUartConfig = EarlyUartConfig {
+    phys_base: 0x1000_0000,
+    clock_hz: 1_843_200,
+    baud: 115_200,
+    reg_offset: 0,
+    reg_shift: 0,
+    io_width: RegisterIoWidth::U8,
+    endian: RegisterEndian::Little,
+};
 
-/// DTB 解析前使用 QEMU fallback，解析后可更新为 `/chosen/stdout-path` 的物理地址。
-static PHYS_BASE: AtomicUsize = AtomicUsize::new(UART_PHYS_FALLBACK);
-/// 运行时 UART 基地址，正式页表建立后切换到 MMIO 高半区。
-static BASE: AtomicUsize = AtomicUsize::new(UART_PHYS_FALLBACK);
+static UART_PHYS_BASE: AtomicUsize = AtomicUsize::new(FALLBACK_EARLY_UART_CONFIG.phys_base);
+static UART_BASE: AtomicUsize = AtomicUsize::new(FALLBACK_EARLY_UART_CONFIG.phys_base);
+static UART_CLOCK_HZ: AtomicUsize = AtomicUsize::new(FALLBACK_EARLY_UART_CONFIG.clock_hz as usize);
+static UART_BAUD: AtomicUsize = AtomicUsize::new(FALLBACK_EARLY_UART_CONFIG.baud as usize);
+static UART_REG_OFFSET: AtomicUsize = AtomicUsize::new(FALLBACK_EARLY_UART_CONFIG.reg_offset);
+static UART_REG_SHIFT: AtomicUsize =
+    AtomicUsize::new(FALLBACK_EARLY_UART_CONFIG.reg_shift as usize);
+static UART_IO_WIDTH: AtomicUsize = AtomicUsize::new(FALLBACK_EARLY_UART_CONFIG.io_width.bytes());
+static UART_ENDIAN: AtomicUsize = AtomicUsize::new(FALLBACK_EARLY_UART_CONFIG.endian as usize);
+static UART_STATE: AtomicUsize = AtomicUsize::new(UART_STATE_UNINITIALIZED);
 
-/// 是否已完成 16550 硬件初始化。
-static INITED: AtomicBool = AtomicBool::new(false);
-
-// ── 公开 API ──────────────────────────────────────────────────────────────────
-
-/// DTB 可用后更新 early UART 物理地址。
-///
-/// 返回 false 表示地址不在当前 1 GiB identity MMIO leaf 内，调用方应继续使用
-/// QEMU fallback；配置后的下一条日志就会访问该地址，不能等正式 MMIO window 建好。
-pub fn configure_physical_base(paddr: usize) -> bool {
-    if paddr == 0 || paddr >= EARLY_MMIO_PHYS_END {
-        return false;
+/// DTB 可用后采用 chosen UART 的完整 binding 配置。
+pub(crate) fn configure_from_dtb(dtb: Fdt<'_>) -> Result<EarlyUartConfig, EarlyUartConfigError> {
+    let config = early_uart_config_from_fdt(dtb)?;
+    let end = config
+        .register_offset(REG_LSR)
+        .and_then(|offset| offset.checked_add(config.io_width.bytes()))
+        .and_then(|span| config.phys_base.checked_add(span))
+        .ok_or(EarlyUartConfigError::AddressOverflow)?;
+    if config.phys_base == 0 || end > EARLY_MMIO_PHYS_END {
+        return Err(EarlyUartConfigError::AddressOverflow);
     }
-    PHYS_BASE.store(paddr, Ordering::Release);
-    BASE.store(paddr, Ordering::Release);
-    INITED.store(false, Ordering::Release);
-    true
+
+    while UART_STATE.load(Ordering::Acquire) == UART_STATE_INITIALIZING {
+        core::hint::spin_loop();
+    }
+    UART_CLOCK_HZ.store(config.clock_hz as usize, Ordering::Relaxed);
+    UART_BAUD.store(config.baud as usize, Ordering::Relaxed);
+    UART_REG_OFFSET.store(config.reg_offset, Ordering::Relaxed);
+    UART_REG_SHIFT.store(config.reg_shift as usize, Ordering::Relaxed);
+    UART_IO_WIDTH.store(config.io_width.bytes(), Ordering::Relaxed);
+    UART_ENDIAN.store(config.endian as usize, Ordering::Relaxed);
+    UART_PHYS_BASE.store(config.phys_base, Ordering::Relaxed);
+    UART_BASE.store(config.phys_base, Ordering::Release);
+    UART_STATE.store(UART_STATE_UNINITIALIZED, Ordering::Release);
+    Ok(config)
 }
 
-/// 内核页表就绪后调用，将 UART 访问切换到 MMIO 虚拟地址。
+/// 采用显式 `earlycon=` 命令行参数指定的 16550 控制台。
 ///
-/// # 调用时序
-///
-/// 必须在以下条件同时满足时调用：
-/// - MMIO 虚拟映射已建立（新地址可达）
-/// - identity mapping 尚未拆除（旧地址仍可达，确保切换窗口安全）
+/// 优先级高于 [`configure_from_dtb`]：u-boot 等直启路径下 bootargs 是唯一可靠
+/// 的定位来源。RISC-V 早期 identity leaf 只覆盖 0..[`EARLY_MMIO_PHYS_END`]，
+/// 因此超出窗口的地址在此拒绝，避免发布后输出不可达。
+pub(crate) fn configure_from_cmdline(value: &str) -> Result<EarlyUartConfig, EarlyUartConfigError> {
+    let config = early_uart_config_from_cmdline(value, FALLBACK_EARLY_UART_CONFIG.clock_hz)?;
+    let end = config
+        .register_offset(REG_LSR)
+        .and_then(|offset| offset.checked_add(config.io_width.bytes()))
+        .and_then(|span| config.phys_base.checked_add(span))
+        .ok_or(EarlyUartConfigError::AddressOverflow)?;
+    if config.phys_base == 0 || end > EARLY_MMIO_PHYS_END {
+        return Err(EarlyUartConfigError::AddressOutOfWindow);
+    }
+
+    while UART_STATE.load(Ordering::Acquire) == UART_STATE_INITIALIZING {
+        core::hint::spin_loop();
+    }
+    UART_CLOCK_HZ.store(config.clock_hz as usize, Ordering::Relaxed);
+    UART_BAUD.store(config.baud as usize, Ordering::Relaxed);
+    UART_REG_OFFSET.store(config.reg_offset, Ordering::Relaxed);
+    UART_REG_SHIFT.store(config.reg_shift as usize, Ordering::Relaxed);
+    UART_IO_WIDTH.store(config.io_width.bytes(), Ordering::Relaxed);
+    UART_ENDIAN.store(config.endian as usize, Ordering::Relaxed);
+    UART_PHYS_BASE.store(config.phys_base, Ordering::Relaxed);
+    UART_BASE.store(config.phys_base, Ordering::Release);
+    UART_STATE.store(UART_STATE_UNINITIALIZED, Ordering::Release);
+    Ok(config)
+}
+
+/// 正式 MMIO 映射建立后切到高半区地址。
 pub fn switch_to_virtual() {
-    let vaddr = PHYS_BASE
+    let vaddr = UART_PHYS_BASE
         .load(Ordering::Acquire)
         .wrapping_add(crate::riscv64::heap_vm::MMIO_VIRT_BASE);
-    BASE.store(vaddr, Ordering::Release);
+    UART_BASE.store(vaddr, Ordering::Release);
 }
 
-/// 格式化输出到早期串口。
 pub fn e_print(args: core::fmt::Arguments) {
-    use core::fmt::Write;
-    struct W;
-    impl core::fmt::Write for W {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            write_bytes(s.as_bytes());
-            Ok(())
-        }
-    }
-    let _ = W.write_fmt(args);
+    let _ = ConsoleWriter.write_fmt(args);
 }
 
-/// 原始字节输出到早期串口。
 pub fn e_write_bytes(bytes: &[u8]) {
-    write_bytes(bytes);
+    console_write_bytes(bytes);
 }
 
-// ── 内部实现 ──────────────────────────────────────────────────────────────────
+fn load_config() -> EarlyUartConfig {
+    let _ = UART_BASE.load(Ordering::Acquire);
+    let io_width = match UART_IO_WIDTH.load(Ordering::Relaxed) {
+        2 => RegisterIoWidth::U16,
+        4 => RegisterIoWidth::U32,
+        _ => RegisterIoWidth::U8,
+    };
+    let endian = match UART_ENDIAN.load(Ordering::Relaxed) {
+        value if value == RegisterEndian::Big as usize => RegisterEndian::Big,
+        _ => RegisterEndian::Little,
+    };
+    EarlyUartConfig {
+        phys_base: UART_PHYS_BASE.load(Ordering::Relaxed),
+        clock_hz: UART_CLOCK_HZ.load(Ordering::Relaxed) as u32,
+        baud: UART_BAUD.load(Ordering::Relaxed) as u32,
+        reg_offset: UART_REG_OFFSET.load(Ordering::Relaxed),
+        reg_shift: UART_REG_SHIFT.load(Ordering::Relaxed) as u32,
+        io_width,
+        endian,
+    }
+}
 
-/// 底层发送：首次调用初始化硬件，之后逐字节轮询写入。
-///
-/// 每字节写入前等待 LSR.THRE=1（TX holding register 空），保证不丢数据。
-/// 不做 FIFO 批量优化——早期输出量小，正确性优先。
-///
-/// 防重入：若初始化过程中被中断且中断 handler 也调 e_print，跳过初始化直接写。
-fn write_bytes(bytes: &[u8]) {
-    static INITIALIZING: AtomicBool = AtomicBool::new(false);
+fn register_address(config: EarlyUartConfig, register: usize) -> usize {
+    let offset = config
+        .register_offset(register)
+        .expect("validated early UART register shift");
+    UART_BASE
+        .load(Ordering::Acquire)
+        .checked_add(offset)
+        .expect("validated early UART register address")
+}
 
-    let base = BASE.load(Ordering::Acquire);
-
+fn write_register(config: EarlyUartConfig, register: usize, value: u8) {
+    let address = register_address(config, register);
+    // Safety: DT 配置在发布前已校验地址、步长、对齐与访问宽度；目标地址处于当前
+    // early identity 或正式高半区 MMIO 映射中，只执行易失设备访问。
     unsafe {
-        if !INITED.load(Ordering::Acquire) {
-            // 防重入：如果已经在初始化中（被中断嵌套调用），跳过初始化直接输出
-            if INITIALIZING
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                // 16550 标准初始化序列
-                reg(base, IER).write_volatile(0x00); // 关闭所有中断
-                reg(base, LCR).write_volatile(LCR_DLAB); // 开 DLAB 设波特率
-                reg(base, THR).write_volatile(DLL); // Divisor Latch Low
-                reg(base, IER).write_volatile(DLM); // Divisor Latch High
-                reg(base, LCR).write_volatile(LCR_8N1); // 8N1, 关 DLAB
-                reg(base, FCR).write_volatile(FCR_ENABLE_CLEAR); // 使能并清空 FIFO
-                reg(base, MCR).write_volatile(MCR_DTR_RTS); // 拉高 DTR/RTS
-                INITED.store(true, Ordering::Release);
-                INITIALIZING.store(false, Ordering::Release);
+        match config.io_width {
+            RegisterIoWidth::U8 => core::ptr::write_volatile(address as *mut u8, value),
+            RegisterIoWidth::U16 => {
+                let value = match config.endian {
+                    RegisterEndian::Little => u16::from(value).to_le(),
+                    RegisterEndian::Big => u16::from(value).to_be(),
+                };
+                core::ptr::write_volatile(address as *mut u16, value);
             }
-            // else: 重入调用，跳过初始化，直接写（QEMU 上 UART 未初始化也能写 THR）
-        }
-
-        let thr = reg(base, THR);
-        let lsr = reg(base, LSR) as *const u8;
-        for &b in bytes {
-            while lsr.read_volatile() & LSR_THRE == 0 {}
-            thr.write_volatile(b);
+            RegisterIoWidth::U32 => {
+                let value = match config.endian {
+                    RegisterEndian::Little => u32::from(value).to_le(),
+                    RegisterEndian::Big => u32::from(value).to_be(),
+                };
+                core::ptr::write_volatile(address as *mut u32, value);
+            }
         }
     }
 }
 
-#[inline(always)]
-fn reg(base: usize, offset: usize) -> *mut u8 {
-    (base + offset) as *mut u8
+fn read_register(config: EarlyUartConfig, register: usize) -> u8 {
+    let address = register_address(config, register);
+    // Safety: 与 `write_register` 相同；多字节值按 binding 端序还原后只取 UART
+    // 寄存器定义的低 8 位。
+    unsafe {
+        match config.io_width {
+            RegisterIoWidth::U8 => core::ptr::read_volatile(address as *const u8),
+            RegisterIoWidth::U16 => {
+                let value = core::ptr::read_volatile(address as *const u16);
+                match config.endian {
+                    RegisterEndian::Little => u16::from_le(value) as u8,
+                    RegisterEndian::Big => u16::from_be(value) as u8,
+                }
+            }
+            RegisterIoWidth::U32 => {
+                let value = core::ptr::read_volatile(address as *const u32);
+                match config.endian {
+                    RegisterEndian::Little => u32::from_le(value) as u8,
+                    RegisterEndian::Big => u32::from_be(value) as u8,
+                }
+            }
+        }
+    }
+}
+
+fn ensure_initialized(config: EarlyUartConfig) {
+    match UART_STATE.compare_exchange(
+        UART_STATE_UNINITIALIZED,
+        UART_STATE_INITIALIZING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            let divisor = config
+                .divisor()
+                .expect("published early UART config must have a valid divisor");
+            write_register(config, REG_IER, 0);
+            write_register(config, REG_LCR, UART_LCR_DLAB);
+            write_register(config, REG_THR, divisor as u8);
+            write_register(config, REG_IER, (divisor >> 8) as u8);
+            write_register(config, REG_LCR, UART_LCR_8N1);
+            write_register(config, REG_FCR, UART_FCR_ENABLE_CLEAR);
+            write_register(config, REG_MCR, UART_MCR_DTR_RTS);
+            UART_STATE.store(UART_STATE_READY, Ordering::Release);
+        }
+        Err(UART_STATE_INITIALIZING) => {
+            while UART_STATE.load(Ordering::Acquire) != UART_STATE_READY {
+                core::hint::spin_loop();
+            }
+        }
+        Err(UART_STATE_READY) => {}
+        Err(_) => unreachable!("early UART state has a closed value set"),
+    }
+}
+
+fn console_write_bytes(bytes: &[u8]) {
+    let config = load_config();
+    ensure_initialized(config);
+    for &byte in bytes {
+        while read_register(config, REG_LSR) & UART_LSR_THRE == 0 {
+            core::hint::spin_loop();
+        }
+        write_register(config, REG_THR, byte);
+    }
+}
+
+struct ConsoleWriter;
+
+impl Write for ConsoleWriter {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
+        console_write_bytes(value.as_bytes());
+        Ok(())
+    }
 }

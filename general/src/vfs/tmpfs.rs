@@ -76,6 +76,16 @@ fn parse_decimal(value: &str) -> VfsResult<u64> {
 
 fn parse_quantity(value: &str) -> VfsResult<u64> {
     let value = value.trim();
+    // Linux 的 tmpfs 支持 `size=20%` 这类按物理内存总量计算的百分比值，
+    // OpenRC 等发行版启动脚本会直接使用该写法挂载 /run。
+    if let Some(percent) = value.strip_suffix('%') {
+        let number = parse_decimal(percent.trim())?;
+        if number > 100 {
+            return Err(VfsError::InvalidArgument);
+        }
+        let total_physical = allocator::KERNEL_ALLOCATOR.detailed_stats().total_physical as u64;
+        return Ok(total_physical / 100 * number);
+    }
     let digit_end = value
         .bytes()
         .position(|byte| !byte.is_ascii_digit())
@@ -139,6 +149,12 @@ fn parse_mount_options(data: &str) -> VfsResult<TmpfsMountOptions> {
             // 这些选项影响 Linux 的其他 tmpfs 后端；当前内存后端没有对应
             // 的策略状态，但接受它们可以保持通用挂载工具的参数兼容性。
             "huge" | "mpol" | "noswap" | "inode32" | "inode64" => {}
+            // busybox mount 会把 `-o nosuid,nodev` 等约束也放进 data 串而不是
+            // 全部转成 mount(2) 标志位；时间戳与执行约束由 VFS 层处理，这里
+            // 只负责不拒绝常见组合（OpenRC 挂 /run 使用 strictatime 等）。
+            "strictatime" | "relatime" | "noatime" | "nodiratime" | "lazytime"
+            | "nosuid" | "nodev" | "noexec" | "suid" | "dev" | "exec" | "sync"
+            | "async" | "dirsync" | "rw" | "ro" | "defaults" | "mand" | "nomand" => {}
             _ => return Err(VfsError::InvalidArgument),
         }
     }

@@ -5,6 +5,21 @@
 #![no_std]
 extern crate alloc;
 
+// 两个架构共享零分配的 16550 DT 配置解析；源码暂保留在原 LoongArch 路径，
+// 避免启动期解析语义分叉。
+#[cfg(any(test, target_arch = "riscv64", target_arch = "loongarch64"))]
+#[path = "loongarch64/early_console_config.rs"]
+pub(crate) mod early_console_config;
+
+// 启动协议抽象：纯逻辑（识别 + 决策），架构无关，host 单测可直接覆盖。
+#[cfg(any(test, target_arch = "riscv64", target_arch = "loongarch64"))]
+pub(crate) mod boot_protocol;
+
+// 非 RISC-V 宿主机只编译分页几何的纯逻辑单测；正式实现归属 riscv64 模块。
+#[cfg(all(test, not(target_arch = "riscv64")))]
+#[path = "riscv64/paging_geometry.rs"]
+mod riscv_paging_geometry;
+
 #[cfg(target_arch = "riscv64")]
 pub mod riscv64;
 #[cfg(target_arch = "riscv64")]

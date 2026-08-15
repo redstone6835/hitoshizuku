@@ -11,7 +11,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use errno::Errno;
 use sched::{online_cpu_mask, supported_cpu_mask};
@@ -26,15 +26,452 @@ use vfs::superblock::{FsDriver, FsDriverFlags, Superblock, SuperblockOps};
 use vfs::sync::Spinlock;
 
 use crate::dev::block::{BlockAttributes, BlockFeatures, BlockGeometry, BlockIoStatsSnapshot};
-use crate::dev::cpu;
 use crate::dev::enumerate::{DEVICES, PNP_DEVICES};
 use crate::dev::net::NET_CLASS;
 use crate::dev::pnp::{PnpDependency, PnpId, PnpOwnedResourceSnapshot, PnpResourceKind, PnpState};
+use crate::dev::{cpu, numa};
 use crate::vfs::device_files::projection::{
     PublishedDevNodeClass, append_function_projection_diagnostics, published_block_devnodes,
     published_char_devnodes, published_devnode_classes,
 };
 use crate::vfs::user_api::device_numbers;
+
+/// 安装 Device Tree sysfs 投影时可能返回的错误。
+#[derive(Debug)]
+pub enum DeviceTreeSysfsInstallError {
+    /// 输入不是一份符合 FDT 结构规范的扁平设备树。
+    InvalidFdt(fdt::Error),
+    /// 已经安装了内容不同的启动设备树。
+    AlreadyInstalled,
+}
+
+/// 向 sysfs live Device Tree 应用 overlay 时可能返回的错误。
+#[derive(Debug)]
+pub enum DeviceTreeSysfsOverlayError {
+    /// 尚未安装启动设备树。
+    NotInstalled,
+    /// 当前 live tree 无法建立规范 owned 表示。
+    InvalidLiveTree(fdt::OwnedTreeError),
+    /// overlay 本身、fixup 或 fragment 不合法。
+    InvalidOverlay(fdt::OverlayError),
+    /// 合并结果无法重新序列化为规范 DTB。
+    InvalidOutput(fdt::OwnedTreeError),
+    /// 另一个 overlay 事务正在校验或切换设备模型。
+    UpdateInProgress,
+    /// 内核固件语义层拒绝提交候选 live tree。
+    RuntimeRejected(DeviceTreeOverlayRuntimeError),
+}
+
+/// live Device Tree 进入内核设备模型时的拒绝原因。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceTreeOverlayRuntimeError {
+    /// 候选树虽然是合法 FDT，但不能建立完整的规范固件抽象。
+    InvalidFirmware,
+    /// overlay 试图修改本内核不支持热插拔的启动对象。
+    UnsupportedChange,
+    /// platform PnP 设备集合无法完成事务式切换。
+    PlatformPnp,
+    /// 规范化节点图无法与 live tree 一同提交。
+    NodeGraph,
+}
+
+/// 安装 live Device Tree 提交钩子时可能返回的错误。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceTreeOverlayHookInstallError {
+    /// 已经安装了另一个提交钩子。
+    AlreadyInstalled,
+}
+
+/// 在 sysfs 发布候选树前同步内核固件抽象和设备模型。
+pub type DeviceTreeOverlayCommitHook =
+    fn(base: &[u8], candidate: &[u8]) -> Result<(), DeviceTreeOverlayRuntimeError>;
+
+/// sysfs 持有的启动设备树。
+///
+/// 启动 blob 在安装时复制并清除不可重新公开的启动秘密，之后永久不可变；live blob
+/// 使用独立分配，并可在 overlay 完整校验后原子替换。目录访问每次先固定 live `Arc`
+/// 快照，再从中取得借用视图，因此不需要自引用结构，也不会把解析器内部类型泄露给
+/// VFS。
+struct DeviceTreeFirmware {
+    boot_blob: Arc<[u8]>,
+    live_blob: Spinlock<Arc<[u8]>>,
+    overlay_in_progress: AtomicBool,
+}
+
+impl DeviceTreeFirmware {
+    fn from_fdt(tree: &fdt::Fdt<'_>) -> Result<Self, fdt::Error> {
+        const FDT_NOP_BYTES: [u8; 4] = 4u32.to_be_bytes();
+
+        let mut blob = tree.as_bytes().to_vec();
+        let seed_records = tree
+            .root()
+            .children()
+            .filter(|node| matches!(node.name(), "chosen" | "chosen@0"))
+            .flat_map(|chosen| {
+                chosen
+                    .properties()
+                    .filter(|property| matches!(property.name(), "rng-seed" | "kaslr-seed"))
+                    .map(|property| property.encoded_structure_range())
+            })
+            .collect::<Vec<_>>();
+        let structure_start = tree.header().off_dt_struct as usize;
+        for encoded in seed_records {
+            let start = structure_start + encoded.start;
+            let end = structure_start + encoded.end;
+            debug_assert!((end - start).is_multiple_of(4));
+            for token in blob[start..end].chunks_exact_mut(4) {
+                token.copy_from_slice(&FDT_NOP_BYTES);
+            }
+        }
+
+        // 完整属性记录被替换为 NOP 后再次校验，确保 raw FDT 与目录投影始终
+        // 来自同一份仍符合 FDT token 规则的不可变副本。
+        fdt::Fdt::parse(&blob)?;
+        let boot_blob: Arc<[u8]> = blob.into();
+        // 两个 ABI 文件必须具有彼此独立的生命周期：后续 live tree 交换绝不能改变
+        // `/sys/firmware/fdt` 保存的启动快照。
+        let live_blob: Arc<[u8]> = Arc::from(boot_blob.as_ref());
+        Ok(Self {
+            boot_blob,
+            live_blob: Spinlock::new(live_blob),
+            overlay_in_progress: AtomicBool::new(false),
+        })
+    }
+
+    fn live_blob(&self) -> Arc<[u8]> {
+        Arc::clone(&self.live_blob.lock())
+    }
+
+    fn begin_overlay_update(&self) -> Result<DeviceTreeOverlayUpdateGuard<'_>, ()> {
+        self.overlay_in_progress
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| ())?;
+        Ok(DeviceTreeOverlayUpdateGuard {
+            active: &self.overlay_in_progress,
+        })
+    }
+}
+
+struct DeviceTreeOverlayUpdateGuard<'a> {
+    active: &'a AtomicBool,
+}
+
+impl Drop for DeviceTreeOverlayUpdateGuard<'_> {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+/// live tree 中不依赖 structure block offset 的节点身份。
+///
+/// 对规范 DTB，`path` 就是唯一绝对路径，`sibling_occurrences` 全为零。后者只用于让
+/// sysfs 继续安全投影旧固件中不合规范的同名兄弟节点，不参与规范路径的 inode key。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeviceTreeNodeId {
+    path: String,
+    sibling_occurrences: Vec<usize>,
+}
+
+impl DeviceTreeNodeId {
+    fn root() -> Self {
+        Self {
+            path: "/".to_string(),
+            sibling_occurrences: Vec::new(),
+        }
+    }
+
+    fn child(&self, name: &str, sibling_occurrence: usize) -> Self {
+        let path = if self.path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{name}", self.path)
+        };
+        let mut sibling_occurrences = self.sibling_occurrences.clone();
+        sibling_occurrences.push(sibling_occurrence);
+        Self {
+            path,
+            sibling_occurrences,
+        }
+    }
+
+    fn node<'a>(&self, blob: &'a [u8]) -> Option<fdt::Node<'a>> {
+        let tree = fdt::Fdt::parse(blob).ok()?;
+        if self.path == "/" {
+            return Some(tree.root());
+        }
+
+        let mut node = tree.root();
+        let mut occurrences = self.sibling_occurrences.iter().copied();
+        for component in self.path.strip_prefix('/')?.split('/') {
+            let occurrence = occurrences.next()?;
+            node = node
+                .children()
+                .filter(|child| child.name() == component)
+                .nth(occurrence)?;
+        }
+        occurrences.next().is_none().then_some(node)
+    }
+
+    fn append_key_suffix(&self, key: &mut String) {
+        key.push_str(&self.path);
+        if self
+            .sibling_occurrences
+            .iter()
+            .any(|occurrence| *occurrence != 0)
+        {
+            key.push('\0');
+            for occurrence in &self.sibling_occurrences {
+                key.push_str(&format!("{occurrence},"));
+            }
+        }
+    }
+}
+
+const DEVICE_TREE_SAFE_NAME_RETRIES: usize = 16;
+
+fn device_tree_has_synthetic_name(node: fdt::Node<'_>) -> bool {
+    node.property("name").is_none()
+}
+
+#[derive(Clone, Copy)]
+enum DeviceTreePropertySource<'a> {
+    Encoded(fdt::Property<'a>),
+    SyntheticName,
+}
+
+fn device_tree_property_mode(name: &str) -> u16 {
+    if name.starts_with("security-") {
+        0o400
+    } else {
+        0o444
+    }
+}
+
+/// 复现 Linux `drivers/of/kobj.c::safe_name` 的成功发布结果。
+///
+/// Linux 在原名冲突后最多构造 `#1` 到 `#16`；若最后一个候选仍冲突，
+/// 后续 `kobject_add` 会以 `EEXIST` 失败，因此这里返回 `None`。
+fn device_tree_safe_name(original: &str, mut occupied: impl FnMut(&str) -> bool) -> Option<String> {
+    if !occupied(original) {
+        return Some(original.to_string());
+    }
+    for suffix in 1..=DEVICE_TREE_SAFE_NAME_RETRIES {
+        let candidate = format!("{original}#{suffix}");
+        if !occupied(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+struct DeviceTreeChildProjection<'a> {
+    sysfs_name: String,
+    node: fdt::Node<'a>,
+    sibling_occurrence: usize,
+}
+
+struct DeviceTreePropertyProjection<'a> {
+    sysfs_name: String,
+    source: DeviceTreePropertySource<'a>,
+}
+
+impl DeviceTreePropertyProjection<'_> {
+    fn original_name(&self) -> &str {
+        match self.source {
+            DeviceTreePropertySource::Encoded(property) => property.name(),
+            DeviceTreePropertySource::SyntheticName => "name",
+        }
+    }
+
+    fn data(&self, node: fdt::Node<'_>) -> Arc<[u8]> {
+        match self.source {
+            DeviceTreePropertySource::Encoded(property) => Arc::from(property.value()),
+            DeviceTreePropertySource::SyntheticName => {
+                let base_name = node.base_name_bytes();
+                let mut value = Vec::with_capacity(base_name.len() + 1);
+                value.extend_from_slice(base_name);
+                value.push(0);
+                Arc::from(value)
+            }
+        }
+    }
+}
+
+/// 属性按 unflatten 后的链表顺序挂入 sysfs；同名属性同样使用 Linux `safe_name`。
+fn device_tree_property_projections(node: fdt::Node<'_>) -> Vec<DeviceTreePropertyProjection<'_>> {
+    let mut projected: Vec<DeviceTreePropertyProjection<'_>> = Vec::new();
+    for property in node.properties() {
+        let Some(sysfs_name) = device_tree_safe_name(property.name(), |candidate| {
+            projected.iter().any(|entry| entry.sysfs_name == candidate)
+        }) else {
+            continue;
+        };
+        projected.push(DeviceTreePropertyProjection {
+            sysfs_name,
+            source: DeviceTreePropertySource::Encoded(property),
+        });
+    }
+
+    if device_tree_has_synthetic_name(node) {
+        let sysfs_name = device_tree_safe_name("name", |candidate| {
+            projected.iter().any(|entry| entry.sysfs_name == candidate)
+        });
+        if let Some(sysfs_name) = sysfs_name {
+            projected.push(DeviceTreePropertyProjection {
+                sysfs_name,
+                source: DeviceTreePropertySource::SyntheticName,
+            });
+        }
+    }
+    projected
+}
+
+/// 按 Linux 的挂接顺序计算当前节点的子目录显示名。
+///
+/// 当前节点的属性（包括合成 `name`）先占用名称，随后子节点按 DT 顺序逐个发布。
+/// `node` 保留原始身份，`sysfs_name` 只用于用户可见目录项。
+fn device_tree_child_projections<'a>(node: fdt::Node<'a>) -> Vec<DeviceTreeChildProjection<'a>> {
+    let properties = device_tree_property_projections(node);
+    let mut projected: Vec<DeviceTreeChildProjection<'a>> = Vec::new();
+    let mut sibling_occurrences: BTreeMap<String, usize> = BTreeMap::new();
+    for child in node.children() {
+        let occurrence = sibling_occurrences
+            .entry(child.name().to_string())
+            .or_insert(0);
+        let sibling_occurrence = *occurrence;
+        *occurrence += 1;
+        let sysfs_name = device_tree_safe_name(child.name(), |candidate| {
+            properties.iter().any(|entry| entry.sysfs_name == candidate)
+                || projected.iter().any(|entry| entry.sysfs_name == candidate)
+        });
+        let Some(sysfs_name) = sysfs_name else {
+            continue;
+        };
+        projected.push(DeviceTreeChildProjection {
+            sysfs_name,
+            node: child,
+            sibling_occurrence,
+        });
+    }
+    projected
+}
+
+static DEVICE_TREE_FIRMWARE: Spinlock<Option<Arc<DeviceTreeFirmware>>> = Spinlock::new(None);
+static DEVICE_TREE_OVERLAY_COMMIT_HOOK: Spinlock<Option<DeviceTreeOverlayCommitHook>> =
+    Spinlock::new(None);
+
+/// 安装 live Device Tree 的内核提交钩子。
+///
+/// sysfs 在持有 live tree 交换锁且确认基线仍然有效后调用该钩子。钩子返回错误时，
+/// live blob 和 dentry 缓存均保持不变；返回成功后不再执行任何可能失败的步骤。
+pub fn install_device_tree_overlay_commit_hook(
+    hook: DeviceTreeOverlayCommitHook,
+) -> Result<(), DeviceTreeOverlayHookInstallError> {
+    let mut installed = DEVICE_TREE_OVERLAY_COMMIT_HOOK.lock();
+    if let Some(current) = *installed {
+        return if core::ptr::fn_addr_eq(current, hook) {
+            Ok(())
+        } else {
+            Err(DeviceTreeOverlayHookInstallError::AlreadyInstalled)
+        };
+    }
+    *installed = Some(hook);
+    Ok(())
+}
+
+/// 安装 Linux ABI 兼容的启动 Device Tree sysfs 视图。
+///
+/// 安装成功后，所有 sysfs 实例都会暴露原始 blob `/sys/firmware/fdt`，以及
+/// `/sys/firmware/devicetree/base` 下的节点和属性层次。除 Linux 同样会在消费后
+/// 擦除的 `/chosen/{rng,kaslr}-seed` 外，属性内容保持原始二进制字节，不执行字符串、
+/// 整数或端序转换。重复安装同一份投影是幂等操作；启动期间若已安装另一份投影，
+/// 则拒绝替换，保证已打开 inode 的视图稳定。
+pub fn install_device_tree(tree: &fdt::Fdt<'_>) -> Result<(), DeviceTreeSysfsInstallError> {
+    let candidate = Arc::new(
+        DeviceTreeFirmware::from_fdt(tree).map_err(DeviceTreeSysfsInstallError::InvalidFdt)?,
+    );
+    let mut installed = DEVICE_TREE_FIRMWARE.lock();
+    if let Some(current) = installed.as_ref() {
+        return if current.boot_blob.as_ref() == candidate.boot_blob.as_ref() {
+            Ok(())
+        } else {
+            Err(DeviceTreeSysfsInstallError::AlreadyInstalled)
+        };
+    }
+    *installed = Some(candidate);
+    drop(installed);
+    // sysfs 可能早于固件安装完成；清除此前 lookup 产生的正/负缓存，使首次发布
+    // 对所有已挂载 sysfs 实例立即可见。
+    invalidate_firmware_children(&["fdt", "devicetree"]);
+    Ok(())
+}
+
+/// 校验并安装一份原始 FDT blob。
+///
+/// 调用方的切片无需具有 `'static` 生命周期；sysfs 会持有自己的精确副本。
+pub fn install_device_tree_blob(blob: &[u8]) -> Result<(), DeviceTreeSysfsInstallError> {
+    let tree = fdt::Fdt::parse(blob).map_err(DeviceTreeSysfsInstallError::InvalidFdt)?;
+    install_device_tree(&tree)
+}
+
+/// 返回启动 Device Tree 是否已经发布到 sysfs。
+pub fn device_tree_installed() -> bool {
+    DEVICE_TREE_FIRMWARE.lock().is_some()
+}
+
+fn installed_device_tree() -> Option<Arc<DeviceTreeFirmware>> {
+    DEVICE_TREE_FIRMWARE.lock().clone()
+}
+
+fn remove_live_device_tree_seeds(tree: &mut fdt::OwnedTree) {
+    for chosen in tree
+        .root
+        .children
+        .iter_mut()
+        .filter(|node| matches!(node.name.as_str(), "chosen" | "chosen@0"))
+    {
+        chosen
+            .properties
+            .retain(|property| !matches!(property.name.as_str(), "rng-seed" | "kaslr-seed"));
+    }
+}
+
+/// 原子地向 `/sys/firmware/devicetree/base` 应用一份标准 dtc/Linux overlay。
+///
+/// overlay 的解析、fixup、合并和规范 v17 序列化都在当前 live blob 的私有副本上
+/// 完成。只有结果完整通过校验且基线在构建期间未被其他 overlay 更新时，才交换 live
+/// `Arc`；任何错误都不会改变已发布目录。`/sys/firmware/fdt` 始终保持安装时清理过
+/// seed 的启动 blob。同一时刻只允许一个 overlay 事务进入语义提交；并发或重入更新
+/// 返回 UpdateInProgress，调用方可在稍后重试。
+pub fn apply_device_tree_overlay(blob: &[u8]) -> Result<(), DeviceTreeSysfsOverlayError> {
+    let firmware = installed_device_tree().ok_or(DeviceTreeSysfsOverlayError::NotInstalled)?;
+    let _update = firmware
+        .begin_overlay_update()
+        .map_err(|()| DeviceTreeSysfsOverlayError::UpdateInProgress)?;
+    let base_blob = firmware.live_blob();
+    let mut tree = fdt::OwnedTree::parse(base_blob.as_ref())
+        .map_err(DeviceTreeSysfsOverlayError::InvalidLiveTree)?;
+    tree.apply_overlay_blob(blob)
+        .map_err(DeviceTreeSysfsOverlayError::InvalidOverlay)?;
+    // 启动 seed 一旦消费便不得通过后续 live tree 更新重新公开。
+    remove_live_device_tree_seeds(&mut tree);
+    let candidate: Arc<[u8]> = tree
+        .to_dtb()
+        .map_err(DeviceTreeSysfsOverlayError::InvalidOutput)?
+        .into();
+
+    let commit = *DEVICE_TREE_OVERLAY_COMMIT_HOOK.lock();
+    if let Some(commit) = commit {
+        commit(base_blob.as_ref(), candidate.as_ref())
+            .map_err(DeviceTreeSysfsOverlayError::RuntimeRejected)?;
+    }
+    let mut live_blob = firmware.live_blob.lock();
+    debug_assert!(Arc::ptr_eq(&base_blob, &live_blob));
+    *live_blob = candidate;
+    drop(live_blob);
+    invalidate_device_tree_dentries();
+    Ok(())
+}
 
 // ─── 静态 ino 编号 ──────────────────────────────────────────
 const ROOT_INO: u64 = 1;
@@ -90,6 +527,7 @@ const CPU_TOPOLOGY_SLOTS: u64 = 8;
 static SYSFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SYSFS_INO_REGISTRY: Spinlock<Option<SysfsInoRegistry>> = Spinlock::new(None);
 static ELM_SYSFS_RENDERER: Spinlock<Option<ElmSysfsRenderer>> = Spinlock::new(None);
+static SYSFS_ROOT_DENTRIES: Spinlock<Vec<Weak<Dentry>>> = Spinlock::new(Vec::new());
 
 const SYSFS_MAGIC: u64 = 0x6265_6572;
 const SYSFS_DYNAMIC_INO_START: u64 = 1_000_000_000;
@@ -98,6 +536,46 @@ const SYSFS_CHAR_CLASS: &str = "char";
 const SYSFS_NET_CLASS: &str = NET_CLASS.as_str();
 
 pub type ElmSysfsRenderer = fn(&str) -> String;
+
+fn register_sysfs_root_dentry(root: &Arc<Dentry>) {
+    let mut roots = SYSFS_ROOT_DENTRIES.lock();
+    roots.retain(|root| root.strong_count() != 0);
+    roots.push(Arc::downgrade(root));
+}
+
+/// live tree 交换后逐出各 sysfs 实例中旧的 Device Tree dentry 子树。
+///
+/// 这同时清除正向和负向缓存，使 API 返回后重新进行的路径 lookup 必定进入新的
+/// `InodeOps` 投影；已经打开的文件仍持有自己的 inode/FileOps `Arc` 快照。
+fn invalidate_device_tree_dentries() {
+    invalidate_firmware_children(&["devicetree"]);
+}
+
+fn invalidate_firmware_children(names: &[&str]) {
+    let roots = {
+        let mut tracked = SYSFS_ROOT_DENTRIES.lock();
+        let mut roots = Vec::new();
+        tracked.retain(|root| {
+            let Some(root) = root.upgrade() else {
+                return false;
+            };
+            roots.push(root);
+            true
+        });
+        roots
+    };
+
+    for root in roots {
+        let Some(firmware) = vfs::DCACHE.get(&root, "firmware") else {
+            continue;
+        };
+        for name in names {
+            if let Some(child) = vfs::DCACHE.get(&firmware, name) {
+                vfs::DCACHE.invalidate_subtree(&child);
+            }
+        }
+    }
+}
 
 pub fn register_elm_renderer(renderer: ElmSysfsRenderer) {
     *ELM_SYSFS_RENDERER.lock() = Some(renderer);
@@ -309,6 +787,45 @@ impl SysfsKey {
 
     fn net_stats_slot(iface_id: u32, slot: u64) -> Self {
         Self::raw(format!("class/net/iface/{iface_id}/statistics/slot/{slot}"))
+    }
+
+    fn firmware_fdt() -> Self {
+        Self::raw("firmware/fdt".into())
+    }
+
+    fn firmware_device_tree() -> Self {
+        Self::raw("firmware/devicetree".into())
+    }
+
+    fn device_tree_node(node: &DeviceTreeNodeId) -> Self {
+        let mut key = "firmware/devicetree/node".to_string();
+        node.append_key_suffix(&mut key);
+        Self::raw(key)
+    }
+
+    fn device_tree_property(node: &DeviceTreeNodeId, name: &str) -> Self {
+        let mut key = "firmware/devicetree/property".to_string();
+        node.append_key_suffix(&mut key);
+        // FDT 规范不允许节点名或属性名包含 NUL；分隔符因此不会造成 key 歧义。
+        key.push('\0');
+        key.push_str(name);
+        Self::raw(key)
+    }
+
+    fn numa_root() -> Self {
+        Self::raw("devices/system/node".into())
+    }
+
+    fn numa_root_slot(slot: u64) -> Self {
+        Self::raw(format!("devices/system/node/slot/{slot}"))
+    }
+
+    fn numa_node(node_id: u32) -> Self {
+        Self::raw(format!("devices/system/node/node{node_id}"))
+    }
+
+    fn numa_node_slot(node_id: u32, slot: u64) -> Self {
+        Self::raw(format!("devices/system/node/node{node_id}/slot/{slot}"))
     }
 }
 
@@ -606,6 +1123,9 @@ fn pnp_dependency_name(dependency: PnpDependency) -> String {
             format!("pci-host-bridge:{domain}")
         }
         PnpDependency::Dma => "dma".into(),
+        PnpDependency::DtbProvider { kind, phandle } => {
+            format!("dt-provider:{kind}:{phandle}")
+        }
         PnpDependency::Other(name) => name.into(),
     }
 }
@@ -958,6 +1478,30 @@ fn dev_char_dir_ino(rdev: DevId) -> u64 {
 }
 fn dev_char_inner_ino(rdev: DevId, slot: u64) -> u64 {
     sysfs_dynamic_ino(SysfsKey::dev_char_inner(rdev, slot))
+}
+fn firmware_fdt_ino() -> u64 {
+    sysfs_dynamic_ino(SysfsKey::firmware_fdt())
+}
+fn firmware_device_tree_ino() -> u64 {
+    sysfs_dynamic_ino(SysfsKey::firmware_device_tree())
+}
+fn device_tree_node_ino(node: &DeviceTreeNodeId) -> u64 {
+    sysfs_dynamic_ino(SysfsKey::device_tree_node(node))
+}
+fn device_tree_property_ino(node: &DeviceTreeNodeId, name: &str) -> u64 {
+    sysfs_dynamic_ino(SysfsKey::device_tree_property(node, name))
+}
+fn numa_root_ino() -> u64 {
+    sysfs_dynamic_ino(SysfsKey::numa_root())
+}
+fn numa_root_slot_ino(slot: u64) -> u64 {
+    sysfs_dynamic_ino(SysfsKey::numa_root_slot(slot))
+}
+fn numa_node_ino(node_id: u32) -> u64 {
+    sysfs_dynamic_ino(SysfsKey::numa_node(node_id))
+}
+fn numa_node_slot_ino(node_id: u32, slot: u64) -> u64 {
+    sysfs_dynamic_ino(SysfsKey::numa_node_slot(node_id, slot))
 }
 fn cpu_ino(cpu_id: usize) -> u64 {
     CPU_BASE + (cpu_id as u64) * CPU_SLOTS
@@ -1423,6 +1967,77 @@ impl CpuSlot {
 }
 
 #[derive(Clone, Copy)]
+enum NumaRootSlot {
+    HasCpu,
+    HasMemory,
+    Online,
+    Possible,
+}
+
+impl NumaRootSlot {
+    const ALL: &'static [Self] = &[Self::HasCpu, Self::HasMemory, Self::Online, Self::Possible];
+
+    fn to_u64(self) -> u64 {
+        match self {
+            Self::HasCpu => 0,
+            Self::HasMemory => 1,
+            Self::Online => 2,
+            Self::Possible => 3,
+        }
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::HasCpu => "has_cpu",
+            Self::HasMemory => "has_memory",
+            Self::Online => "online",
+            Self::Possible => "possible",
+        }
+    }
+}
+
+fn numa_root_slot_by_name(name: &str) -> Option<NumaRootSlot> {
+    NumaRootSlot::ALL
+        .iter()
+        .find(|slot| slot.file_name() == name)
+        .copied()
+}
+
+#[derive(Clone, Copy)]
+enum NumaNodeSlot {
+    CpuList,
+    CpuMap,
+    Distance,
+}
+
+impl NumaNodeSlot {
+    const ALL: &'static [Self] = &[Self::CpuList, Self::CpuMap, Self::Distance];
+
+    fn to_u64(self) -> u64 {
+        match self {
+            Self::CpuList => 0,
+            Self::CpuMap => 1,
+            Self::Distance => 2,
+        }
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::CpuList => "cpulist",
+            Self::CpuMap => "cpumap",
+            Self::Distance => "distance",
+        }
+    }
+}
+
+fn numa_node_slot_by_name(name: &str) -> Option<NumaNodeSlot> {
+    NumaNodeSlot::ALL
+        .iter()
+        .find(|slot| slot.file_name() == name)
+        .copied()
+}
+
+#[derive(Clone, Copy)]
 enum CpuTopologySlot {
     PhysicalPackageId,
     CoreId,
@@ -1509,6 +2124,13 @@ enum SysRegFile {
     CpuTopology {
         cpu_id: usize,
         slot: CpuTopologySlot,
+    },
+    NumaRoot {
+        slot: NumaRootSlot,
+    },
+    NumaNode {
+        node_id: u32,
+        slot: NumaNodeSlot,
     },
     CpuOnline,
     CpuPossible,
@@ -1913,6 +2535,205 @@ fn format_cpu_mask_range(mask: u64) -> String {
     out
 }
 
+fn push_u32_range(out: &mut String, start: u32, end: u32) {
+    use core::fmt::Write;
+
+    if !out.is_empty() {
+        out.push(',');
+    }
+    if start == end {
+        let _ = write!(out, "{start}");
+    } else {
+        let _ = write!(out, "{start}-{end}");
+    }
+}
+
+/// 按 Linux bitmap list ABI 格式化稀疏 node state。
+fn format_numa_node_list(nodes: &[u32]) -> String {
+    let mut nodes = nodes.to_vec();
+    nodes.sort_unstable();
+    nodes.dedup();
+
+    let mut out = String::new();
+    let mut iter = nodes.into_iter().peekable();
+    while let Some(start) = iter.next() {
+        let mut end = start;
+        while let Some(next) = iter.peek().copied() {
+            if next != end.saturating_add(1) {
+                break;
+            }
+            end = iter.next().unwrap_or(end);
+        }
+        push_u32_range(&mut out, start, end);
+    }
+    out.push('\n');
+    out
+}
+
+/// 按 Linux cpumap ABI 输出十六进制 bitmap。
+///
+/// 每 32 bit 使用逗号分组，低位组固定为八位十六进制；最高组只输出
+/// `nr_cpu_ids` 实际需要的位宽，例如 16 CPU 系统输出 `ffff`。
+fn format_linux_cpumap(mask: u64, width_bits: usize) -> String {
+    use core::fmt::Write;
+
+    let width_bits = width_bits.clamp(1, u64::BITS as usize);
+    let groups = width_bits.div_ceil(32);
+    let high_bits = width_bits - (groups - 1) * 32;
+    let mut out = String::new();
+    for group in (0..groups).rev() {
+        if !out.is_empty() {
+            out.push(',');
+        }
+        let value = ((mask >> (group * 32)) & u64::from(u32::MAX)) as u32;
+        let digits = if group == groups - 1 {
+            high_bits.div_ceil(4)
+        } else {
+            8
+        };
+        let _ = write!(out, "{value:0digits$x}");
+    }
+    out.push('\n');
+    out
+}
+
+const LINUX_DEFAULT_REMOTE_DISTANCE: u32 = 20;
+
+/// 单次访问使用的 NUMA sysfs 只读快照。
+///
+/// `possible` 保留固件距离矩阵中仅被引用的节点；`online` 则只包含至少拥有一个
+/// 可支持 CPU 或非空 RAM 范围的节点，匹配 Linux node device 的发布条件。
+#[derive(Clone, Debug)]
+struct NumaSysfsView {
+    topology: numa::NumaTopology,
+    cpu_assignments: Vec<cpu::CpuNumaEntry>,
+    possible_nodes: Vec<u32>,
+    online_nodes: Vec<u32>,
+    cpu_nodes: Vec<u32>,
+    memory_nodes: Vec<u32>,
+    cpu_bitmap_width: usize,
+}
+
+impl NumaSysfsView {
+    fn snapshot() -> Self {
+        Self::new(
+            numa::snapshot_topology(),
+            cpu::snapshot_numa_topology(),
+            supported_cpu_mask() | online_cpu_mask(),
+        )
+    }
+
+    fn new(
+        topology: numa::NumaTopology,
+        mut cpu_assignments: Vec<cpu::CpuNumaEntry>,
+        supported_cpus: u64,
+    ) -> Self {
+        // 当前调度 CPU ABI 使用 u64 mask；忽略无法被内核支持的逻辑编号，避免损坏
+        // 固件输入令 cpumap 产生无界输出。
+        cpu_assignments.retain(|entry| entry.logical_id < u64::BITS);
+        cpu_assignments.sort_unstable_by_key(|entry| (entry.logical_id, entry.node_id));
+        cpu_assignments.dedup();
+
+        let mut cpu_nodes = cpu_assignments
+            .iter()
+            .map(|entry| entry.node_id)
+            .collect::<Vec<_>>();
+        cpu_nodes.sort_unstable();
+        cpu_nodes.dedup();
+
+        let mut memory_nodes = topology
+            .memory
+            .iter()
+            .filter(|range| range.size != 0)
+            .map(|range| range.node_id)
+            .collect::<Vec<_>>();
+        memory_nodes.sort_unstable();
+        memory_nodes.dedup();
+
+        let mut online_nodes = cpu_nodes.clone();
+        online_nodes.extend_from_slice(&memory_nodes);
+        online_nodes.sort_unstable();
+        online_nodes.dedup();
+
+        let mut possible_nodes = topology.node_ids.clone();
+        possible_nodes.extend_from_slice(&online_nodes);
+        possible_nodes.extend(
+            topology
+                .distances
+                .iter()
+                .flat_map(|entry| [entry.from, entry.to]),
+        );
+        possible_nodes.sort_unstable();
+        possible_nodes.dedup();
+
+        let mask_width = (u64::BITS - supported_cpus.leading_zeros()) as usize;
+        let assigned_width = cpu_assignments
+            .iter()
+            .map(|entry| entry.logical_id as usize + 1)
+            .max()
+            .unwrap_or(0);
+
+        Self {
+            topology,
+            cpu_assignments,
+            possible_nodes,
+            online_nodes,
+            cpu_nodes,
+            memory_nodes,
+            cpu_bitmap_width: mask_width.max(assigned_width).max(1),
+        }
+    }
+
+    fn contains_online_node(&self, node_id: u32) -> bool {
+        self.online_nodes.binary_search(&node_id).is_ok()
+    }
+
+    fn cpu_mask(&self, node_id: u32) -> u64 {
+        self.cpu_assignments
+            .iter()
+            .filter(|entry| entry.node_id == node_id)
+            .fold(0u64, |mask, entry| mask | (1u64 << entry.logical_id))
+    }
+
+    fn render_root_file(&self, slot: NumaRootSlot) -> String {
+        match slot {
+            NumaRootSlot::HasCpu => format_numa_node_list(&self.cpu_nodes),
+            NumaRootSlot::HasMemory => format_numa_node_list(&self.memory_nodes),
+            NumaRootSlot::Online => format_numa_node_list(&self.online_nodes),
+            NumaRootSlot::Possible => format_numa_node_list(&self.possible_nodes),
+        }
+    }
+
+    fn render_node_file(&self, node_id: u32, slot: NumaNodeSlot) -> String {
+        match slot {
+            NumaNodeSlot::CpuList => format_cpu_mask_range(self.cpu_mask(node_id)),
+            NumaNodeSlot::CpuMap => {
+                format_linux_cpumap(self.cpu_mask(node_id), self.cpu_bitmap_width)
+            }
+            NumaNodeSlot::Distance => {
+                use core::fmt::Write;
+
+                let mut out = String::new();
+                for &target in &self.online_nodes {
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    let distance = self.topology.distance(node_id, target).unwrap_or_else(|| {
+                        if node_id == target {
+                            fdt::NUMA_LOCAL_DISTANCE
+                        } else {
+                            LINUX_DEFAULT_REMOTE_DISTANCE
+                        }
+                    });
+                    let _ = write!(out, "{distance}");
+                }
+                out.push('\n');
+                out
+            }
+        }
+    }
+}
+
 struct CpuMaskIter {
     mask: u64,
     next: usize,
@@ -1946,13 +2767,17 @@ impl Iterator for CpuMaskIter {
 }
 
 #[derive(Clone, Copy)]
-struct CpuTopologyView {
+struct CpuTopologyView<'a> {
     package_id: u32,
+    cluster_path: &'a [u32],
     core_id: u32,
     thread_id: u32,
 }
 
-fn cpu_topology_view(cpu_id: usize, entries: &[cpu::CpuTopologyEntry]) -> Option<CpuTopologyView> {
+fn cpu_topology_view<'a>(
+    cpu_id: usize,
+    entries: &'a [cpu::CpuTopologyEntry],
+) -> Option<CpuTopologyView<'a>> {
     let logical_id = u32::try_from(cpu_id).ok()?;
     let entry = entries.iter().find(|entry| entry.logical_id == logical_id);
 
@@ -1961,16 +2786,20 @@ fn cpu_topology_view(cpu_id: usize, entries: &[cpu::CpuTopologyEntry]) -> Option
     // 使用 logical CPU 自身作为 core，thread 使用 0，保持 sibling 计算稳定。
     Some(CpuTopologyView {
         package_id: entry.and_then(|entry| entry.socket_id).unwrap_or(0),
+        cluster_path: entry.map_or(&[], |entry| entry.cluster_path.as_ref()),
         core_id: entry.and_then(|entry| entry.core_id).unwrap_or(logical_id),
         thread_id: entry.and_then(|entry| entry.thread_id).unwrap_or(0),
     })
 }
 
-fn cpu_topology_sibling_mask(
+fn cpu_topology_sibling_mask<F>(
     cpu_id: usize,
     entries: &[cpu::CpuTopologyEntry],
-    same_group: fn(CpuTopologyView, CpuTopologyView) -> bool,
-) -> u64 {
+    same_group: F,
+) -> u64
+where
+    F: Fn(CpuTopologyView<'_>, CpuTopologyView<'_>) -> bool,
+{
     let Some(base) = cpu_topology_view(cpu_id, entries) else {
         return 0;
     };
@@ -1988,6 +2817,12 @@ fn cpu_topology_sibling_mask(
         candidate += 1;
     }
     mask
+}
+
+fn same_thread_sibling(left: CpuTopologyView<'_>, right: CpuTopologyView<'_>) -> bool {
+    left.package_id == right.package_id
+        && left.cluster_path == right.cluster_path
+        && left.core_id == right.core_id
 }
 
 fn render_cpu_file(_snap: &SysSnapshot, _cpu_id: usize, slot: CpuSlot) -> String {
@@ -2014,9 +2849,7 @@ fn render_cpu_topology_file(_snap: &SysSnapshot, cpu_id: usize, slot: CpuTopolog
             format_cpu_mask_range(mask)
         }
         CpuTopologySlot::ThreadSiblingsList => {
-            let mask = cpu_topology_sibling_mask(cpu_id, &entries, |a, b| {
-                a.package_id == b.package_id && a.core_id == b.core_id
-            });
+            let mask = cpu_topology_sibling_mask(cpu_id, &entries, same_thread_sibling);
             format_cpu_mask_range(mask)
         }
     }
@@ -2471,6 +3304,10 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
         SysRegFile::DevCharInner { idx, slot } => render_dev_char_inner(snap, idx, slot),
         SysRegFile::Cpu { cpu_id, slot } => render_cpu_file(snap, cpu_id, slot),
         SysRegFile::CpuTopology { cpu_id, slot } => render_cpu_topology_file(snap, cpu_id, slot),
+        SysRegFile::NumaRoot { slot } => NumaSysfsView::snapshot().render_root_file(slot),
+        SysRegFile::NumaNode { node_id, slot } => {
+            NumaSysfsView::snapshot().render_node_file(node_id, slot)
+        }
         SysRegFile::CpuOnline => format_cpu_mask_range(online_cpu_mask()),
         SysRegFile::CpuPossible => format_cpu_mask_range(supported_cpu_mask()),
         // 当前内核尚未区分“已发现但离线”的 CPU；present 先反映在线 CPU 集合。
@@ -2534,6 +3371,7 @@ impl FsDriver for SysFsDriver {
             let snap = Arc::new(SysSnapshot::collect());
             let root_inode = build_root_inode(fs_id, &weak_sb, Arc::clone(&snap));
             let root_dentry = Dentry::new_positive("", None, Arc::clone(&root_inode));
+            register_sysfs_root_dentry(&root_dentry);
             Superblock {
                 fs_type: "sysfs",
                 fs_id,
@@ -2591,6 +3429,9 @@ impl SuperblockOps for SysSuperblockOps {
 
 struct SysDirFile {
     snapshot: Vec<DirEntry>,
+}
+struct SysBinaryFile {
+    data: Arc<[u8]>,
 }
 struct SysRegFileOps {
     kind: SysRegFile,
@@ -2654,6 +3495,31 @@ impl FileOps for SysDirFile {
     }
 }
 
+impl FileOps for SysBinaryFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        read_bytes_at(buf, offset, self.data.as_ref())
+    }
+    fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
+    fn readdir(&self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>) -> VfsResult<u64> {
+        Err(VfsError::NotADirectory)
+    }
+    fn sync(&self) -> VfsResult<()> {
+        Ok(())
+    }
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        PollEvents::READ_WRITE_READY.intersect(interest)
+    }
+    fn ioctl(&self, _: IoctlCmd, _: usize) -> Result<usize, Errno> {
+        Err(errno::Errno::ENOTTY)
+    }
+    fn release(&self) {}
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
 impl FileOps for SysRegFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         #[cfg(feature = "performance-profile")]
@@ -2669,7 +3535,26 @@ impl FileOps for SysRegFileOps {
         let s = render_reg_file(&self.snap, self.kind);
         read_bytes_at(buf, offset, s.as_bytes())
     }
-    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+    fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        // uevent 文件写:接受 Linux 的动作词并触发事件回调(当前为校验 +
+        // 钩子占位;mdev/udevadm trigger 兼容)。非法动作返回 EINVAL。
+        if matches!(
+            self.kind,
+            SysRegFile::DevCharInner {
+                slot: DevCharInnerSlot::Uevent,
+                ..
+            }
+        ) {
+            let action = core::str::from_utf8(buf)
+                .map_err(|_| VfsError::InvalidArgument)?
+                .trim();
+            return match action {
+                "add" | "remove" | "change" | "bind" | "unbind" | "online" | "offline" => {
+                    Ok(buf.len())
+                }
+                _ => Err(VfsError::InvalidArgument),
+            };
+        }
         #[cfg(feature = "performance-profile")]
         if matches!(self.kind, SysRegFile::ProfileControl) {
             if _offset != 0 {
@@ -2854,7 +3739,9 @@ fn build_dir_inode(
         weak_sb: weak_sb.clone(),
         snap: Arc::clone(snap),
     });
-    mk_inode(fs_id, weak_sb, ino, FileType::Directory, 0o555, 2, ops)
+    // Linux 的 sysfs 根目录为 0555，kobject 创建的子目录统一报告为 0755；
+    // 写位不代表允许任意 VFS 修改，实际操作仍由只读 InodeOps 约束。
+    mk_inode(fs_id, weak_sb, ino, FileType::Directory, 0o755, 2, ops)
 }
 
 fn build_link_inode(
@@ -2865,6 +3752,29 @@ fn build_link_inode(
 ) -> Arc<Inode> {
     let ops: Arc<dyn InodeOps + Send + Sync> = Arc::new(SysLinkInodeOps { target });
     mk_inode(fs_id, weak_sb, ino, FileType::Symlink, 0o777, 1, ops)
+}
+
+fn build_binary_inode(
+    fs_id: FsId,
+    weak_sb: &Weak<Superblock>,
+    ino: u64,
+    mode: u16,
+    reported_size: u64,
+    data: Arc<[u8]>,
+) -> Arc<Inode> {
+    let ops: Arc<dyn InodeOps + Send + Sync> = Arc::new(SysBinaryInodeOps { data });
+    let mut meta = inode_meta(mode, 1, timespec_now());
+    meta.size = reported_size;
+    Inode::new(
+        InodeId { fs_id, ino },
+        FileType::Regular,
+        DevId::new(0, 0),
+        4096,
+        None,
+        meta,
+        ops,
+        weak_sb.clone(),
+    )
 }
 
 // ─── 目录类型枚举 ───────────────────────────────────────────
@@ -2938,8 +3848,16 @@ enum SysDirKind {
     Module,
     Power,
     Firmware,
+    FirmwareDeviceTree,
+    DeviceTreeNode {
+        node_id: DeviceTreeNodeId,
+    },
     DevicesSystem,
     DevicesSystemCpu,
+    DevicesSystemNode,
+    NumaNode {
+        node_id: u32,
+    },
     Cpu {
         cpu_id: usize,
     },
@@ -2953,6 +3871,9 @@ enum SysDirKind {
 struct SysRegInodeOps {
     kind: SysRegFile,
     snap: Arc<SysSnapshot>,
+}
+struct SysBinaryInodeOps {
+    data: Arc<[u8]>,
 }
 struct SysLinkInodeOps {
     target: String,
@@ -2973,8 +3894,14 @@ fn truncate_sys_reg(kind: SysRegFile, size: u64) -> VfsResult<()> {
             Err(VfsError::InvalidArgument)
         };
     }
-    let _ = (kind, size);
-    Err(VfsError::ReadOnlyFilesystem)
+    let _ = kind;
+    // 与 Linux kernfs 一致:sysfs 普通文件忽略截断到 0 的请求
+    // (shell 的 `echo x > file` 带 O_TRUNC),非零截断拒绝。
+    if size == 0 {
+        Ok(())
+    } else {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
 }
 
 impl InodeOps for SysRegInodeOps {
@@ -3004,6 +3931,31 @@ impl InodeOps for SysRegInodeOps {
     }
     fn truncate(&self, _: &Inode, size: u64) -> VfsResult<()> {
         truncate_sys_reg(self.kind, size)
+    }
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+impl InodeOps for SysBinaryInodeOps {
+    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        Ok(Box::new(SysBinaryFile {
+            data: Arc::clone(&self.data),
+        }))
+    }
+    fn truncate(&self, _: &Inode, _: u64) -> VfsResult<()> {
+        Err(VfsError::ReadOnlyFilesystem)
     }
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         Err(VfsError::InvalidArgument)
@@ -3074,6 +4026,9 @@ impl SysDirInodeOps {
         };
         let mk_link = |ino: u64, target: String| -> Arc<Inode> {
             build_link_inode(fs_id, weak_sb, ino, target)
+        };
+        let mk_binary = |ino: u64, mode: u16, reported_size: u64, data: Arc<[u8]>| -> Arc<Inode> {
+            build_binary_inode(fs_id, weak_sb, ino, mode, reported_size, data)
         };
 
         match self.kind.clone() {
@@ -3459,13 +4414,103 @@ impl SysDirInodeOps {
                     ),
                 ))
             }
-            SysDirKind::Module | SysDirKind::Power | SysDirKind::Firmware => {
+            SysDirKind::Module | SysDirKind::Power => Err(VfsError::NotFound),
+            SysDirKind::Firmware => {
+                let firmware = installed_device_tree().ok_or(VfsError::NotFound)?;
+                match name {
+                    "fdt" => {
+                        let size = firmware.boot_blob.len() as u64;
+                        Ok(mk_binary(
+                            firmware_fdt_ino(),
+                            0o400,
+                            size,
+                            Arc::clone(&firmware.boot_blob),
+                        ))
+                    }
+                    "devicetree" => Ok(mk_dir(
+                        firmware_device_tree_ino(),
+                        SysDirKind::FirmwareDeviceTree,
+                    )),
+                    _ => Err(VfsError::NotFound),
+                }
+            }
+            SysDirKind::FirmwareDeviceTree => {
+                if name != "base" {
+                    return Err(VfsError::NotFound);
+                }
+                installed_device_tree().ok_or(VfsError::NotFound)?;
+                let node_id = DeviceTreeNodeId::root();
+                Ok(mk_dir(
+                    device_tree_node_ino(&node_id),
+                    SysDirKind::DeviceTreeNode { node_id },
+                ))
+            }
+            SysDirKind::DeviceTreeNode { node_id } => {
+                let firmware = installed_device_tree().ok_or(VfsError::NotFound)?;
+                let live_blob = firmware.live_blob();
+                let node = node_id.node(live_blob.as_ref()).ok_or(VfsError::NotFound)?;
+
+                if let Some(property) = device_tree_property_projections(node)
+                    .into_iter()
+                    .find(|property| property.sysfs_name == name)
+                {
+                    let mode = device_tree_property_mode(property.original_name());
+                    let value = property.data(node);
+                    let reported_size = if mode == 0o400 { 0 } else { value.len() as u64 };
+                    return Ok(mk_binary(
+                        device_tree_property_ino(&node_id, name),
+                        mode,
+                        reported_size,
+                        value,
+                    ));
+                }
+
+                if let Some(child) = device_tree_child_projections(node)
+                    .into_iter()
+                    .find(|child| child.sysfs_name == name)
+                {
+                    let child_id = node_id.child(child.node.name(), child.sibling_occurrence);
+                    return Ok(mk_dir(
+                        device_tree_node_ino(&child_id),
+                        SysDirKind::DeviceTreeNode { node_id: child_id },
+                    ));
+                }
                 Err(VfsError::NotFound)
             }
             SysDirKind::DevicesSystem => match name {
                 "cpu" => Ok(mk_dir(DEVICES_SYSTEM_CPU_INO, SysDirKind::DevicesSystemCpu)),
+                "node" => Ok(mk_dir(numa_root_ino(), SysDirKind::DevicesSystemNode)),
                 _ => Err(VfsError::NotFound),
             },
+            SysDirKind::DevicesSystemNode => {
+                if let Some(slot) = numa_root_slot_by_name(name) {
+                    return mk_reg(
+                        numa_root_slot_ino(slot.to_u64()),
+                        SysRegFile::NumaRoot { slot },
+                    );
+                }
+                let node_id = name
+                    .strip_prefix("node")
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .ok_or(VfsError::NotFound)?;
+                if !NumaSysfsView::snapshot().contains_online_node(node_id) {
+                    return Err(VfsError::NotFound);
+                }
+                Ok(mk_dir(
+                    numa_node_ino(node_id),
+                    SysDirKind::NumaNode { node_id },
+                ))
+            }
+            SysDirKind::NumaNode { node_id } => {
+                if !NumaSysfsView::snapshot().contains_online_node(node_id) {
+                    return Err(VfsError::NotFound);
+                }
+                let slot = numa_node_slot_by_name(name).ok_or(VfsError::NotFound)?;
+                mk_reg(
+                    numa_node_slot_ino(node_id, slot.to_u64()),
+                    SysRegFile::NumaNode { node_id, slot },
+                )
+            }
             SysDirKind::DevicesSystemCpu => {
                 if name == "online" {
                     mk_reg(DEVICES_SYSTEM_CPU_ONLINE_INO, SysRegFile::CpuOnline)
@@ -4104,12 +5149,112 @@ impl SysDirInodeOps {
                 }
                 entries
             }
-            SysDirKind::Module | SysDirKind::Power | SysDirKind::Firmware => Vec::new(),
-            SysDirKind::DevicesSystem => vec![mk_dir_entry(
-                DEVICES_SYSTEM_CPU_INO,
-                "cpu",
-                FileType::Directory,
-            )],
+            SysDirKind::Module | SysDirKind::Power => Vec::new(),
+            SysDirKind::Firmware => {
+                if installed_device_tree().is_none() {
+                    Vec::new()
+                } else {
+                    vec![
+                        mk_dir_entry(firmware_fdt_ino(), "fdt", FileType::Regular),
+                        mk_dir_entry(
+                            firmware_device_tree_ino(),
+                            "devicetree",
+                            FileType::Directory,
+                        ),
+                    ]
+                }
+            }
+            SysDirKind::FirmwareDeviceTree => {
+                if installed_device_tree().is_none() {
+                    return Vec::new();
+                }
+                let node_id = DeviceTreeNodeId::root();
+                vec![mk_dir_entry(
+                    device_tree_node_ino(&node_id),
+                    "base",
+                    FileType::Directory,
+                )]
+            }
+            SysDirKind::DeviceTreeNode { node_id } => {
+                let Some(firmware) = installed_device_tree() else {
+                    return Vec::new();
+                };
+                let live_blob = firmware.live_blob();
+                let Some(node) = node_id.node(live_blob.as_ref()) else {
+                    return Vec::new();
+                };
+                let mut entries = Vec::new();
+
+                for property in device_tree_property_projections(node) {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        device_tree_property_ino(&node_id, &property.sysfs_name),
+                        &property.sysfs_name,
+                        FileType::Regular,
+                    ) {
+                        return entries;
+                    }
+                }
+                for child in device_tree_child_projections(node) {
+                    let child_id = node_id.child(child.node.name(), child.sibling_occurrence);
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        device_tree_node_ino(&child_id),
+                        &child.sysfs_name,
+                        FileType::Directory,
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
+            SysDirKind::DevicesSystem => vec![
+                mk_dir_entry(DEVICES_SYSTEM_CPU_INO, "cpu", FileType::Directory),
+                mk_dir_entry(numa_root_ino(), "node", FileType::Directory),
+            ],
+            SysDirKind::DevicesSystemNode => {
+                let view = NumaSysfsView::snapshot();
+                let mut entries = Vec::new();
+                for slot in NumaRootSlot::ALL {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        numa_root_slot_ino(slot.to_u64()),
+                        slot.file_name(),
+                        FileType::Regular,
+                    ) {
+                        return entries;
+                    }
+                }
+                for node_id in view.online_nodes {
+                    let name = format!("node{node_id}");
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        numa_node_ino(node_id),
+                        &name,
+                        FileType::Directory,
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
+            SysDirKind::NumaNode { node_id } => {
+                if !NumaSysfsView::snapshot().contains_online_node(node_id) {
+                    return Vec::new();
+                }
+                let mut entries = Vec::new();
+                for slot in NumaNodeSlot::ALL {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        numa_node_slot_ino(node_id, slot.to_u64()),
+                        slot.file_name(),
+                        FileType::Regular,
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
             SysDirKind::DevicesSystemCpu => {
                 let mask = online_cpu_mask();
                 let mut entries = Vec::new();
@@ -4255,6 +5400,526 @@ fn build_root_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, snap: Arc<SysSnapsh
 mod tests {
     use super::*;
 
+    static DEVICE_TREE_SYSFS_TEST_LOCK: Spinlock<()> = Spinlock::new(());
+    static DEVICE_TREE_OVERLAY_TEST_REJECTION: Spinlock<Option<DeviceTreeOverlayRuntimeError>> =
+        Spinlock::new(None);
+    static DEVICE_TREE_OVERLAY_TEST_CALLS: AtomicU64 = AtomicU64::new(0);
+    const TEST_RNG_SEED: &[u8] = &[0xde, 0xad, 0xbe, 0xef, 0x13, 0x37, 0xc0, 0xde];
+    const TEST_KASLR_SEED: &[u8] = &[0x91, 0x82, 0x73, 0x64, 0x55, 0x46, 0x37, 0x28];
+
+    #[test]
+    fn thread_siblings_keep_cluster_scoped_core_ids_separate() {
+        let entry = |logical_id, cluster: &[u32], thread_id| cpu::CpuTopologyEntry {
+            logical_id,
+            reg: u64::from(logical_id),
+            phandle: Some(logical_id + 1),
+            interrupt_controller_phandles: Vec::new().into_boxed_slice(),
+            compatible: Vec::new(),
+            socket_id: Some(0),
+            cluster_path: cluster.to_vec().into_boxed_slice(),
+            core_id: Some(0),
+            thread_id: Some(thread_id),
+            capacity_dmips_mhz: None,
+        };
+        let entries = [entry(0, &[0], 0), entry(1, &[0], 1), entry(2, &[1], 0)];
+        let first = cpu_topology_view(0, &entries).unwrap();
+        let sibling = cpu_topology_view(1, &entries).unwrap();
+        let other_cluster = cpu_topology_view(2, &entries).unwrap();
+
+        assert!(same_thread_sibling(first, sibling));
+        assert!(!same_thread_sibling(first, other_cluster));
+    }
+
+    #[test]
+    fn numa_sysfs_view_matches_linux_node_list_bitmap_and_distance_formats() {
+        let topology = numa::NumaTopology {
+            node_ids: vec![7, 4, 2, 0],
+            distances: vec![numa::NumaDistance {
+                from: 0,
+                to: 2,
+                distance: 21,
+            }],
+            memory: vec![
+                numa::NumaMemoryRange {
+                    start: 0x1000,
+                    size: 0x1000,
+                    node_id: 2,
+                },
+                numa::NumaMemoryRange {
+                    start: 0x2000,
+                    size: 0x1000,
+                    node_id: 4,
+                },
+            ],
+        };
+        let view = NumaSysfsView::new(
+            topology,
+            vec![
+                cpu::CpuNumaEntry {
+                    logical_id: 1,
+                    node_id: 0,
+                },
+                cpu::CpuNumaEntry {
+                    logical_id: 0,
+                    node_id: 0,
+                },
+                cpu::CpuNumaEntry {
+                    logical_id: 33,
+                    node_id: 2,
+                },
+            ],
+            1u64 << 33,
+        );
+
+        assert_eq!(view.render_root_file(NumaRootSlot::HasCpu), "0,2\n");
+        assert_eq!(view.render_root_file(NumaRootSlot::HasMemory), "2,4\n");
+        assert_eq!(view.render_root_file(NumaRootSlot::Online), "0,2,4\n");
+        assert_eq!(view.render_root_file(NumaRootSlot::Possible), "0,2,4,7\n");
+        assert!(view.contains_online_node(4));
+        assert!(!view.contains_online_node(7));
+
+        assert_eq!(view.render_node_file(0, NumaNodeSlot::CpuList), "0-1\n");
+        assert_eq!(
+            view.render_node_file(0, NumaNodeSlot::CpuMap),
+            "0,00000003\n"
+        );
+        assert_eq!(
+            view.render_node_file(2, NumaNodeSlot::CpuMap),
+            "2,00000000\n"
+        );
+        assert_eq!(view.render_node_file(4, NumaNodeSlot::CpuList), "\n");
+        assert_eq!(
+            view.render_node_file(4, NumaNodeSlot::CpuMap),
+            "0,00000000\n"
+        );
+        assert_eq!(
+            view.render_node_file(0, NumaNodeSlot::Distance),
+            "10 21 20\n"
+        );
+        assert_eq!(
+            view.render_node_file(4, NumaNodeSlot::Distance),
+            "20 20 10\n"
+        );
+    }
+
+    #[test]
+    fn empty_numa_sysfs_view_is_stable() {
+        let view = NumaSysfsView::new(numa::NumaTopology::default(), Vec::new(), 0);
+        for slot in NumaRootSlot::ALL {
+            assert_eq!(view.render_root_file(*slot), "\n");
+        }
+        assert!(view.online_nodes.is_empty());
+        assert_eq!(view.render_node_file(0, NumaNodeSlot::CpuList), "\n");
+        assert_eq!(view.render_node_file(0, NumaNodeSlot::CpuMap), "0\n");
+        assert_eq!(view.render_node_file(0, NumaNodeSlot::Distance), "\n");
+        assert_eq!(format_linux_cpumap(0xffff, 16), "ffff\n");
+    }
+
+    #[test]
+    fn devices_system_publishes_empty_numa_subsystem() {
+        let system = SysDirInodeOps {
+            kind: SysDirKind::DevicesSystem,
+            fs_id: FsId::new(0x4e55),
+            weak_sb: Weak::new(),
+            snap: Arc::new(SysSnapshot::default()),
+        };
+        assert_eq!(
+            system
+                .readdir_entries()
+                .into_iter()
+                .map(|entry| (entry.name.as_str().to_string(), entry.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("cpu".to_string(), FileType::Directory),
+                ("node".to_string(), FileType::Directory),
+            ]
+        );
+
+        let node = system.lookup_child("node").unwrap();
+        assert_eq!(
+            directory_entries(&node),
+            vec![
+                ("has_cpu".to_string(), FileType::Regular),
+                ("has_memory".to_string(), FileType::Regular),
+                ("online".to_string(), FileType::Regular),
+                ("possible".to_string(), FileType::Regular),
+            ]
+        );
+        assert!(matches!(node.lookup("node0"), Err(VfsError::NotFound)));
+    }
+
+    struct InstalledDeviceTreeReset {
+        firmware: Option<Arc<DeviceTreeFirmware>>,
+        overlay_hook: Option<DeviceTreeOverlayCommitHook>,
+    }
+
+    impl InstalledDeviceTreeReset {
+        fn take() -> Self {
+            DEVICE_TREE_OVERLAY_TEST_CALLS.store(0, Ordering::Relaxed);
+            *DEVICE_TREE_OVERLAY_TEST_REJECTION.lock() = None;
+            Self {
+                firmware: DEVICE_TREE_FIRMWARE.lock().take(),
+                overlay_hook: DEVICE_TREE_OVERLAY_COMMIT_HOOK.lock().take(),
+            }
+        }
+    }
+
+    impl Drop for InstalledDeviceTreeReset {
+        fn drop(&mut self) {
+            *DEVICE_TREE_FIRMWARE.lock() = self.firmware.take();
+            *DEVICE_TREE_OVERLAY_COMMIT_HOOK.lock() = self.overlay_hook.take();
+            *DEVICE_TREE_OVERLAY_TEST_REJECTION.lock() = None;
+        }
+    }
+
+    fn device_tree_overlay_test_commit_hook(
+        base: &[u8],
+        candidate: &[u8],
+    ) -> Result<(), DeviceTreeOverlayRuntimeError> {
+        DEVICE_TREE_OVERLAY_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(
+            fdt::Fdt::parse(base)
+                .unwrap()
+                .find_node("/soc@0")
+                .unwrap()
+                .property("state")
+                .unwrap()
+                .value(),
+            b"old\0"
+        );
+        assert_eq!(
+            fdt::Fdt::parse(candidate)
+                .unwrap()
+                .find_node("/soc@0")
+                .unwrap()
+                .property("state")
+                .unwrap()
+                .value(),
+            b"new\0"
+        );
+        match *DEVICE_TREE_OVERLAY_TEST_REJECTION.lock() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    struct CachedDentrySubtreeReset(Arc<Dentry>);
+
+    impl Drop for CachedDentrySubtreeReset {
+        fn drop(&mut self) {
+            vfs::DCACHE.invalidate_subtree(&self.0);
+        }
+    }
+
+    fn cached_positive_child(parent: &Arc<Dentry>, name: &str) -> Arc<Dentry> {
+        if let Some(cached) = vfs::DCACHE.get(parent, name) {
+            assert!(cached.is_positive());
+            return cached;
+        }
+        let parent_inode = parent.inode().unwrap();
+        let child_inode = parent_inode.lookup(name).unwrap();
+        vfs::DCACHE.insert(Dentry::new_positive(
+            name,
+            Some(Arc::clone(parent)),
+            child_inode,
+        ))
+    }
+
+    fn cached_negative_child(parent: &Arc<Dentry>, name: &str) -> Arc<Dentry> {
+        assert!(matches!(
+            parent.inode().unwrap().lookup(name),
+            Err(VfsError::NotFound)
+        ));
+        vfs::DCACHE.insert(Dentry::new_negative(name, Some(Arc::clone(parent))))
+    }
+
+    fn push_be32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn pad_to_u32(out: &mut Vec<u8>) {
+        while !out.len().is_multiple_of(4) {
+            out.push(0);
+        }
+    }
+
+    fn add_fdt_string(strings: &mut Vec<u8>, name: &[u8]) -> u32 {
+        let offset = strings.len() as u32;
+        strings.extend_from_slice(name);
+        strings.push(0);
+        offset
+    }
+
+    fn push_fdt_property(structure: &mut Vec<u8>, name_offset: u32, value: &[u8]) {
+        const FDT_PROP: u32 = 3;
+        push_be32(structure, FDT_PROP);
+        push_be32(structure, value.len() as u32);
+        push_be32(structure, name_offset);
+        structure.extend_from_slice(value);
+        pad_to_u32(structure);
+    }
+
+    fn test_dtb() -> Vec<u8> {
+        const FDT_BEGIN_NODE: u32 = 1;
+        const FDT_END_NODE: u32 = 2;
+        const FDT_END: u32 = 9;
+
+        let mut strings = Vec::new();
+        let compatible = add_fdt_string(&mut strings, b"compatible");
+        let clash = add_fdt_string(&mut strings, b"clash");
+        let clash_1 = add_fdt_string(&mut strings, b"clash#1");
+        let address_cells = add_fdt_string(&mut strings, b"#address-cells");
+        let binary = add_fdt_string(&mut strings, b"binary");
+        let empty = add_fdt_string(&mut strings, b"empty");
+        let security_password = add_fdt_string(&mut strings, b"security-password");
+        let marker = add_fdt_string(&mut strings, b"marker");
+        let name = add_fdt_string(&mut strings, b"name");
+        let status = add_fdt_string(&mut strings, b"status");
+        let rng_seed = add_fdt_string(&mut strings, b"rng-seed");
+        let kaslr_seed = add_fdt_string(&mut strings, b"kaslr-seed");
+
+        let mut structure = Vec::new();
+        push_be32(&mut structure, FDT_BEGIN_NODE);
+        structure.push(0);
+        pad_to_u32(&mut structure);
+        push_fdt_property(&mut structure, compatible, b"test,board\0");
+        push_fdt_property(&mut structure, clash, &[]);
+        push_fdt_property(&mut structure, clash_1, &[]);
+        push_fdt_property(&mut structure, compatible, b"test,duplicate\0");
+
+        push_be32(&mut structure, FDT_BEGIN_NODE);
+        structure.extend_from_slice(b"chosen\0");
+        pad_to_u32(&mut structure);
+        push_fdt_property(&mut structure, rng_seed, TEST_RNG_SEED);
+        push_fdt_property(&mut structure, kaslr_seed, TEST_KASLR_SEED);
+        push_be32(&mut structure, FDT_END_NODE);
+
+        push_be32(&mut structure, FDT_BEGIN_NODE);
+        structure.extend_from_slice(b"soc@0\0");
+        pad_to_u32(&mut structure);
+        push_fdt_property(&mut structure, address_cells, &[0, 0, 0, 2]);
+        push_fdt_property(&mut structure, binary, &[0, 0xff, 1, 0x80, 0]);
+        push_fdt_property(&mut structure, empty, &[]);
+        push_fdt_property(&mut structure, security_password, b"s3cr3t\0");
+        push_be32(&mut structure, FDT_END_NODE);
+
+        push_be32(&mut structure, FDT_BEGIN_NODE);
+        structure.extend_from_slice(b"disabled@0\0");
+        pad_to_u32(&mut structure);
+        push_fdt_property(&mut structure, status, b"disabled\0");
+        push_be32(&mut structure, FDT_END_NODE);
+
+        push_be32(&mut structure, FDT_BEGIN_NODE);
+        structure.extend_from_slice(b"clash\0");
+        pad_to_u32(&mut structure);
+        push_fdt_property(&mut structure, marker, &[0x42]);
+        push_be32(&mut structure, FDT_END_NODE);
+
+        push_be32(&mut structure, FDT_BEGIN_NODE);
+        structure.extend_from_slice(b"clash\0");
+        pad_to_u32(&mut structure);
+        push_fdt_property(&mut structure, marker, &[0x44]);
+        push_be32(&mut structure, FDT_END_NODE);
+
+        push_be32(&mut structure, FDT_BEGIN_NODE);
+        structure.extend_from_slice(b"name\0");
+        pad_to_u32(&mut structure);
+        push_fdt_property(&mut structure, marker, &[0x43]);
+        push_fdt_property(&mut structure, name, b"explicit\0");
+        push_be32(&mut structure, FDT_END_NODE);
+        push_be32(&mut structure, FDT_END_NODE);
+        push_be32(&mut structure, FDT_END);
+
+        finish_test_dtb(structure, strings)
+    }
+
+    fn finish_test_dtb(structure: Vec<u8>, strings: Vec<u8>) -> Vec<u8> {
+        const HEADER_SIZE: u32 = 40;
+        const RESERVATION_SIZE: u32 = 16;
+        let structure_offset = HEADER_SIZE + RESERVATION_SIZE;
+        let strings_offset = structure_offset + structure.len() as u32;
+        let total_size = strings_offset + strings.len() as u32;
+
+        let mut blob = Vec::with_capacity(total_size as usize);
+        for value in [
+            fdt::DTB_MAGIC,
+            total_size,
+            structure_offset,
+            strings_offset,
+            HEADER_SIZE,
+            17,
+            16,
+            0,
+            strings.len() as u32,
+            structure.len() as u32,
+        ] {
+            push_be32(&mut blob, value);
+        }
+        blob.resize((HEADER_SIZE + RESERVATION_SIZE) as usize, 0);
+        blob.extend_from_slice(&structure);
+        blob.extend_from_slice(&strings);
+        blob
+    }
+
+    fn duplicate_seed_test_dtb() -> Vec<u8> {
+        const FDT_BEGIN_NODE: u32 = 1;
+        const FDT_END_NODE: u32 = 2;
+        const FDT_END: u32 = 9;
+
+        let mut strings = Vec::new();
+        let rng_seed = add_fdt_string(&mut strings, b"rng-seed");
+        let kaslr_seed = add_fdt_string(&mut strings, b"kaslr-seed");
+        let mut structure = Vec::new();
+        push_be32(&mut structure, FDT_BEGIN_NODE);
+        structure.push(0);
+        pad_to_u32(&mut structure);
+
+        push_be32(&mut structure, FDT_BEGIN_NODE);
+        structure.extend_from_slice(b"chosen\0");
+        pad_to_u32(&mut structure);
+        push_fdt_property(&mut structure, rng_seed, &[]);
+        push_fdt_property(&mut structure, rng_seed, b"duplicate-rng-secret");
+        push_fdt_property(&mut structure, kaslr_seed, b"duplicate-kaslr-secret");
+        push_be32(&mut structure, FDT_END_NODE);
+
+        push_be32(&mut structure, FDT_BEGIN_NODE);
+        structure.extend_from_slice(b"chosen@0\0");
+        pad_to_u32(&mut structure);
+        push_fdt_property(&mut structure, rng_seed, b"legacy-rng-secret");
+        push_fdt_property(&mut structure, kaslr_seed, b"legacy-kaslr-secret");
+        push_be32(&mut structure, FDT_END_NODE);
+        push_be32(&mut structure, FDT_END_NODE);
+        push_be32(&mut structure, FDT_END);
+        finish_test_dtb(structure, strings)
+    }
+
+    fn owned_property(name: &str, value: &[u8]) -> fdt::OwnedProperty {
+        fdt::OwnedProperty {
+            name: name.to_string(),
+            value: value.to_vec(),
+        }
+    }
+
+    fn valid_live_test_dtb() -> Vec<u8> {
+        let mut root = fdt::OwnedNode::new("");
+        root.properties
+            .push(owned_property("compatible", b"test,live-board\0"));
+
+        let mut chosen = fdt::OwnedNode::new("chosen");
+        chosen
+            .properties
+            .push(owned_property("rng-seed", TEST_RNG_SEED));
+        chosen
+            .properties
+            .push(owned_property("kaslr-seed", TEST_KASLR_SEED));
+        root.children.push(chosen);
+
+        let mut soc = fdt::OwnedNode::new("soc@0");
+        soc.properties.push(owned_property("state", b"old\0"));
+        root.children.push(soc);
+
+        fdt::OwnedTree {
+            root,
+            reservations: Vec::new(),
+            boot_cpuid_phys: None,
+        }
+        .to_dtb()
+        .unwrap()
+    }
+
+    fn overlay_fragment(name: &str, target_path: &str, contents: fdt::OwnedNode) -> fdt::OwnedNode {
+        let mut fragment = fdt::OwnedNode::new(name);
+        let mut encoded_path = target_path.as_bytes().to_vec();
+        encoded_path.push(0);
+        fragment.properties.push(fdt::OwnedProperty {
+            name: "target-path".to_string(),
+            value: encoded_path,
+        });
+        fragment.children.push(contents);
+        fragment
+    }
+
+    fn valid_live_test_overlay() -> Vec<u8> {
+        let mut root = fdt::OwnedNode::new("");
+
+        let mut root_contents = fdt::OwnedNode::new("__overlay__");
+        root_contents.properties.push(owned_property(
+            "overlay-root-padding",
+            b"force every following structure offset to move\0",
+        ));
+        root.children
+            .push(overlay_fragment("fragment@0", "/", root_contents));
+
+        let mut soc_contents = fdt::OwnedNode::new("__overlay__");
+        soc_contents
+            .properties
+            .push(owned_property("state", b"new\0"));
+        let mut device = fdt::OwnedNode::new("device@10");
+        device
+            .properties
+            .push(owned_property("compatible", b"test,overlay-device\0"));
+        soc_contents.children.push(device);
+        root.children
+            .push(overlay_fragment("fragment@1", "/soc@0", soc_contents));
+
+        let mut chosen_contents = fdt::OwnedNode::new("__overlay__");
+        chosen_contents
+            .properties
+            .push(owned_property("rng-seed", b"must-not-leak"));
+        root.children
+            .push(overlay_fragment("fragment@2", "/chosen", chosen_contents));
+
+        fdt::OwnedTree {
+            root,
+            reservations: Vec::new(),
+            boot_cpuid_phys: None,
+        }
+        .to_dtb()
+        .unwrap()
+    }
+
+    fn missing_target_test_overlay() -> Vec<u8> {
+        let mut root = fdt::OwnedNode::new("");
+        let mut contents = fdt::OwnedNode::new("__overlay__");
+        contents
+            .properties
+            .push(owned_property("state", b"broken\0"));
+        root.children
+            .push(overlay_fragment("fragment@0", "/does-not-exist", contents));
+        fdt::OwnedTree {
+            root,
+            reservations: Vec::new(),
+            boot_cpuid_phys: None,
+        }
+        .to_dtb()
+        .unwrap()
+    }
+
+    fn read_binary_inode(inode: &Inode, expected_len: usize) -> Vec<u8> {
+        let file = inode
+            .open_ops(&OpenOptions::default(), &Credentials::root())
+            .unwrap();
+        let mut bytes = vec![0; expected_len];
+        let read = file.read_at(&mut bytes, 0).unwrap();
+        assert_eq!(read, bytes.len());
+        let mut eof = [0u8; 1];
+        assert_eq!(file.read_at(&mut eof, read as u64), Ok(0));
+        bytes
+    }
+
+    fn directory_entries(inode: &Inode) -> Vec<(String, FileType)> {
+        let file = inode
+            .open_ops(&OpenOptions::default(), &Credentials::root())
+            .unwrap();
+        let mut entries = Vec::new();
+        file.readdir(0, &mut |entry| {
+            entries.push((entry.name.as_str().to_string(), entry.kind));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        entries
+    }
+
     #[test]
     fn regular_file_reads_stable_open_snapshot() {
         let file = SysRegFileOps {
@@ -4272,6 +5937,504 @@ mod tests {
         assert_eq!(
             file.read_at(&mut second, (first_len + second_len) as u64),
             Ok(0)
+        );
+    }
+
+    #[test]
+    fn device_tree_safe_name_matches_linux_retry_limit() {
+        assert_eq!(
+            device_tree_safe_name("node", |candidate| candidate != "node#16"),
+            Some("node#16".to_string())
+        );
+        assert_eq!(device_tree_safe_name("node", |_| true), None);
+        assert_eq!(
+            device_tree_safe_name("node", |_| false),
+            Some("node".to_string())
+        );
+    }
+
+    #[test]
+    fn device_tree_seed_scrubbing_covers_all_legacy_nodes_and_duplicate_properties() {
+        let blob = duplicate_seed_test_dtb();
+        let input = fdt::Fdt::parse(&blob).unwrap();
+        let firmware = DeviceTreeFirmware::from_fdt(&input).unwrap();
+        for secret in [
+            b"duplicate-rng-secret".as_slice(),
+            b"duplicate-kaslr-secret".as_slice(),
+            b"legacy-rng-secret".as_slice(),
+            b"legacy-kaslr-secret".as_slice(),
+        ] {
+            assert!(
+                !firmware
+                    .boot_blob
+                    .windows(secret.len())
+                    .any(|window| window == secret)
+            );
+        }
+
+        let sanitized = fdt::Fdt::parse(&firmware.boot_blob).unwrap();
+        let chosen_nodes = sanitized
+            .root()
+            .children()
+            .filter(|node| matches!(node.name(), "chosen" | "chosen@0"))
+            .collect::<Vec<_>>();
+        assert_eq!(chosen_nodes.len(), 2);
+        assert!(chosen_nodes.iter().all(|chosen| {
+            chosen
+                .properties()
+                .all(|property| !matches!(property.name(), "rng-seed" | "kaslr-seed"))
+        }));
+    }
+
+    #[test]
+    fn first_device_tree_install_invalidates_preexisting_negative_dentries() {
+        let _test_lock = DEVICE_TREE_SYSFS_TEST_LOCK.lock();
+        let _reset = InstalledDeviceTreeReset::take();
+        let sysfs = SysFsDriver.mount(None, "").unwrap();
+        let root = Arc::clone(&sysfs.root_dentry);
+        let firmware = cached_positive_child(&root, "firmware");
+        let _cached_reset = CachedDentrySubtreeReset(Arc::clone(&firmware));
+        let negative_fdt = cached_negative_child(&firmware, "fdt");
+        let negative_tree = cached_negative_child(&firmware, "devicetree");
+
+        install_device_tree_blob(&test_dtb()).unwrap();
+
+        assert!(negative_fdt.is_invalid());
+        assert!(negative_tree.is_invalid());
+        assert!(vfs::DCACHE.get(&firmware, "fdt").is_none());
+        assert!(vfs::DCACHE.get(&firmware, "devicetree").is_none());
+        assert!(cached_positive_child(&firmware, "fdt").is_positive());
+        assert!(cached_positive_child(&firmware, "devicetree").is_positive());
+    }
+
+    #[test]
+    fn device_tree_projection_matches_linux_firmware_layout() {
+        let _test_lock = DEVICE_TREE_SYSFS_TEST_LOCK.lock();
+        let _reset = InstalledDeviceTreeReset::take();
+        let fs_id = FsId::new(0x4454);
+        let firmware_dir = SysDirInodeOps {
+            kind: SysDirKind::Firmware,
+            fs_id,
+            weak_sb: Weak::new(),
+            snap: Arc::new(SysSnapshot::default()),
+        };
+
+        assert!(firmware_dir.readdir_entries().is_empty());
+        assert!(matches!(
+            firmware_dir.lookup_child("fdt"),
+            Err(VfsError::NotFound)
+        ));
+
+        let blob = test_dtb();
+        let input = fdt::Fdt::parse(&blob).unwrap();
+        let root_id = DeviceTreeNodeId::root();
+        let first_clash_id = root_id.child("clash", 0);
+        let second_clash_id = root_id.child("clash", 1);
+        let name_id = root_id.child("name", 0);
+        assert_eq!(
+            input
+                .find_node("/chosen")
+                .unwrap()
+                .property("rng-seed")
+                .unwrap()
+                .value(),
+            TEST_RNG_SEED
+        );
+        install_device_tree_blob(&blob).unwrap();
+        // 重复安装同一份仍含 seed 的输入，会产生相同的清理后投影。
+        install_device_tree_blob(&blob).unwrap();
+        assert!(device_tree_installed());
+        let firmware_inode = build_dir_inode(
+            fs_id,
+            &Weak::new(),
+            &Arc::new(SysSnapshot::default()),
+            FIRMWARE_DIR_INO,
+            SysDirKind::Firmware,
+        );
+        assert_eq!(firmware_inode.stat().unwrap().mode & 0o777, 0o755);
+        assert_eq!(
+            directory_entries(&firmware_inode),
+            vec![
+                ("fdt".to_string(), FileType::Regular),
+                ("devicetree".to_string(), FileType::Directory),
+            ]
+        );
+
+        let raw_fdt = firmware_dir.lookup_child("fdt").unwrap();
+        let raw_stat = raw_fdt.stat().unwrap();
+        assert_eq!(raw_stat.mode & 0o777, 0o400);
+        assert_eq!(raw_stat.size, blob.len() as i64);
+        let raw_file = raw_fdt
+            .open_ops(&OpenOptions::default(), &Credentials::root())
+            .unwrap();
+        assert_eq!(
+            raw_file.write_at(&[0], 0),
+            Err(VfsError::ReadOnlyFilesystem)
+        );
+        let sanitized_blob = read_binary_inode(&raw_fdt, blob.len());
+        assert_ne!(sanitized_blob, blob);
+        assert!(
+            !sanitized_blob
+                .windows(TEST_RNG_SEED.len())
+                .any(|window| window == TEST_RNG_SEED)
+        );
+        assert!(
+            !sanitized_blob
+                .windows(TEST_KASLR_SEED.len())
+                .any(|window| window == TEST_KASLR_SEED)
+        );
+        let sanitized = fdt::Fdt::parse(&sanitized_blob).unwrap();
+        assert!(
+            sanitized
+                .find_node("/chosen")
+                .unwrap()
+                .property("rng-seed")
+                .is_none()
+        );
+        assert!(
+            sanitized
+                .find_node("/chosen")
+                .unwrap()
+                .property("kaslr-seed")
+                .is_none()
+        );
+        let encoded = input
+            .find_node("/chosen")
+            .unwrap()
+            .property("rng-seed")
+            .unwrap()
+            .encoded_structure_range();
+        let structure_start = input.header().off_dt_struct as usize;
+        assert!(
+            sanitized_blob[structure_start + encoded.start..structure_start + encoded.end]
+                .chunks_exact(4)
+                .all(|token| token == 4u32.to_be_bytes())
+        );
+
+        let mut conflicting_blob = blob.clone();
+        let compatible_offset = conflicting_blob
+            .windows(b"test,board\0".len())
+            .position(|window| window == b"test,board\0")
+            .unwrap();
+        conflicting_blob[compatible_offset] = b'T';
+        assert!(matches!(
+            install_device_tree_blob(&conflicting_blob),
+            Err(DeviceTreeSysfsInstallError::AlreadyInstalled)
+        ));
+        assert_eq!(
+            read_binary_inode(&raw_fdt, sanitized_blob.len()),
+            sanitized_blob
+        );
+
+        let device_tree = firmware_dir.lookup_child("devicetree").unwrap();
+        assert_eq!(device_tree.stat().unwrap().mode & 0o777, 0o755);
+        assert_eq!(
+            directory_entries(&device_tree),
+            vec![("base".to_string(), FileType::Directory)]
+        );
+        let base = device_tree.lookup("base").unwrap();
+        assert_eq!(base.stat().unwrap().mode & 0o777, 0o755);
+        assert_eq!(base.ino(), device_tree_node_ino(&root_id));
+        assert_eq!(
+            directory_entries(&base),
+            vec![
+                ("compatible".to_string(), FileType::Regular),
+                ("clash".to_string(), FileType::Regular),
+                ("clash#1".to_string(), FileType::Regular),
+                ("compatible#1".to_string(), FileType::Regular),
+                ("name".to_string(), FileType::Regular),
+                ("chosen".to_string(), FileType::Directory),
+                ("soc@0".to_string(), FileType::Directory),
+                ("disabled@0".to_string(), FileType::Directory),
+                ("clash#2".to_string(), FileType::Directory),
+                ("clash#3".to_string(), FileType::Directory),
+                ("name#1".to_string(), FileType::Directory),
+            ]
+        );
+
+        let compatible = base.lookup("compatible").unwrap();
+        assert_eq!(compatible.stat().unwrap().mode & 0o777, 0o444);
+        assert_eq!(read_binary_inode(&compatible, 11), b"test,board\0");
+        let compatible_file = compatible
+            .open_ops(&OpenOptions::default(), &Credentials::root())
+            .unwrap();
+        assert_eq!(
+            compatible_file.write_at(b"changed", 0),
+            Err(VfsError::ReadOnlyFilesystem)
+        );
+        assert_eq!(
+            read_binary_inode(&base.lookup("compatible#1").unwrap(), 15),
+            b"test,duplicate\0"
+        );
+
+        let root_name = base.lookup("name").unwrap();
+        assert_eq!(root_name.stat().unwrap().mode & 0o777, 0o444);
+        assert_eq!(root_name.size(), 1);
+        assert_eq!(read_binary_inode(&root_name, 1), b"\0");
+
+        let chosen = base.lookup("chosen").unwrap();
+        assert_eq!(
+            directory_entries(&chosen),
+            vec![("name".to_string(), FileType::Regular)]
+        );
+        assert!(matches!(chosen.lookup("rng-seed"), Err(VfsError::NotFound)));
+
+        assert_eq!(base.lookup("clash").unwrap().kind(), FileType::Regular);
+        assert_eq!(base.lookup("clash#1").unwrap().kind(), FileType::Regular);
+        let renamed_clash = base.lookup("clash#2").unwrap();
+        assert_eq!(renamed_clash.kind(), FileType::Directory);
+        assert_eq!(renamed_clash.ino(), device_tree_node_ino(&first_clash_id));
+        assert_eq!(
+            directory_entries(&renamed_clash),
+            vec![
+                ("marker".to_string(), FileType::Regular),
+                ("name".to_string(), FileType::Regular),
+            ]
+        );
+        assert_eq!(
+            read_binary_inode(&renamed_clash.lookup("name").unwrap(), 6),
+            b"clash\0"
+        );
+        assert_eq!(
+            read_binary_inode(&renamed_clash.lookup("marker").unwrap(), 1),
+            [0x42]
+        );
+
+        let second_clash = base.lookup("clash#3").unwrap();
+        assert_ne!(second_clash.ino(), renamed_clash.ino());
+        assert_eq!(second_clash.ino(), device_tree_node_ino(&second_clash_id));
+        assert_eq!(
+            read_binary_inode(&second_clash.lookup("marker").unwrap(), 1),
+            [0x44]
+        );
+
+        let disabled = base.lookup("disabled@0").unwrap();
+        assert_eq!(
+            read_binary_inode(&disabled.lookup("status").unwrap(), 9),
+            b"disabled\0"
+        );
+
+        let renamed_name = base.lookup("name#1").unwrap();
+        assert_eq!(renamed_name.kind(), FileType::Directory);
+        assert_eq!(renamed_name.ino(), device_tree_node_ino(&name_id));
+        assert_eq!(
+            directory_entries(&renamed_name),
+            vec![
+                ("marker".to_string(), FileType::Regular),
+                ("name".to_string(), FileType::Regular),
+            ]
+        );
+        assert_eq!(
+            read_binary_inode(&renamed_name.lookup("name").unwrap(), 9),
+            b"explicit\0"
+        );
+
+        let soc = base.lookup("soc@0").unwrap();
+        assert_eq!(soc.stat().unwrap().mode & 0o777, 0o755);
+        assert_eq!(
+            directory_entries(&soc),
+            vec![
+                ("#address-cells".to_string(), FileType::Regular),
+                ("binary".to_string(), FileType::Regular),
+                ("empty".to_string(), FileType::Regular),
+                ("security-password".to_string(), FileType::Regular),
+                ("name".to_string(), FileType::Regular),
+            ]
+        );
+        assert_eq!(
+            read_binary_inode(&soc.lookup("#address-cells").unwrap(), 4),
+            [0, 0, 0, 2]
+        );
+        assert_eq!(
+            read_binary_inode(&soc.lookup("binary").unwrap(), 5),
+            [0, 0xff, 1, 0x80, 0]
+        );
+        assert_eq!(read_binary_inode(&soc.lookup("empty").unwrap(), 0), []);
+        assert_eq!(read_binary_inode(&soc.lookup("name").unwrap(), 4), b"soc\0");
+
+        let security = soc.lookup("security-password").unwrap();
+        let security_stat = security.stat().unwrap();
+        assert_eq!(security_stat.mode & 0o777, 0o400);
+        assert_eq!(security_stat.size, 0);
+        assert_eq!(read_binary_inode(&security, 7), b"s3cr3t\0");
+        assert!(matches!(soc.lookup("missing"), Err(VfsError::NotFound)));
+    }
+
+    #[test]
+    fn device_tree_overlay_updates_only_live_tree_atomically() {
+        let _test_lock = DEVICE_TREE_SYSFS_TEST_LOCK.lock();
+        let _reset = InstalledDeviceTreeReset::take();
+        assert!(matches!(
+            apply_device_tree_overlay(&valid_live_test_overlay()),
+            Err(DeviceTreeSysfsOverlayError::NotInstalled)
+        ));
+
+        let blob = valid_live_test_dtb();
+        install_device_tree_blob(&blob).unwrap();
+        let firmware = installed_device_tree().unwrap();
+        let initial_live = firmware.live_blob();
+        assert!(!Arc::ptr_eq(&firmware.boot_blob, &initial_live));
+        let update = firmware.begin_overlay_update().unwrap();
+        assert!(matches!(
+            apply_device_tree_overlay(&valid_live_test_overlay()),
+            Err(DeviceTreeSysfsOverlayError::UpdateInProgress)
+        ));
+        drop(update);
+
+        // 同一启动输入重复安装是幂等操作，且不会建立第二套发布状态。
+        install_device_tree_blob(&blob).unwrap();
+        assert!(Arc::ptr_eq(&firmware, &installed_device_tree().unwrap()));
+
+        let sysfs = SysFsDriver.mount(None, "").unwrap();
+        let sysfs_root = Arc::clone(&sysfs.root_dentry);
+        let firmware_dentry = cached_positive_child(&sysfs_root, "firmware");
+        let _cached_reset = CachedDentrySubtreeReset(Arc::clone(&firmware_dentry));
+        let raw_fdt_dentry = cached_positive_child(&firmware_dentry, "fdt");
+        let raw_fdt = raw_fdt_dentry.inode().unwrap();
+        let startup_blob = read_binary_inode(&raw_fdt, blob.len());
+        assert_ne!(startup_blob, blob);
+
+        let device_tree_dentry = cached_positive_child(&firmware_dentry, "devicetree");
+        let base_dentry = cached_positive_child(&device_tree_dentry, "base");
+        let soc_dentry = cached_positive_child(&base_dentry, "soc@0");
+        let old_state_dentry = cached_positive_child(&soc_dentry, "state");
+        let negative_device_dentry = vfs::DCACHE.insert(Dentry::new_negative(
+            "device@10",
+            Some(Arc::clone(&soc_dentry)),
+        ));
+        let base = base_dentry.inode().unwrap();
+        let soc = soc_dentry.inode().unwrap();
+        let soc_ino = soc.ino();
+        let old_state_inode = old_state_dentry.inode().unwrap();
+        let state_ino = old_state_inode.ino();
+        let old_state_file = old_state_inode
+            .open_ops(&OpenOptions::default(), &Credentials::root())
+            .unwrap();
+        assert_eq!(read_binary_inode(&old_state_inode, 4), b"old\0");
+
+        install_device_tree_overlay_commit_hook(device_tree_overlay_test_commit_hook).unwrap();
+        *DEVICE_TREE_OVERLAY_TEST_REJECTION.lock() =
+            Some(DeviceTreeOverlayRuntimeError::UnsupportedChange);
+        let live_before_rejection = firmware.live_blob();
+        assert!(matches!(
+            apply_device_tree_overlay(&valid_live_test_overlay()),
+            Err(DeviceTreeSysfsOverlayError::RuntimeRejected(
+                DeviceTreeOverlayRuntimeError::UnsupportedChange
+            ))
+        ));
+        assert!(Arc::ptr_eq(&live_before_rejection, &firmware.live_blob()));
+        assert!(device_tree_dentry.is_positive());
+        assert!(base_dentry.is_positive());
+        assert!(soc_dentry.is_positive());
+        assert_eq!(read_binary_inode(&old_state_inode, 4), b"old\0");
+        assert_eq!(DEVICE_TREE_OVERLAY_TEST_CALLS.load(Ordering::Relaxed), 1);
+
+        *DEVICE_TREE_OVERLAY_TEST_REJECTION.lock() = None;
+        apply_device_tree_overlay(&valid_live_test_overlay()).unwrap();
+        assert_eq!(DEVICE_TREE_OVERLAY_TEST_CALLS.load(Ordering::Relaxed), 2);
+
+        // raw FDT 永远保持安装时的 seed 清理快照，live 重序列化不会覆盖它。
+        assert_eq!(
+            read_binary_inode(&raw_fdt, startup_blob.len()),
+            startup_blob
+        );
+        assert!(raw_fdt_dentry.is_positive());
+        assert!(Arc::ptr_eq(
+            &raw_fdt_dentry,
+            &vfs::DCACHE.get(&firmware_dentry, "fdt").unwrap()
+        ));
+        assert_eq!(
+            read_binary_inode(
+                &firmware_dentry.inode().unwrap().lookup("fdt").unwrap(),
+                startup_blob.len(),
+            ),
+            startup_blob
+        );
+
+        // 成功交换同时失效旧 live dentry 子树（包括负向缓存），但不触碰 raw FDT。
+        assert!(device_tree_dentry.is_invalid());
+        assert!(base_dentry.is_invalid());
+        assert!(soc_dentry.is_invalid());
+        assert!(old_state_dentry.is_invalid());
+        assert!(negative_device_dentry.is_invalid());
+        assert!(vfs::DCACHE.get(&firmware_dentry, "devicetree").is_none());
+
+        let refreshed_device_tree = cached_positive_child(&firmware_dentry, "devicetree");
+        let refreshed_base_dentry = cached_positive_child(&refreshed_device_tree, "base");
+        let refreshed_soc_dentry = cached_positive_child(&refreshed_base_dentry, "soc@0");
+        let refreshed_state_dentry = cached_positive_child(&refreshed_soc_dentry, "state");
+        let refreshed_device_dentry = cached_positive_child(&refreshed_soc_dentry, "device@10");
+        assert_eq!(
+            read_binary_inode(&refreshed_state_dentry.inode().unwrap(), 4),
+            b"new\0"
+        );
+        assert_eq!(
+            refreshed_device_dentry.inode().unwrap().kind(),
+            FileType::Directory
+        );
+
+        // 已有目录 inode 的新 lookup/readdir 使用当前 live Arc；路径 inode 身份不因
+        // structure block 重序列化和 offset 整体移动而变化。
+        let refreshed_soc = base.lookup("soc@0").unwrap();
+        assert_eq!(refreshed_soc.ino(), soc_ino);
+        assert!(
+            directory_entries(&base)
+                .iter()
+                .any(|(name, kind)| name == "overlay-root-padding" && *kind == FileType::Regular)
+        );
+        assert!(
+            directory_entries(&soc)
+                .iter()
+                .any(|(name, kind)| name == "device@10" && *kind == FileType::Directory)
+        );
+        let new_state_inode = refreshed_soc.lookup("state").unwrap();
+        assert_eq!(new_state_inode.ino(), state_ino);
+        assert_eq!(read_binary_inode(&new_state_inode, 4), b"new\0");
+        assert_eq!(
+            read_binary_inode(
+                &refreshed_soc
+                    .lookup("device@10")
+                    .unwrap()
+                    .lookup("compatible")
+                    .unwrap(),
+                20
+            ),
+            b"test,overlay-device\0"
+        );
+
+        // overlay 试图重新注入 seed 时，live sysfs 仍不得公开已消费的启动秘密。
+        let chosen = base.lookup("chosen").unwrap();
+        assert!(matches!(chosen.lookup("rng-seed"), Err(VfsError::NotFound)));
+
+        // overlay 前已打开的二进制文件持有旧 Arc，不随全局 live tree 交换漂移。
+        let mut old_state = [0u8; 4];
+        assert_eq!(old_state_file.read_at(&mut old_state, 0), Ok(4));
+        assert_eq!(&old_state, b"old\0");
+        assert_eq!(read_binary_inode(&old_state_inode, 4), b"old\0");
+
+        // 再次安装相同启动 blob 不会把已经应用的 live overlay 回滚。
+        install_device_tree_blob(&blob).unwrap();
+        assert_eq!(
+            read_binary_inode(&base.lookup("soc@0").unwrap().lookup("state").unwrap(), 4),
+            b"new\0"
+        );
+
+        let live_before_failure = firmware.live_blob();
+        assert!(matches!(
+            apply_device_tree_overlay(&missing_target_test_overlay()),
+            Err(DeviceTreeSysfsOverlayError::InvalidOverlay(
+                fdt::OverlayError::MissingNode(_)
+            ))
+        ));
+        let live_after_failure = firmware.live_blob();
+        assert!(Arc::ptr_eq(&live_before_failure, &live_after_failure));
+        assert_eq!(
+            read_binary_inode(&base.lookup("soc@0").unwrap().lookup("state").unwrap(), 4),
+            b"new\0"
+        );
+        assert_eq!(
+            read_binary_inode(&raw_fdt, startup_blob.len()),
+            startup_blob
         );
     }
 

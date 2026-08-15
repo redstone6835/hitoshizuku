@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod config;
 mod driver;
 
 use elm::{ElmModule, HookError, HookResult, LifecycleContext};

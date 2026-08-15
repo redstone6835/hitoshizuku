@@ -15,6 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from riscv_instruction_encoding import decode_riscv64_instruction
+from riscv_weight_model_seal import ModelSealError, verify_model_document_seal
+from riscv_weight_provenance import (
+    ProvenanceError,
+    discover_provenance_root,
+    verify_finalized_model,
+)
 
 
 class MappingError(ValueError):
@@ -23,9 +29,23 @@ class MappingError(ValueError):
 
 CATALOG_SCHEMA = "mygo.riscv-tb-catalog.v1"
 CATALOG_TARGET = "riscv64"
-MODEL_SCHEMA_VERSION = 2
+MODEL_SCHEMA_VERSION = 3
 MODEL_INSTRUCTION_KEY = (
     "raw-encoding+semantic-decoding+execution-pattern"
+)
+REQUIRED_PUBLICATION_COMPONENTS = frozenset(
+    {
+        "statistical_core",
+        "raw",
+        "anchor_adjusted",
+        "positive_anchor",
+        "raw_adjusted_discrepancy",
+        "estimator_sensitivity",
+        "single_super_run_influence",
+        "joint_bootstrap",
+        "host_isolation",
+        "ml_validation",
+    }
 )
 RAW_EXACT_LIMIT = 256
 RAW_EXAMPLE_LIMIT = 16
@@ -279,6 +299,71 @@ def map_weights(
             "权重模型 instruction_key="
             f"{model.get('instruction_key')!r}，期望 {MODEL_INSTRUCTION_KEY!r}"
         )
+    publication_gate = model.get("publication_gate")
+    if not isinstance(publication_gate, Mapping):
+        raise MappingError("权重模型缺少显式 publication_gate")
+    # 未 finalized 的模型仍可用于输出诊断性的未分配 catalog；只有声称
+    # publication gate 已通过的模型必须携带完整内容封印。
+    if publication_gate.get("passed") is True:
+        try:
+            verify_model_document_seal(model)
+        except ModelSealError as error:
+            raise MappingError(str(error)) from error
+    components = publication_gate.get("components")
+    host_audit = model.get("host_isolation_audit")
+    host_binding = model.get("host_isolation_audit_binding")
+    ml_validation = model.get("ml_validation")
+    ml_conclusion = (
+        ml_validation.get("conclusion")
+        if isinstance(ml_validation, Mapping)
+        else None
+    )
+    ml_evidence = model.get("ml_validation_evidence")
+    ml_evidence_checks = (
+        ml_evidence.get("checks")
+        if isinstance(ml_evidence, Mapping)
+        else None
+    )
+    ml_binding_checks = (
+        ml_evidence.get("binding_checks")
+        if isinstance(ml_evidence, Mapping)
+        else None
+    )
+    publication_allowed = (
+        publication_gate.get("passed") is True
+        and isinstance(components, Mapping)
+        and all(
+            components.get(name) is True
+            for name in REQUIRED_PUBLICATION_COMPONENTS
+        )
+        and isinstance(host_audit, Mapping)
+        and host_audit.get("schema") == "mygo.riscv-weight-host-audit.v1"
+        and host_audit.get("status") == "accepted"
+        and model.get("host_isolation_audit_source") == "current"
+        and isinstance(host_binding, Mapping)
+        and host_binding.get("schema")
+        == "mygo.riscv-weight-host-audit-binding.v1"
+        and host_binding.get("source") == "current"
+        and host_binding.get("publication_allowed") is True
+        and isinstance(ml_validation, Mapping)
+        and ml_validation.get("schema")
+        == "mygo.riscv-instruction-ml-validation.v3"
+        and isinstance(ml_conclusion, Mapping)
+        and ml_conclusion.get("status") == "supported"
+        and ml_conclusion.get("high_confidence_status") == "supported"
+        and ml_conclusion.get("high_confidence_gate_passed") is True
+        and ml_conclusion.get("may_publish_weights") is False
+        and isinstance(ml_evidence, Mapping)
+        and ml_evidence.get("schema")
+        == "mygo.riscv-instruction-ml-validation.v3"
+        and isinstance(ml_evidence_checks, Mapping)
+        and bool(ml_evidence_checks)
+        and all(value is True for value in ml_evidence_checks.values())
+        and isinstance(ml_binding_checks, Mapping)
+        and set(ml_binding_checks)
+        == {"samples", "statistical_weights_pre_finalization"}
+        and all(value is True for value in ml_binding_checks.values())
+    )
     instructions = model.get("instructions")
     if not isinstance(instructions, list):
         raise MappingError("权重模型缺少 instructions")
@@ -291,6 +376,27 @@ def map_weights(
         )
         if not isinstance(encoding_key, str) or not encoding_key:
             raise MappingError("权重项缺少 encoding_key")
+        if item.get("calibration_only") is True:
+            continue
+        adjusted = item.get("anchor_adjusted")
+        adjusted_value = (
+            adjusted.get("ns_per_instruction")
+            if isinstance(adjusted, Mapping)
+            else None
+        )
+        published_value = item.get("published_ns_per_instruction")
+        if published_value is not None and (
+            isinstance(published_value, bool)
+            or not isinstance(published_value, (int, float))
+            or not math.isfinite(float(published_value))
+            or isinstance(adjusted_value, bool)
+            or not isinstance(adjusted_value, (int, float))
+            or not math.isfinite(float(adjusted_value))
+            or float(published_value) != float(adjusted_value)
+        ):
+            raise MappingError(
+                f"权重项 {encoding_key!r} 的 published 与 anchor-adjusted 不一致"
+            )
         by_encoding[encoding_key].append(item)
 
     catalog_keys = set(catalog)
@@ -305,15 +411,17 @@ def map_weights(
         numeric = [
             item
             for item in contexts
-            if not isinstance(item.get("ns_per_instruction"), bool)
-            and isinstance(item.get("ns_per_instruction"), (int, float))
-            and math.isfinite(float(item["ns_per_instruction"]))
-            and float(item["ns_per_instruction"]) >= 0
+            if not isinstance(item.get("published_ns_per_instruction"), bool)
+            and isinstance(
+                item.get("published_ns_per_instruction"), (int, float)
+            )
+            and math.isfinite(float(item["published_ns_per_instruction"]))
+            and float(item["published_ns_per_instruction"]) >= 0
         ]
         acceptable = [
             item
             for item in numeric
-            if item.get("quality") == "high-confidence"
+            if publication_allowed and item.get("quality") == "high-confidence"
         ]
         assigned: float | None = None
         assignment = "unassigned"
@@ -321,10 +429,13 @@ def map_weights(
         if restricted is not None:
             assignment = restricted
         elif len(acceptable) == 1 and len(contexts) == 1:
-            assigned = float(acceptable[0]["ns_per_instruction"])
+            assigned = float(acceptable[0]["published_ns_per_instruction"])
             assignment = "semantic-class-transfer-from-one-raw-context"
         elif acceptable and len(acceptable) == len(contexts):
-            values = [float(item["ns_per_instruction"]) for item in acceptable]
+            values = [
+                float(item["published_ns_per_instruction"])
+                for item in acceptable
+            ]
             center = sorted(values)[len(values) // 2]
             tolerance = max(0.05, abs(center) * 0.15)
             if max(values) - min(values) <= tolerance:
@@ -333,7 +444,11 @@ def map_weights(
             else:
                 assignment = "context-dependent"
         elif contexts:
-            assignment = "measured-but-confidence-gates-failed"
+            assignment = (
+                "model-publication-gate-failed"
+                if not publication_allowed
+                else "measured-but-confidence-gates-failed"
+            )
         else:
             assignment = _missing_reason(source)
         measured_estimate: float | None = None
@@ -342,17 +457,26 @@ def map_weights(
         elif assigned is not None:
             measured_estimate = assigned
             estimate_quality = "high-confidence"
-        elif len(contexts) == 1 and len(numeric) == 1:
-            context_quality = numeric[0].get("quality")
+        elif len(contexts) == 1:
+            context_quality = contexts[0].get("quality")
             estimate_quality = (
                 context_quality
                 if isinstance(context_quality, str) and context_quality
                 else "quality-unavailable"
             )
-            if context_quality == "low-confidence":
-                measured_estimate = float(
-                    numeric[0]["ns_per_instruction"]
-                )
+            adjusted = contexts[0].get("anchor_adjusted")
+            exploratory = (
+                adjusted.get("ns_per_instruction")
+                if isinstance(adjusted, Mapping)
+                else None
+            )
+            if (
+                context_quality == "low-confidence"
+                and not isinstance(exploratory, bool)
+                and isinstance(exploratory, (int, float))
+                and math.isfinite(float(exploratory))
+            ):
+                measured_estimate = float(exploratory)
         elif len(contexts) > 1:
             estimate_quality = "context-dependent"
         elif contexts:
@@ -395,9 +519,27 @@ def map_weights(
                     {
                         "pattern": item["key"].get("pattern"),
                         "raw_encoding_key": item["key"].get("encoding_key"),
-                        "ns_per_instruction": item.get("ns_per_instruction"),
+                        "ns_per_instruction": (
+                            item.get("anchor_adjusted", {}).get(
+                                "ns_per_instruction"
+                            )
+                            if isinstance(item.get("anchor_adjusted"), Mapping)
+                            else None
+                        ),
                         "relative_weight": item.get("relative_weight"),
-                        "simultaneous_ci": item.get("simultaneous_ci"),
+                        "simultaneous_ci": (
+                            item.get("anchor_adjusted", {}).get(
+                                "simultaneous_ci"
+                            )
+                            if isinstance(item.get("anchor_adjusted"), Mapping)
+                            else None
+                        ),
+                        "raw_diagnostic_ns_per_instruction": item.get(
+                            "ns_per_instruction"
+                        ),
+                        "raw_diagnostic_simultaneous_ci": item.get(
+                            "simultaneous_ci"
+                        ),
                         "quality": item.get("quality"),
                         "quality_failures": item.get("quality_failures", []),
                     }
@@ -406,8 +548,9 @@ def map_weights(
             }
         )
     result = {
-        "schema": "mygo.riscv-instruction-catalog-weights.v2",
+        "schema": "mygo.riscv-instruction-catalog-weights.v3",
         "model_schema_version": model.get("schema_version"),
+        "model_publication_gate": publication_gate,
         "catalog_encoding_count": len(output),
         "catalog_key_semantics": "decoded-semantic-class",
         "assignment_scope": (
@@ -477,6 +620,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--weights", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--csv")
+    parser.add_argument(
+        "--provenance-root",
+        help="final weights acquisition root；省略时从 manifest 路径唯一推导",
+    )
     parser.add_argument("--expected-key-count", type=int)
     arguments = parser.parse_args(argv)
     if (
@@ -484,9 +631,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         and arguments.expected_key_count <= 0
     ):
         parser.error("--expected-key-count 必须是正整数")
-    model = json.loads(Path(arguments.weights).read_text(encoding="utf-8"))
+    weights_path = Path(arguments.weights).resolve()
+    model = json.loads(weights_path.read_text(encoding="utf-8"))
     if not isinstance(model, dict):
         raise MappingError("权重模型根必须是 object")
+    if model.get("publication_gate", {}).get("passed") is True:
+        try:
+            provenance_root = (
+                Path(arguments.provenance_root).resolve()
+                if arguments.provenance_root
+                else discover_provenance_root(weights_path)
+            )
+            verify_finalized_model(weights_path, root=provenance_root)
+        except ProvenanceError as error:
+            raise MappingError(str(error)) from error
     result = map_weights(
         load_catalog(
             Path(arguments.catalog),

@@ -595,7 +595,35 @@ pub(super) fn sys_ioctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         file.set_status_flags(flags.append, enabled, flags.sync, flags.direct);
         return Ok(0);
     }
+    if cmd.raw() == general::dev::tty::TIOCGPTPEER {
+        return sys_tiocgptpeer(ctx, &file);
+    }
     file.ioctl(cmd, ctx.args[2])
+}
+
+/// TIOCGPTPEER:返回指向 pty master 的 slave 的新 fd(Linux 语义)。
+fn sys_tiocgptpeer(
+    ctx: &mut SyscallContext<'_>,
+    file: &vfs::file::File,
+) -> Result<usize, Errno> {
+    let Some(master) = file.downcast_ops::<general::dev::tty::PtyMasterFileOps>() else {
+        return Err(Errno::ENOTTY);
+    };
+    let flags = ctx.args[2];
+    let pair = master.pair().clone();
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let opts = vfs::file::OpenOptions {
+        access: vfs::file::AccessMode::ReadWrite,
+        nonblock: (flags & O_NONBLOCK) != 0,
+        cloexec: (flags & O_CLOEXEC) != 0,
+        ..Default::default()
+    };
+    let slave = general::dev::tty::open_slave_file(&pair, opts, vfs_ctx.cred().clone())
+        .map_err(|e| e.to_errno())?;
+    let fd_flags = if opts.cloexec { FdFlags::CLOEXEC } else { FdFlags::default() };
+    let fd = fdt.alloc_fd(slave, fd_flags).map_err(|e| e.to_errno())?;
+    Ok(fd.as_raw() as usize)
 }
 
 pub(super) fn sys_pipe2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

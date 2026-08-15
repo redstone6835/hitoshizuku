@@ -39,6 +39,79 @@ pub trait MsiController: Send + Sync {
     fn free_vector(&self, hwirq: u32);
 }
 
+struct ElmMsiControllerProxy {
+    context: elm_model::ElmCurrentContext,
+    controller: u32,
+    driver: Option<Arc<dyn MsiController>>,
+}
+
+impl ElmMsiControllerProxy {
+    fn driver(&self) -> &dyn MsiController {
+        self.driver
+            .as_deref()
+            .expect("ELM MSI controller proxy used after drop")
+    }
+
+    fn enter(&self, operation: &'static str) -> Option<elm_model::ElmCurrentContextGuard> {
+        let guard = super::pnp::enter_elm_snapshot(self.context);
+        if guard.is_none() {
+            log::error!(
+                "[msi] cannot enter ELM controller context: controller={} operation={} cell={} generation={}",
+                self.controller,
+                operation,
+                self.context.cell_id.0,
+                self.context.generation.0,
+            );
+            super::elm_lifecycle::mark_context_failed(self.context);
+        }
+        guard
+    }
+}
+
+impl MsiController for ElmMsiControllerProxy {
+    fn allocate_vector(&self, requester: u32) -> Option<MsiVector> {
+        let _guard = self.enter("allocate_vector")?;
+        self.driver().allocate_vector(requester)
+    }
+
+    fn free_vector(&self, hwirq: u32) {
+        let Some(_guard) = self.enter("free_vector") else {
+            return;
+        };
+        self.driver().free_vector(hwirq);
+    }
+}
+
+impl Drop for ElmMsiControllerProxy {
+    fn drop(&mut self) {
+        let Some(driver) = self.driver.take() else {
+            return;
+        };
+        let Some(_guard) = super::pnp::enter_elm_snapshot(self.context) else {
+            super::elm_lifecycle::mark_context_failed(self.context);
+            core::mem::forget(driver);
+            return;
+        };
+        drop(driver);
+    }
+}
+
+fn wrap_elm_msi_controller(
+    controller: u32,
+    driver: Arc<dyn MsiController>,
+) -> Result<Arc<dyn MsiController>, MsiError> {
+    let Some(context) = elm_model::current_context() else {
+        return Ok(driver);
+    };
+    let _accounting =
+        allocator::suspend_implicit_allocation_accounting().ok_or(MsiError::OutOfMemory)?;
+    Ok(Arc::new(ElmMsiControllerProxy {
+        context,
+        controller,
+        driver: Some(driver),
+    }))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MsiError {
     OutOfMemory,
@@ -108,6 +181,7 @@ struct MsiControllerRegistration {
 struct MsiVectorRegistration {
     hwirq: u32,
     releasing: bool,
+    prepared: bool,
 }
 
 static MSI_CONTROLLERS: Spinlock<Vec<MsiControllerRegistration>> = Spinlock::new(Vec::new());
@@ -125,6 +199,7 @@ pub fn register_msi_controller(
     controller: u32,
     driver: Arc<dyn MsiController>,
 ) -> Result<MsiControllerHandle, MsiError> {
+    let driver = wrap_elm_msi_controller(controller, driver)?;
     let mut controllers = MSI_CONTROLLERS.lock();
     if controllers
         .iter()
@@ -238,9 +313,6 @@ pub fn allocate_msi(controller: u32, requester: u32) -> Result<MsiHandle, MsiErr
         .checked_sub(1)
         .ok_or(MsiError::Busy)?;
     let Some(vector) = vector else {
-        if controller_ready_to_retire(entry) {
-            controllers.remove(index);
-        }
         return Err(MsiError::AllocationFailed);
     };
     if entry
@@ -261,6 +333,7 @@ pub fn allocate_msi(controller: u32, requester: u32) -> Result<MsiHandle, MsiErr
     entry.vectors.push(MsiVectorRegistration {
         hwirq: vector.hwirq,
         releasing: false,
+        prepared: false,
     });
     let handle = MsiHandle {
         controller,
@@ -285,6 +358,10 @@ pub fn allocate_msi(controller: u32, requester: u32) -> Result<MsiHandle, MsiErr
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
 pub fn free_msi(handle: MsiHandle) -> Result<(), MsiError> {
+    free_msi_inner(handle, false)
+}
+
+fn free_msi_inner(handle: MsiHandle, allow_prepared: bool) -> Result<(), MsiError> {
     let driver = {
         let mut controllers = MSI_CONTROLLERS.lock();
         let index = controllers
@@ -298,7 +375,9 @@ pub fn free_msi(handle: MsiHandle) -> Result<(), MsiError> {
             .iter()
             .position(|vector| vector.hwirq == handle.hwirq)
             .ok_or(MsiError::NotFound)?;
-        if controllers[index].vectors[vector_index].releasing {
+        if controllers[index].vectors[vector_index].releasing
+            || (controllers[index].vectors[vector_index].prepared && !allow_prepared)
+        {
             return Err(MsiError::Busy);
         }
         controllers[index].frees_in_flight = controllers[index]
@@ -322,42 +401,88 @@ pub fn free_msi(handle: MsiHandle) -> Result<(), MsiError> {
         .ok_or(MsiError::NotFound)?;
     entry.vectors.remove(vector_index);
     entry.frees_in_flight = entry.frees_in_flight.checked_sub(1).ok_or(MsiError::Busy)?;
-    if controller_ready_to_retire(entry) {
-        controllers.remove(index);
-    }
     drop(controllers);
     super::elm_lifecycle::forget_msi_vector(handle);
     Ok(())
 }
 
-fn controller_ready_to_retire(entry: &MsiControllerRegistration) -> bool {
-    entry.retiring
-        && entry.vectors.is_empty()
+fn release_msi_controller_resource(handle: MsiControllerHandle) -> bool {
+    unregister_msi_controller(handle).is_ok()
+}
+
+fn prepare_msi_controller_resource(handle: MsiControllerHandle) -> bool {
+    let mut controllers = MSI_CONTROLLERS.lock();
+    let Some(entry) = controllers
+        .iter_mut()
+        .find(|entry| entry.controller == handle.controller && entry.id == handle.id)
+    else {
+        return false;
+    };
+    if entry.retiring {
+        return false;
+    }
+    entry.retiring = true;
+    if entry.vectors.iter().all(|vector| vector.prepared)
         && entry.allocations_in_flight == 0
         && entry.frees_in_flight == 0
-}
-
-fn retire_msi_controller(handle: MsiControllerHandle) -> Result<(), MsiError> {
-    let mut controllers = MSI_CONTROLLERS.lock();
-    let Some(index) = controllers
-        .iter()
-        .position(|entry| entry.controller == handle.controller && entry.id == handle.id)
-    else {
-        return Err(MsiError::NotFound);
-    };
-    controllers[index].retiring = true;
-    if controller_ready_to_retire(&controllers[index]) {
-        controllers.remove(index);
+    {
+        true
+    } else {
+        entry.retiring = false;
+        false
     }
-    Ok(())
 }
 
-fn release_msi_controller_resource(handle: MsiControllerHandle) -> bool {
-    retire_msi_controller(handle).is_ok()
+fn cancel_msi_controller_resource(handle: MsiControllerHandle) {
+    let mut controllers = MSI_CONTROLLERS.lock();
+    if let Some(entry) = controllers
+        .iter_mut()
+        .find(|entry| entry.controller == handle.controller && entry.id == handle.id)
+    {
+        entry.retiring = false;
+    }
 }
 
 fn release_msi_vector_resource(handle: MsiHandle) -> bool {
-    free_msi(handle).is_ok()
+    free_msi_inner(handle, true).is_ok()
+}
+
+fn prepare_msi_vector_resource(handle: MsiHandle) -> bool {
+    let mut controllers = MSI_CONTROLLERS.lock();
+    let Some(entry) = controllers
+        .iter_mut()
+        .find(|entry| entry.controller == handle.controller && entry.id == handle.controller_id)
+    else {
+        return false;
+    };
+    let Some(vector) = entry
+        .vectors
+        .iter_mut()
+        .find(|vector| vector.hwirq == handle.hwirq)
+    else {
+        return false;
+    };
+    if vector.releasing || vector.prepared {
+        return false;
+    }
+    vector.prepared = true;
+    true
+}
+
+fn cancel_msi_vector_resource(handle: MsiHandle) {
+    let mut controllers = MSI_CONTROLLERS.lock();
+    if let Some(vector) = controllers
+        .iter_mut()
+        .find(|entry| entry.controller == handle.controller && entry.id == handle.controller_id)
+        .and_then(|entry| {
+            entry
+                .vectors
+                .iter_mut()
+                .find(|vector| vector.hwirq == handle.hwirq)
+        })
+    {
+        vector.prepared = false;
+    }
 }
 
 /// 将 MSI controller 注册 handle 包装成 PnP-owned resource。
@@ -372,12 +497,16 @@ pub fn controller_pnp_resource(
     handle: MsiControllerHandle,
     label: &'static str,
 ) -> PnpHandleResource<MsiControllerHandle> {
-    PnpHandleResource::new(
+    PnpHandleResource::new_checked(
         PnpResourceKind::MsiController,
         label,
         handle,
+        prepare_msi_controller_resource,
+        cancel_msi_controller_resource,
+        crate::dev::pnp::PnpResourceReleaseOrder::Provider,
         release_msi_controller_resource,
     )
+    .with_provided_dependency(PnpDependency::MsiController(handle.controller))
 }
 
 /// 将单个 MSI vector 分配 handle 包装成 PnP-owned resource。
@@ -389,10 +518,68 @@ pub fn controller_pnp_resource(
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
 )]
 pub fn vector_pnp_resource(handle: MsiHandle, label: &'static str) -> PnpHandleResource<MsiHandle> {
-    PnpHandleResource::new(
+    PnpHandleResource::new_checked(
         PnpResourceKind::Msi,
         label,
         handle,
+        prepare_msi_vector_resource,
+        cancel_msi_vector_resource,
+        crate::dev::pnp::PnpResourceReleaseOrder::Consumer,
         release_msi_vector_resource,
     )
+    .with_consumed_dependency(PnpDependency::MsiController(handle.controller))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dev::pnp::PnpResource;
+    use alloc::boxed::Box;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    struct SyntheticController {
+        next: AtomicU32,
+        frees: Arc<AtomicU32>,
+    }
+
+    impl MsiController for SyntheticController {
+        fn allocate_vector(&self, _requester: u32) -> Option<MsiVector> {
+            let hwirq = self.next.fetch_add(1, Ordering::Relaxed);
+            Some(MsiVector {
+                hwirq,
+                line: IrqLine::Hardware(hwirq as usize),
+                message: MsiMessage {
+                    address: 0x2800_0000,
+                    data: hwirq,
+                },
+            })
+        }
+
+        fn free_vector(&self, _hwirq: u32) {
+            self.frees.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn planned_vectors_allow_controller_provider_prepare() {
+        let controller = 0xf000_00a1;
+        let frees = Arc::new(AtomicU32::new(0));
+        let driver: Arc<dyn MsiController> = Arc::new(SyntheticController {
+            next: AtomicU32::new(1),
+            frees: Arc::clone(&frees),
+        });
+        let controller_handle = register_msi_controller(controller, driver).unwrap();
+        let vector_handle = allocate_msi(controller, 0).unwrap();
+        let vector_resource = vector_pnp_resource(vector_handle, "test-vector");
+        let controller_resource = controller_pnp_resource(controller_handle, "test-controller");
+
+        assert!(controller_resource.prepare_release().is_err());
+        vector_resource.prepare_release().unwrap();
+        controller_resource.prepare_release().unwrap();
+        assert_eq!(free_msi(vector_handle), Err(MsiError::Busy));
+
+        PnpResource::release(Box::new(vector_resource)).unwrap();
+        PnpResource::release(Box::new(controller_resource)).unwrap();
+        assert_eq!(frees.load(Ordering::Relaxed), 1);
+    }
 }

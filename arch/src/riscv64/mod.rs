@@ -33,6 +33,7 @@ pub mod heap_vm;
 mod mem;
 pub mod mm;
 pub mod paging;
+pub(crate) mod paging_geometry;
 
 // ── 任务 ──────────────────────────────────────────────────────────────────────
 
@@ -42,6 +43,7 @@ pub mod task;
 
 // ── 平台服务 ──────────────────────────────────────────────────────────────────
 
+pub mod aia;
 pub mod early_console;
 pub mod sbi;
 pub mod specific;

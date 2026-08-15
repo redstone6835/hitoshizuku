@@ -167,9 +167,10 @@ pub use elm_macros::{
 pub use context::{
     ELM_CONTEXT_MAX_CPUS, ELM_CONTEXT_MAX_DEPTH, ELM_NATIVE_HOOK_CONTEXT_ABI_VERSION,
     ELM_NATIVE_MIGRATION_CONTEXT_ABI_VERSION, ElmContext, ElmCurrentContext,
-    ElmCurrentContextGuard, ElmCurrentContextOps, ElmLifecyclePhase, ElmNativeHookContextV1,
-    ElmNativeMigrationContextV1, current_cell, current_context, enter_current_context,
-    register_current_context_ops, register_current_cpu_id, try_enter_current_context,
+    ElmCurrentContextGuard, ElmCurrentContextOps, ElmCurrentContextSuspensionGuard,
+    ElmLifecyclePhase, ElmNativeHookContextV1, ElmNativeMigrationContextV1, current_cell,
+    current_context, enter_current_context, register_current_context_ops, register_current_cpu_id,
+    suspend_current_context, try_enter_current_context,
 };
 #[cfg(any(feature = "runtime-model", feature = "management"))]
 pub use ctl::{

@@ -271,7 +271,12 @@ impl SchedDomain {
         self.capacity
     }
 
-    /// 返回只计入 active CPU 后的有效容量。
+    /// 在同一调度域内 CPU 同构的前提下，返回只计入 active CPU
+    /// 后的有效容量。
+    ///
+    /// 异构拓扑的运行期统计必须使用
+    /// [`SchedTopology::effective_domain_capacity`]，由拓扑按实际 active CPU
+    /// 的 per-CPU capacity 精确求和。本方法保留给独立构造的同构域使用。
     pub fn effective_capacity(self, active: CpuMask) -> u64 {
         let total_cpus = self.span.count() as u64;
         let active_cpus = self.span.intersection(active).count() as u64;
@@ -435,6 +440,25 @@ impl SchedTopology {
             .unwrap_or_else(|| self.root_domain());
         let cpus = domain.span().count().max(1) as u64;
         (domain.capacity() / cpus).max(1)
+    }
+
+    /// 对 `cpus` 中每个 CPU 所属最小域的容量精确求和。
+    ///
+    /// 固件异构拓扑会为每个 CPU 建立单 CPU 叶域，因此这里无需改变
+    /// `SchedTopology` 的 `kernel.sched.topology@1` 值 ABI，也能在 CPU 离线后
+    /// 保留真实的容量差异。
+    pub fn capacity_of(self, cpus: CpuMask) -> u64 {
+        let mut capacity = 0u64;
+        for cpu in cpus.intersection(CpuMask::SUPPORTED).iter() {
+            capacity = capacity.saturating_add(self.cpu_capacity(cpu));
+        }
+        capacity
+    }
+
+    /// 返回调度域在 `active` CPU 子集上的精确有效容量。
+    pub fn effective_domain_capacity(self, domain_id: usize, active: CpuMask) -> Option<u64> {
+        let domain = self.domain(domain_id)?;
+        Some(self.capacity_of(domain.span.intersection(active)))
     }
 
     pub fn root_domain(self) -> SchedDomain {

@@ -21,6 +21,8 @@ pub const VIRTIO_STATUS_FAILED: u32 = 128;
 
 /// VirtIO Feature: VERSION_1（仅 modern 模式存在）。
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+/// 设备必须通过平台 DMA/IOMMU API 访问队列和数据缓冲区。
+pub const VIRTIO_F_ACCESS_PLATFORM: u64 = 1 << 33;
 pub const VIRTIO_F_RING_EVENT_IDX: u64 = 1 << 29;
 
 // ── Modern MMIO 寄存器偏移 ──────────────────────────────────────────────────

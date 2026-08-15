@@ -129,6 +129,55 @@ fn sched_domain_capacity_tracks_online_cpus() {
 }
 
 #[ktest]
+fn heterogeneous_topology_sums_exact_active_cpu_capacities() {
+    let pair = SchedDomain::with_capacity(
+        1,
+        CpuMask::single_raw(0).union(CpuMask::single_raw(1)),
+        1,
+        Some(0),
+        1408,
+    )
+    .expect("pair domain");
+    let slow = SchedDomain::with_capacity(2, CpuMask::single_raw(0), 2, Some(1), 384)
+        .expect("slow cpu leaf");
+    let fast = SchedDomain::with_capacity(3, CpuMask::single_raw(1), 2, Some(1), 1024)
+        .expect("fast cpu leaf");
+    let topology = SchedTopology::from_domains(&[SchedDomain::root(), pair, slow, fast])
+        .expect("heterogeneous topology");
+
+    assert_eq!(topology.cpu_capacity(CpuId::new(0).unwrap()), 384);
+    assert_eq!(topology.cpu_capacity(CpuId::new(1).unwrap()), 1024);
+    assert_eq!(topology.domain(1).unwrap().capacity(), 1408);
+    assert_eq!(
+        topology.effective_domain_capacity(1, CpuMask::single_raw(0)),
+        Some(384)
+    );
+    assert_eq!(
+        topology.effective_domain_capacity(1, CpuMask::single_raw(1)),
+        Some(1024)
+    );
+    assert_eq!(
+        topology.effective_domain_capacity(1, CpuMask::single_raw(0).union(CpuMask::single_raw(1))),
+        Some(1408)
+    );
+}
+
+#[ktest]
+fn legacy_domain_capacity_constructor_infers_per_cpu_capacity() {
+    let slow = SchedDomain::with_capacity(1, CpuMask::single_raw(0), 1, Some(0), 512)
+        .expect("slow cpu domain");
+    let fast = SchedDomain::with_capacity(2, CpuMask::single_raw(1), 1, Some(0), 1024)
+        .expect("fast cpu domain");
+    let topology =
+        SchedTopology::from_domains(&[SchedDomain::root(), slow, fast]).expect("topology");
+    let active = CpuMask::single_raw(0).union(CpuMask::single_raw(1));
+
+    assert_eq!(topology.cpu_capacity(CpuId::new(0).unwrap()), 512);
+    assert_eq!(topology.cpu_capacity(CpuId::new(1).unwrap()), 1024);
+    assert_eq!(topology.effective_domain_capacity(0, active), Some(1536));
+}
+
+#[ktest]
 fn synthetic_topology_assigns_each_cpu_to_its_own_domain() {
     let topology = SchedTopology::with_cpu_domains();
 

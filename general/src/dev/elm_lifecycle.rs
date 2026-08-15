@@ -7,8 +7,11 @@ use alloc::vec::Vec;
 use vfs::sync::Spinlock;
 
 use super::dma::{DmaOps, replace_dma_ops};
+use super::dt_bus::{DtbBusControllerHandle, unregister_controller as unregister_dtb_bus};
+use super::dt_provider::{DtbProviderHandle, unregister as unregister_dtb_provider};
 use super::firmware_bus::{FirmwareBusHandle, unregister as unregister_firmware_bus};
 use super::function::{DeviceClassId, unregister_function_class};
+use super::iommu::{IommuControllerHandle, unregister_iommu_controller};
 use super::irq::{
     DefaultIrqDomainHandle, IocsrOps, IrqDomainHandle, IrqHandle, IrqLineOps, replace_iocsr_ops,
     replace_irq_line_ops, unregister_default_irq_domain, unregister_irq_domain,
@@ -16,9 +19,13 @@ use super::irq::{
 };
 use super::msi::{MsiControllerHandle, MsiHandle, free_msi, unregister_msi_controller};
 use super::pci::{
-    PciConfigAccess, PciHostBridgeHandle, replace_pci_config_access, unregister_host_bridge,
+    PciBarMapper, PciConfigAccess, PciHostBridgeHandle, replace_pci_access_pair,
+    replace_pci_bar_mapper, replace_pci_config_access, unregister_host_bridge,
 };
-use super::pnp::{DriverHandle, PnpDevice, unregister_driver, unsubscribe_device_events};
+use super::pnp::{
+    DriverHandle, PNP_DRIVERS, PnpDevice, PnpError, PreparedDriverDetach, unregister_driver,
+    unsubscribe_device_events,
+};
 
 const RESOURCE_CAPACITY: usize = 4096;
 const SUSPEND_UNSUPPORTED: i32 = -0x45_4c_44;
@@ -37,7 +44,10 @@ enum DeviceResource {
         owner: &'static str,
         name: Box<str>,
     },
+    DtbBusController(DtbBusControllerHandle),
+    DtbProvider(DtbProviderHandle),
     FirmwareBus(FirmwareBusHandle),
+    IommuController(IommuControllerHandle),
     IrqHandler(IrqHandle),
     IrqDomain(IrqDomainHandle),
     DefaultIrqDomain(DefaultIrqDomainHandle),
@@ -48,9 +58,30 @@ enum DeviceResource {
     IrqLineOps(Option<IrqLineOps>),
     IocsrOps(Option<IocsrOps>),
     PciConfigAccess(Option<PciConfigAccess>),
+    PciBarMapper(Option<PciBarMapper>),
+    PciAccessPair {
+        config: Option<PciConfigAccess>,
+        bar_mapper: Option<PciBarMapper>,
+    },
 }
 
 impl DeviceResource {
+    fn release_phase(&self) -> ResourceReleasePhase {
+        match self {
+            // 驱动注销会同步解绑设备，并由 PnP core 深度优先移除 probe
+            // 期间枚举出的子设备。它必须先于这些设备依赖的 host/backend。
+            Self::Driver(_) => ResourceReleasePhase::Driver,
+            Self::Device(_) | Self::DeviceFunction { .. } => ResourceReleasePhase::Device,
+            Self::DmaOps(_)
+            | Self::IrqLineOps(_)
+            | Self::IocsrOps(_)
+            | Self::PciConfigAccess(_)
+            | Self::PciBarMapper(_)
+            | Self::PciAccessPair { .. } => ResourceReleasePhase::GlobalBackend,
+            _ => ResourceReleasePhase::Registration,
+        }
+    }
+
     fn matches(&self, key: ResourceKey<'_>) -> bool {
         match (self, key) {
             (Self::FunctionClass(left), ResourceKey::FunctionClass(right)) => *left == right,
@@ -79,7 +110,10 @@ impl DeviceResource {
                     name: expected_name,
                 },
             ) => *owner == expected_owner && name.as_ref() == expected_name,
+            (Self::DtbBusController(left), ResourceKey::DtbBusController(right)) => *left == right,
+            (Self::DtbProvider(left), ResourceKey::DtbProvider(right)) => *left == right,
             (Self::FirmwareBus(left), ResourceKey::FirmwareBus(right)) => *left == right,
+            (Self::IommuController(left), ResourceKey::IommuController(right)) => *left == right,
             (Self::IrqHandler(left), ResourceKey::IrqHandler(right)) => *left == right,
             (Self::IrqDomain(left), ResourceKey::IrqDomain(right)) => *left == right,
             (Self::DefaultIrqDomain(left), ResourceKey::DefaultIrqDomain(right)) => *left == right,
@@ -93,11 +127,11 @@ impl DeviceResource {
     fn release(&self) -> Result<(), i32> {
         match self {
             Self::FunctionClass(handle) => unregister_function_class(*handle).map_err(|_| -1),
-            Self::Driver(handle) => unregister_driver(*handle).map_err(|_| -1),
-            Self::Device(device) => {
-                device.remove_device();
-                Ok(())
-            }
+            Self::Driver(handle) => match unregister_driver(*handle) {
+                Ok(()) | Err(PnpError::NoDriver) => Ok(()),
+                Err(_) => Err(-1),
+            },
+            Self::Device(device) => device.try_remove_device().map_err(|_| -1),
             Self::DeviceFunction {
                 device,
                 class_id,
@@ -108,7 +142,10 @@ impl DeviceResource {
             Self::EventSubscription { owner, name } => {
                 unsubscribe_device_events(*owner, name.as_ref()).map_err(|_| -1)
             }
+            Self::DtbBusController(handle) => unregister_dtb_bus(*handle).map_err(|_| -1),
+            Self::DtbProvider(handle) => unregister_dtb_provider(*handle).map_err(|_| -1),
             Self::FirmwareBus(handle) => unregister_firmware_bus(*handle).map_err(|_| -1),
+            Self::IommuController(handle) => unregister_iommu_controller(*handle).map_err(|_| -1),
             Self::IrqHandler(handle) => unregister_irq_handler(*handle).map_err(|_| -1),
             Self::IrqDomain(handle) => unregister_irq_domain(*handle).map_err(|_| -1),
             Self::DefaultIrqDomain(handle) => {
@@ -133,7 +170,42 @@ impl DeviceResource {
                 let _ = replace_pci_config_access(*previous);
                 Ok(())
             }
+            Self::PciBarMapper(previous) => {
+                let _ = replace_pci_bar_mapper(*previous);
+                Ok(())
+            }
+            Self::PciAccessPair { config, bar_mapper } => {
+                let _ = replace_pci_access_pair(*config, *bar_mapper);
+                Ok(())
+            }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ResourceReleasePhase {
+    Driver,
+    Device,
+    Registration,
+    GlobalBackend,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResourceOwner {
+    id: u64,
+    generation: u64,
+}
+
+impl ResourceOwner {
+    fn from_context(context: elm_model::ElmCurrentContext) -> Self {
+        Self {
+            id: context.cell_id.0,
+            generation: context.generation.0,
+        }
+    }
+
+    fn current() -> Option<Self> {
+        elm_model::current_context().map(Self::from_context)
     }
 }
 
@@ -151,7 +223,10 @@ enum ResourceKey<'a> {
         owner: &'static str,
         name: &'a str,
     },
+    DtbBusController(DtbBusControllerHandle),
+    DtbProvider(DtbProviderHandle),
     FirmwareBus(FirmwareBusHandle),
+    IommuController(IommuControllerHandle),
     IrqHandler(IrqHandle),
     IrqDomain(IrqDomainHandle),
     DefaultIrqDomain(DefaultIrqDomainHandle),
@@ -162,12 +237,21 @@ enum ResourceKey<'a> {
 
 struct ResourceRecord {
     id: u64,
+    owner: Option<ResourceOwner>,
+    release_phase: ResourceReleasePhase,
     resource: Option<DeviceResource>,
 }
 
 struct ResourceRegistry {
     next_id: u64,
     records: Vec<ResourceRecord>,
+    prepared_owners: Vec<PreparedOwnerDetach>,
+    failed_owners: Vec<ResourceOwner>,
+}
+
+struct PreparedOwnerDetach {
+    owner: ResourceOwner,
+    detach: PreparedDriverDetach<'static>,
 }
 
 impl ResourceRegistry {
@@ -175,6 +259,8 @@ impl ResourceRegistry {
         Self {
             next_id: 1,
             records: Vec::new(),
+            prepared_owners: Vec::new(),
+            failed_owners: Vec::new(),
         }
     }
 
@@ -184,7 +270,11 @@ impl ResourceRegistry {
         (id != 0).then_some(id)
     }
 
-    fn insert(&mut self, resource: DeviceResource) -> Result<u64, ()> {
+    fn insert(
+        &mut self,
+        owner: Option<ResourceOwner>,
+        resource: DeviceResource,
+    ) -> Result<u64, ()> {
         if self.records.len() >= RESOURCE_CAPACITY {
             log::error!("[elm-device] 设备资源归属表已满");
             return Err(());
@@ -202,11 +292,62 @@ impl ResourceRegistry {
         let id = self.allocate_id().ok_or_else(|| {
             log::error!("[elm-device] 设备资源归属编号耗尽");
         })?;
+        let release_phase = resource.release_phase();
         self.records.push(ResourceRecord {
             id,
+            owner,
+            release_phase,
             resource: Some(resource),
         });
         Ok(id)
+    }
+
+    fn take_next_owned(&mut self, owner: ResourceOwner) -> Option<(u64, DeviceResource)> {
+        let mut selected = None;
+        for (index, record) in self.records.iter().enumerate() {
+            if record.owner != Some(owner) || record.resource.is_none() {
+                continue;
+            }
+            let replace = selected.is_none_or(|best_index| {
+                let best: &ResourceRecord = &self.records[best_index];
+                record.release_phase < best.release_phase
+                    || (record.release_phase == best.release_phase && record.id > best.id)
+            });
+            if replace {
+                selected = Some(index);
+            }
+        }
+        let record = &mut self.records[selected?];
+        Some((record.id, record.resource.take()?))
+    }
+
+    fn restore(&mut self, id: u64, resource: DeviceResource) -> Result<(), DeviceResource> {
+        let Some(record) = self.records.iter_mut().find(|record| record.id == id) else {
+            return Err(resource);
+        };
+        if record.resource.is_some() {
+            return Err(resource);
+        }
+        record.resource = Some(resource);
+        Ok(())
+    }
+
+    fn owner_is_prepared(&self, owner: ResourceOwner) -> bool {
+        self.prepared_owners
+            .iter()
+            .any(|prepared| prepared.owner == owner)
+    }
+
+    fn owner_failed(&self, owner: ResourceOwner) -> bool {
+        self.failed_owners.iter().any(|failed| *failed == owner)
+    }
+
+    fn take_prepared_owner(&mut self, owner: ResourceOwner) -> Option<PreparedOwnerDetach> {
+        let index = self
+            .prepared_owners
+            .iter()
+            .position(|prepared| prepared.owner == owner)?;
+        Some(self.prepared_owners.swap_remove(index))
     }
 }
 
@@ -226,7 +367,9 @@ fn track(resource: DeviceResource) -> Result<(), ()> {
     if !kernel_symbols::runtime_hooks_installed() {
         return Ok(());
     }
-    let id = RESOURCES.lock().insert(resource)?;
+    let id = RESOURCES
+        .lock()
+        .insert(ResourceOwner::current(), resource)?;
     commit_tracking(id)
 }
 
@@ -288,38 +431,157 @@ fn resume_resource(_owner: u64, _generation: u64, _handle: u64) -> Result<(), i3
     Ok(())
 }
 
-fn quiesce_resource(_owner: u64, _generation: u64, handle: u64) -> Result<(), i32> {
-    let resource = {
+fn quiesce_resource(owner: u64, generation: u64, handle: u64) -> Result<(), i32> {
+    let owner = ResourceOwner {
+        id: owner,
+        generation,
+    };
+    let grouped = {
         let registry = RESOURCES.lock();
-        let Some(record) = registry.records.iter().find(|record| record.id == handle) else {
-            return Ok(());
-        };
-        record.resource.clone()
+        if registry.owner_failed(owner) {
+            return Err(elm_model::ELM_OWNED_RESOURCE_STATUS_ROLLBACK_FAILED);
+        }
+        registry
+            .records
+            .iter()
+            .any(|record| record.id == handle && record.owner == Some(owner))
     };
-    let Some(resource) = resource else {
+    if !grouped {
         return Ok(());
-    };
-    resource.release()?;
-    let mut registry = RESOURCES.lock();
-    if let Some(record) = registry
-        .records
-        .iter_mut()
-        .find(|record| record.id == handle)
-    {
-        record.resource = None;
     }
+    prepare_owner_detach(owner)
+}
+
+fn prepare_owner_detach(owner: ResourceOwner) -> Result<(), i32> {
+    let (drivers, devices) = {
+        let mut registry = RESOURCES.lock();
+        if registry.owner_failed(owner) {
+            return Err(elm_model::ELM_OWNED_RESOURCE_STATUS_ROLLBACK_FAILED);
+        }
+        if registry.owner_is_prepared(owner) {
+            return Ok(());
+        }
+        let count = registry
+            .records
+            .iter()
+            .filter(|record| record.owner == Some(owner) && record.resource.is_some())
+            .count();
+        let mut drivers = Vec::new();
+        let mut devices = Vec::new();
+        drivers.try_reserve(count).map_err(|_| -1)?;
+        devices.try_reserve(count).map_err(|_| -1)?;
+        for record in &registry.records {
+            if record.owner != Some(owner) {
+                continue;
+            }
+            match record.resource.as_ref() {
+                Some(DeviceResource::Driver(handle)) => drivers.push(*handle),
+                Some(DeviceResource::Device(device)) => devices.push(Arc::clone(device)),
+                _ => {}
+            }
+        }
+        registry.prepared_owners.try_reserve(1).map_err(|_| -1)?;
+        registry.failed_owners.try_reserve(1).map_err(|_| -1)?;
+        (drivers, devices)
+    };
+
+    let detach = PNP_DRIVERS
+        .prepare_detach(&drivers, &devices)
+        .map_err(|_| -1)?;
+    let mut registry = RESOURCES.lock();
+    if registry.owner_is_prepared(owner) {
+        drop(registry);
+        drop(detach);
+        return Ok(());
+    }
+    registry
+        .prepared_owners
+        .push(PreparedOwnerDetach { owner, detach });
     Ok(())
 }
 
-fn cancel_resource(_owner: u64, _generation: u64, _handle: u64) -> Result<(), i32> {
+fn cancel_resource(owner: u64, generation: u64, _handle: u64) -> Result<(), i32> {
+    let owner = ResourceOwner {
+        id: owner,
+        generation,
+    };
+    // 同一 owner 的所有设备资源共享一条 PreparedDriverDetach。owned-resource core
+    // 可能为组内多个 handle 逐一调用 cancel；第一条负责取出并 drop 事务，后续调用
+    // 幂等返回。PreparedDriverDetach::drop 会先解冻设备/资源，再重新开放 driver probe。
+    let prepared = RESOURCES.lock().take_prepared_owner(owner);
+    drop(prepared);
     Ok(())
 }
 
 fn drain_resource(_owner: u64, _generation: u64, _handle: u64) -> Result<(), i32> {
+    let owner = ResourceOwner {
+        id: _owner,
+        generation: _generation,
+    };
+    {
+        let registry = RESOURCES.lock();
+        if registry.owner_failed(owner) {
+            return Err(elm_model::ELM_OWNED_RESOURCE_STATUS_ROLLBACK_FAILED);
+        }
+    }
+    let prepared = RESOURCES.lock().take_prepared_owner(owner);
+    let Some(prepared) = prepared else {
+        return Ok(());
+    };
+    if prepared.detach.commit().is_err() {
+        mark_owner_failed(owner);
+        return Err(elm_model::ELM_OWNED_RESOURCE_STATUS_ROLLBACK_FAILED);
+    }
+    if RESOURCES.lock().owner_failed(owner) {
+        return Err(elm_model::ELM_OWNED_RESOURCE_STATUS_ROLLBACK_FAILED);
+    }
+
+    while let Some((id, resource)) = RESOURCES.lock().take_next_owned(owner) {
+        if let Err(status) = resource.release() {
+            if RESOURCES.lock().restore(id, resource).is_err() {
+                log::error!("[elm-device] 无法恢复释放失败的设备资源: id={}", id);
+            }
+            mark_owner_failed(owner);
+            return Err(
+                if status == elm_model::ELM_OWNED_RESOURCE_STATUS_ROLLBACK_FAILED {
+                    status
+                } else {
+                    elm_model::ELM_OWNED_RESOURCE_STATUS_ROLLBACK_FAILED
+                },
+            );
+        }
+    }
     Ok(())
 }
 
-fn release_resource(_owner: u64, _generation: u64, handle: u64) -> Result<(), i32> {
+fn mark_owner_failed(owner: ResourceOwner) {
+    let mut registry = RESOURCES.lock();
+    if !registry.owner_failed(owner) {
+        if registry.failed_owners.try_reserve(1).is_err() {
+            log::error!(
+                "[elm-device] 无法记录设备 owner 失败: owner={} generation={}",
+                owner.id,
+                owner.generation
+            );
+            return;
+        }
+        registry.failed_owners.push(owner);
+    }
+}
+
+pub(crate) fn mark_context_failed(context: elm_model::ElmCurrentContext) {
+    if kernel_symbols::runtime_hooks_installed() {
+        mark_owner_failed(ResourceOwner::from_context(context));
+    }
+}
+
+fn release_resource(owner: u64, generation: u64, handle: u64) -> Result<(), i32> {
+    if RESOURCES.lock().owner_failed(ResourceOwner {
+        id: owner,
+        generation,
+    }) {
+        return Err(elm_model::ELM_OWNED_RESOURCE_STATUS_ROLLBACK_FAILED);
+    }
     match remove_record(handle) {
         Some(resource) => resource.release(),
         None => Ok(()),
@@ -416,8 +678,11 @@ fn install_exclusive_global(
         })?;
         let resource = install();
         let rollback = resource.clone();
+        let release_phase = resource.release_phase();
         registry.records.push(ResourceRecord {
             id,
+            owner: ResourceOwner::current(),
+            release_phase,
             resource: Some(resource),
         });
         (id, rollback)
@@ -458,8 +723,49 @@ pub(crate) fn install_iocsr_ops(ops: IocsrOps) -> Result<(), ()> {
 
 pub(crate) fn install_pci_config_access(access: PciConfigAccess) -> Result<(), ()> {
     install_exclusive_global(
-        |resource| matches!(resource, DeviceResource::PciConfigAccess(_)),
+        |resource| {
+            matches!(
+                resource,
+                DeviceResource::PciConfigAccess(_) | DeviceResource::PciAccessPair { .. }
+            )
+        },
         || DeviceResource::PciConfigAccess(replace_pci_config_access(Some(access))),
+    )
+}
+
+pub(crate) fn install_pci_bar_mapper(mapper: Option<PciBarMapper>) -> Result<(), ()> {
+    install_exclusive_global(
+        |resource| {
+            matches!(
+                resource,
+                DeviceResource::PciBarMapper(_) | DeviceResource::PciAccessPair { .. }
+            )
+        },
+        || DeviceResource::PciBarMapper(replace_pci_bar_mapper(mapper)),
+    )
+}
+
+/// 原子安装 PCI 配置访问与 BAR 地址翻译后端。
+///
+/// 两个回调共享同一个 ELM owned-resource；跟踪失败时会一起恢复，避免只发布
+/// config access 却遗漏 BAR mapper 的半安装状态。
+pub(crate) fn install_pci_access_pair(
+    access: PciConfigAccess,
+    mapper: PciBarMapper,
+) -> Result<(), ()> {
+    install_exclusive_global(
+        |resource| {
+            matches!(
+                resource,
+                DeviceResource::PciConfigAccess(_)
+                    | DeviceResource::PciBarMapper(_)
+                    | DeviceResource::PciAccessPair { .. }
+            )
+        },
+        || {
+            let (config, bar_mapper) = replace_pci_access_pair(Some(access), Some(mapper));
+            DeviceResource::PciAccessPair { config, bar_mapper }
+        },
     )
 }
 
@@ -476,11 +782,32 @@ macro_rules! simple_resource_helpers {
 }
 
 simple_resource_helpers!(
+    track_dtb_bus_controller,
+    forget_dtb_bus_controller,
+    DtbBusController,
+    DtbBusController,
+    DtbBusControllerHandle
+);
+simple_resource_helpers!(
+    track_dtb_provider,
+    forget_dtb_provider,
+    DtbProvider,
+    DtbProvider,
+    DtbProviderHandle
+);
+simple_resource_helpers!(
     track_firmware_bus,
     forget_firmware_bus,
     FirmwareBus,
     FirmwareBus,
     FirmwareBusHandle
+);
+simple_resource_helpers!(
+    track_iommu_controller,
+    forget_iommu_controller,
+    IommuController,
+    IommuController,
+    IommuControllerHandle
 );
 simple_resource_helpers!(
     track_irq_handler,
@@ -524,3 +851,85 @@ simple_resource_helpers!(
     PciHostBridge,
     PciHostBridgeHandle
 );
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::*;
+
+    fn inert_record(
+        id: u64,
+        owner: ResourceOwner,
+        release_phase: ResourceReleasePhase,
+    ) -> ResourceRecord {
+        ResourceRecord {
+            id,
+            owner: Some(owner),
+            release_phase,
+            resource: Some(DeviceResource::PciConfigAccess(None)),
+        }
+    }
+
+    fn planned_ids(mut registry: ResourceRegistry, owner: ResourceOwner) -> Vec<u64> {
+        let mut ids = Vec::new();
+        while let Some((id, _)) = registry.take_next_owned(owner) {
+            ids.push(id);
+        }
+        ids
+    }
+
+    #[test]
+    fn detach_plan_is_stable_for_device_before_or_after_driver() {
+        let owner = ResourceOwner {
+            id: 7,
+            generation: 3,
+        };
+        let other = ResourceOwner {
+            id: 8,
+            generation: 1,
+        };
+
+        // platform device 已存在：probe 产生的 backend/host/endpoint 先登记，
+        // register_driver_factory 返回后 driver 才登记。
+        let platform_first = ResourceRegistry {
+            next_id: 6,
+            records: vec![
+                inert_record(1, owner, ResourceReleasePhase::GlobalBackend),
+                inert_record(2, owner, ResourceReleasePhase::Registration),
+                inert_record(3, owner, ResourceReleasePhase::Device),
+                inert_record(4, owner, ResourceReleasePhase::Driver),
+                inert_record(5, other, ResourceReleasePhase::Driver),
+            ],
+            prepared_owners: Vec::new(),
+            failed_owners: Vec::new(),
+        };
+        assert_eq!(planned_ids(platform_first, owner), vec![4, 3, 2, 1]);
+
+        // driver 已存在：后续 platform probe 把 backend/host/endpoint 追加在它后面。
+        let driver_first = ResourceRegistry {
+            next_id: 5,
+            records: vec![
+                inert_record(1, owner, ResourceReleasePhase::Driver),
+                inert_record(2, owner, ResourceReleasePhase::GlobalBackend),
+                inert_record(3, owner, ResourceReleasePhase::Registration),
+                inert_record(4, owner, ResourceReleasePhase::Device),
+            ],
+            prepared_owners: Vec::new(),
+            failed_owners: Vec::new(),
+        };
+        assert_eq!(planned_ids(driver_first, owner), vec![1, 4, 3, 2]);
+    }
+
+    #[test]
+    fn pci_access_pair_is_a_last_phase_backend() {
+        let resource = DeviceResource::PciAccessPair {
+            config: None,
+            bar_mapper: None,
+        };
+        assert_eq!(
+            resource.release_phase(),
+            ResourceReleasePhase::GlobalBackend
+        );
+    }
+}

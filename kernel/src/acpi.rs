@@ -3,6 +3,7 @@
 //! 当前 ACPI 的实现只是一个最小的 AIGC 实现，因为工程目前的重心不在于 ACPI，而
 //! 在于 DTB。在决赛的时候可能会对 ACPI 的实现进行充分完善。
 
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -26,6 +27,7 @@ use acpi::sdt::spcr::{Spcr, SpcrInterfaceType};
 use acpi::{AcpiTable, AmlHandler, Handle, Handler, PhysicalMapping};
 
 use allocator::KERNEL_ALLOCATOR;
+use general::dev::dma::{DmaBouncePolicy, DmaConstraints, DmaContext};
 use general::dev::platform::{
     DeviceMatchId, DeviceProperties, DeviceResource, IrqPolarity, IrqResourceAttributes,
     IrqSharing, IrqTrigger, PlatformDeviceInfo, PlatformProbeStatus,
@@ -36,13 +38,6 @@ use general::firmware::power::{
     PowerAccessWidth, PowerControlInfo, PowerControlMethod, PowerRegister, PowerRegisterSpace,
 };
 use general::firmware::{FirmwareTableMapping, SerialPortInfo};
-use general::vfs::FS_REGISTRY;
-use general::vfs::VfsContext;
-use general::vfs::cred::Credentials;
-use general::vfs::dentry::VfsRoot;
-use general::vfs::limits::VfsLimits;
-use general::vfs::mount::{Mount, MountFlags, MountNamespace};
-use general::vfs::stat::FileMode;
 use general::{StartContext, StartFirmware};
 use log::printk;
 
@@ -230,7 +225,7 @@ struct FirmwareSerialDevice {
 
 #[derive(Clone)]
 struct FirmwareMmioDevice {
-    name: &'static str,
+    name: Box<str>,
     phys_addr: usize,
     resources: Vec<DeviceResource>,
 }
@@ -272,7 +267,7 @@ pub fn kernel_start_init(context: &StartContext) {
 
     // ── 阶段 2：安装电源控制入口 ───────────────────────────────────────────
 
-    general::firmware::power::install(power_controls, context.address.phys_to_virt);
+    general::firmware::power::install(power_controls, context.address.device_mmio_to_virt);
 
     // ── 阶段 3：初始化分层内存分配器 ───────────────────────────────────────
 
@@ -360,37 +355,7 @@ pub fn kernel_start_init(context: &StartContext) {
 
     crate::device_init::register_core_filesystems("acpi");
 
-    let root_sb = FS_REGISTRY
-        .find("tmpfs")
-        .expect("[kernel-start][acpi] tmpfs driver not found")
-        .mount(None, "")
-        .expect("[kernel-start][acpi] failed to mount tmpfs root");
-
-    let root_mount = Mount::new(
-        Arc::clone(&root_sb),
-        Arc::clone(&root_sb.root_dentry),
-        Arc::clone(&root_sb.root_dentry),
-        MountFlags::default(),
-        None,
-    );
-
-    let mount_ns = MountNamespace::new(1, Arc::clone(&root_mount));
-
-    let cred = Credentials::root();
-
-    let vfs_ctx = VfsContext::new(
-        Arc::clone(&root_sb.root_dentry),
-        Arc::clone(&root_mount),
-        VfsRoot::new(Arc::clone(&root_sb.root_dentry), Arc::clone(&root_mount)),
-        Arc::clone(&mount_ns),
-        Arc::new(cred.clone()),
-        FileMode::new(0),
-        VfsLimits::default_arc(),
-    );
-
     let dev_sb = crate::device_init::mount_devtmpfs("acpi");
-    crate::device_init::mount_devtmpfs_on_dev("acpi", &vfs_ctx, Arc::clone(&dev_sb));
-
     crate::device_init::activate_device_subsystem(
         "acpi",
         Arc::clone(&dev_sb),
@@ -407,19 +372,21 @@ pub fn kernel_start_init(context: &StartContext) {
     let stdout_phys = console_serial_port_phys;
     let mut platform_bound = 0usize;
     for device in &serial_devices {
-        let port = device.port;
+        let port = device.port.clone();
         let mut ids = Vec::new();
         ids.push(DeviceMatchId::AcpiHid(ACPI_HID_PNP0500.into()));
         ids.push(DeviceMatchId::AcpiHid(ACPI_HID_PNP0501.into()));
         let info = PlatformDeviceInfo {
-            fw_name: port.name.into(),
+            fw_name: port.name.clone(),
             fw_path: None,
             fw_parent_path: None,
             ids,
             resources: device.resources.clone(),
+            irq_names: Vec::new(),
             properties: DeviceProperties {
                 clock_hz: port.clock_hz,
                 baud: port.baud,
+                numa_node_id: None,
                 fw_phandle: None,
                 fw_interrupt_parent: None,
                 interrupt_controller: false,
@@ -430,6 +397,10 @@ pub fn kernel_start_init(context: &StartContext) {
                 stdout: stdout_phys == Some(port.phys_addr),
             },
             fw_properties: Vec::new(),
+            dma: acpi_platform_dma_context(),
+            dtb_bindings: None,
+            dtb_pcie_host: None,
+            dtb_owned_nodes: None,
         };
         if register_platform_device(info, "acpi") {
             platform_bound += 1;
@@ -439,13 +410,18 @@ pub fn kernel_start_init(context: &StartContext) {
         let mut ids = Vec::new();
         ids.push(DeviceMatchId::AcpiHid(ACPI_HID_VIRTIO_MMIO.into()));
         let info = PlatformDeviceInfo {
-            fw_name: device.name.into(),
+            fw_name: device.name.clone(),
             fw_path: None,
             fw_parent_path: None,
             ids,
             resources: device.resources.clone(),
+            irq_names: Vec::new(),
             properties: DeviceProperties::default(),
             fw_properties: Vec::new(),
+            dma: acpi_platform_dma_context(),
+            dtb_bindings: None,
+            dtb_pcie_host: None,
+            dtb_owned_nodes: None,
         };
         if register_platform_device(info, "acpi") {
             platform_bound += 1;
@@ -457,21 +433,32 @@ pub fn kernel_start_init(context: &StartContext) {
         platform_bound
     );
 
+    let root = crate::boot_root::prepare(
+        "acpi",
+        context.boot.command_line,
+        crate::initramfs::embedded_image(),
+        None,
+    );
+    printk!("[kernel-start][acpi] root source selected: {}", root.source);
+    crate::device_init::mount_devtmpfs_on_dev("acpi", &root.vfs_ctx, Arc::clone(&dev_sb));
+
     // ── 阶段 6：注册控制台并绑定日志输出 ──────────────────────────────────
 
-    crate::device_init::mount_standard_user_api_filesystems("acpi", &vfs_ctx);
+    crate::device_init::mount_standard_user_api_filesystems("acpi", &root.vfs_ctx);
 
     // 把同一套部件交给 sched shim 保管：随后 sched::boot_init 会据此给 init
     // 任务挂上 TASKEXT_VFS_CONTEXT / TASKEXT_VFS_FDTABLE。
     crate::sched::stash_boot_vfs_parts(
-        Arc::clone(&root_sb.root_dentry),
-        Arc::clone(&root_mount),
-        Arc::clone(&mount_ns),
-        Arc::new(cred.clone()),
+        Arc::clone(&root.superblock.root_dentry),
+        Arc::clone(&root.root_mount),
+        Arc::clone(&root.mount_ns),
+        Arc::clone(&root.cred),
+        root.is_initramfs,
     );
 
     printk!(
-        "[kernel-start][acpi] VFS ready: tmpfs '/' + devtmpfs '/dev' + tmpfs '/dev/shm' + sysfs '/sys'"
+        "[kernel-start][acpi] VFS ready: '{}' mounted as '/' + devtmpfs '/dev' + tmpfs '/dev/shm' + sysfs '/sys'",
+        root.source
     );
 
     let console_selector = if let Some(name) = cmdline.as_ref().and_then(|cl| {
@@ -491,7 +478,7 @@ pub fn kernel_start_init(context: &StartContext) {
             device.port.name
         );
         Some(crate::device_init::BootConsoleSelector::FirmwareName(
-            String::from(device.port.name),
+            String::from(device.port.name.as_ref()),
         ))
     } else {
         None
@@ -499,7 +486,7 @@ pub fn kernel_start_init(context: &StartContext) {
     if let Some(selector) = console_selector {
         let _ = crate::device_init::bind_or_defer_boot_console(
             "acpi",
-            &vfs_ctx,
+            &root.vfs_ctx,
             Arc::clone(&dev_sb),
             selector,
         );
@@ -508,6 +495,17 @@ pub fn kernel_start_init(context: &StartContext) {
     }
 
     printk!("[kernel-start][acpi] kernel initialization complete, jumping to main entry");
+}
+
+fn acpi_platform_dma_context() -> DmaContext {
+    DmaContext::with_constraints(DmaConstraints {
+        address_mask: usize::MAX,
+        max_segment_size: usize::MAX,
+        max_segments: 1,
+        coherent: false,
+        supports_scatter_gather: false,
+        bounce: DmaBouncePolicy::Disabled,
+    })
 }
 
 fn register_platform_device(info: PlatformDeviceInfo, tag: &str) -> bool {
@@ -603,7 +601,7 @@ fn discover_acpi_namespace_devices(
             continue;
         };
 
-        let name = alloc::format!("{}", path).leak();
+        let name: Box<str> = alloc::format!("{}", path).into();
         if is_serial {
             if !serial_devices
                 .iter()
@@ -1289,7 +1287,7 @@ fn serial_device_from_spcr(tables: &acpi::AcpiTables<AcpiMapper>) -> Option<Firm
     let baud = spcr.baud_rate().map(|baud| baud.get());
     let phys_addr = base_address.address as usize;
     let name = spcr_namespace_name(&spcr)
-        .unwrap_or_else(|| alloc::format!("serial@{:#x}", phys_addr).leak());
+        .unwrap_or_else(|| alloc::format!("serial@{:#x}", phys_addr).into());
 
     if let Some(clock_hz) = clock_hz {
         printk!(
@@ -1336,13 +1334,13 @@ fn spcr_interface_is_16550_compatible(interface: SpcrInterfaceType) -> bool {
     )
 }
 
-fn spcr_namespace_name(spcr: &Spcr) -> Option<&'static str> {
+fn spcr_namespace_name(spcr: &Spcr) -> Option<Box<str>> {
     let name = spcr.namespace_string().ok()?;
     let name = name.trim_matches('\0').trim();
     if name.is_empty() || name == "." {
         return None;
     }
-    Some(name.to_string().leak())
+    Some(name.into())
 }
 
 fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {

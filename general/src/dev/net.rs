@@ -73,7 +73,7 @@ impl DeviceFunction for NetFunction {
     }
 
     fn dma_context(&self) -> Option<DmaContext> {
-        (!self.is_gone()).then_some(self.dma_context)
+        (!self.is_gone()).then_some(self.dma_context.clone())
     }
 
     fn is_gone(&self) -> bool {

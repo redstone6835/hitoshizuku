@@ -10,7 +10,7 @@ use alloc::string::String;
 use general::vfs::fdtable::FdTable;
 use general::vfs::file::{AccessMode, OpenOptions};
 use general::vfs::path::{Dirfd, LookupFlags};
-use general::vfs::stat::FileMode;
+use general::vfs::stat::{DevId, FileMode, FileType};
 use general::vfs::{self, VfsContext};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +67,8 @@ pub fn unpack_newc(image: InitramfsImage, ctx: &VfsContext) -> Result<(), Initra
         let header = &bytes[cursor..cursor + 110];
         cursor += 110;
 
-        if &header[0..6] != b"070701" && &header[0..6] != b"070702" {
+        let checksum_present = &header[0..6] == b"070702";
+        if &header[0..6] != b"070701" && !checksum_present {
             return Err(InitramfsError::BadArchive);
         }
 
@@ -76,6 +77,7 @@ pub fn unpack_newc(image: InitramfsImage, ctx: &VfsContext) -> Result<(), Initra
         let rdev_major = read_hex(header, 78)?;
         let rdev_minor = read_hex(header, 86)?;
         let name_size = read_hex(header, 94)? as usize;
+        let expected_checksum = read_hex(header, 102)?;
         if name_size == 0 {
             return Err(InitramfsError::BadArchive);
         }
@@ -100,10 +102,34 @@ pub fn unpack_newc(image: InitramfsImage, ctx: &VfsContext) -> Result<(), Initra
         }
         let data = &bytes[cursor..data_end];
         cursor = align4(data_end);
+        if checksum_present
+            && mode & 0o170000 == 0o100000
+            && data
+                .iter()
+                .fold(0u32, |sum, byte| sum.wrapping_add(u32::from(*byte)))
+                != expected_checksum
+        {
+            return Err(InitramfsError::BadArchive);
+        }
 
         let name = core::str::from_utf8(raw_name).map_err(|_| InitramfsError::Utf8)?;
         if name == "TRAILER!!!" {
-            return Ok(());
+            // Linux accepts concatenated newc members.  Skip the zero padding
+            // between trailers and the next member, while allowing a final
+            // zero-filled tail to terminate the archive normally.
+            while cursor < bytes.len() && bytes[cursor] == 0 {
+                cursor += 1;
+            }
+            if cursor == bytes.len() {
+                return Ok(());
+            }
+            if bytes.len() - cursor < 6
+                || (&bytes[cursor..cursor + 6] != b"070701"
+                    && &bytes[cursor..cursor + 6] != b"070702")
+            {
+                return Err(InitramfsError::BadArchive);
+            }
+            continue;
         }
         let Some(path) = normalize_archive_path(name) else {
             continue;
@@ -111,14 +137,33 @@ pub fn unpack_newc(image: InitramfsImage, ctx: &VfsContext) -> Result<(), Initra
 
         ensure_parent_dirs(ctx, &path)?;
         match mode & 0o170000 {
-            0o040000 => ensure_dir(ctx, &path, mode_bits(mode))?,
+            0o040000 => create_directory(ctx, &path, mode_bits(mode))?,
             0o100000 => create_regular(ctx, &path, mode_bits(mode), data)?,
             0o120000 => {
                 let target = core::str::from_utf8(data).map_err(|_| InitramfsError::Utf8)?;
+                clean_path(ctx, &path, None)?;
                 vfs::operation::symlinkat(ctx, target, &Dirfd::Cwd, &path)?;
             }
             0o020000 | 0o060000 | 0o010000 | 0o140000 => {
-                let _ = (rdev_major, rdev_minor);
+                let kind = match mode & 0o170000 {
+                    0o020000 => FileType::CharDevice,
+                    0o060000 => FileType::BlockDevice,
+                    0o010000 => FileType::Fifo,
+                    0o140000 => FileType::Socket,
+                    _ => unreachable!(),
+                };
+                clean_path(ctx, &path, Some(kind))?;
+                if path_kind(ctx, &path)? != Some(kind) {
+                    vfs::operation::mknodat(
+                        ctx,
+                        &Dirfd::Cwd,
+                        &path,
+                        kind,
+                        mode_bits(mode),
+                        DevId::new(rdev_major, rdev_minor),
+                    )?;
+                }
+                vfs::operation::fchmodat(ctx, &Dirfd::Cwd, &path, mode_bits(mode), true)?;
             }
             _ => return Err(InitramfsError::UnsupportedEntry),
         }
@@ -172,20 +217,64 @@ fn ensure_parent_dirs(ctx: &VfsContext, path: &str) -> Result<(), InitramfsError
         }
         cur.push('/');
         cur.push_str(component);
-        ensure_dir(ctx, &cur, FileMode::new(0o755))?;
+        ensure_parent_dir(ctx, &cur)?;
     }
     Ok(())
 }
 
-fn ensure_dir(ctx: &VfsContext, path: &str, mode: FileMode) -> Result<(), InitramfsError> {
+fn path_kind(ctx: &VfsContext, path: &str) -> Result<Option<FileType>, InitramfsError> {
+    match vfs::path::lookup(ctx, &Dirfd::Cwd, path, LookupFlags::NO_FOLLOW) {
+        Ok(result) => Ok(Some(
+            result
+                .dentry
+                .inode()
+                .ok_or(vfs::error::VfsError::NotFound)?
+                .kind(),
+        )),
+        Err(vfs::error::VfsError::NotFound) => Ok(None),
+        Err(err) => Err(InitramfsError::Vfs(err)),
+    }
+}
+
+/// 与 Linux initramfs `clean_path()` 一样，对末端分量做 no-follow 类型比较。
+/// 类型不一致时先移除旧对象，避免普通文件覆盖符号链接时写入链接目标。
+fn clean_path(
+    ctx: &VfsContext,
+    path: &str,
+    expected: Option<FileType>,
+) -> Result<(), InitramfsError> {
+    let Some(existing) = path_kind(ctx, path)? else {
+        return Ok(());
+    };
+    if expected == Some(existing) {
+        return Ok(());
+    }
+    if existing == FileType::Directory {
+        vfs::operation::rmdir(ctx, &Dirfd::Cwd, path)?;
+    } else {
+        vfs::operation::unlink(ctx, &Dirfd::Cwd, path)?;
+    }
+    Ok(())
+}
+
+fn ensure_parent_dir(ctx: &VfsContext, path: &str) -> Result<(), InitramfsError> {
     match vfs::path::lookup(ctx, &Dirfd::Cwd, path, LookupFlags::DIRECTORY) {
         Ok(_) => Ok(()),
         Err(vfs::error::VfsError::NotFound) => {
-            vfs::operation::mkdirat(ctx, &Dirfd::Cwd, path, mode)?;
+            vfs::operation::mkdirat(ctx, &Dirfd::Cwd, path, FileMode::new(0o755))?;
             Ok(())
         }
         Err(err) => Err(InitramfsError::Vfs(err)),
     }
+}
+
+fn create_directory(ctx: &VfsContext, path: &str, mode: FileMode) -> Result<(), InitramfsError> {
+    clean_path(ctx, path, Some(FileType::Directory))?;
+    if path_kind(ctx, path)?.is_none() {
+        vfs::operation::mkdirat(ctx, &Dirfd::Cwd, path, mode)?;
+    }
+    vfs::operation::fchmodat(ctx, &Dirfd::Cwd, path, mode, false)?;
+    Ok(())
 }
 
 fn create_regular(
@@ -194,6 +283,7 @@ fn create_regular(
     mode: FileMode,
     data: &[u8],
 ) -> Result<(), InitramfsError> {
+    clean_path(ctx, path, Some(FileType::Regular))?;
     let fdt = FdTable::new_default();
     let fd = vfs::operation::openat(
         ctx,
@@ -211,6 +301,7 @@ fn create_regular(
     let file = fdt
         .get_file(fd)
         .ok_or(vfs::error::VfsError::BadFileDescriptor)?;
+    vfs::operation::fchmod(ctx, &fdt, fd, mode)?;
 
     let mut written = 0usize;
     while written < data.len() {

@@ -115,6 +115,10 @@ struct UserPgdInner {
 
 impl UserPgdInner {
     fn new() -> Option<Box<Self>> {
+        assert!(
+            crate::riscv64::paging::paging_mode_is_final(),
+            "[arch][mm] user PGD created before paging mode finalization"
+        );
         let request =
             allocator::PhysicalAllocRequest::new(allocator::PAGE_SIZE, allocator::PAGE_SIZE);
         let pgd_alloc = allocator::KERNEL_ALLOCATOR
@@ -211,7 +215,7 @@ fn free_table_entries(table_vaddr: usize, level: usize, entries: usize) {
         if !Riscv64Paging::pte_is_valid(pte) || Riscv64Paging::pte_is_leaf(pte) {
             continue;
         }
-        if level + 1 >= Riscv64Paging::LEVELS {
+        if level + 1 >= Riscv64Paging::active_levels() {
             continue;
         }
         let child_paddr = Riscv64Paging::pte_addr(pte);
@@ -358,7 +362,7 @@ unsafe fn map_user_pages(
         root_virt,
         vaddr,
         paddr,
-        Riscv64Paging::LEVELS - 1,
+        Riscv64Paging::active_levels() - 1,
         read,
         write,
         execute,
@@ -384,7 +388,7 @@ unsafe fn map_user_page_batch(
         inner.pgd_virt(),
         vaddr,
         paddrs,
-        Riscv64Paging::LEVELS - 1,
+        Riscv64Paging::active_levels() - 1,
         flags.has(VmFlags::READ),
         flags.has(VmFlags::WRITE),
         flags.has(VmFlags::EXEC),
@@ -430,7 +434,7 @@ unsafe fn protect_user_pages(pgd: PgdHandle, vaddr: usize, len: usize, flags: Vm
     let user = flags.has(VmFlags::USER);
     let mut va = vaddr & !(Riscv64Paging::PAGE_SIZE - 1);
     let end = vaddr.saturating_add(len);
-    let base_level = Riscv64Paging::LEVELS - 1;
+    let base_level = Riscv64Paging::active_levels() - 1;
     let mut leaf_table_vaddr = 0usize;
     let mut leaf_table_end = va;
     while va < end {
@@ -515,7 +519,7 @@ unsafe fn clone_for_fork_user_pages(
             dst_inner.pgd_virt(),
             va,
             new_paddr,
-            Riscv64Paging::LEVELS - 1,
+            Riscv64Paging::active_levels() - 1,
             Riscv64Paging::flags_readable(f),
             Riscv64Paging::flags_writable(f),
             Riscv64Paging::flags_executable(f),

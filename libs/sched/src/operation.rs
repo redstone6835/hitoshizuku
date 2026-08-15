@@ -116,6 +116,42 @@ pub fn getsid(pid: PidT) -> Result<PidT, Errno> {
         .ok_or(Errno::ESRCH)
 }
 
+/// 当前任务所在会话的 sid(无会话返回 None)。
+pub fn current_session_id() -> Option<PidT> {
+    let me = current_task();
+    let pg = me.process_group();
+    let session = pg.session()?;
+    (session.sid() > 0).then_some(session.sid())
+}
+
+/// 当前会话是否为调用者(会话首进程)。
+pub fn is_current_session_leader() -> bool {
+    let Some(sid) = current_session_id() else {
+        return false;
+    };
+    getpid() == sid
+}
+
+/// 当前会话的控制终端 cookie。
+pub fn current_session_ctty() -> Option<u64> {
+    current_task().process_group().session()?.ctty()
+}
+
+/// 设置当前会话的控制终端 cookie。
+pub fn set_current_session_ctty(cookie: Option<u64>) -> Result<(), Errno> {
+    let session = current_task()
+        .process_group()
+        .session()
+        .ok_or(Errno::EPERM)?;
+    session.set_ctty(cookie);
+    Ok(())
+}
+
+/// 会话是否仍然存活(惰性释放检查用)。
+pub fn session_exists(sid: PidT) -> bool {
+    getsid(sid).is_ok()
+}
+
 /// 设置 pid 所在的进程组为 pgid。POSIX 语义：
 /// - pid==0 → 当前线程
 /// - pgid==0 → pgid 等于 pid（自成一组 leader）
