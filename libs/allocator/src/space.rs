@@ -26,7 +26,7 @@ use crate::Mutex;
 use crate::boot::BootAllocator;
 use crate::buddy::{BuddyAllocError, BuddyAllocator, BuddyFreeError, PAGE_SIZE};
 use crate::error::AddressSpaceError;
-use crate::request::{MemoryPlacement, PagePolicy, PhysicalAllocRequest};
+use crate::request::{MemoryPlacement, PagePolicy, PhysicalAllocRequest, PhysicalAllocation};
 use crate::vmem::{VmemAllocPolicy, VmemArena, VmemStats};
 
 #[inline]
@@ -84,6 +84,7 @@ pub struct KernelAddressSpace {
     tracked: Mutex<VmemArena>,
     initialized: AtomicBool,
     kernel_direct_map: AtomicBool,
+    kernel_phys_to_virt: AtomicUsize,
     kernel_virt_to_phys: AtomicUsize,
     kernel_heap_map: AtomicUsize,
     kernel_heap_unmap: AtomicUsize,
@@ -97,6 +98,7 @@ impl KernelAddressSpace {
             tracked: Mutex::new(VmemArena::new()),
             initialized: AtomicBool::new(false),
             kernel_direct_map: AtomicBool::new(false),
+            kernel_phys_to_virt: AtomicUsize::new(0),
             kernel_virt_to_phys: AtomicUsize::new(0),
             kernel_heap_map: AtomicUsize::new(0),
             kernel_heap_unmap: AtomicUsize::new(0),
@@ -114,6 +116,17 @@ impl KernelAddressSpace {
             .store(unmap_fn as usize, Ordering::Release);
     }
 
+    fn configure_kernel_backing_mode(&self, virt_to_phys: fn(usize) -> usize) {
+        let direct = uses_direct_backing(ArenaKind::Kernel);
+        self.kernel_direct_map.store(direct, Ordering::Release);
+        if direct {
+            self.kernel_virt_to_phys
+                .store(virt_to_phys as usize, Ordering::Release);
+        } else {
+            self.kernel_virt_to_phys.store(0, Ordering::Release);
+        }
+    }
+
     pub fn init_from_phys(
         &self,
         phys: &BuddyAllocator,
@@ -127,6 +140,10 @@ impl KernelAddressSpace {
         if !phys.is_initialized() {
             return Err(AddressSpaceError::NotInitialized);
         }
+        self.kernel_phys_to_virt
+            .store(phys_to_virt as usize, Ordering::Release);
+        self.kernel_virt_to_phys
+            .store(virt_to_phys as usize, Ordering::Release);
 
         let init_start_ns = now_ns();
         let direct_map_init_us;
@@ -289,9 +306,6 @@ impl KernelAddressSpace {
                         });
                     }
                 }
-                self.kernel_direct_map.store(true, Ordering::Release);
-                self.kernel_virt_to_phys
-                    .store(virt_to_phys as usize, Ordering::Release);
             } else {
                 if !kernel.init(
                     b"kernel_heap",
@@ -307,9 +321,8 @@ impl KernelAddressSpace {
                     self.initialized.store(false, Ordering::Release);
                     return Err(AddressSpaceError::InvalidRange);
                 }
-                self.kernel_direct_map.store(false, Ordering::Release);
-                self.kernel_virt_to_phys.store(0, Ordering::Release);
             }
+            self.configure_kernel_backing_mode(virt_to_phys);
             kernel_init_us = elapsed_us(phase_start_ns);
         }
 
@@ -457,6 +470,28 @@ impl KernelAddressSpace {
         }
     }
 
+    fn load_kernel_phys_to_virt_fn(&self) -> Option<fn(usize) -> usize> {
+        let raw = self.kernel_phys_to_virt.load(Ordering::Acquire);
+        if raw == 0 {
+            None
+        } else {
+            Some(unsafe { core::mem::transmute::<usize, fn(usize) -> usize>(raw) })
+        }
+    }
+
+    pub(crate) fn direct_map_region(&self, phys: &BuddyAllocator) -> Option<(usize, usize)> {
+        let phys_to_virt = self.load_kernel_phys_to_virt_fn()?;
+        let mut base = usize::MAX;
+        let mut end = 0usize;
+        for segment in phys.iter_segments() {
+            let segment_base = phys_to_virt(segment.start);
+            let segment_end = segment_base.checked_add(segment.size)?;
+            base = base.min(segment_base);
+            end = end.max(segment_end);
+        }
+        (base != usize::MAX && end > base).then_some((base, end - base))
+    }
+
     pub(crate) fn alloc_backed_range(
         &self,
         arena: ArenaKind,
@@ -471,6 +506,27 @@ impl KernelAddressSpace {
         let order = effective_order_for_page_policy(order, page_policy);
         let block_pages = 1usize << order;
         let size = block_pages * PAGE_SIZE;
+
+        if uses_direct_backing(arena) {
+            let phys_to_virt = self
+                .load_kernel_phys_to_virt_fn()
+                .ok_or(AddressSpaceError::MappingUnavailable)?;
+            let allocation = phys
+                .lock()
+                .alloc_pages_with(
+                    &PhysicalAllocRequest::new(size, size)
+                        .with_page_policy(page_policy)
+                        .with_placement(MemoryPlacement::Any),
+                )
+                .map_err(|_| AddressSpaceError::PhysicalRangeUnavailable)?;
+            return Ok(BackedRange {
+                arena,
+                vaddr: phys_to_virt(allocation.paddr),
+                paddr: allocation.paddr,
+                size: allocation.size,
+                order: allocation.order,
+            });
+        }
 
         // 第一步：分配虚拟地址（短暂持有 arena_lock）
         let vaddr = {
@@ -566,9 +622,31 @@ impl KernelAddressSpace {
         Ok(backed)
     }
 
-    pub(crate) fn backed_range(&self, arena: ArenaKind, vaddr: usize) -> Option<BackedRange> {
+    pub(crate) fn backed_range(
+        &self,
+        arena: ArenaKind,
+        vaddr: usize,
+        phys: &Mutex<BuddyAllocator>,
+    ) -> Option<BackedRange> {
         if !self.is_initialized() {
             return None;
+        }
+        if uses_direct_backing(arena) {
+            let phys_to_virt = self.load_kernel_phys_to_virt_fn()?;
+            let virt_to_phys = self.load_kernel_virt_to_phys_fn()?;
+            let paddr = virt_to_phys(vaddr);
+            let roundtrip = phys_to_virt(paddr);
+            if roundtrip != vaddr {
+                return None;
+            }
+            let allocation = phys.lock().allocated_range(paddr)?;
+            return Some(BackedRange {
+                arena,
+                vaddr,
+                paddr,
+                size: allocation.size,
+                order: allocation.order,
+            });
         }
         let (paddr, size, order) = self.arena_lock(arena).lock().backing(vaddr)?;
         Some(BackedRange {
@@ -587,6 +665,22 @@ impl KernelAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         if !self.is_initialized() {
             return Err(AddressSpaceError::NotInitialized);
+        }
+
+        if uses_direct_backing(range.arena) {
+            let phys_to_virt = self
+                .load_kernel_phys_to_virt_fn()
+                .ok_or(AddressSpaceError::MappingUnavailable)?;
+            let mut phys = phys.lock();
+            let Some(allocation) = phys.allocated_range(range.paddr) else {
+                return Err(AddressSpaceError::InvalidRange);
+            };
+            if !direct_backed_range_matches(range, allocation, phys_to_virt) {
+                return Err(AddressSpaceError::InvalidRange);
+            }
+            return phys
+                .free_pages(range.paddr, range.order)
+                .map_err(AddressSpaceError::from);
         }
 
         if range.arena != ArenaKind::DirectMap
@@ -661,5 +755,107 @@ fn effective_order_for_page_policy(order: usize, page_policy: PagePolicy) -> usi
         order.max(MIN_LARGE_PAGE_ORDER)
     } else {
         order
+    }
+}
+
+#[inline]
+const fn uses_direct_backing(arena: ArenaKind) -> bool {
+    matches!(arena, ArenaKind::Kernel | ArenaKind::DirectMap)
+}
+
+fn direct_backed_range_matches(
+    range: BackedRange,
+    allocation: PhysicalAllocation,
+    phys_to_virt: impl FnOnce(usize) -> usize,
+) -> bool {
+    range.paddr == allocation.paddr
+        && range.size == allocation.size
+        && range.order == allocation.order
+        && allocation.page_size == allocation.size
+        && phys_to_virt(range.paddr) == range.vaddr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ArenaKind, BackedRange, KernelAddressSpace, direct_backed_range_matches,
+        uses_direct_backing,
+    };
+    use crate::PhysicalAllocation;
+
+    fn identity(address: usize) -> usize {
+        address
+    }
+
+    #[test]
+    fn kernel_arena_uses_direct_backing() {
+        assert!(uses_direct_backing(ArenaKind::Kernel));
+    }
+
+    #[test]
+    fn tracked_arena_keeps_mapped_backing() {
+        assert!(!uses_direct_backing(ArenaKind::Tracked));
+    }
+
+    #[test]
+    fn kernel_direct_backing_keeps_reverse_translation() {
+        let space = KernelAddressSpace::new();
+        space.configure_kernel_backing_mode(identity);
+
+        assert!(
+            space
+                .kernel_direct_map
+                .load(core::sync::atomic::Ordering::Acquire)
+        );
+        assert_eq!(
+            space
+                .load_kernel_virt_to_phys_fn()
+                .map(|translate| translate(0x20_0000)),
+            Some(0x20_0000)
+        );
+    }
+
+    #[test]
+    fn direct_backing_rejects_mismatched_geometry() {
+        let allocation = PhysicalAllocation {
+            paddr: 0x20_0000,
+            size: 4 * super::PAGE_SIZE,
+            order: 2,
+            page_size: 4 * super::PAGE_SIZE,
+        };
+        let range = BackedRange {
+            arena: ArenaKind::Kernel,
+            vaddr: allocation.paddr + 0x1000_0000,
+            paddr: allocation.paddr,
+            size: allocation.size,
+            order: allocation.order,
+        };
+        let phys_to_virt = |paddr| paddr + 0x1000_0000;
+
+        assert!(direct_backed_range_matches(range, allocation, phys_to_virt));
+        assert!(!direct_backed_range_matches(
+            BackedRange {
+                order: range.order + 1,
+                ..range
+            },
+            allocation,
+            phys_to_virt,
+        ));
+        assert!(!direct_backed_range_matches(
+            BackedRange {
+                size: range.size / 2,
+                ..range
+            },
+            allocation,
+            phys_to_virt,
+        ));
+        assert!(!direct_backed_range_matches(
+            BackedRange {
+                vaddr: range.vaddr + super::PAGE_SIZE,
+                ..range
+            },
+            allocation,
+            phys_to_virt,
+        ));
     }
 }

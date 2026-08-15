@@ -16,13 +16,14 @@
 //!
 //! 它和 `kheap` 的分工边界很明确：不适合放进 slab 的对象，直接交给大对象路径。
 use core::alloc::Layout;
+use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::Mutex;
 
-use crate::buddy::{BuddyAllocator, MAX_TRACKED_ORDER, PAGE_SIZE};
+use crate::buddy::{BuddyAllocator, MAX_TRACKED_ORDER, PAGE_SIZE, SlabOwnerIndex};
 use crate::request::{AllocationArena, AllocationKind, AllocationRecord, MemoryDomain};
 use crate::space::{ArenaKind, BackedRange, KernelAddressSpace};
 
@@ -188,15 +189,23 @@ impl SlabDirectoryPage {
 struct SlabPageDirectory {
     base: AtomicUsize,
     page_count: AtomicUsize,
+    direct_index: UnsafeCell<SlabOwnerIndex>,
+    direct_virt_to_phys: AtomicUsize,
+    direct_ready: AtomicBool,
     grow_lock: Mutex<()>,
     root: SlabDirectoryPage,
 }
+
+unsafe impl Sync for SlabPageDirectory {}
 
 impl SlabPageDirectory {
     const fn new() -> Self {
         Self {
             base: AtomicUsize::new(0),
             page_count: AtomicUsize::new(0),
+            direct_index: UnsafeCell::new(SlabOwnerIndex::empty()),
+            direct_virt_to_phys: AtomicUsize::new(0),
+            direct_ready: AtomicBool::new(false),
             grow_lock: Mutex::new(()),
             root: SlabDirectoryPage::new(),
         }
@@ -220,7 +229,21 @@ impl SlabPageDirectory {
         true
     }
 
+    fn init_direct(&self, index: SlabOwnerIndex, virt_to_phys: fn(usize) -> usize) -> bool {
+        if self.direct_ready.load(Ordering::Acquire) {
+            return false;
+        }
+        unsafe { *self.direct_index.get() = index };
+        self.direct_virt_to_phys
+            .store(virt_to_phys as usize, Ordering::Relaxed);
+        self.direct_ready.store(true, Ordering::Release);
+        true
+    }
+
     fn ensure_range(&self, base: usize, size: usize) -> bool {
+        if let Some((index, paddr)) = self.direct_range(base) {
+            return index.covers_range(paddr, size);
+        }
         let Some((start, pages)) = self.range_pages(base, size) else {
             return false;
         };
@@ -234,6 +257,9 @@ impl SlabPageDirectory {
     }
 
     fn publish_range(&self, base: usize, size: usize, node_addr: usize) -> bool {
+        if let Some((index, paddr)) = self.direct_range(base) {
+            return index.publish_range(paddr, size, node_addr);
+        }
         let Some((start, pages)) = self.range_pages(base, size) else {
             return false;
         };
@@ -263,6 +289,9 @@ impl SlabPageDirectory {
         if size == 0 {
             return true;
         }
+        if let Some((index, paddr)) = self.direct_range(base) {
+            return index.clear_range(paddr, size, node_addr);
+        }
         let Some((start, pages)) = self.range_pages(base, size) else {
             return false;
         };
@@ -283,6 +312,9 @@ impl SlabPageDirectory {
     }
 
     fn owns_range(&self, base: usize, size: usize, node_addr: usize) -> bool {
+        if let Some((index, paddr)) = self.direct_range(base) {
+            return index.owns_range(paddr, size, node_addr);
+        }
         let Some((start, pages)) = self.range_pages(base, size) else {
             return false;
         };
@@ -294,6 +326,19 @@ impl SlabPageDirectory {
 
     #[inline]
     fn lookup(&self, ptr: usize) -> Option<SlabOwner> {
+        if let Some(index) = self.load_direct_index() {
+            let paddr = self.direct_virt_to_phys(ptr)?;
+            let node_addr = index.lookup(paddr)?;
+            let node = slab_node(node_addr);
+            if !node.try_pin() {
+                return None;
+            }
+            let owner = SlabOwner { node_addr };
+            if index.lookup(paddr) != Some(node_addr) || !node.slab.contains(ptr) {
+                return None;
+            }
+            return Some(owner);
+        }
         let page = self.page_index(ptr)?;
         let (leaf, slot) = self.leaf_entry(page)?;
         // 节点内容由 lifecycle 的 Release/Acquire 发布；owner 本身只负责提供永久有效的
@@ -311,6 +356,26 @@ impl SlabPageDirectory {
             return None;
         }
         Some(owner)
+    }
+
+    fn load_direct_index(&self) -> Option<SlabOwnerIndex> {
+        self.direct_ready
+            .load(Ordering::Acquire)
+            .then(|| unsafe { *self.direct_index.get() })
+    }
+
+    fn direct_virt_to_phys(&self, vaddr: usize) -> Option<usize> {
+        let raw = self.direct_virt_to_phys.load(Ordering::Relaxed);
+        if raw == 0 {
+            return None;
+        }
+        let convert = unsafe { core::mem::transmute::<usize, fn(usize) -> usize>(raw) };
+        Some(convert(vaddr))
+    }
+
+    fn direct_range(&self, vaddr: usize) -> Option<(SlabOwnerIndex, usize)> {
+        let index = self.load_direct_index()?;
+        Some((index, self.direct_virt_to_phys(vaddr)?))
     }
 
     fn ensure_leaf(&self, page: usize) -> Option<&'static SlabDirectoryPage> {
@@ -2146,6 +2211,21 @@ impl SlabAllocator {
         self.initialized.store(true, Ordering::Release);
     }
 
+    pub(crate) fn init_direct(
+        &self,
+        cpu_count: usize,
+        owner_index: SlabOwnerIndex,
+        virt_to_phys: fn(usize) -> usize,
+    ) {
+        self.cpu_count
+            .store(cpu_count.clamp(1, MAX_CPUS), Ordering::Release);
+        assert!(
+            self.directory.init_direct(owner_index, virt_to_phys),
+            "[alloc][invariant] direct slab owner index must initialize exactly once"
+        );
+        self.initialized.store(true, Ordering::Release);
+    }
+
     pub fn is_initialized(&self) -> bool {
         self.initialized.load(Ordering::Acquire)
     }
@@ -2579,7 +2659,9 @@ mod slab_state_tests {
     extern crate std;
 
     use alloc::boxed::Box;
+    use core::alloc::Layout;
     use core::sync::atomic::Ordering;
+    use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error};
 
     use super::{
         CACHE_CAPACITY, CacheDrainBuffer, CacheEntry, FLUSH_BATCH, INVALID_SLAB_NODE,
@@ -2587,7 +2669,8 @@ mod slab_state_tests {
         SlabAuditFlags, SlabDirectoryPage, SlabNode, SlabObjectState, SlabPageDirectory, ZoneState,
         directory_page, slab_lookup_bucket,
     };
-    use crate::buddy::PAGE_SIZE;
+    use crate::boot::BootAllocator;
+    use crate::buddy::{BuddyAllocator, MemorySegment, PAGE_SIZE};
     use crate::space::{ArenaKind, BackedRange};
 
     fn test_slab_node(base: usize) -> Box<SlabNode> {
@@ -2609,6 +2692,39 @@ mod slab_state_tests {
         );
         assert!(node.activate());
         node
+    }
+
+    struct TestPhysicalMemory {
+        ptr: *mut u8,
+        layout: Layout,
+    }
+
+    impl TestPhysicalMemory {
+        fn new() -> Self {
+            let layout = Layout::from_size_align(32 * 1024 * 1024, PAGE_SIZE).unwrap();
+            let ptr = unsafe { alloc_zeroed(layout) };
+            if ptr.is_null() {
+                handle_alloc_error(layout);
+            }
+            Self { ptr, layout }
+        }
+
+        fn segment(&self) -> MemorySegment {
+            MemorySegment {
+                start: self.ptr as usize,
+                size: self.layout.size(),
+            }
+        }
+    }
+
+    impl Drop for TestPhysicalMemory {
+        fn drop(&mut self) {
+            unsafe { dealloc(self.ptr, self.layout) };
+        }
+    }
+
+    fn identity(address: usize) -> usize {
+        address
     }
 
     fn prepare_test_directory_page(directory: &SlabPageDirectory, page: usize) {
@@ -2778,6 +2894,39 @@ mod slab_state_tests {
         assert!(directory.clear_range(slab_base, 4 * PAGE_SIZE, node_addr));
         assert!(!directory.owns_range(slab_base, 4 * PAGE_SIZE, node_addr));
         assert!(directory.lookup(slab_base).is_none());
+    }
+
+    #[test]
+    fn direct_owner_directory_maps_every_pfn_without_virtual_tables() {
+        let memory = TestPhysicalMemory::new();
+        let mut buddy = BuddyAllocator::new();
+        buddy
+            .init(&[memory.segment()], &[], identity, &BootAllocator::new())
+            .unwrap();
+        let allocation = buddy
+            .alloc_pages_with(&crate::PhysicalAllocRequest::new(
+                4 * PAGE_SIZE,
+                4 * PAGE_SIZE,
+            ))
+            .unwrap();
+        let directory = SlabPageDirectory::new();
+        assert!(directory.init_direct(buddy.slab_owner_index(), identity));
+        let mut node = test_slab_node_with_pages(allocation.paddr, 4);
+        let node_addr = (&mut *node as *mut SlabNode) as usize;
+
+        assert!(directory.ensure_range(allocation.paddr, allocation.size));
+        assert!(directory.publish_range(allocation.paddr, allocation.size, node_addr));
+        for offset in (0..allocation.size).step_by(PAGE_SIZE) {
+            assert_eq!(
+                directory
+                    .lookup(allocation.paddr + offset)
+                    .map(|owner| owner.node_addr()),
+                Some(node_addr)
+            );
+        }
+        assert!(directory.clear_range(allocation.paddr, allocation.size, node_addr));
+        assert!(directory.lookup(allocation.paddr).is_none());
+        buddy.free_allocation(allocation).unwrap();
     }
 
     #[test]

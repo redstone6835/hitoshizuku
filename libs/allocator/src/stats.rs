@@ -160,6 +160,7 @@ pub struct AllocatorReclaimStats {
     pub kheap: KernelHeapReclaimStats,
     pub slab: SlabReclaimStats,
     pub phys: BuddyReclaimStats,
+    pub order0_cached_pages: usize,
 }
 
 impl AllocatorReclaimStats {
@@ -169,12 +170,14 @@ impl AllocatorReclaimStats {
             && self.slab.reclaimed_slabs == 0
             && self.phys.deferred_reclaim_passes == 0
             && self.phys.merged_blocks == 0
+            && self.order0_cached_pages == 0
     }
 
     pub const fn reclaimed_bytes(self) -> usize {
         self.kheap
             .released_bytes
             .saturating_add(self.slab.reclaimed_bytes)
+            .saturating_add(self.order0_cached_pages.saturating_mul(crate::PAGE_SIZE))
     }
 }
 

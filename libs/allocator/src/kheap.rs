@@ -537,7 +537,7 @@ impl KernelHeap {
         else {
             return Err(DeallocationError::InvalidPointer);
         };
-        let Some(range) = vmem.backed_range(self.arena, ptr) else {
+        let Some(range) = vmem.backed_range(self.arena, ptr, phys) else {
             return Err(DeallocationError::UnknownPointer);
         };
         if range.order != order || range.size != (1usize << order) * PAGE_SIZE {
@@ -561,6 +561,7 @@ impl KernelHeap {
         ptr: usize,
         old_layout: Layout,
         new_layout: Layout,
+        phys: &crate::Mutex<BuddyAllocator>,
         vmem: &KernelAddressSpace,
     ) -> bool {
         let Some((old_order, _)) = effective_layout_policy(old_layout, PagePolicy::BaseOnly) else {
@@ -571,7 +572,7 @@ impl KernelHeap {
         };
         old_order == new_order
             && vmem
-                .backed_range(self.arena, ptr)
+                .backed_range(self.arena, ptr, phys)
                 .is_some_and(|range| range.order == old_order)
     }
 
