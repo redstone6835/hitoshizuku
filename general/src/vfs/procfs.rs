@@ -2298,8 +2298,17 @@ fn render_task_status(task: &Arc<Task>) -> String {
         .map(|fdt| fdt.snapshot_fds().len())
         .unwrap_or(0);
     let (vsize, rss, data) = task_memory_usage(task);
+    let cap_inh = creds.cap_inheritable.raw() & LINUX_CAP_VALID_MASK;
+    let cap_prm = creds.cap_permitted.raw() & LINUX_CAP_VALID_MASK;
+    let cap_eff = creds.caps.raw() & LINUX_CAP_VALID_MASK;
+    let cap_bnd = creds.cap_bset.raw() & LINUX_CAP_VALID_MASK;
+    let seccomp = task
+        .ext_lookup(crate::syscall::TASKEXT_SECCOMP)
+        .and_then(|payload| payload.downcast::<crate::seccomp::SeccompState>().ok())
+        .map(|state| state.mode())
+        .unwrap_or(0);
     format!(
-        "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nVmData:\t{} kB\nThreads:\t{}\n",
+        "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nVmData:\t{} kB\nThreads:\t{}\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nNoNewPrivs:\t{}\nSeccomp:\t{}\n",
         name,
         task_state_char(state),
         task_state_name(state),
@@ -2309,18 +2318,26 @@ fn render_task_status(task: &Arc<Task>) -> String {
         creds.uid.0,
         creds.euid.0,
         creds.suid.0,
-        creds.euid.0,
+        creds.fsuid.0,
         creds.gid.0,
         creds.egid.0,
         creds.sgid.0,
-        creds.egid.0,
+        creds.fsgid.0,
         fd_count,
         vsize / 1024,
         rss / 1024,
         data / 1024,
         task_thread_count(task),
+        cap_inh,
+        cap_prm,
+        cap_eff,
+        cap_bnd,
+        task.no_new_privs() as usize,
+        seccomp,
     )
 }
+
+const LINUX_CAP_VALID_MASK: u64 = (1u64 << 41) - 1;
 
 fn render_task_stat(task: &Arc<Task>) -> String {
     let pid = task.pid_root().unwrap_or(0);
