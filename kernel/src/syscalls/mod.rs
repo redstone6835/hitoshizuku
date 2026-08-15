@@ -7,10 +7,10 @@
 //! `register_all()` 在 `kernel::sched::boot_init` 的末尾调用一次。
 
 mod fs;
-mod ipc;
+pub(crate) mod ipc;
 mod mm;
 mod nr;
-mod process;
+pub(crate) mod process;
 mod signal;
 mod syslog;
 
@@ -48,6 +48,14 @@ pub(super) fn vfs_cred_from_sched(src: &SchedCredentials) -> VfsCredentials {
         (SchedCapability::SysAdmin, VfsCapability::SysAdmin),
         (SchedCapability::SysBoot, VfsCapability::SysAdmin),
         (SchedCapability::SysResource, VfsCapability::SysResource),
+        (SchedCapability::Mknod, VfsCapability::MkNod),
+        (SchedCapability::IpcOwner, VfsCapability::IpcOwner),
+        (SchedCapability::IpcLock, VfsCapability::IpcLock),
+        (SchedCapability::SysPtrace, VfsCapability::SysPtrace),
+        (
+            SchedCapability::CheckpointRestore,
+            VfsCapability::CheckpointRestore,
+        ),
     ] {
         if src.has_cap(sched_cap) {
             caps = caps.with(vfs_cap);
@@ -458,6 +466,15 @@ pub fn register_all() {
         signal::sys_rt_sigtimedwait_time64,
     );
     register_syscall(nr::SYS_PIDFD_SEND_SIGNAL, signal::sys_pidfd_send_signal);
+
+    ipc::register_mq_notify_dispatcher_once();
+    general::vfs::nsfs::register_ns_provider(process::ns_provider);
+    #[cfg(target_arch = "riscv64")]
+    arch::riscv64::trap::exception::register_user_break_hook(process::ptrace_singlestep_trap_hook);
+    #[cfg(target_arch = "loongarch64")]
+    arch::loongarch64::trap::exception::register_user_break_hook(
+        process::ptrace_singlestep_trap_hook,
+    );
 
     let registered = general::syscall::registered_count();
     log::info!("[syscalls] registered {} entries", registered);

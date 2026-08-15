@@ -12,6 +12,7 @@ members = [
     "libs/native-abi",
     "libs/soyo",
     "libs/mm",
+    "libs/ns",
     "libs/sched",
     "libs/allocator",
     "libs/socket",
@@ -32,6 +33,7 @@ members = [
     "kernel"
 ]
 exclude = [
+    "**/drivers/*",
     "drivers/ahci",
     "drivers/cfi-flash",
     "drivers/dt-providers",

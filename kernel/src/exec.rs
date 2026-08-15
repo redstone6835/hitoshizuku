@@ -30,6 +30,8 @@ const EXEC_MAX_ARG_BYTES: usize = 128 * 1024;
 pub(crate) struct PreparedImage {
     vm: Arc<VmSpace>,
     exec_access: Arc<ExecutableAccessSet>,
+    /// exec 后的新凭据（setuid/setgid 位、能力转换；`None` = 不变）。
+    exec_credentials: Option<Arc<sched::ids::Credentials>>,
     sync_icache: bool,
     #[cfg(feature = "performance-profile")]
     main_profile: (u64, usize, usize),
@@ -66,6 +68,7 @@ pub(crate) struct PreparedInitialThread {
 struct PreparedLoad {
     vm: Arc<VmSpace>,
     exec_access: Arc<ExecutableAccessSet>,
+    exec_credentials: Option<Arc<sched::ids::Credentials>>,
     sync_icache: bool,
     personality: ProcessPersonalityState,
     fdtable: Option<Arc<FdTable>>,
@@ -114,6 +117,7 @@ enum InstallStep {
     FileDescriptors,
     AddressSpace,
     ExecutableAccess,
+    Credentials,
     ExecPath,
     Arguments,
     Environment,
@@ -122,10 +126,11 @@ enum InstallStep {
     UserContext,
 }
 
-const INSTALL_STEPS: [InstallStep; 9] = [
+const INSTALL_STEPS: [InstallStep; 10] = [
     InstallStep::FileDescriptors,
     InstallStep::AddressSpace,
     InstallStep::ExecutableAccess,
+    InstallStep::Credentials,
     InstallStep::ExecPath,
     InstallStep::Arguments,
     InstallStep::Environment,
@@ -540,7 +545,7 @@ pub(crate) fn prepare_exec(task: &Arc<Task>, request: ExecRequest) -> Result<Pre
 
     let kernel_stack_top = task.ensure_kernel_stack();
     let loaded = match loaded {
-        LoadedExecutionImage::Tomori { image, argv, envp } => {
+        LoadedExecutionImage::Tomori { image, argv, envp, file_owner } => {
             let prepared_fdtable = observed
                 .fdtable
                 .as_ref()
@@ -570,9 +575,11 @@ pub(crate) fn prepare_exec(task: &Arc<Task>, request: ExecRequest) -> Result<Pre
                 .as_ref()
                 .map(|(path, range)| (crate::sched::profile_image_id(path), range.start, range.end))
                 .unwrap_or((0, 0, 0));
+            let exec_credentials = compute_exec_credentials(task, file_owner);
             PreparedLoad {
                 vm,
                 exec_access,
+                exec_credentials,
                 sync_icache: false,
                 personality: ProcessPersonalityState::TomoriLinux,
                 fdtable: prepared_fdtable,
@@ -636,6 +643,7 @@ pub(crate) fn prepare_exec(task: &Arc<Task>, request: ExecRequest) -> Result<Pre
             PreparedLoad {
                 vm: image.vm,
                 exec_access,
+                exec_credentials: None,
                 sync_icache: true,
                 personality: ProcessPersonalityState::MygoNative(personality),
                 fdtable: None,
@@ -658,6 +666,7 @@ pub(crate) fn prepare_exec(task: &Arc<Task>, request: ExecRequest) -> Result<Pre
         image: PreparedImage {
             vm: loaded.vm,
             exec_access: loaded.exec_access,
+            exec_credentials: loaded.exec_credentials,
             sync_icache: loaded.sync_icache,
             #[cfg(feature = "performance-profile")]
             main_profile: loaded.main_profile,
@@ -908,6 +917,11 @@ pub(crate) fn commit_exec(
             InstallStep::ExecutableAccess => {
                 replace_required_extension(task, TASKEXT_EXEC_ACCESS, &prepared.image.exec_access)?;
             }
+            InstallStep::Credentials => {
+                if let Some(credentials) = prepared.image.exec_credentials.as_ref() {
+                    install_exec_credentials(task, Arc::clone(credentials))?;
+                }
+            }
             InstallStep::ExecPath => {
                 replace_required_extension(task, TASKEXT_EXEC_PATH, &prepared.startup.exec_path)?;
                 task.set_comm(&prepared.startup.comm);
@@ -976,6 +990,117 @@ pub(crate) fn commit_exec(
             source.suppress_drop_notifications_for_exec();
         }
     }
+    ptrace_notify_exec(task);
+    Ok(())
+}
+
+/// `PTRACE_O_TRACEEXEC`：exec 完成事件（消息为 0）。
+fn ptrace_notify_exec(task: &Arc<Task>) {
+    const PTRACE_O_TRACEEXEC: u64 = 0x0000_0010;
+    const PTRACE_EVENT_EXEC: u16 = 4;
+    if !task.is_ptrace_traced() || task.ptrace_options() & PTRACE_O_TRACEEXEC == 0 {
+        return;
+    }
+    task.set_ptrace_event_msg(0);
+    task.set_ptrace_stop_event(PTRACE_EVENT_EXEC);
+    task.clear_ptrace_last_siginfo();
+    sched::operation::ptrace_mark_stopped(task, sched::SignalNumber::SIGTRAP);
+}
+
+/// Linux `commit_creds` 的 exec 凭据语义（无文件能力时）。
+///
+/// - `PR_SET_NO_NEW_PRIVS`：完全跳过权限提升；
+/// - `SECBIT_NO_SETUID_FIXUP`：跳过 setuid/setgid 位；
+/// - `S_ISUID`/`S_ISGID`：euid/egid 切换为文件属主；euid 变化时 suid 同步、
+///   `dumpable = 0`；
+/// - 能力转换（`prepare_kernel_cred`/`bprm` 公式，`fP=fI=fE=0`）：
+///   `pP' = bset & (pI | pP)`，`pE' = pE & pP'`；setuid 生效（secureexec）
+///   且未设 `SECBIT_KEEP_CAPS` 时 `pP' = bset & pI`（丢弃原有 permitted）；
+/// - `PR_SET_KEEPCAPS` 与 `SECBIT_KEEP_CAPS` 等价。
+fn compute_exec_credentials(
+    task: &Arc<Task>,
+    file_owner: Option<(u32, u32, u16)>,
+) -> Option<Arc<sched::ids::Credentials>> {
+    use sched::ids::{CapSet, Gid, Uid};
+
+    const SECBIT_KEEP_CAPS: u32 = 1 << 0;
+    const SECBIT_NO_SETUID_FIXUP: u32 = 1 << 2;
+    const S_ISUID: u16 = 0o4000;
+    const S_ISGID: u16 = 0o2000;
+
+    let old = task.credentials();
+    if task.no_new_privs() {
+        return None;
+    }
+    let securebits = old.securebits;
+    let mut new = (*old).clone();
+
+    let mut secureexec = false;
+    if securebits & SECBIT_NO_SETUID_FIXUP == 0 {
+        if let Some((file_uid, file_gid, mode)) = file_owner {
+            if mode & S_ISUID != 0 {
+                new.euid = Uid(file_uid);
+                secureexec = true;
+            }
+            if mode & S_ISGID != 0 {
+                new.egid = Gid(file_gid);
+                secureexec = true;
+            }
+        }
+    }
+    if new.euid != old.euid {
+        new.suid = new.euid;
+        task.set_dumpable(0);
+        secureexec = true;
+    }
+    if new.egid != old.egid {
+        new.fsgid = new.egid;
+        secureexec = true;
+    }
+    if !secureexec
+        && new.uid == old.uid
+        && new.euid == old.euid
+        && new.suid == old.suid
+        && new.fsuid == old.fsuid
+        && new.gid == old.gid
+        && new.egid == old.egid
+        && new.sgid == old.sgid
+        && new.fsgid == old.fsgid
+        && new.caps.raw() == old.caps.raw()
+    {
+        return None;
+    }
+
+    // 能力转换。
+    let bset = old.cap_bset;
+    let inherited = old.cap_inheritable;
+    let old_permitted = old.cap_permitted;
+    let effective = old.caps;
+    let keep_caps = task.keepcaps() || securebits & SECBIT_KEEP_CAPS != 0;
+    let inherited_or_permitted = CapSet::from_raw(inherited.raw() | old_permitted.raw());
+    let new_permitted = if secureexec && !keep_caps {
+        bset.mask(inherited)
+    } else {
+        bset.mask(inherited_or_permitted)
+    };
+    let new_effective = effective.mask(new_permitted);
+    new.cap_permitted = new_permitted;
+    new.caps = new_effective;
+    // 无 ambient 能力；inheritable 保持不变（Linux pI' = pI）。
+
+    Some(Arc::new(new))
+}
+
+/// 安装 exec 凭据：sched 凭据 + VFS 上下文凭据原子替换。
+fn install_exec_credentials(
+    task: &Arc<Task>,
+    credentials: Arc<sched::ids::Credentials>,
+) -> Result<(), Errno> {
+    task.set_credentials(Arc::clone(&credentials));
+    if let Some(vfs_ctx) = general::vfs::current_vfs_context() {
+        vfs_ctx.set_cred(Arc::new(crate::syscalls::vfs_cred_from_sched(&credentials)));
+    }
+    let _ = task;
     Ok(())
 }
 

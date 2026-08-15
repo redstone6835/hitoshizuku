@@ -22,6 +22,7 @@ kernel-symbols = { path = "../kernel-symbols" }
 mm = { path = "../mm" }
 net = { path = "../net" }
 profiling = { path = "../profiling", optional = true }
+ns = { path = "../ns", default-features = false }
 sched = { path = "../sched" }
 socket = { path = "../socket" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }

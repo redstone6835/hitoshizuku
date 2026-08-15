@@ -67,6 +67,7 @@ errno = { path = "../libs/errno" }
 extfs = { path = "../libs/extfs" }
 fatfs = { path = "../libs/fatfs" }
 general = { path = "../general" }
+ns = { path = "../libs/ns", default-features = false }
 ktest = { path = "../libs/ktest" }
 kcsan = { path = "../libs/kcsan", optional = true }
 kernel-symbols = { path = "../libs/kernel-symbols", default-features = false }

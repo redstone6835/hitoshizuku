@@ -4,3 +4,7 @@ timerfd01 timerfd01
 timerfd02 timerfd02
 timerfd_settime01 timerfd_settime01
 alarm02 alarm02
+adjtimex01 adjtimex01
+adjtimex02 adjtimex02
+clock_adjtime01 clock_adjtime01
+clock_adjtime02 clock_adjtime02

@@ -55,6 +55,14 @@ pub fn realtime_ns() -> u64 {
     apply_realtime_offset(monotonic_ns())
 }
 
+/// 相对调整真实时间（`adjtimex(ADJ_OFFSET)` 等使用）。
+pub fn adjust_realtime_ns(delta_ns: i64) {
+    let current = REALTIME_OFFSET_NS.load(Ordering::Relaxed);
+    let next = current.saturating_add(delta_ns);
+    REALTIME_OFFSET_NS.store(next, Ordering::Relaxed);
+    try_write_data(monotonic_ns());
+}
+
 pub fn set_realtime_ns(realtime_ns: u64) {
     let now_ns = monotonic_ns();
     let offset = (realtime_ns as i128).saturating_sub(now_ns as i128);

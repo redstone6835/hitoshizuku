@@ -310,6 +310,34 @@ impl VfsContext {
         requested.without(*self.umask.lock())
     }
 
+    /// `setns(CLONE_NEWNS)`：返回挂载命名空间为 `mount_ns` 的新 VFS 上下文，
+    /// cwd 与 root 按挂载树重映射（找不到对应挂载时退回新 ns 的根）。
+    pub fn with_mount_ns(&self, mount_ns: Arc<MountNamespace>) -> VfsResult<Arc<Self>> {
+        let cwd_st = self.cwd_state.lock();
+        let new_cwd_mount = mount_ns
+            .find_mount_for_root(&cwd_st.cwd_mount.mount_root)
+            .unwrap_or_else(|| Arc::clone(&mount_ns.root.lock()));
+        let root_dentry = self.root.root();
+        let new_root_mount = mount_ns
+            .find_mount_for_root(&self.root.mount().mount_root)
+            .unwrap_or_else(|| Arc::clone(&mount_ns.root.lock()));
+        VFS_CONTEXT_CREATED.fetch_add(1, Ordering::Relaxed);
+        VFS_CONTEXT_LIVE.fetch_add(1, Ordering::Relaxed);
+        Ok(Arc::new(Self {
+            cwd_state: sync::Spinlock::new(CwdState {
+                cwd: Arc::clone(&cwd_st.cwd),
+                cwd_mount: new_cwd_mount,
+            }),
+            root: VfsRoot::new(root_dentry, new_root_mount),
+            mount_ns,
+            cred: sync::Spinlock::new(self.cred()),
+            umask: sync::Spinlock::new(*self.umask.lock()),
+            mutation_gate: sync::Spinlock::new(()),
+            generation: AtomicU64::new(0),
+            limits: Arc::clone(&self.limits),
+        }))
+    }
+
     #[kernel_symbols::export(
         name = "vfs.VfsContext.fork",
         contract = "kernel.vfs.context@1",

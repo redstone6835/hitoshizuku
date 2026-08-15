@@ -135,6 +135,16 @@ impl WaitStatus {
         Self(((sig.raw() as i32) << 8) | 0x7f)
     }
 
+    /// 原始停止信号编码（支持 `PTRACE_O_TRACESYSGOOD` 的 `0x80|SIGTRAP`）。
+    pub const fn from_stop_raw(raw_sig: i32) -> Self {
+        Self(((raw_sig & 0xff) << 8) | 0x7f)
+    }
+
+    /// 子进程的 `PTRACE_EVENT_*` 停止：`(sig<<8) | (event<<16) | 0x7f`。
+    pub const fn from_stop_event(sig: SignalNumber, event: u16) -> Self {
+        Self(((sig.raw() as i32) << 8) | ((event as i32) << 16) | 0x7f)
+    }
+
     /// 子进程从停止状态恢复。
     pub const fn continued() -> Self {
         Self(0xffff)

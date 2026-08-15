@@ -266,6 +266,38 @@ static INIT_THREAD_GROUP: AtomicPtr<ThreadGroup> = AtomicPtr::new(core::ptr::nul
 /// 根 PID namespace。所有任务在分配 pid 时至少在该 ns 中登记一次。
 static ROOT_PID_NS: AtomicPtr<PidNamespace> = AtomicPtr::new(core::ptr::null_mut());
 static INIT_READY: AtomicBool = AtomicBool::new(false);
+
+/// 启动期 pid 命名空间占位。
+///
+/// `Task::new` 在 `sched::init()` 完成前不能调用 [`root_pid_ns()`]
+/// （`ROOT_PID_NS` 尚未发布、`INIT_READY` 未置位），因此构造任务时先用
+/// 这个独立的根 ns 占位；所有真实创建路径（`sched::init` 的 init 任务、
+/// [`crate::spawn_child`] 及各类 kthread spawn）随后都会用
+/// [`Task::set_pid_ns`] 覆盖为正确的命名空间。host 侧单测也依赖它，
+/// 避免在未初始化调度器的环境下 panic。
+static BOOT_PID_NS: AtomicPtr<PidNamespace> = AtomicPtr::new(core::ptr::null_mut());
+
+/// 取启动期 pid 命名空间占位（见 [`BOOT_PID_NS`]，首次访问时构造）。
+pub fn boot_pid_ns() -> Arc<PidNamespace> {
+    if !BOOT_PID_NS.load(Ordering::Acquire).is_null() {
+        return clone_global_arc(&BOOT_PID_NS, "[sched] BOOT_PID_NS slot empty");
+    }
+    let leaked = Arc::into_raw(PidNamespace::new_root()).cast_mut();
+    if BOOT_PID_NS
+        .compare_exchange(
+            core::ptr::null_mut(),
+            leaked,
+            Ordering::Release,
+            Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        // 并发首建失败：释放本次构造，取已发布的。
+        drop(unsafe { Arc::from_raw(leaked) });
+    }
+    clone_global_arc(&BOOT_PID_NS, "[sched] BOOT_PID_NS slot empty")
+}
+
 static DEFERRED_TIMER_TICK_NS: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
 static DEFERRED_TASK_WAKES: [AtomicPtr<Task>; NR_CPUS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; NR_CPUS];
@@ -411,6 +443,9 @@ pub fn init() -> Arc<Task> {
         Arc::clone(&tgroup),
         Arc::clone(&pgroup),
     );
+    // 2.1) 绑定根 pid 命名空间。Task::new 只能用启动期占位 ns
+    //      （root_pid_ns() 在 init 完成前不可用），此处显式覆盖。
+    init_task.set_pid_ns(Arc::clone(&root_ns));
 
     // 3) 反向登记。
     tgroup.set_leader(&init_task);

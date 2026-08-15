@@ -138,6 +138,7 @@ pub use scheduler::{
     schedule_once, scheduler_diag, set_realtime_itimer, set_sched_rr_timeslice_ms,
     set_sched_rt_period_us, set_sched_rt_runtime_us, signal_wakeup, spawn_idle_for,
     supported_cpu_mask, try_current_task_ref, user_return_work_pending_on,
+    boot_pid_ns,
 };
 pub use scheduler::{
     DeadlineObserver, cancel_deadline_observer, cancel_sleep_deadline, register_deadline_observer,
@@ -172,7 +173,8 @@ pub use task::{
     DEFAULT_TIMER_SLACK_NS, ExecutionActionClaim, ExecutionScopeKind, ExitCode, RobustListState,
     RseqRegistration, SigAltStack, TASK_COMM_LEN, TASKEXT_ELM_EXECUTION, TASKEXT_EXEC_ACCESS,
     TASKEXT_EXEC_ARGS, TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_RISCV_VECTOR_SIGNAL_STACK,
-    TASKEXT_RISCV_VECTOR_STATE, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE,
+    TASKEXT_RISCV_VECTOR_STATE, TASKEXT_PTRACE_FRAME, TASKEXT_USER_TRAP_FRAME,
+    TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE,
     TASKEXT_VM_SPACE, Task, TaskDiag, TaskExitAccountingHook, TaskExt, TaskExtCloneHook,
     TaskExtExitHook, TaskExtKey, TaskKind, TaskPreExitHook, TaskState, TaskUsage, WaitReason,
     ext_clone_hook, ext_exit_hook, pre_exit_hook, register_exit_accounting_hook,

@@ -35,6 +35,7 @@ pub mod dtb;
 pub mod firmware;
 pub mod ipc;
 pub mod mm;
+pub mod seccomp;
 pub mod syscall;
 pub mod vfs;
 
