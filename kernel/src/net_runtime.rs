@@ -3065,6 +3065,18 @@ fn netlink_neighbor_snapshot() -> Vec<vfs::netlink_socket::NeighborSnapshot> {
         .collect()
 }
 
+fn procfs_neighbor_snapshot() -> Vec<net::control::NeighborSnapshotEntry> {
+    net::control::neighbor_snapshot()
+}
+
+fn procfs_dns_snapshot() -> Vec<IpAddr> {
+    CONFIG_STORE
+        .lock()
+        .as_ref()
+        .map(|store| store.snapshot().dns_servers.clone())
+        .unwrap_or_default()
+}
+
 fn publish_device_config() {
     let store = CONFIG_STORE.lock().as_ref().cloned();
     let Some(store) = store else {
@@ -3557,6 +3569,9 @@ pub fn start_workers() {
     vfs::netlink_socket::install_route_snapshot_provider(netlink_route_snapshot);
     vfs::netlink_socket::install_neighbor_snapshot_provider(netlink_neighbor_snapshot);
     vfs::netlink_socket::install_netlink_config_handler(netlink_config_update);
+    general::vfs::procfs::install_proc_net_route_provider(netlink_route_snapshot);
+    general::vfs::procfs::install_proc_net_neighbor_provider(procfs_neighbor_snapshot);
+    general::vfs::procfs::install_proc_net_dns_provider(procfs_dns_snapshot);
     vfs::net_socket::install_net_realtime_clock(crate::vdso::realtime_ns);
     let boot = net::stack::boot_config().expect("网络 stack 启动配置未安装");
     let online = sched::online_cpu_mask();

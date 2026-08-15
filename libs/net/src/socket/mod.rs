@@ -414,6 +414,43 @@ fn enter_resident_allocation_scope()
         .ok_or(SocketError::Buffer)
 }
 
+/// INET socket 快照（/proc/net/{tcp,udp} 与观测接口用）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InetSocketSnapshot {
+    pub id: SocketId,
+    pub kind: SocketKind,
+    pub family: AddressFamily,
+    pub local: Option<Endpoint>,
+    pub peer: Option<Endpoint>,
+    /// TCP 状态（仅 Stream；Datagram/Raw 为 0）。
+    pub tcp_state: u8,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+}
+
+/// 遍历全部存活 INET socket，生成观测快照。
+pub fn snapshot_inet_sockets() -> Vec<InetSocketSnapshot> {
+    let registry = SOCKET_REGISTRY.read();
+    let mut out = Vec::with_capacity(registry.len());
+    for entry in registry.iter() {
+        let Some(facade) = entry.upgrade() else {
+            continue;
+        };
+        let info = facade.tcp_info();
+        out.push(InetSocketSnapshot {
+            id: facade.id(),
+            kind: facade.kind(),
+            family: facade.family(),
+            local: facade.local_endpoint(),
+            peer: facade.peer_endpoint(),
+            tcp_state: info.state,
+            bytes_sent: info.bytes_sent,
+            bytes_received: info.bytes_received,
+        });
+    }
+    out
+}
+
 /// 将一个已经交给常驻 host/VFS 的 socket 纳入代际卸载跟踪。
 pub fn track_socket_facade(facade: &Arc<SocketFacade>, generation: u64) {
     if generation == 0 {

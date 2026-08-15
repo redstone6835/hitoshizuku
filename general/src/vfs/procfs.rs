@@ -43,6 +43,28 @@ static HOTPLUG_PATH: Spinlock<String> = Spinlock::new(String::new());
 static FILE_MAX: AtomicU64 = AtomicU64::new(i64::MAX as u64);
 static KERNEL_TAINT_FLAGS: AtomicU64 = AtomicU64::new(0);
 
+// ── /proc/net 数据源（由内核 net_runtime 安装）───────────────────────────────
+
+static ROUTE_SNAPSHOT_PROVIDER: Spinlock<Option<fn() -> Vec<net::control::RouteEntry>>> =
+    Spinlock::new(None);
+static NEIGHBOR_SNAPSHOT_PROVIDER:
+    Spinlock<Option<fn() -> Vec<net::control::NeighborSnapshotEntry>>> = Spinlock::new(None);
+static DNS_SNAPSHOT_PROVIDER: Spinlock<Option<fn() -> Vec<net::IpAddr>>> = Spinlock::new(None);
+
+pub fn install_proc_net_route_provider(provider: fn() -> Vec<net::control::RouteEntry>) {
+    *ROUTE_SNAPSHOT_PROVIDER.lock() = Some(provider);
+}
+
+pub fn install_proc_net_neighbor_provider(
+    provider: fn() -> Vec<net::control::NeighborSnapshotEntry>,
+) {
+    *NEIGHBOR_SNAPSHOT_PROVIDER.lock() = Some(provider);
+}
+
+pub fn install_proc_net_dns_provider(provider: fn() -> Vec<net::IpAddr>) {
+    *DNS_SNAPSHOT_PROVIDER.lock() = Some(provider);
+}
+
 const ROOT_INO: u64 = 1;
 const FILESYSTEMS_INO: u64 = 2;
 const MOUNTS_INO: u64 = 3;
@@ -612,16 +634,18 @@ enum ProcNetSnapshotKind {
     Unix,
     Arp,
     Sockstat,
+    Dns,
 }
 
 impl ProcNetSnapshotKind {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Tcp,
         Self::Udp,
         Self::Route,
         Self::Unix,
         Self::Arp,
         Self::Sockstat,
+        Self::Dns,
     ];
 
     const fn name(self) -> &'static str {
@@ -632,6 +656,7 @@ impl ProcNetSnapshotKind {
             Self::Unix => "unix",
             Self::Arp => "arp",
             Self::Sockstat => "sockstat",
+            Self::Dns => "dns",
         }
     }
 
@@ -644,6 +669,7 @@ impl ProcNetSnapshotKind {
                 Self::Unix => 4,
                 Self::Arp => 5,
                 Self::Sockstat => 6,
+                Self::Dns => 7,
             }
     }
 
@@ -659,6 +685,7 @@ impl ProcNetSnapshotKind {
             Self::Unix => render_proc_net_unix(),
             Self::Arp => render_proc_net_arp(),
             Self::Sockstat => render_proc_net_sockstat(),
+            Self::Dns => render_proc_net_dns(),
         }
     }
 }
@@ -721,6 +748,112 @@ impl FileOps for ProcNetSnapshotFile {
     }
 }
 
+/// IPv4 端点按 Linux /proc/net 格式渲染：地址小端 hex + 端口 hex。
+fn proc_ipv4_endpoint(address: net::Ipv4Addr, port: u16) -> alloc::string::String {
+    let mut raw = String::new();
+    let _ = alloc::fmt::write(
+        &mut raw,
+        format_args!("{:02X}{:02X}{:02X}{:02X}:{:04X}", address.0[3], address.0[2], address.0[1], address.0[0], port),
+    );
+    raw
+}
+
+fn proc_ipv6_endpoint(address: net::Ipv6Addr, port: u16) -> alloc::string::String {
+    // Linux 用 32 位小端字序的 4 组 hex。
+    let mut raw = String::new();
+    for chunk in address.0.chunks_exact(4) {
+        let word = u32::from_le_bytes(chunk.try_into().unwrap());
+        let _ = alloc::fmt::write(&mut raw, format_args!("{:08X}", word));
+    }
+    let _ = alloc::fmt::write(&mut raw, format_args!(":{:04X}", port));
+    raw
+}
+
+fn proc_endpoint(endpoint: net::Endpoint) -> alloc::string::String {
+    match endpoint.addr {
+        net::IpAddr::V4(address) => proc_ipv4_endpoint(address, endpoint.port),
+        net::IpAddr::V6(address) => proc_ipv6_endpoint(address, endpoint.port),
+    }
+}
+
+/// TCP 状态码（Linux /proc/net/tcp st 字段）。
+fn proc_tcp_state_code(state: u8) -> u8 {
+    match state {
+        1 => 0x01, // ESTABLISHED
+        2 => 0x02, // SYN_SENT
+        3 => 0x03, // SYN_RECV
+        4 => 0x04, // FIN_WAIT1
+        5 => 0x05, // FIN_WAIT2
+        6 => 0x06, // TIME_WAIT
+        7 => 0x07, // CLOSE
+        8 => 0x08, // CLOSE_WAIT
+        9 => 0x09, // LAST_ACK
+        10 => 0x0a, // LISTEN
+        11 => 0x0b, // CLOSING
+        _ => 0x07,
+    }
+}
+
+fn render_proc_net_tcp_lines(sockets: &[net::InetSocketSnapshot]) -> alloc::string::String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+    );
+    for (index, socket) in sockets.iter().enumerate() {
+        if socket.kind != net::SocketKind::Stream {
+            continue;
+        }
+        let local = socket.local.map(proc_endpoint).unwrap_or_else(|| "00000000:0000".into());
+        let peer = socket.peer.map(proc_endpoint).unwrap_or_else(|| "00000000:0000".into());
+        let state = proc_tcp_state_code(socket.tcp_state);
+        let inode = socket.id.counter;
+        let _ = writeln!(
+            out,
+            "{:5}: {:<23} {:<23} {:02X} {:08X}:{:08X} 00:00000000 {:08X}     0        0 {}",
+            format_args!("{:X}", index),
+            local,
+            peer,
+            state,
+            0u32,
+            0u32,
+            0u32,
+            inode,
+        );
+    }
+    out
+}
+
+fn render_proc_net_udp_lines(sockets: &[net::InetSocketSnapshot]) -> alloc::string::String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+    );
+    for (index, socket) in sockets.iter().enumerate() {
+        if socket.kind != net::SocketKind::Datagram {
+            continue;
+        }
+        let local = socket.local.map(proc_endpoint).unwrap_or_else(|| "00000000:0000".into());
+        let peer = socket.peer.map(proc_endpoint).unwrap_or_else(|| "00000000:0000".into());
+        let inode = socket.id.counter;
+        let _ = writeln!(
+            out,
+            "{:5}: {:<23} {:<23} 07 {:08X}:{:08X} 00:00000000 {:08X}     0        0 {}",
+            format_args!("{:X}", index),
+            local,
+            peer,
+            0u32,
+            0u32,
+            0u32,
+            inode,
+        );
+    }
+    out
+}
+
 fn render_proc_net_route() -> String {
     use alloc::fmt::Write;
     let mut out = String::new();
@@ -728,27 +861,62 @@ fn render_proc_net_route() -> String {
         out,
         "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT"
     );
+    let routes = ROUTE_SNAPSHOT_PROVIDER
+        .lock()
+        .map(|provider| provider())
+        .unwrap_or_default();
+    for route in routes {
+        let (destination, gateway, mask) = match route.network {
+            net::IpAddr::V4(network) => {
+                let mask = if route.prefix_len == 0 {
+                    0u32
+                } else {
+                    u32::MAX << (32 - route.prefix_len)
+                };
+                let gateway = route.gateway.map(|gw| match gw {
+                    net::IpAddr::V4(address) => u32::from_be_bytes(address.0),
+                    _ => 0,
+                });
+                (network, gateway, mask)
+            }
+            // /proc/net/route 只覆盖 IPv4（Linux 语义）。
+            net::IpAddr::V6(_) => continue,
+        };
+        let iface = proc_route_iface_name(route.interface);
+        let mut flags = 1u32; // RTF_UP
+        if route.gateway.is_some() {
+            flags |= 2; // RTF_GATEWAY
+        }
+        let destination_raw = u32::from_be_bytes(destination.0);
+        let gateway_raw = gateway.unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "{}\t{:08X}\t{:08X}\t{:04X}\t0\t0\t{}\t{:08X}\t0\t0\t0",
+            iface,
+            destination_raw,
+            gateway_raw,
+            flags,
+            route.metric,
+            mask,
+        );
+    }
     out
+}
+
+fn proc_route_iface_name(interface: net::InterfaceId) -> alloc::string::String {
+    net::device::snapshot_devices()
+        .into_iter()
+        .find(|device| device.id.raw() == interface.0)
+        .map(|device| device.name.as_ref().to_string())
+        .unwrap_or_else(|| format!("if{}", interface.0))
 }
 
 fn render_proc_net_tcp() -> String {
-    use alloc::fmt::Write;
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
-    );
-    out
+    render_proc_net_tcp_lines(&net::snapshot_inet_sockets())
 }
 
 fn render_proc_net_udp() -> String {
-    use alloc::fmt::Write;
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
-    );
-    out
+    render_proc_net_udp_lines(&net::snapshot_inet_sockets())
 }
 
 fn render_proc_net_unix() -> String {
@@ -811,16 +979,61 @@ fn render_proc_net_arp() -> String {
         out,
         "IP address       HW type     Flags       HW address            Mask     Device"
     );
+    let neighbors = NEIGHBOR_SNAPSHOT_PROVIDER
+        .lock()
+        .map(|provider| provider())
+        .unwrap_or_default();
+    for neighbor in neighbors {
+        let (address, _) = match neighbor.address {
+            net::IpAddr::V4(address) => (address, 0u32),
+            net::IpAddr::V6(_) => continue, // /proc/net/arp 只覆盖 IPv4（Linux 语义）
+        };
+        let iface = proc_route_iface_name(neighbor.interface);
+        // ATF_COM=0x2 表示解析完成（镜像表只保存已解析条目）。
+        let flags = 0x2u16;
+        let hw = format!(
+            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            neighbor.mac[0],
+            neighbor.mac[1],
+            neighbor.mac[2],
+            neighbor.mac[3],
+            neighbor.mac[4],
+            neighbor.mac[5]
+        );
+        let address_text = format!(
+            "{}.{}.{}.{}",
+            address.0[0], address.0[1], address.0[2], address.0[3]
+        );
+        let _ = writeln!(
+            out,
+            "{:<16} 0x1         {:<12} {:<19} *        {}",
+            address_text,
+            format_args!("0x{:x}", flags),
+            hw,
+            iface,
+        );
+    }
     out
 }
 
 fn render_proc_net_sockstat() -> String {
     use alloc::fmt::Write;
     let mut out = String::new();
-    let tcp_total = 0usize;
-    let udp_total = 0usize;
+    let sockets = net::snapshot_inet_sockets();
+    let tcp_total = sockets
+        .iter()
+        .filter(|socket| socket.kind == net::SocketKind::Stream)
+        .count();
+    let udp_total = sockets
+        .iter()
+        .filter(|socket| socket.kind == net::SocketKind::Datagram)
+        .count();
+    let raw_total = sockets
+        .iter()
+        .filter(|socket| socket.kind == net::SocketKind::Raw)
+        .count();
     let unix_total = socket::snapshot_sockets().len();
-    let total = tcp_total + udp_total + unix_total;
+    let total = tcp_total + udp_total + raw_total + unix_total;
     let _ = writeln!(out, "sockets: used {}", total);
     let _ = writeln!(
         out,
@@ -828,8 +1041,40 @@ fn render_proc_net_sockstat() -> String {
         tcp_total, tcp_total
     );
     let _ = writeln!(out, "UDP: inuse {} mem 0", udp_total);
-    let _ = writeln!(out, "RAW: inuse 0");
+    let _ = writeln!(out, "RAW: inuse {}", raw_total);
     let _ = writeln!(out, "FRAG: inuse 0 memory 0");
+    out
+}
+
+fn render_proc_net_dns() -> String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let servers = DNS_SNAPSHOT_PROVIDER
+        .lock()
+        .map(|provider| provider())
+        .unwrap_or_default();
+    for server in servers {
+        let text = match server {
+            net::IpAddr::V4(address) => format!(
+                "{}.{}.{}.{}",
+                address.0[0], address.0[1], address.0[2], address.0[3]
+            ),
+            net::IpAddr::V6(address) => {
+                let mut groups = alloc::string::String::new();
+                for chunk in address.0.chunks_exact(2) {
+                    if !groups.is_empty() {
+                        groups.push(':');
+                    }
+                    let _ = alloc::fmt::write(
+                        &mut groups,
+                        format_args!("{:02x}{:02x}", chunk[0], chunk[1]),
+                    );
+                }
+                groups
+            }
+        };
+        let _ = writeln!(out, "{}", text);
+    }
     out
 }
 
