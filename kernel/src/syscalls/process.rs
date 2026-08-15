@@ -2,6 +2,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use errno::Errno;
@@ -2297,14 +2298,38 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
 }
 
-/// 占位：seccomp 过滤器安装（由 seccomp 子系统实现；当前无过滤器时接受
-/// `SECCOMP_MODE_NONE`）。
+/// `PR_SET_SECCOMP`：老式 seccomp 入口，等价 `seccomp(2)`。
 pub(super) fn seccomp_filter_setup(
-    _task: &Arc<Task>,
-    _mode: usize,
-    _filter_user: usize,
+    task: &Arc<Task>,
+    mode: usize,
+    filter_user: usize,
 ) -> Result<(), Errno> {
-    Err(Errno::EINVAL)
+    use general::seccomp::*;
+    match mode as u32 {
+        SECCOMP_SET_MODE_STRICT => {
+            seccomp_state(task).set_strict();
+            Ok(())
+        }
+        SECCOMP_SET_MODE_FILTER => {
+            let cred = vfs_cred_from_sched(&task.credentials());
+            if !filter_install_allowed(task.no_new_privs(), &cred) {
+                return Err(Errno::EACCES);
+            }
+            let mut fprog = [0u8; 16];
+            copy_from_user(filter_user, &mut fprog).map_err(|e| e.as_errno())?;
+            let len = u16::from_le_bytes(fprog[0..2].try_into().unwrap()) as usize;
+            let ptr = u64::from_le_bytes(fprog[8..16].try_into().unwrap()) as usize;
+            let mut bytes = vec![0u8; len * 8];
+            if len > 0 {
+                copy_from_user(ptr, &mut bytes).map_err(|e| e.as_errno())?;
+            }
+            let insns = parse_program(&bytes)?;
+            let filter = SeccompFilter::new(insns, 0)?;
+            seccomp_state(task).push_filter(filter);
+            Ok(())
+        }
+        _ => Err(Errno::EINVAL),
+    }
 }
 
 pub(super) fn sys_capget(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -5479,8 +5504,103 @@ pub(super) fn sys_finit_module(_ctx: &mut SyscallContext<'_>) -> Result<usize, E
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_seccomp(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_seccomp(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    use general::seccomp::*;
+
+    const KNOWN_FLAGS: u32 = SECCOMP_FILTER_FLAG_TSYNC
+        | SECCOMP_FILTER_FLAG_LOG
+        | SECCOMP_FILTER_FLAG_SPEC_ALLOW
+        | SECCOMP_FILTER_FLAG_NEW_LISTENER
+        | SECCOMP_FILTER_FLAG_TSYNC_ESRCH;
+    const KNOWN_ACTIONS: [u32; 8] = [
+        SECCOMP_RET_KILL_PROCESS,
+        SECCOMP_RET_KILL_THREAD,
+        SECCOMP_RET_TRAP,
+        SECCOMP_RET_ERRNO,
+        SECCOMP_RET_USER_NOTIF,
+        SECCOMP_RET_TRACE,
+        SECCOMP_RET_LOG,
+        SECCOMP_RET_ALLOW,
+    ];
+
+    let op = ctx.args[0] as u32;
+    let flags = ctx.args[1] as u32;
+    let filter_user = ctx.args[2];
+    let task = ctx.task();
+
+    match op {
+        SECCOMP_SET_MODE_STRICT => {
+            if flags != 0 || filter_user != 0 {
+                return Err(Errno::EINVAL);
+            }
+            seccomp_state(task).set_strict();
+            Ok(0)
+        }
+        SECCOMP_SET_MODE_FILTER => {
+            if filter_user == 0 {
+                return Err(Errno::EFAULT);
+            }
+            if flags & !KNOWN_FLAGS != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let cred = vfs_cred_from_sched(&task.credentials());
+            if !filter_install_allowed(task.no_new_privs(), &cred) {
+                return Err(Errno::EACCES);
+            }
+            // struct sock_fprog { u16 len; u16 pad; ... ptr }
+            let mut fprog = [0u8; 16];
+            copy_from_user(filter_user, &mut fprog).map_err(|e| e.as_errno())?;
+            let len = u16::from_le_bytes(fprog[0..2].try_into().unwrap()) as usize;
+            let ptr = u64::from_le_bytes(fprog[8..16].try_into().unwrap()) as usize;
+            if ptr == 0 {
+                return Err(Errno::EFAULT);
+            }
+            let mut bytes = vec![0u8; len * 8];
+            if len > 0 {
+                copy_from_user(ptr, &mut bytes).map_err(|e| e.as_errno())?;
+            }
+            let insns = parse_program(&bytes)?;
+            let filter = SeccompFilter::new(insns, flags)?;
+            seccomp_state(task).push_filter(filter);
+            Ok(0)
+        }
+        SECCOMP_GET_ACTION_AVAIL => {
+            let action = ctx.args[1] as u32;
+            if action & !SECCOMP_RET_ACTION_FULL != 0
+                || !KNOWN_ACTIONS.contains(&(action & SECCOMP_RET_ACTION_FULL))
+            {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            Ok(0)
+        }
+        SECCOMP_GET_NOTIF_SIZES => {
+            // struct seccomp_notif_sizes { u16 seccomp_notif; u16 seccomp_notif_resp; u16 seccomp_data; }
+            if filter_user == 0 {
+                return Err(Errno::EFAULT);
+            }
+            let mut sizes = [0u8; 8];
+            sizes[0..2].copy_from_slice(&16u16.to_le_bytes());
+            sizes[2..4].copy_from_slice(&16u16.to_le_bytes());
+            sizes[4..6].copy_from_slice(&64u16.to_le_bytes());
+            copy_to_user(filter_user, &sizes[..6]).map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// 取任务的 seccomp 状态（惰性创建并挂载）。
+fn seccomp_state(task: &Arc<Task>) -> Arc<general::seccomp::SeccompState> {
+    if let Some(state) = task
+        .ext_lookup(general::syscall::TASKEXT_SECCOMP)
+        .and_then(|payload| payload.downcast::<general::seccomp::SeccompState>().ok())
+    {
+        return state;
+    }
+    let state = general::seccomp::SeccompState::new();
+    let erased: Arc<dyn core::any::Any + Send + Sync> = state.clone();
+    task.ext_install(general::syscall::TASKEXT_SECCOMP, erased);
+    state
 }
 
 pub(super) fn sys_bpf(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

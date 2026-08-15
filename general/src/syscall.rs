@@ -532,6 +532,125 @@ fn ptrace_syscall_exit(ctx: &SyscallContext<'_>, ret: isize) -> bool {
 
 const PTRACE_O_TRACESYSGOOD: u64 = 0x0000_0001;
 
+/// 任务的 seccomp 状态扩展键（`Arc<seccomp::SeccompState>`）。
+pub const TASKEXT_SECCOMP: sched::TaskExtKey = 0x0004_0004;
+
+/// `PTRACE_O_TRACESECCOMP`。
+const PTRACE_O_TRACESECCOMP: u64 = 0x0000_0080;
+/// `PTRACE_EVENT_SECCOMP`。
+const PTRACE_EVENT_SECCOMP: u16 = 7;
+
+/// 在 syscall 入口执行 seccomp 过滤器。
+///
+/// 返回 `true` 表示 syscall 已被消费（KILL/TRAP/ERRNO/TRACE/NOTIF 或
+/// strict 模式拒绝），dispatch 不应继续执行。
+fn seccomp_filter_syscall(ctx: &mut SyscallContext<'_>) -> bool {
+    use crate::seccomp::*;
+
+    let task = ctx.task();
+    let Some(state) = task
+        .ext_lookup(TASKEXT_SECCOMP)
+        .and_then(|payload| payload.downcast::<SeccompState>().ok())
+    else {
+        return false;
+    };
+
+    let mode = state.mode();
+    if mode == SECCOMP_MODE_STRICT {
+        if crate::seccomp::SeccompState::strict_allows(ctx.nr) {
+            return false;
+        }
+        let _ = sched::operation::tkill(
+            task.pid_root().unwrap_or(0),
+            Some(sched::SignalNumber::from_raw(31).unwrap_or(sched::SignalNumber::SIGSEGV)),
+        );
+        return true;
+    }
+    if mode != SECCOMP_MODE_FILTER {
+        return false;
+    }
+    if state.filters.lock().is_empty() {
+        return false;
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    const AUDIT_ARCH: u32 = 0x4000_0102;
+    #[cfg(target_arch = "riscv64")]
+    const AUDIT_ARCH: u32 = 0x4000_00f3;
+
+    let mut data = [0u8; 64];
+    data[SECCOMP_DATA_NR..SECCOMP_DATA_NR + 8]
+        .copy_from_slice(&(ctx.nr as i64).to_le_bytes());
+    data[SECCOMP_DATA_ARCH..SECCOMP_DATA_ARCH + 4]
+        .copy_from_slice(&AUDIT_ARCH.to_le_bytes());
+    data[SECCOMP_DATA_IP..SECCOMP_DATA_IP + 8].copy_from_slice(&0u64.to_le_bytes());
+    for (index, arg) in ctx.args.iter().enumerate() {
+        let offset = SECCOMP_DATA_ARGS + index * 8;
+        data[offset..offset + 8].copy_from_slice(&(*arg as u64).to_le_bytes());
+    }
+
+    let result = state.run(&data);
+    let action = result & SECCOMP_RET_ACTION_FULL;
+    let data_bits = result & SECCOMP_RET_DATA;
+    match action {
+        SECCOMP_RET_KILL_PROCESS | SECCOMP_RET_KILL_THREAD => {
+            let _ = sched::operation::tkill(
+                task.pid_root().unwrap_or(0),
+                Some(sched::SignalNumber::from_raw(31).unwrap_or(sched::SignalNumber::SIGSEGV)),
+            );
+            true
+        }
+        SECCOMP_RET_TRAP => {
+            let _ = sched::operation::tkill(
+                task.pid_root().unwrap_or(0),
+                Some(sched::SignalNumber::from_raw(31).unwrap_or(sched::SignalNumber::SIGSEGV)),
+            );
+            true
+        }
+        SECCOMP_RET_ERRNO => {
+            let errno = data_bits as i32;
+            ctx.finalize_frame();
+            let ops = crate::syscall::frame_ops().expect("frame ops 已注册");
+            (ops.set_sys_ret)(ctx.tf, -(errno as isize));
+            (ops.advance_pc)(ctx.tf);
+            true
+        }
+        SECCOMP_RET_TRACE => {
+            if task.is_ptrace_traced() && task.ptrace_options() & PTRACE_O_TRACESECCOMP != 0 {
+                task.record_syscall_seccomp(ctx.nr, ctx.args);
+                task.set_ptrace_event_msg(result as i64);
+                task.set_ptrace_stop_event(PTRACE_EVENT_SECCOMP);
+                task.clear_ptrace_last_siginfo();
+                sched::operation::ptrace_mark_stopped(task, sched::SignalNumber::SIGTRAP);
+                return true;
+            }
+            ctx.finalize_frame();
+            let ops = crate::syscall::frame_ops().expect("frame ops 已注册");
+            (ops.set_sys_ret)(ctx.tf, -38);
+            (ops.advance_pc)(ctx.tf);
+            true
+        }
+        SECCOMP_RET_USER_NOTIF => {
+            ctx.finalize_frame();
+            let ops = crate::syscall::frame_ops().expect("frame ops 已注册");
+            (ops.set_sys_ret)(ctx.tf, -38);
+            (ops.advance_pc)(ctx.tf);
+            true
+        }
+        SECCOMP_RET_LOG => {
+            log::info!(
+                "[seccomp] log pid={:?} nr={} action={:#x}",
+                task.pid_root(),
+                ctx.nr,
+                result
+            );
+            false
+        }
+        _ => false,
+    }
+}
+
+
 fn dispatch_tomori_for_task(
     tf: TrapFramePtr,
     ops: &'static SyscallFrameOps,
@@ -549,6 +668,9 @@ fn dispatch_tomori_for_task(
     let mut ctx = SyscallContext::new(nr, args, tf, task);
 
     if ptrace_syscall_entry(&ctx) {
+        return;
+    }
+    if seccomp_filter_syscall(&mut ctx) {
         return;
     }
 
