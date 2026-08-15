@@ -138,6 +138,10 @@ pub enum VfsError {
 
     /// 连接被对端重置（ECONNRESET）。
     ConnectionReset,
+
+    /// 操作被取消（ECANCELED）。例如实时钟被设置后，
+    /// `TFD_TIMER_CANCEL_ON_SET` 的 timerfd 读取返回此错误。
+    Canceled,
 }
 
 impl VfsError {
@@ -175,6 +179,7 @@ impl VfsError {
             VfsError::TimedOut => Errno::ETIMEDOUT,
             VfsError::BrokenPipe => Errno::EPIPE,
             VfsError::ConnectionReset => Errno::ECONNRESET,
+            VfsError::Canceled => Errno::ECANCELED,
         }
     }
 }

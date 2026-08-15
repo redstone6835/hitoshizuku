@@ -39,6 +39,21 @@ const SHMID64_DS_SIZE: usize = 112;
 static SYSV_SHM_MANAGER: Spinlock<Option<Arc<ShmManager>>> = Spinlock::new(None);
 static SYSV_SEM_MANAGER: Spinlock<Option<Arc<SemManager>>> = Spinlock::new(None);
 
+/// SysV shm 当前占用总字节数（`sysinfo` 的 `sharedram` 数据源）。
+///
+/// 管理器未初始化（尚未创建任何段）时返回 0。
+pub(super) fn sysv_shm_total_bytes() -> u64 {
+    let manager = {
+        let guard = SYSV_SHM_MANAGER.lock();
+        match guard.as_ref() {
+            Some(m) => Arc::clone(m),
+            None => return 0,
+        }
+    };
+    let info = manager.info();
+    info.total_pages as u64 * general::mm::page_size() as u64
+}
+
 pub(super) fn sys_shmget(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let key = ShmKey(ctx.args[0] as i32);
     let size = ctx.args[1] as u64;

@@ -12,6 +12,7 @@ use general::vfs::pidfd;
 use general::vfs::{self, fdtable::Fd};
 use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::ids::{CapSet, Capability, Credentials, Gid, Uid};
+use sched::pid::PidT;
 use sched::process_ops::{ExecRequest, UserContextRef};
 use sched::sync::Spinlock;
 use sched::task::{RseqRegistration, Task, TaskState};
@@ -1106,10 +1107,30 @@ pub(super) fn sys_getitimer(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     if curr_value == 0 {
         return Err(Errno::EFAULT);
     }
-    if which != ITIMER_REAL {
-        return Err(Errno::EINVAL);
-    }
-    let spec = sched::get_realtime_itimer(ctx.task());
+    let spec = match which {
+        ITIMER_REAL => sched::get_realtime_itimer(ctx.task()),
+        ITIMER_VIRTUAL => {
+            let s = sched::cpu_itimer::get_cpu_itimer(
+                &ctx.task(),
+                sched::cpu_itimer::CpuItimerKind::Virtual,
+            );
+            sched::RealtimeItimerSpec {
+                value_ns: s.value_ns,
+                interval_ns: s.interval_ns,
+            }
+        }
+        ITIMER_PROF => {
+            let s = sched::cpu_itimer::get_cpu_itimer(
+                &ctx.task(),
+                sched::cpu_itimer::CpuItimerKind::Prof,
+            );
+            sched::RealtimeItimerSpec {
+                value_ns: s.value_ns,
+                interval_ns: s.interval_ns,
+            }
+        }
+        _ => return Err(Errno::EINVAL),
+    };
     write_itimerval(curr_value, spec)?;
     Ok(0)
 }
@@ -1118,16 +1139,40 @@ pub(super) fn sys_setitimer(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let which = ctx.args[0];
     let new_value = ctx.args[1];
     let old_value = ctx.args[2];
-    if which != ITIMER_REAL {
-        return Err(Errno::EINVAL);
-    }
 
     let new_spec = if new_value == 0 {
         sched::RealtimeItimerSpec::default()
     } else {
         read_itimerval(new_value)?
     };
-    let old_spec = sched::set_realtime_itimer(ctx.task(), new_spec.value_ns, new_spec.interval_ns);
+    let old_spec = match which {
+        ITIMER_REAL => sched::set_realtime_itimer(ctx.task(), new_spec.value_ns, new_spec.interval_ns),
+        ITIMER_VIRTUAL => {
+            let old = sched::cpu_itimer::set_cpu_itimer(
+                &ctx.task(),
+                sched::cpu_itimer::CpuItimerKind::Virtual,
+                new_spec.value_ns,
+                new_spec.interval_ns,
+            );
+            sched::RealtimeItimerSpec {
+                value_ns: old.value_ns,
+                interval_ns: old.interval_ns,
+            }
+        }
+        ITIMER_PROF => {
+            let old = sched::cpu_itimer::set_cpu_itimer(
+                &ctx.task(),
+                sched::cpu_itimer::CpuItimerKind::Prof,
+                new_spec.value_ns,
+                new_spec.interval_ns,
+            );
+            sched::RealtimeItimerSpec {
+                value_ns: old.value_ns,
+                interval_ns: old.interval_ns,
+            }
+        }
+        _ => return Err(Errno::EINVAL),
+    };
     if old_value != 0 {
         write_itimerval(old_value, old_spec)?;
     }
@@ -1352,22 +1397,49 @@ fn write_timeval_pair(out: &mut [u8], off: usize, ns: u64) {
 pub(super) fn sys_sysinfo(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let info = ctx.args[0];
     if info != 0 {
+        // Linux UAPI `struct sysinfo`（64 位布局，112 字节）：
+        //   uptime i64 @0；loads[3] u64 @8/16/24；totalram u64 @32；freeram u64 @40；
+        //   sharedram u64 @48；bufferram u64 @56；totalswap u64 @64；freeswap u64 @72；
+        //   procs u16 @80；pad u16 @82；totalhigh u64 @84；freehigh u64 @88；
+        //   mem_unit u32 @92；_f[20] @96。
+        // mem_unit = 1（按字节上报），全部字段取真实统计，与 /proc/meminfo 同源。
         let mut out = [0u8; 112];
         put_i64(&mut out, 0, sched::now_ns_direct() as i64 / 1_000_000_000);
-        put_u64(&mut out, 8, 0);
-        put_u64(&mut out, 16, 0);
-        put_u64(&mut out, 24, 0);
-        put_u64(&mut out, 32, 256 * 1024 * 1024);
-        put_u64(&mut out, 40, 128 * 1024 * 1024);
-        put_u64(&mut out, 48, 256 * 1024 * 1024);
-        put_u16(&mut out, 56, 0);
-        put_u16(&mut out, 58, 0);
-        put_u16(&mut out, 60, 0);
-        put_u16(&mut out, 62, 0);
-        put_u32(&mut out, 64, 1);
-        put_u32(&mut out, 68, 65536);
-        put_u32(&mut out, 72, 65536);
-        put_u32(&mut out, 76, 0);
+        let loads = sched::avenrun::loads_scaled();
+        put_u64(&mut out, 8, loads[0]);
+        put_u64(&mut out, 16, loads[1]);
+        put_u64(&mut out, 24, loads[2]);
+        let overview = allocator::KERNEL_ALLOCATOR.detailed_stats();
+        let layers = allocator::KERNEL_ALLOCATOR.layer_stats();
+        put_u64(&mut out, 32, overview.total_physical as u64);
+        put_u64(&mut out, 40, overview.free_physical as u64);
+        put_u64(&mut out, 48, super::ipc::sysv_shm_total_bytes());
+        // bufferram：可回收缓存（与 /proc/meminfo 的 MemAvailable 口径一致）。
+        let page_size = general::mm::page_size() as u64;
+        let slab_reclaimable_bytes = allocator::KERNEL_ALLOCATOR
+            .slab_class_stats()
+            .iter()
+            .fold(0u64, |sum, class| {
+                sum.saturating_add(class.reclaimable_empty_pages as u64 * page_size)
+            });
+        let bufferram = layers.kheap.cached_bytes as u64 + slab_reclaimable_bytes;
+        put_u64(&mut out, 56, bufferram);
+        // 无交换设备：totalswap/freeswap 恒 0。
+        put_u64(&mut out, 64, 0);
+        put_u64(&mut out, 72, 0);
+        // procs：当前进程/线程总数（与 /proc/stat 的 processes 同源）。
+        let mut processes = 0u16;
+        if sched::is_ready() {
+            for (_, weak) in sched::root_pid_ns().registry().snapshot() {
+                let Some(_task) = weak.upgrade() else {
+                    continue;
+                };
+                processes = processes.saturating_add(1);
+            }
+        }
+        put_u16(&mut out, 80, processes);
+        // pad @82、totalhigh/freehigh @84/88（无高端内存）保持 0。
+        put_u32(&mut out, 92, 1); // mem_unit = 1 字节
         copy_to_user(info, &out).map_err(|e| e.as_errno())?;
     }
     Ok(0)
@@ -4536,25 +4608,203 @@ pub(super) fn sys_delete_module(_ctx: &mut SyscallContext<'_>) -> Result<usize, 
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_timer_create(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_timer_create(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    timer_create_common(ctx, false)
 }
 
-pub(super) fn sys_timer_gettime(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_timer_gettime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    timer_gettime_common(ctx)
 }
 
-pub(super) fn sys_timer_getoverrun(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_timer_getoverrun(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    timer_getoverrun_common(ctx)
 }
 
-pub(super) fn sys_timer_settime(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_timer_settime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    timer_settime_common(ctx)
 }
 
-pub(super) fn sys_timer_delete(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_timer_delete(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    timer_delete_common(ctx)
 }
+
+/// Linux `sigevent`（64 位）前 20 字节：`sigev_value`(8) + `sigev_signo`(4)
+/// + `sigev_notify`(4) + `sigev_notify_thread_id`(4)。
+const SIGEV_HEADER_SIZE: usize = 20;
+const SIGEV_VALUE_OFF: usize = 0;
+const SIGEV_SIGNO_OFF: usize = 8;
+const SIGEV_NOTIFY_OFF: usize = 12;
+const SIGEV_TID_OFF: usize = 16;
+
+const SIGEV_SIGNAL: i32 = 0;
+const SIGEV_NONE: i32 = 1;
+// SIGEV_THREAD(2) 由 glibc 用 SIGEV_THREAD_ID + 自建线程翻译，内核不接受。
+const SIGEV_THREAD_ID: i32 = 4;
+
+const TIMER_ABSTIME: i32 = 1;
+
+/// Linux `struct itimerspec`（64 位，32 字节）。
+const ITIMERSPEC_SIZE: usize = 32;
+const ITIMERSPEC_INTERVAL_OFF: usize = 0;
+const ITIMERSPEC_VALUE_OFF: usize = 16;
+
+fn timer_create_common(ctx: &mut SyscallContext<'_>, _time64: bool) -> Result<usize, Errno> {
+    let clockid = ctx.args[0] as i32;
+    let sevp = ctx.args[1];
+    let timeridp = ctx.args[2];
+    let clock = sched::posix_timer::TimerClock::from_clockid(clockid).ok_or(Errno::EINVAL)?;
+
+    // sigevent 默认：SIGEV_SIGNAL + SIGALRM（sevp == NULL）。
+    let mut sigev_value = 0u64;
+    let mut signo = SignalNumber::SIGALRM;
+    let mut notify = SIGEV_SIGNAL;
+    let mut thread_id = 0i32;
+    if sevp != 0 {
+        let mut buf = [0u8; SIGEV_HEADER_SIZE];
+        copy_from_user(sevp, &mut buf).map_err(|e| e.as_errno())?;
+        sigev_value = u64::from_le_bytes(buf[SIGEV_VALUE_OFF..SIGEV_VALUE_OFF + 8].try_into().unwrap());
+        signo = SignalNumber::from_raw(i32::from_le_bytes(
+            buf[SIGEV_SIGNO_OFF..SIGEV_SIGNO_OFF + 4].try_into().unwrap(),
+        ))
+        .ok_or(Errno::EINVAL)?;
+        notify = i32::from_le_bytes(buf[SIGEV_NOTIFY_OFF..SIGEV_NOTIFY_OFF + 4].try_into().unwrap());
+        thread_id = i32::from_le_bytes(buf[SIGEV_TID_OFF..SIGEV_TID_OFF + 4].try_into().unwrap());
+    }
+
+    let caller = ctx.task();
+    let caller_tgid = caller.thread_group().tgid();
+    let target_tid = match notify {
+        SIGEV_NONE => {
+            let _ = sigev_value;
+            let _ = signo;
+            None
+        }
+        SIGEV_SIGNAL => {
+            let _ = sigev_value;
+            let _ = signo;
+            None
+        }
+        SIGEV_THREAD_ID => {
+            if thread_id <= 0 {
+                return Err(Errno::EINVAL);
+            }
+            // 目标线程必须属于调用者线程组（Linux 语义）。
+            let tid = thread_id as PidT;
+            let target = sched::posix_timer::lookup_task(tid).ok_or(Errno::EINVAL)?;
+            if target.is_kernel_task() || target.thread_group().tgid() != caller_tgid {
+                return Err(Errno::EINVAL);
+            }
+            Some(tid)
+        }
+        _ => return Err(Errno::EINVAL),
+    };
+    let sigev = match notify {
+        SIGEV_NONE => sched::posix_timer::SigevNotify::None,
+        _ => sched::posix_timer::SigevNotify::Signal { signo, value: sigev_value },
+    };
+    let timer_t = sched::posix_timer::create(clock, &caller, sigev, target_tid)?;
+    copy_to_user(timeridp, &timer_t.to_le_bytes()).map_err(|e| e.as_errno())?;
+    Ok(0)
+}
+
+fn timer_settime_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let timer_t = ctx.args[0] as u32;
+    let flags = ctx.args[1] as i32;
+    let new_value = ctx.args[2];
+    let old_value = ctx.args[3];
+    if flags & !TIMER_ABSTIME != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let mut buf = [0u8; ITIMERSPEC_SIZE];
+    copy_from_user(new_value, &mut buf).map_err(|e| e.as_errno())?;
+    let read_timespec = |off: usize| -> Result<(i64, i64), Errno> {
+        let sec = i64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(buf[off + 8..off + 16].try_into().unwrap());
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            return Err(Errno::EINVAL);
+        }
+        Ok((sec, nsec))
+    };
+    let (interval_sec, interval_nsec) = read_timespec(ITIMERSPEC_INTERVAL_OFF)?;
+    let (value_sec, value_nsec) = read_timespec(ITIMERSPEC_VALUE_OFF)?;
+    let interval_ns = (interval_sec as u64) * 1_000_000_000 + interval_nsec as u64;
+    let value_ns = (value_sec as u64) * 1_000_000_000 + value_nsec as u64;
+
+    // 旧值快照（timer_settime 的 old_value 输出上一次挂载的剩余时间）。
+    if old_value != 0 {
+        let (remaining_ns, old_interval_ns) =
+            sched::posix_timer::gettime(timer_t).unwrap_or((0, 0));
+        let mut old = [0u8; ITIMERSPEC_SIZE];
+        write_timespec_pair(&mut old, ITIMERSPEC_INTERVAL_OFF, old_interval_ns);
+        write_timespec_pair(&mut old, ITIMERSPEC_VALUE_OFF, remaining_ns);
+        copy_to_user(old_value, &old).map_err(|e| e.as_errno())?;
+    }
+
+    if value_ns == 0 {
+        // 解除定时器。
+        if !sched::posix_timer::arm(timer_t, sched::posix_timer::TimerSpec { deadline_ns: 0, interval_ns: 0 }) {
+            return Err(Errno::EINVAL);
+        }
+        return Ok(0);
+    }
+
+    let clock = sched::posix_timer::clock_of(timer_t).ok_or(Errno::EINVAL)?;
+    let absolute = flags & TIMER_ABSTIME != 0;
+    if absolute && clock.is_cpu_clock() {
+        // Linux：CPU 时钟定时器不支持 TIMER_ABSTIME。
+        return Err(Errno::EINVAL);
+    }
+    let now = sched::posix_timer::now_in_domain(clock, &ctx.task());
+    let deadline = match (clock, absolute) {
+        (sched::posix_timer::TimerClock::Realtime, true) => {
+            // 绝对 REALTIME：换算到单调域。
+            let offset = crate::vdso::realtime_ns().saturating_sub(crate::vdso::monotonic_ns());
+            value_ns.saturating_sub(offset)
+        }
+        (_, true) => value_ns,
+        (_, false) => now.saturating_add(value_ns),
+    };
+    if !sched::posix_timer::arm(
+        timer_t,
+        sched::posix_timer::TimerSpec { deadline_ns: deadline, interval_ns: interval_ns },
+    ) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(0)
+}
+
+fn timer_gettime_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let timer_t = ctx.args[0] as u32;
+    let curr = ctx.args[1];
+    let (remaining_ns, interval_ns) = sched::posix_timer::gettime(timer_t).ok_or(Errno::EINVAL)?;
+    let mut out = [0u8; ITIMERSPEC_SIZE];
+    write_timespec_pair(&mut out, ITIMERSPEC_INTERVAL_OFF, interval_ns);
+    write_timespec_pair(&mut out, ITIMERSPEC_VALUE_OFF, remaining_ns);
+    copy_to_user(curr, &mut out).map_err(|e| e.as_errno())?;
+    Ok(0)
+}
+
+fn timer_getoverrun_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let timer_t = ctx.args[0] as u32;
+    let overrun = sched::posix_timer::getoverrun(timer_t).ok_or(Errno::EINVAL)?;
+    Ok(overrun as usize)
+}
+
+fn timer_delete_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let timer_t = ctx.args[0] as u32;
+    if !sched::posix_timer::delete(timer_t) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(0)
+}
+
+/// 把 ns 写成一对 `struct timespec`（sec i64 @off，nsec i64 @off+8）。
+fn write_timespec_pair(out: &mut [u8], off: usize, ns: u64) {
+    put_i64(out, off, (ns / 1_000_000_000) as i64);
+    put_i64(out, off + 8, (ns % 1_000_000_000) as i64);
+}
+
+
 
 pub(super) fn sys_clock_settime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     clock_settime_common(ctx)
@@ -4663,20 +4913,96 @@ pub(super) fn sys_settimeofday(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     require_cap(ctx.task(), Capability::SysTime)?;
     let mut raw = [0u8; TIMEVAL_SIZE];
     copy_from_user(tv, &mut raw).map_err(|e| e.as_errno())?;
-    crate::vdso::set_realtime_ns(timeval_to_ns(&raw)?);
+    let new_ns = timeval_to_ns(&raw)?;
+    let old_offset = crate::vdso::realtime_offset_ns();
+    crate::vdso::set_realtime_ns(new_ns);
+    // 实时钟被设置：取消登记了 TFD_TIMER_CANCEL_ON_SET 的 timerfd。
+    if crate::vdso::realtime_offset_ns() != old_offset {
+        vfs::timerfd::cancel_timers_on_clock_set();
+    }
     Ok(0)
 }
 
-pub(super) fn sys_adjtimex(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_adjtimex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    adjtimex_common(ctx, 0)
 }
+
+/// Linux `struct timex`（musl 64 位布局，208 字节）。
+const TIMEX_SIZE: usize = 208;
+const TIMEX_MODES_OFF: usize = 0;
+const TIMEX_OFFSET_OFF: usize = 8;
+const TIMEX_FREQ_OFF: usize = 16;
+const TIMEX_MAXERROR_OFF: usize = 24;
+const TIMEX_ESTERROR_OFF: usize = 32;
+const TIMEX_STATUS_OFF: usize = 40;
+const TIMEX_CONSTANT_OFF: usize = 48;
+const TIMEX_PRECISION_OFF: usize = 56;
+const TIMEX_TOLERANCE_OFF: usize = 64;
+const TIMEX_TIME_OFF: usize = 72;
+const TIMEX_TICK_OFF: usize = 88;
+
+/// `adjtimex`（arg0 = timex*）与 `clock_adjtime`（arg1 = timex*）共用实现。
+fn adjtimex_common(ctx: &mut SyscallContext<'_>, timex_arg: usize) -> Result<usize, Errno> {
+    let ptr = ctx.args[timex_arg];
+    if ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut buf = [0u8; TIMEX_SIZE];
+    copy_from_user(ptr, &mut buf).map_err(|e| e.as_errno())?;
+
+    let read_i64 = |off: usize| i64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+    let read_i32 = |off: usize| i32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+    let fields = crate::adjtimex::TimexFields {
+        modes: u32::from_le_bytes(buf[TIMEX_MODES_OFF..TIMEX_MODES_OFF + 4].try_into().unwrap()),
+        offset: read_i64(TIMEX_OFFSET_OFF),
+        freq: read_i64(TIMEX_FREQ_OFF),
+        maxerror: read_i64(TIMEX_MAXERROR_OFF),
+        esterror: read_i64(TIMEX_ESTERROR_OFF),
+        status: read_i32(TIMEX_STATUS_OFF),
+        constant: read_i64(TIMEX_CONSTANT_OFF),
+        tick: read_i64(TIMEX_TICK_OFF),
+        precision: 0,
+        tolerance: 0,
+    };
+
+    let out = crate::adjtimex::do_adjtimex(fields)?;
+
+    let write_i64 = |buf: &mut [u8; TIMEX_SIZE], off: usize, v: i64| {
+        buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    };
+    buf[TIMEX_MODES_OFF..TIMEX_MODES_OFF + 4].copy_from_slice(&out.modes.to_le_bytes());
+    write_i64(&mut buf, TIMEX_OFFSET_OFF, out.offset);
+    write_i64(&mut buf, TIMEX_FREQ_OFF, out.freq);
+    write_i64(&mut buf, TIMEX_MAXERROR_OFF, out.maxerror);
+    write_i64(&mut buf, TIMEX_ESTERROR_OFF, out.esterror);
+    buf[TIMEX_STATUS_OFF..TIMEX_STATUS_OFF + 4].copy_from_slice(&out.status.to_le_bytes());
+    write_i64(&mut buf, TIMEX_CONSTANT_OFF, out.constant);
+    write_i64(&mut buf, TIMEX_PRECISION_OFF, out.precision);
+    write_i64(&mut buf, TIMEX_TOLERANCE_OFF, out.tolerance);
+    write_i64(&mut buf, TIMEX_TICK_OFF, out.tick);
+    // time 字段：当前 CLOCK_REALTIME（sec/usec）。
+    let realtime_ns = crate::vdso::realtime_ns();
+    write_i64(&mut buf, TIMEX_TIME_OFF, (realtime_ns / 1_000_000_000) as i64);
+    write_i64(&mut buf, TIMEX_TIME_OFF + 8, ((realtime_ns % 1_000_000_000) / 1_000) as i64);
+    copy_to_user(ptr, &buf).map_err(|e| e.as_errno())?;
+
+    // 返回值 = 时钟状态（TIME_OK/TIME_INS/TIME_DEL/TIME_ERROR）。
+    Ok(crate::adjtimex::clock_state(out.status) as usize)
+}
+
+
 
 pub(super) fn sys_perf_event_open(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_clock_adjtime(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_clock_adjtime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let clockid = ctx.args[0] as i32;
+    if clockid != crate::vdso::CLOCK_REALTIME as i32 {
+        // Linux 仅支持 CLOCK_REALTIME 与 CLOCK_TAI；本内核未实现 TAI。
+        return Err(Errno::EINVAL);
+    }
+    adjtimex_common(ctx, 1)
 }
 
 pub(super) fn sys_setns(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -4830,8 +5156,8 @@ pub(super) fn sys_clock_settime64(ctx: &mut SyscallContext<'_>) -> Result<usize,
     clock_settime_common(ctx)
 }
 
-pub(super) fn sys_clock_adjtime64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_clock_adjtime64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    sys_clock_adjtime(ctx)
 }
 
 pub(super) fn sys_clock_getres_time64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -4842,12 +5168,12 @@ pub(super) fn sys_clock_nanosleep_time64(ctx: &mut SyscallContext<'_>) -> Result
     sys_clock_nanosleep(ctx)
 }
 
-pub(super) fn sys_timer_gettime64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_timer_gettime64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    timer_gettime_common(ctx)
 }
 
-pub(super) fn sys_timer_settime64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_timer_settime64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    timer_settime_common(ctx)
 }
 
 pub(super) fn sys_pidfd_open(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -5555,6 +5881,8 @@ fn write_user_u32(user: usize, value: u32) -> Result<(), Errno> {
 }
 
 const ITIMER_REAL: usize = 0;
+const ITIMER_VIRTUAL: usize = 1;
+const ITIMER_PROF: usize = 2;
 const ITIMERVAL_SIZE: usize = 32;
 const TIMEVAL_SIZE: usize = 16;
 const USEC_PER_SEC: i64 = 1_000_000;
@@ -5611,7 +5939,13 @@ fn clock_settime_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         return Err(Errno::EFAULT);
     }
     require_cap(ctx.task(), Capability::SysTime)?;
-    crate::vdso::set_realtime_ns(read_timespec_ns(tp)?);
+    let new_ns = read_timespec_ns(tp)?;
+    let old_offset = crate::vdso::realtime_offset_ns();
+    crate::vdso::set_realtime_ns(new_ns);
+    // 实时钟被设置：取消登记了 TFD_TIMER_CANCEL_ON_SET 的 timerfd。
+    if crate::vdso::realtime_offset_ns() != old_offset {
+        vfs::timerfd::cancel_timers_on_clock_set();
+    }
     Ok(0)
 }
 

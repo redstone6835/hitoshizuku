@@ -5116,7 +5116,12 @@ fn timerfd_settime_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     } else {
         Some(now_mono.saturating_add(new_value.value_ns))
     };
-    let old = timer.set_deadline(now_mono, deadline, new_value.interval_ns);
+    // Linux：CANCEL_ON_SET 在 settime 时按 (CLOCK_REALTIME + ABSTIME + 标志)
+    // 登记/注销；定时器照常 arm，但若此前已被时钟设置取消则返回 ECANCELED。
+    timer.update_cancel_registration(flags);
+    let old = timer
+        .set_deadline(now_mono, deadline, new_value.interval_ns)
+        .map_err(|e| e.to_errno())?;
     write_itimerspec(old_value, old)?;
     Ok(0)
 }

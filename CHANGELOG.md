@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## 2026-08-15
+### feat/fs-time-full
+- `feat(time)`：时间子系统完整化——`sysinfo(2)` 真实统计（1/5/15 分钟负载 avenrun 定点衰减 + 真实内存/进程数，mem_unit=1 字节单位）；POSIX timer 全套（`timer_create/settime/gettime/getoverrun/delete` + time64，SIGEV_NONE/SIGNAL/THREAD_ID，overrun 追赶计数，CLOCK_REALTIME/MONOTONIC/BOOTTIME + PROCESS/THREAD_CPUTIME_ID，DeadlineObserver 复用）；`adjtimex/clock_adjtime` NTP 状态机（ADJ_OFFSET/FREQUENCY/STATUS/TIMECONST/TICK/NANO 等，频率误差按 tick 折叠进 REALTIME 偏移，vDSO 与内核路径一致）；`ITIMER_VIRTUAL/ITIMER_PROF`（tick 级 user/system CPU 记账，两架构 timer ISR 传 from_user）；timerfd `TFD_TIMER_CANCEL_ON_SET`（Linux 语义：settime 登记、时钟设置取消、read/settime 返回 ECANCELED）
+- `chore(scripts)`：新增 `wrap-kernel-elf.py`（裸内核镜像包装为最小 ELF64，使 QEMU loongarch virt 走 `-kernel` 直启路径）
+
+
 ## 2026-06-16
 ### feat/test -> dev
 - 修复 `Mutex` 释放后 `dequeue_and_wake` 将 waiter 切为 `Runnable` 入队，但 `push_back -> continue` 循环不检查唤醒后是否仍在等待队列，导致无限循环；修复为 `wake_futex_waiters` 与 `Mutex` 解锁后统一执行 `restore_current_after_wait` 恢复状态再重新竞争锁

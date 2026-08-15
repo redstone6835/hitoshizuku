@@ -56,8 +56,10 @@
 extern crate alloc;
 
 pub mod arch_hooks;
+pub mod avenrun;
 pub mod clone_flags;
 pub mod cpu;
+pub mod cpu_itimer;
 mod deadline_admission;
 pub mod eevdf;
 pub mod group;
@@ -68,6 +70,7 @@ pub mod mutex;
 pub mod operation;
 pub mod pid;
 pub mod placement;
+pub mod posix_timer;
 pub mod process_ops;
 pub mod rlimit;
 pub mod rseq;
@@ -87,6 +90,7 @@ pub use arch_hooks::{
     mark_urgent_work, poll_urgent_work, urgent_pending_slots, urgent_work_pending,
 };
 pub use clone_flags::{CloneArgs, CloneFlags};
+pub use cpu_itimer::{account_tick_user_system, CpuItimerKind, CpuItimerSpec};
 pub use cpu::{
     CpuId, CpuMask, MAX_SCHED_DOMAINS, SCHED_CAPACITY_SCALE, SchedDomain, SchedPlacement,
     SchedTopology,
