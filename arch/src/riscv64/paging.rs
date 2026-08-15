@@ -123,6 +123,24 @@ impl Riscv64Paging {
         Riscv64Pte((Self::make_ppn(pa) << 10) | Self::leaf_flags(r, w, x, u, g))
     }
 
+    #[inline]
+    pub(crate) const fn satp_value(root: PhysPageTableRoot, asid: usize) -> usize {
+        SATP_MODE_SV48 | ((asid & ASID_MASK) << PPN_BITS) | Self::make_ppn(root.as_usize())
+    }
+
+    #[inline]
+    pub(crate) fn current_satp() -> usize {
+        let current: usize;
+        unsafe {
+            core::arch::asm!(
+                "csrr {current}, satp",
+                current = out(reg) current,
+                options(nostack, preserves_flags)
+            );
+        }
+        current
+    }
+
     /// 激活页表根并设置 ASID。
     ///
     /// # Safety
@@ -136,16 +154,24 @@ impl Riscv64Paging {
         asid: usize,
         needs_page_table_fence: bool,
     ) {
-        let satp =
-            SATP_MODE_SV48 | ((asid & ASID_MASK) << PPN_BITS) | (Self::make_ppn(root.as_usize()));
-        let current: usize;
+        let current = Self::current_satp();
         unsafe {
-            core::arch::asm!(
-                "csrr {current}, satp",
-                current = out(reg) current,
-                options(nostack, preserves_flags)
-            );
-        }
+            Self::activate_with_asid_from_current(root, asid, needs_page_table_fence, current)
+        };
+    }
+
+    /// 使用调用方已经读取的 satp 完成激活，避免热路径重复读取 CSR。
+    ///
+    /// # Safety
+    /// 与 [`activate_with_asid`] 相同；`current` 必须是进入本函数前同一 hart
+    /// 读取的 satp，且调用期间不得被抢占或迁移。
+    pub(crate) unsafe fn activate_with_asid_from_current(
+        root: PhysPageTableRoot,
+        asid: usize,
+        needs_page_table_fence: bool,
+        current: usize,
+    ) {
+        let satp = Self::satp_value(root, asid);
         if current == satp && !needs_page_table_fence {
             // 同一进程内的 pthread 切换会反复进入 VmSpace::activate。
             // root/asid 未变化时不需要重写 satp，也不能白白做全局 sfence.vma。

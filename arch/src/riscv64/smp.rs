@@ -114,8 +114,15 @@ fn for_each_remote_hart_mask(
     logical_targets: usize,
     mut action: impl FnMut(usize, usize) -> sbi::SbiRet,
 ) {
+    if logical_targets == 0 {
+        return;
+    }
+    let online = ONLINE_HARTS.load(Ordering::Acquire);
+    if online == 0 {
+        return;
+    }
     let source = crate::riscv64::specific::current_cpu_id();
-    let targets = logical_targets & ONLINE_HARTS.load(Ordering::Acquire) & !(1 << source);
+    let targets = logical_targets & online & !(1 << source);
     if targets == 0 {
         return;
     }
@@ -133,9 +140,37 @@ fn for_each_remote_hart_mask(
         hart_ids[count] = physical_hart_id(logical_id).expect("[smp] online hart has no mapping");
         count += 1;
     }
-    hart_ids[..count].sort_unstable();
 
     let mask_bits = usize::BITS as usize;
+    let min_hart = hart_ids[..count]
+        .iter()
+        .copied()
+        .min()
+        .expect("[smp] non-empty remote hart set");
+    let max_hart = hart_ids[..count]
+        .iter()
+        .copied()
+        .max()
+        .expect("[smp] non-empty remote hart set");
+    if max_hart - min_hart < mask_bits {
+        let mut mask = 0usize;
+        for &hart_id in &hart_ids[..count] {
+            mask |= 1usize << (hart_id - min_hart);
+        }
+        let ret = action(mask, min_hart);
+        assert!(
+            ret.is_ok(),
+            "[smp] remote fence failed: mask={:#x} base={} error={}",
+            mask,
+            min_hart,
+            ret.error
+        );
+        return;
+    }
+
+    // 物理 hart 跨越一个 SBI mask 窗口时才需要排序并分组；该路径只出现在
+    // 非连续或编号稀疏的硬件拓扑上。
+    hart_ids[..count].sort_unstable();
     let mut first = 0usize;
     while first < count {
         let base = hart_ids[first];

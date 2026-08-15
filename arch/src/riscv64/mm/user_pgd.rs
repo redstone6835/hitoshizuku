@@ -247,18 +247,31 @@ unsafe fn drop_pgd(pgd: PgdHandle) {
 unsafe fn activate(pgd: PgdHandle) {
     let inner = unsafe { inner_ref(pgd) };
     let asid = inner.asid();
+    let root = PhysPageTableRoot::new(inner.pgd_phys());
     let cpu = crate::riscv64::specific::current_cpu_id();
     let cpu_bit = 1usize
         .checked_shl(cpu as u32)
         .expect("[arch][mm] logical CPU exceeds active mask width");
-    let first_activation = inner.active_cpus.fetch_or(cpu_bit, Ordering::AcqRel) & cpu_bit == 0;
-    let needs_page_table_fence = inner.needs_page_table_fence.swap(false, Ordering::AcqRel);
-    let needs_asid_fence = inner.needs_asid_fence.swap(false, Ordering::AcqRel);
+    let current = Riscv64Paging::current_satp();
+    let needs_page_table_fence = inner.needs_page_table_fence.load(Ordering::Acquire);
+    let needs_asid_fence = inner.needs_asid_fence.load(Ordering::Acquire);
+    if current == Riscv64Paging::satp_value(root, asid)
+        && !needs_page_table_fence
+        && !needs_asid_fence
+        && inner.active_cpus.load(Ordering::Relaxed) & cpu_bit != 0
+    {
+        // 同一 hart 已经安装了完全有效的页表时，跳过活跃位图和两个交换操作。
+        return;
+    }
+    let first_activation = inner.active_cpus.fetch_or(cpu_bit, Ordering::Relaxed) & cpu_bit == 0;
+    let needs_page_table_fence = inner.needs_page_table_fence.swap(false, Ordering::Acquire);
+    let needs_asid_fence = inner.needs_asid_fence.swap(false, Ordering::Acquire);
     unsafe {
-        Riscv64Paging::activate_with_asid(
-            PhysPageTableRoot::new(inner.pgd_phys()),
+        Riscv64Paging::activate_with_asid_from_current(
+            root,
             asid,
             first_activation || needs_page_table_fence || needs_asid_fence,
+            current,
         );
     }
 }
@@ -526,7 +539,7 @@ unsafe fn clone_for_fork_user_pages(
 
 unsafe fn invalidate_range(pgd: PgdHandle, vaddr: usize, len: usize) {
     let inner = unsafe { inner_ref(pgd) };
-    let active_cpus = inner.active_cpus.load(Ordering::Acquire);
+    let active_cpus = inner.active_cpus.load(Ordering::Relaxed);
     flush_user_tlb_range(inner.asid(), active_cpus, vaddr, len);
     // 本次定向 fence 已覆盖相应页表修改，但不能消费新一代 ASID 的首次激活
     // 标记；后者要求 activate() 在安装该 ASID 时完成一次完整 ASID fence。
