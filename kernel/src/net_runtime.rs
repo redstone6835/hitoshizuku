@@ -2623,6 +2623,344 @@ fn update_interface_config(
     Ok(())
 }
 
+// ── netlink 配置更新（RTM_NEWADDR/NEWROUTE/NEWLINK 写操作）───────────────────
+
+/// 把 ConfigError 映射为负 errno（NLMSG_ERROR 语义）。
+fn map_config_error(error: net::control::ConfigError) -> i32 {
+    let code = match error {
+        net::control::ConfigError::InvalidInterface => Errno::ENODEV,
+        net::control::ConfigError::InvalidAddress | net::control::ConfigError::InvalidRoute => {
+            Errno::EINVAL
+        }
+        net::control::ConfigError::GatewayUnreachable => Errno::ENETUNREACH,
+        net::control::ConfigError::TooManyRouteTables
+        | net::control::ConfigError::TooManyPolicyRules => Errno::ENOBUFS,
+        net::control::ConfigError::MissingMainRouteTable => Errno::EINVAL,
+        net::control::ConfigError::GenerationNotIncreasing => Errno::EAGAIN,
+        net::control::ConfigError::NoRoute | net::control::ConfigError::NoSourceAddress => {
+            Errno::ESRCH
+        }
+    };
+    -i32::from(code)
+}
+
+/// netlink 配置写请求的真正执行者（由 vfs netlink_socket 经 handler 注入调用）。
+fn netlink_config_update(
+    request: &vfs::netlink_socket::NetlinkConfigRequest,
+) -> Result<(), i32> {
+    let _guard = NET_IOCTL_LOCK.lock();
+    let store = CONFIG_STORE
+        .lock()
+        .as_ref()
+        .cloned()
+        .ok_or(-i32::from(Errno::ENODEV))?;
+    let current = store.snapshot();
+
+    // ── 前置校验（自由 errno 检查，闭包内只产生 ConfigError）──────────────
+    let interface = match request {
+        vfs::netlink_socket::NetlinkConfigRequest::AddAddress { interface, .. }
+        | vfs::netlink_socket::NetlinkConfigRequest::DelAddress { interface, .. }
+        | vfs::netlink_socket::NetlinkConfigRequest::AddRoute { interface, .. }
+        | vfs::netlink_socket::NetlinkConfigRequest::DelRoute { interface, .. }
+        | vfs::netlink_socket::NetlinkConfigRequest::SetLinkRunning { interface, .. }
+        | vfs::netlink_socket::NetlinkConfigRequest::SetLinkMtu { interface, .. } => *interface,
+    };
+    if !current
+        .interfaces
+        .iter()
+        .any(|candidate| candidate.id == interface)
+    {
+        return Err(-i32::from(Errno::ENODEV));
+    }
+    match request {
+        vfs::netlink_socket::NetlinkConfigRequest::AddAddress {
+            address,
+            prefix_len,
+            ..
+        } => {
+            let max_prefix = match address {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+            if *prefix_len > max_prefix {
+                return Err(-i32::from(Errno::EINVAL));
+            }
+        }
+        vfs::netlink_socket::NetlinkConfigRequest::DelAddress {
+            interface,
+            address,
+            ..
+        } => {
+            let present = current
+                .addresses
+                .iter()
+                .any(|entry| entry.interface == *interface && entry.address == *address);
+            if !present {
+                return Err(-i32::from(Errno::EADDRNOTAVAIL));
+            }
+        }
+        vfs::netlink_socket::NetlinkConfigRequest::AddRoute {
+            network,
+            gateway,
+            ..
+        } => {
+            if let Some(gateway) = gateway
+                && !same_family_public(*network, *gateway)
+            {
+                return Err(-i32::from(Errno::EINVAL));
+            }
+        }
+        vfs::netlink_socket::NetlinkConfigRequest::DelRoute {
+            table,
+            network,
+            prefix_len,
+            gateway,
+            interface,
+        } => {
+            let present = current.routes.entries().iter().any(|route| {
+                route.table == *table
+                    && route.network == *network
+                    && route.prefix_len == *prefix_len
+                    && route.gateway == *gateway
+                    && route.interface == *interface
+            });
+            if !present {
+                return Err(-i32::from(Errno::ESRCH));
+            }
+        }
+        vfs::netlink_socket::NetlinkConfigRequest::SetLinkRunning { .. }
+        | vfs::netlink_socket::NetlinkConfigRequest::SetLinkMtu { .. } => {}
+    }
+    let interface_mtu = current
+        .interfaces
+        .iter()
+        .find(|candidate| candidate.id == interface)
+        .map(|candidate| candidate.mtu)
+        .unwrap_or(1500);
+
+    store
+        .update(|current| {
+            let mut addresses = current.addresses.clone();
+            let mut routes = current.routes.entries().to_vec();
+            match request {
+                vfs::netlink_socket::NetlinkConfigRequest::AddAddress {
+                    interface,
+                    address,
+                    prefix_len,
+                } => {
+                    addresses.retain(|entry| {
+                        !(entry.interface == *interface && entry.address == *address)
+                    });
+                    addresses.push(AddressEntry {
+                        interface: *interface,
+                        address: *address,
+                        prefix_len: *prefix_len,
+                        primary: true,
+                    });
+                    // Linux 语义：新地址自动补直连路由（仅 IPv4，IPv6 由 DAD/RA 管理）。
+                    if let IpAddr::V4(address) = address {
+                        routes.push(RouteEntry {
+                            table: 0,
+                            network: IpAddr::V4(ipv4_network(*address, *prefix_len)),
+                            prefix_len: *prefix_len,
+                            gateway: None,
+                            interface: *interface,
+                            metric: 0,
+                            mtu: Some(interface_mtu),
+                        });
+                    }
+                }
+                vfs::netlink_socket::NetlinkConfigRequest::DelAddress {
+                    interface,
+                    address,
+                    prefix_len,
+                } => {
+                    addresses.retain(|entry| {
+                        !(entry.interface == *interface && entry.address == *address)
+                    });
+                    // 删除关联的直连路由。
+                    if let IpAddr::V4(address) = address {
+                        let network = ipv4_network(*address, *prefix_len);
+                        routes.retain(|route| {
+                            !(route.interface == *interface
+                                && route.gateway.is_none()
+                                && route.network == IpAddr::V4(network)
+                                && route.prefix_len == *prefix_len)
+                        });
+                    }
+                }
+                vfs::netlink_socket::NetlinkConfigRequest::AddRoute {
+                    table,
+                    network,
+                    prefix_len,
+                    gateway,
+                    interface,
+                    metric,
+                } => {
+                    routes.push(RouteEntry {
+                        table: *table,
+                        network: *network,
+                        prefix_len: *prefix_len,
+                        gateway: *gateway,
+                        interface: *interface,
+                        metric: *metric,
+                        mtu: Some(interface_mtu),
+                    });
+                }
+                vfs::netlink_socket::NetlinkConfigRequest::DelRoute {
+                    table,
+                    network,
+                    prefix_len,
+                    gateway,
+                    interface,
+                } => {
+                    routes.retain(|route| {
+                        !(route.table == *table
+                            && route.network == *network
+                            && route.prefix_len == *prefix_len
+                            && route.gateway == *gateway
+                            && route.interface == *interface)
+                    });
+                }
+                vfs::netlink_socket::NetlinkConfigRequest::SetLinkRunning { interface, running } => {
+                    let mut interfaces = current.interfaces.clone();
+                    if let Some(candidate) = interfaces
+                        .iter_mut()
+                        .find(|candidate| candidate.id == *interface)
+                    {
+                        candidate.running = *running;
+                    }
+                    return ConfigSnapshot::new_with_dns(
+                        current.generation.saturating_add(1),
+                        interfaces,
+                        addresses,
+                        routes,
+                        current.policy.clone(),
+                        current.dns_servers.clone(),
+                    );
+                }
+                vfs::netlink_socket::NetlinkConfigRequest::SetLinkMtu { interface, mtu } => {
+                    let mut interfaces = current.interfaces.clone();
+                    if let Some(candidate) = interfaces
+                        .iter_mut()
+                        .find(|candidate| candidate.id == *interface)
+                    {
+                        candidate.mtu = *mtu;
+                    }
+                    for route in &mut routes {
+                        if route.interface == *interface && route.mtu.is_some() {
+                            route.mtu = Some(*mtu);
+                        }
+                    }
+                    return ConfigSnapshot::new_with_dns(
+                        current.generation.saturating_add(1),
+                        interfaces,
+                        addresses,
+                        routes,
+                        current.policy.clone(),
+                        current.dns_servers.clone(),
+                    );
+                }
+            }
+            ConfigSnapshot::new_with_dns(
+                current.generation.saturating_add(1),
+                current.interfaces.clone(),
+                addresses,
+                routes,
+                current.policy.clone(),
+                current.dns_servers.clone(),
+            )
+        })
+        .map_err(map_config_error)?;
+    // 设备快照同步（running/mtu 变更反映到设备层）。
+    let link_interface = match request {
+        vfs::netlink_socket::NetlinkConfigRequest::SetLinkRunning { interface, .. }
+        | vfs::netlink_socket::NetlinkConfigRequest::SetLinkMtu { interface, .. } => {
+            Some(*interface)
+        }
+        _ => None,
+    };
+    if let Some(interface) = link_interface
+        && let Some(device) = DEVICES
+            .lock()
+            .iter_mut()
+            .find(|device| device.snapshot.id.raw() == interface.0)
+    {
+        match request {
+            vfs::netlink_socket::NetlinkConfigRequest::SetLinkRunning { running, .. } => {
+                device.snapshot.running = *running;
+            }
+            vfs::netlink_socket::NetlinkConfigRequest::SetLinkMtu { mtu, .. } => {
+                device.snapshot.mtu = *mtu;
+            }
+            _ => {}
+        }
+    }
+    netlink_broadcast_config_change(request);
+    Ok(())
+}
+
+fn same_family_public(left: IpAddr, right: IpAddr) -> bool {
+    matches!(
+        (left, right),
+        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+    )
+}
+
+/// 配置变化后向订阅者广播 RTM_* 事件。
+fn netlink_broadcast_config_change(request: &vfs::netlink_socket::NetlinkConfigRequest) {
+    use alloc::vec;
+    let (msg_type, payload): (u16, Vec<u8>) = match request {
+        vfs::netlink_socket::NetlinkConfigRequest::AddAddress { .. } => {
+            (vfs::netlink_socket::NETLINK_MSG_RTM_NEWADDR, vec![])
+        }
+        vfs::netlink_socket::NetlinkConfigRequest::DelAddress { .. } => {
+            (vfs::netlink_socket::NETLINK_MSG_RTM_DELADDR, vec![])
+        }
+        vfs::netlink_socket::NetlinkConfigRequest::AddRoute { .. } => {
+            (vfs::netlink_socket::NETLINK_MSG_RTM_NEWROUTE, vec![])
+        }
+        vfs::netlink_socket::NetlinkConfigRequest::DelRoute { .. } => {
+            (vfs::netlink_socket::NETLINK_MSG_RTM_DELROUTE, vec![])
+        }
+        vfs::netlink_socket::NetlinkConfigRequest::SetLinkRunning { .. }
+        | vfs::netlink_socket::NetlinkConfigRequest::SetLinkMtu { .. } => {
+            (vfs::netlink_socket::NETLINK_MSG_RTM_NEWLINK, vec![])
+        }
+    };
+    // 最小消息：nlmsghdr(16) + 空载荷。订阅者按类型与 seq=0/pid=0 识别事件。
+    let mut message = Vec::with_capacity(16 + payload.len());
+    message.extend_from_slice(&((16 + payload.len()) as u32).to_ne_bytes());
+    message.extend_from_slice(&msg_type.to_ne_bytes());
+    message.extend_from_slice(&0u16.to_ne_bytes()); // flags
+    message.extend_from_slice(&0u32.to_ne_bytes()); // seq
+    message.extend_from_slice(&0u32.to_ne_bytes()); // pid
+    message.extend_from_slice(&payload);
+    vfs::netlink_socket::netlink_event_broadcast(msg_type, message);
+}
+
+// ── netlink 快照 provider（RTM_GETROUTE / RTM_GETNEIGH / procfs）──────────────
+
+fn netlink_route_snapshot() -> Vec<net::control::RouteEntry> {
+    CONFIG_STORE
+        .lock()
+        .as_ref()
+        .map(|store| store.snapshot().routes.entries().to_vec())
+        .unwrap_or_default()
+}
+
+fn netlink_neighbor_snapshot() -> Vec<vfs::netlink_socket::NeighborSnapshot> {
+    net::control::neighbor_snapshot()
+        .into_iter()
+        .map(|entry| vfs::netlink_socket::NeighborSnapshot {
+            interface: entry.interface,
+            address: entry.address,
+            mac: entry.mac,
+            nud_state: entry.nud_state,
+        })
+        .collect()
+}
+
 fn publish_device_config() {
     let store = CONFIG_STORE.lock().as_ref().cloned();
     let Some(store) = store else {
@@ -3112,6 +3450,9 @@ pub fn start_workers() {
     );
     vfs::net_socket::install_net_ioctl_handler(net_ioctl);
     vfs::netlink_socket::install_address_snapshot_provider(netlink_address_snapshot);
+    vfs::netlink_socket::install_route_snapshot_provider(netlink_route_snapshot);
+    vfs::netlink_socket::install_neighbor_snapshot_provider(netlink_neighbor_snapshot);
+    vfs::netlink_socket::install_netlink_config_handler(netlink_config_update);
     vfs::net_socket::install_net_realtime_clock(crate::vdso::realtime_ns);
     let boot = net::stack::boot_config().expect("网络 stack 启动配置未安装");
     let online = sched::online_cpu_mask();

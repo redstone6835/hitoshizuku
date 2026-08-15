@@ -1,8 +1,17 @@
-//! AF_NETLINK/NETLINK_ROUTE 的链路信息实现。
+//! AF_NETLINK/NETLINK_ROUTE 的完整链路信息实现。
 //!
-//! 设备信息来自网络设备快照，地址信息来自网络控制面的只读配置投影；尚未实现的路由
-//! 和邻居查询返回空 dump，修改请求明确返回 `EAFNOSUPPORT`。
+//! 支持：
+//! - 读：RTM_GETLINK / RTM_GETADDR / RTM_GETROUTE / RTM_GETNEIGH（真实数据快照）
+//! - 写：RTM_NEWADDR / DELADDR / NEWROUTE / DELROUTE / NEWLINK / DELLINK / SETLINK
+//!   （经内核配置更新入口生效）
+//! - 组播：NETLINK_ADD/DROP_MEMBERSHIP 真实订阅，配置变化时向订阅者推送
+//!   RTM_NEWLINK / RTM_NEWADDR / RTM_NEWROUTE 事件
+//! - sockopt：SO_SNDBUF/SO_RCVBUF 真实调整缓冲上限，SO_PASSCRED 附加发送者凭据
+//!
+//! 数据源通过 provider 注入（内核 net_runtime 安装），配置修改通过 handler 注入
+//! （内核 net_runtime 实现），与 ioctl 分派模式一致。
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -19,43 +28,212 @@ use crate::error::{VfsError, VfsResult};
 use crate::file::{DirEntry, FileOps, PollEvents};
 use crate::poll_source::PollSource;
 
+// ── netlink 消息类型 ──────────────────────────────────────────────────────────
+
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const RTM_NEWLINK: u16 = 16;
 const RTM_DELLINK: u16 = 17;
 const RTM_GETLINK: u16 = 18;
+const RTM_SETLINK: u16 = 19;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
 const RTM_GETADDR: u16 = 22;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_DELROUTE: u16 = 25;
 const RTM_GETROUTE: u16 = 26;
+const RTM_NEWNEIGH: u16 = 28;
+const RTM_DELNEIGH: u16 = 29;
 const RTM_GETNEIGH: u16 = 30;
+
+// kernel 侧事件广播使用的公开别名。
+pub const NETLINK_MSG_RTM_NEWLINK: u16 = RTM_NEWLINK;
+pub const NETLINK_MSG_RTM_NEWADDR: u16 = RTM_NEWADDR;
+pub const NETLINK_MSG_RTM_DELADDR: u16 = RTM_DELADDR;
+pub const NETLINK_MSG_RTM_NEWROUTE: u16 = RTM_NEWROUTE;
+pub const NETLINK_MSG_RTM_DELROUTE: u16 = RTM_DELROUTE;
+
+// ── nlmsg 标志 ────────────────────────────────────────────────────────────────
+
+const NLM_F_REQUEST: u16 = 1;
 const NLM_F_MULTI: u16 = 2;
-const IFA_F_SECONDARY: u8 = 1;
+const NLM_F_ACK: u16 = 4;
+const NLM_F_REPLACE: u16 = 0x100;
+const NLM_F_EXCL: u16 = 0x200;
+const NLM_F_CREATE: u16 = 0x400;
+const NLM_F_APPEND: u16 = 0x800;
+
+// ── RTMGRP 组播组（订阅位）───────────────────────────────────────────────────
+
+const RTMGRP_LINK: u32 = 1;
+const RTMGRP_NOTIFY: u32 = 2;
+const RTMGRP_NEIGH: u32 = 4;
+const RTMGRP_IPV4_IFADDR: u32 = 0x10;
+const RTMGRP_IPV4_ROUTE: u32 = 0x40;
+const RTMGRP_IPV6_IFADDR: u32 = 0x100;
+const RTMGRP_IPV6_ROUTE: u32 = 0x400;
+const RTMGRP_IPV6_IFINFO: u32 = 0x800;
+
+// ── 属性类型 ──────────────────────────────────────────────────────────────────
+
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 const IFA_LABEL: u16 = 3;
 const IFLA_ADDRESS: u16 = 1;
 const IFLA_IFNAME: u16 = 3;
 const IFLA_MTU: u16 = 4;
+const RTA_DST: u16 = 1;
+const RTA_SRC: u16 = 2;
+const RTA_OIF: u16 = 4;
+const RTA_GATEWAY: u16 = 5;
+const RTA_PRIORITY: u16 = 9;
+const RTA_TABLE: u16 = 15;
+const NDA_DST: u16 = 1;
+const NDA_LLADDR: u16 = 2;
+
+// ── 地址族 / 作用域 / 状态 ────────────────────────────────────────────────────
+
 const AF_UNSPEC: u8 = 0;
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
 const RT_SCOPE_UNIVERSE: u8 = 0;
+const RT_SCOPE_LINK: u8 = 253;
 const RT_SCOPE_HOST: u8 = 254;
+const RTN_UNICAST: u8 = 1;
+const RTPROT_BOOT: u8 = 3;
 const IFF_UP: u32 = 1;
 const IFF_BROADCAST: u32 = 2;
 const IFF_RUNNING: u32 = 0x40;
 const IFF_MULTICAST: u32 = 0x1000;
+const IFA_F_SECONDARY: u8 = 1;
+const NUD_INCOMPLETE: u16 = 0x01;
+const NUD_REACHABLE: u16 = 0x02;
+const NUD_STALE: u16 = 0x04;
+const NUD_DELAY: u16 = 0x08;
+const NUD_PROBE: u16 = 0x10;
+const NUD_FAILED: u16 = 0x20;
+const NUD_NOARP: u16 = 0x40;
+const NUD_PERMANENT: u16 = 0x80;
 const AF_NETLINK: u16 = 16;
+const SOL_NETLINK: i32 = 270;
+const NETLINK_ADD_MEMBERSHIP: i32 = 1;
+const NETLINK_DROP_MEMBERSHIP: i32 = 2;
+
+// ── 数据源 provider（由内核 net_runtime 安装）────────────────────────────────
 
 static NEXT_NETLINK_PORT: AtomicU32 = AtomicU32::new(1);
 static ADDRESS_SNAPSHOT_PROVIDER: Mutex<Option<fn() -> Vec<net::control::AddressEntry>>> =
     Mutex::new(None);
+static ROUTE_SNAPSHOT_PROVIDER: Mutex<Option<fn() -> Vec<net::control::RouteEntry>>> =
+    Mutex::new(None);
+static NEIGHBOR_SNAPSHOT_PROVIDER: Mutex<Option<fn() -> Vec<NeighborSnapshot>>> =
+    Mutex::new(None);
 
 pub fn install_address_snapshot_provider(provider: fn() -> Vec<net::control::AddressEntry>) {
     *ADDRESS_SNAPSHOT_PROVIDER.lock() = Some(provider);
+}
+
+pub fn install_route_snapshot_provider(provider: fn() -> Vec<net::control::RouteEntry>) {
+    *ROUTE_SNAPSHOT_PROVIDER.lock() = Some(provider);
+}
+
+pub fn install_neighbor_snapshot_provider(provider: fn() -> Vec<NeighborSnapshot>) {
+    *NEIGHBOR_SNAPSHOT_PROVIDER.lock() = Some(provider);
+}
+
+/// 邻居表快照条目（内核 net_runtime 从镜像表填充）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NeighborSnapshot {
+    pub interface: net::InterfaceId,
+    pub address: net::IpAddr,
+    pub mac: [u8; 6],
+    /// 可达性状态（NUD_* 位），由内核按邻居表状态映射。
+    pub nud_state: u16,
+}
+
+// ── 配置写请求（vfs 定义，内核 net_runtime 实现）────────────────────────────
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NetlinkConfigRequest {
+    AddAddress {
+        interface: net::InterfaceId,
+        address: net::IpAddr,
+        prefix_len: u8,
+    },
+    DelAddress {
+        interface: net::InterfaceId,
+        address: net::IpAddr,
+        prefix_len: u8,
+    },
+    AddRoute {
+        table: u8,
+        network: net::IpAddr,
+        prefix_len: u8,
+        gateway: Option<net::IpAddr>,
+        interface: net::InterfaceId,
+        metric: u32,
+    },
+    DelRoute {
+        table: u8,
+        network: net::IpAddr,
+        prefix_len: u8,
+        gateway: Option<net::IpAddr>,
+        interface: net::InterfaceId,
+    },
+    SetLinkRunning {
+        interface: net::InterfaceId,
+        running: bool,
+    },
+    SetLinkMtu {
+        interface: net::InterfaceId,
+        mtu: u32,
+    },
+}
+
+/// 配置写处理器：返回 Ok(()) 或 Err(负 errno，与 NLMSG_ERROR 语义一致)。
+static NETLINK_CONFIG_HANDLER: Mutex<Option<fn(&NetlinkConfigRequest) -> Result<(), i32>>> =
+    Mutex::new(None);
+
+pub fn install_netlink_config_handler(handler: fn(&NetlinkConfigRequest) -> Result<(), i32>) {
+    *NETLINK_CONFIG_HANDLER.lock() = Some(handler);
+}
+
+// ── netlink socket 注册表（事件广播用）──────────────────────────────────────
+//
+// 生命周期保证：new（socket 创建）时入表、release（File 关闭）时出表，
+// 广播读取与入/出表共用同一把锁，因此表内指针在锁持有期间必然存活。
+
+/// 注册表中的 netlink socket 指针。生命周期由表锁保证：
+/// 入表（new）到出表（release）期间对象必然存活，广播读与出表互斥。
+struct NetlinkSocketPtr(*const NetlinkSocketFileOps);
+
+// Safety: 指针本身不跨线程解引用；解引用只在持表锁的广播路径发生，
+// 而该路径与 release 出表互斥，因此不存在悬垂访问。
+unsafe impl Send for NetlinkSocketPtr {}
+unsafe impl Sync for NetlinkSocketPtr {}
+
+static NETLINK_SOCKETS: Mutex<Vec<NetlinkSocketPtr>> = Mutex::new(Vec::new());
+
+/// 向订阅了对应组播组的所有 netlink socket 推送事件消息。
+pub fn netlink_event_broadcast(msg_type: u16, message: Vec<u8>) {
+    let groups = match msg_type {
+        RTM_NEWLINK | RTM_DELLINK | RTM_SETLINK => {
+            RTMGRP_LINK | RTMGRP_IPV6_IFINFO | RTMGRP_NOTIFY
+        }
+        RTM_NEWADDR | RTM_DELADDR => RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR,
+        RTM_NEWROUTE | RTM_DELROUTE => RTMGRP_IPV4_ROUTE | RTMGRP_IPV6_ROUTE,
+        RTM_NEWNEIGH | RTM_DELNEIGH => RTMGRP_NEIGH,
+        _ => return,
+    };
+    let registry = NETLINK_SOCKETS.lock();
+    for entry in registry.iter() {
+        // Safety: 表锁持有期间没有并发 release 出表（release 也持同一把锁），
+        // 因此指针必然指向存活的 NetlinkSocketFileOps。
+        let socket = unsafe { &*entry.0 };
+        if socket.groups.load(Ordering::Acquire) & groups != 0 {
+            socket.push_event(message.clone());
+        }
+    }
 }
 
 pub struct NetlinkSocketFileOps {
@@ -67,12 +245,17 @@ pub struct NetlinkSocketFileOps {
     bound: AtomicBool,
     local_pid: AtomicU32,
     groups: AtomicU32,
+    /// SO_RCVBUF 控制的最大缓冲字节数（超限丢弃最早消息并计数）。
+    rx_limit: AtomicU32,
+    rx_dropped: AtomicU32,
+    /// SO_PASSCRED：接收时附加发送者凭据。
+    passcred: AtomicBool,
     poll_source: PollSource,
 }
 
 impl NetlinkSocketFileOps {
     pub fn new(protocol: u32, nonblock: bool) -> Self {
-        Self {
+        let ops = Self {
             protocol,
             rx_buf: Mutex::new(VecDeque::new()),
             wait_queue: WaitQueue::new_with_reason(sched::WaitReason::SocketRead),
@@ -80,8 +263,34 @@ impl NetlinkSocketFileOps {
             bound: AtomicBool::new(false),
             local_pid: AtomicU32::new(0),
             groups: AtomicU32::new(0),
+            rx_limit: AtomicU32::new(212_992),
+            rx_dropped: AtomicU32::new(0),
+            passcred: AtomicBool::new(false),
             poll_source: PollSource::new(PollEvents::POLLOUT),
+        };
+        ops.register();
+        ops
+    }
+
+    /// 从当前对象地址构造注册表条目（生命周期由表锁 + release 出表保证）。
+    fn register(&self) {
+        NETLINK_SOCKETS
+            .lock()
+            .push(NetlinkSocketPtr(self as *const NetlinkSocketFileOps));
+    }
+
+    fn push_event(&self, message: Vec<u8>) {
+        let mut buf = self.rx_buf.lock();
+        let limit = self.rx_limit.load(Ordering::Relaxed) as usize;
+        let queued: usize = buf.iter().map(|m| m.len()).sum();
+        if queued + message.len() > limit {
+            self.rx_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
         }
+        buf.push_back(message);
+        drop(buf);
+        self.refresh_readiness();
+        self.wait_queue.wake_all();
     }
 
     fn refresh_readiness(&self) {
@@ -131,6 +340,8 @@ impl NetlinkSocketFileOps {
         address
     }
 
+    /// 读取一条消息。若启用 SO_PASSCRED，在消息前附加 12 字节发送者凭据
+    /// （pid/uid/gid，u32×3），与 Linux netlink 的 SO_PASSCRED 语义一致。
     pub fn recv(
         &self,
         buf: &mut [u8],
@@ -138,7 +349,25 @@ impl NetlinkSocketFileOps {
         deadline_ns: Option<u64>,
     ) -> Result<usize, Errno> {
         loop {
-            let message = { self.rx_buf.lock().pop_front() };
+            let message = {
+                let base = self.rx_buf.lock().pop_front();
+                match base {
+                    Some(msg) => {
+                        if self.passcred.load(Ordering::Acquire) {
+                            let cred = sender_credentials();
+                            let mut with_cred = Vec::with_capacity(msg.len() + 12);
+                            with_cred.extend_from_slice(&cred.pid.to_ne_bytes());
+                            with_cred.extend_from_slice(&cred.uid.to_ne_bytes());
+                            with_cred.extend_from_slice(&cred.gid.to_ne_bytes());
+                            with_cred.extend_from_slice(&msg);
+                            Some(with_cred)
+                        } else {
+                            Some(msg)
+                        }
+                    }
+                    None => None,
+                }
+            };
             if let Some(msg) = message {
                 let len = msg.len().min(buf.len());
                 buf[..len].copy_from_slice(&msg[..len]);
@@ -188,18 +417,36 @@ impl NetlinkSocketFileOps {
             return Err(VfsError::InvalidArgument);
         }
         let msg_type = u16::from_ne_bytes([buf[4], buf[5]]);
+        let flags = u16::from_ne_bytes([buf[6], buf[7]]);
         let seq = u32::from_ne_bytes([buf[8], buf[9], buf[10], buf[11]]);
         let local_pid = self.local_pid.load(Ordering::Acquire);
-        let responses = dispatch_message(msg_type, seq, local_pid);
+        let responses = dispatch_message(msg_type, flags, seq, local_pid, &buf[16..]);
         let mut combined = Vec::new();
         for response in responses {
             combined.extend_from_slice(&response);
         }
-        self.rx_buf.lock().push_back(combined);
-        self.refresh_readiness();
-        self.wait_queue.wake_all();
+        if !combined.is_empty() {
+            self.push_event(combined);
+        }
         Ok(buf.len())
     }
+}
+
+/// 当前任务的发送者凭据快照（SO_PASSCRED 语义）。
+fn sender_credentials() -> SenderCred {
+    let task = sched::current_task();
+    let cred = task.credentials();
+    SenderCred {
+        pid: task.pid_root_cached().unwrap_or(0) as u32,
+        uid: cred.euid.0,
+        gid: cred.egid.0,
+    }
+}
+
+struct SenderCred {
+    pid: u32,
+    uid: u32,
+    gid: u32,
 }
 
 impl FileOps for NetlinkSocketFileOps {
@@ -268,55 +515,310 @@ impl FileOps for NetlinkSocketFileOps {
         false
     }
 
-    fn release(&self) {}
+    fn release(&self) {
+        // 出表：与广播读取共用表锁，保证广播期间表内指针存活。
+        NETLINK_SOCKETS
+            .lock()
+            .retain(|entry| entry.0 != self as *const NetlinkSocketFileOps);
+    }
 
     fn as_any(&self) -> &dyn Any {
         self
     }
 }
 
-pub fn create_netlink_socket(protocol: u32, nonblock: bool) -> NetlinkSocketFileOps {
-    NetlinkSocketFileOps::new(protocol, nonblock)
+/// 创建 netlink socket。返回 Box 以保证对象地址稳定（注册表持有裸指针，
+/// 栈上对象的地址在返回值拷贝后不保证不变）。
+pub fn create_netlink_socket(protocol: u32, nonblock: bool) -> Box<NetlinkSocketFileOps> {
+    let ops = Box::new(NetlinkSocketFileOps::new(protocol, nonblock));
+    ops.register();
+    ops
 }
 
-fn dispatch_message(msg_type: u16, seq: u32, local_pid: u32) -> Vec<Vec<u8>> {
+// ── 消息分发 ─────────────────────────────────────────────────────────────────
+
+fn dispatch_message(
+    msg_type: u16,
+    flags: u16,
+    seq: u32,
+    local_pid: u32,
+    payload: &[u8],
+) -> Vec<Vec<u8>> {
+    if flags & NLM_F_REQUEST != 0 {
+        match msg_type {
+            RTM_GETLINK => return get_link(seq, local_pid),
+            RTM_GETADDR => return get_addr(seq, local_pid),
+            RTM_GETROUTE => return get_route(seq, local_pid),
+            RTM_GETNEIGH => return get_neigh(seq, local_pid),
+            _ => {}
+        }
+    }
     match msg_type {
-        RTM_GETLINK => {
-            let mut messages = net::device::snapshot_devices()
-                .into_iter()
-                .map(|device| build_ifinfomsg(&device, seq, local_pid))
-                .collect::<Vec<_>>();
-            messages.push(build_nlmsg_done(seq, local_pid));
-            messages
+        RTM_NEWADDR | RTM_DELADDR => {
+            let result = handle_addr_change(msg_type, payload);
+            vec![nlmsg_ack_or_error(result, seq, local_pid)]
         }
-        RTM_GETADDR => {
-            let mut messages = ADDRESS_SNAPSHOT_PROVIDER
-                .lock()
-                .map(|provider| provider())
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|entry| build_ifaddrmsg(entry, seq, local_pid))
-                .collect::<Vec<_>>();
-            messages.push(build_nlmsg_done(seq, local_pid));
-            messages
+        RTM_NEWROUTE | RTM_DELROUTE => {
+            let result = handle_route_change(msg_type, payload);
+            vec![nlmsg_ack_or_error(result, seq, local_pid)]
         }
-        RTM_GETROUTE | RTM_GETNEIGH => {
-            vec![build_nlmsg_done(seq, local_pid)]
+        RTM_NEWLINK | RTM_DELLINK | RTM_SETLINK => {
+            let result = handle_link_change(msg_type, payload);
+            vec![nlmsg_ack_or_error(result, seq, local_pid)]
         }
-        RTM_NEWLINK | RTM_DELLINK | RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE | RTM_DELROUTE => {
-            vec![build_nlmsg_error(
-                seq,
-                local_pid,
-                -i32::from(Errno::EAFNOSUPPORT),
-            )]
-        }
-        _ => vec![build_nlmsg_error(
-            seq,
-            local_pid,
-            -i32::from(Errno::EOPNOTSUPP),
-        )],
+        _ => vec![build_nlmsg_error(seq, local_pid, -i32::from(Errno::EOPNOTSUPP))],
     }
 }
+
+fn nlmsg_ack_or_error(result: Result<(), i32>, seq: u32, local_pid: u32) -> Vec<u8> {
+    match result {
+        Ok(()) => {
+            let mut payload = Vec::with_capacity(20);
+            payload.extend_from_slice(&0i32.to_ne_bytes());
+            payload.extend_from_slice(&16u32.to_ne_bytes());
+            payload.extend_from_slice(&0u16.to_ne_bytes());
+            payload.extend_from_slice(&0u16.to_ne_bytes());
+            payload.extend_from_slice(&seq.to_ne_bytes());
+            payload.extend_from_slice(&0u32.to_ne_bytes());
+            wrap_nlmsg(NLMSG_ERROR, 0, seq, local_pid, &payload)
+        }
+        Err(code) => build_nlmsg_error(seq, local_pid, code),
+    }
+}
+
+fn get_link(seq: u32, local_pid: u32) -> Vec<Vec<u8>> {
+    let mut messages = net::device::snapshot_devices()
+        .into_iter()
+        .map(|device| build_ifinfomsg(&device, seq, local_pid))
+        .collect::<Vec<_>>();
+    messages.push(build_nlmsg_done(seq, local_pid));
+    messages
+}
+
+fn get_addr(seq: u32, local_pid: u32) -> Vec<Vec<u8>> {
+    let mut messages = ADDRESS_SNAPSHOT_PROVIDER
+        .lock()
+        .map(|provider| provider())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| {
+            let device = net::device::snapshot_devices()
+                .into_iter()
+                .find(|device| device.id.raw() == entry.interface.0)?;
+            Some(build_ifaddrmsg_for_device(entry, &device, seq, local_pid))
+        })
+        .collect::<Vec<_>>();
+    messages.push(build_nlmsg_done(seq, local_pid));
+    messages
+}
+
+fn get_route(seq: u32, local_pid: u32) -> Vec<Vec<u8>> {
+    let mut messages = ROUTE_SNAPSHOT_PROVIDER
+        .lock()
+        .map(|provider| provider())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|route| build_rtmsg(route, seq, local_pid))
+        .collect::<Vec<_>>();
+    messages.push(build_nlmsg_done(seq, local_pid));
+    messages
+}
+
+fn get_neigh(seq: u32, local_pid: u32) -> Vec<Vec<u8>> {
+    let mut messages = NEIGHBOR_SNAPSHOT_PROVIDER
+        .lock()
+        .map(|provider| provider())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|neighbor| build_ndmsg(neighbor, seq, local_pid))
+        .collect::<Vec<_>>();
+    messages.push(build_nlmsg_done(seq, local_pid));
+    messages
+}
+
+// ── 写操作解析与执行 ─────────────────────────────────────────────────────────
+
+fn handle_addr_change(msg_type: u16, payload: &[u8]) -> Result<(), i32> {
+    if payload.len() < 8 {
+        return Err(-i32::from(Errno::EINVAL));
+    }
+    let family = payload[0];
+    let prefix_len = payload[1];
+    let index = u32::from_ne_bytes(payload[4..8].try_into().unwrap());
+    let interface = net::InterfaceId(index);
+    let attrs = parse_attributes(&payload[8..]);
+    let address = attrs
+        .iter()
+        .find(|(kind, _)| *kind == IFA_LOCAL)
+        .or_else(|| attrs.iter().find(|(kind, _)| *kind == IFA_ADDRESS))
+        .map(|(_, data)| decode_address(family, data))
+        .transpose()?
+        .ok_or(-i32::from(Errno::EINVAL))?;
+    let request = if msg_type == RTM_NEWADDR {
+        NetlinkConfigRequest::AddAddress {
+            interface,
+            address,
+            prefix_len,
+        }
+    } else {
+        NetlinkConfigRequest::DelAddress {
+            interface,
+            address,
+            prefix_len,
+        }
+    };
+    dispatch_config(&request)
+}
+
+fn handle_route_change(msg_type: u16, payload: &[u8]) -> Result<(), i32> {
+    if payload.len() < 12 {
+        return Err(-i32::from(Errno::EINVAL));
+    }
+    let family = payload[0];
+    if family != AF_INET && family != AF_INET6 {
+        return Err(-i32::from(Errno::EAFNOSUPPORT));
+    }
+    let dst_len = payload[1];
+    let table = payload[4];
+    let attrs = parse_attributes(&payload[12..]);
+    let network = attrs
+        .iter()
+        .find(|(kind, _)| *kind == RTA_DST)
+        .map(|(_, data)| decode_address(family, data))
+        .transpose()?
+        .unwrap_or_else(|| match family {
+            AF_INET => net::IpAddr::V4(net::Ipv4Addr::UNSPECIFIED),
+            _ => net::IpAddr::V6(net::Ipv6Addr::UNSPECIFIED),
+        });
+    let gateway = attrs
+        .iter()
+        .find(|(kind, _)| *kind == RTA_GATEWAY)
+        .map(|(_, data)| decode_address(family, data))
+        .transpose()?;
+    let interface = attrs
+        .iter()
+        .find(|(kind, _)| *kind == RTA_OIF)
+        .map(|(_, data)| {
+            if data.len() < 4 {
+                return Err(-i32::from(Errno::EINVAL));
+            }
+            Ok(net::InterfaceId(u32::from_ne_bytes(data[..4].try_into().unwrap())))
+        })
+        .transpose()?
+        .unwrap_or(net::InterfaceId(0));
+    let metric = attrs
+        .iter()
+        .find(|(kind, _)| *kind == RTA_PRIORITY)
+        .map(|(_, data)| {
+            if data.len() < 4 {
+                return Err(-i32::from(Errno::EINVAL));
+            }
+            Ok(u32::from_ne_bytes(data[..4].try_into().unwrap()))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let table = attrs
+        .iter()
+        .find(|(kind, _)| *kind == RTA_TABLE)
+        .map(|(_, data)| {
+            if data.len() < 4 {
+                return Err(-i32::from(Errno::EINVAL));
+            }
+            Ok(u8::try_from(u32::from_ne_bytes(data[..4].try_into().unwrap()))
+                .map_err(|_| -i32::from(Errno::EINVAL))?)
+        })
+        .transpose()?
+        .unwrap_or(table);
+    let request = if msg_type == RTM_NEWROUTE {
+        NetlinkConfigRequest::AddRoute {
+            table,
+            network,
+            prefix_len: dst_len,
+            gateway,
+            interface,
+            metric,
+        }
+    } else {
+        NetlinkConfigRequest::DelRoute {
+            table,
+            network,
+            prefix_len: dst_len,
+            gateway,
+            interface,
+        }
+    };
+    dispatch_config(&request)
+}
+
+fn handle_link_change(msg_type: u16, payload: &[u8]) -> Result<(), i32> {
+    if payload.len() < 16 {
+        return Err(-i32::from(Errno::EINVAL));
+    }
+    let index = i32::from_ne_bytes(payload[4..8].try_into().unwrap());
+    let flags = u32::from_ne_bytes(payload[8..12].try_into().unwrap());
+    let interface = net::InterfaceId(index as u32);
+    let attrs = parse_attributes(&payload[16..]);
+    if msg_type == RTM_SETLINK || msg_type == RTM_NEWLINK {
+        let running = flags & IFF_UP != 0;
+        dispatch_config(&NetlinkConfigRequest::SetLinkRunning { interface, running })?;
+    }
+    if let Some((_, data)) = attrs.iter().find(|(kind, _)| *kind == IFLA_MTU) {
+        if data.len() < 4 {
+            return Err(-i32::from(Errno::EINVAL));
+        }
+        let mtu = u32::from_ne_bytes(data[..4].try_into().unwrap());
+        if mtu == 0 {
+            return Err(-i32::from(Errno::EINVAL));
+        }
+        dispatch_config(&NetlinkConfigRequest::SetLinkMtu { interface, mtu })?;
+    }
+    Ok(())
+}
+
+fn dispatch_config(request: &NetlinkConfigRequest) -> Result<(), i32> {
+    let handler = NETLINK_CONFIG_HANDLER
+        .lock()
+        .ok_or(-i32::from(Errno::EOPNOTSUPP))?;
+    handler(request)
+}
+
+fn decode_address(family: u8, data: &[u8]) -> Result<net::IpAddr, i32> {
+    match family {
+        AF_INET => {
+            if data.len() < 4 {
+                return Err(-i32::from(Errno::EINVAL));
+            }
+            Ok(net::IpAddr::V4(net::Ipv4Addr(data[..4].try_into().unwrap())))
+        }
+        AF_INET6 => {
+            if data.len() < 16 {
+                return Err(-i32::from(Errno::EINVAL));
+            }
+            Ok(net::IpAddr::V6(net::Ipv6Addr(data[..16].try_into().unwrap())))
+        }
+        _ => Err(-i32::from(Errno::EAFNOSUPPORT)),
+    }
+}
+
+fn parse_attributes(mut bytes: &[u8]) -> Vec<(u16, &[u8])> {
+    let mut attributes = Vec::new();
+    while bytes.len() >= 4 {
+        let length = u16::from_ne_bytes(bytes[..2].try_into().unwrap()) as usize;
+        let kind = u16::from_ne_bytes(bytes[2..4].try_into().unwrap());
+        if length < 4 || length > bytes.len() {
+            break;
+        }
+        attributes.push((kind, &bytes[4..length]));
+        let aligned = (length + 3) & !3;
+        if aligned > bytes.len() {
+            break;
+        }
+        bytes = &bytes[aligned..];
+    }
+    attributes
+}
+
+// ── 响应构建 ─────────────────────────────────────────────────────────────────
 
 fn build_ifinfomsg(device: &net::device::NetDeviceSnapshot, seq: u32, pid: u32) -> Vec<u8> {
     let mut payload = Vec::with_capacity(96);
@@ -337,13 +839,6 @@ fn build_ifinfomsg(device: &net::device::NetDeviceSnapshot, seq: u32, pid: u32) 
     put_nlattr(&mut payload, IFLA_MTU, &device.mtu.to_ne_bytes());
     put_nlattr(&mut payload, IFLA_ADDRESS, &device.mac_address);
     wrap_nlmsg(RTM_NEWLINK, NLM_F_MULTI, seq, pid, &payload)
-}
-
-fn build_ifaddrmsg(entry: net::control::AddressEntry, seq: u32, pid: u32) -> Option<Vec<u8>> {
-    let device = net::device::snapshot_devices()
-        .into_iter()
-        .find(|device| device.id.raw() == entry.interface.0)?;
-    Some(build_ifaddrmsg_for_device(entry, &device, seq, pid))
 }
 
 fn build_ifaddrmsg_for_device(
@@ -372,6 +867,56 @@ fn build_ifaddrmsg_for_device(
     label.push(0);
     put_nlattr(&mut payload, IFA_LABEL, &label);
     wrap_nlmsg(RTM_NEWADDR, NLM_F_MULTI, seq, pid, &payload)
+}
+
+fn build_rtmsg(route: net::control::RouteEntry, seq: u32, pid: u32) -> Vec<u8> {
+    let (family, address): (u8, &[u8]) = match &route.network {
+        net::IpAddr::V4(address) => (AF_INET, &address.0),
+        net::IpAddr::V6(address) => (AF_INET6, &address.0),
+    };
+    let mut payload = Vec::with_capacity(96);
+    payload.push(family);
+    payload.push(route.prefix_len);
+    payload.push(0); // src_len
+    payload.push(0); // tos
+    payload.push(route.table);
+    payload.push(RTPROT_BOOT);
+    payload.push(if route.gateway.is_some() || route.prefix_len == 0 {
+        RT_SCOPE_UNIVERSE
+    } else {
+        RT_SCOPE_LINK
+    });
+    payload.push(RTN_UNICAST);
+    payload.extend_from_slice(&0u32.to_ne_bytes()); // flags
+    put_nlattr(&mut payload, RTA_DST, address);
+    if let Some(gateway) = route.gateway {
+        let bytes: &[u8] = match &gateway {
+            net::IpAddr::V4(address) => &address.0,
+            net::IpAddr::V6(address) => &address.0,
+        };
+        put_nlattr(&mut payload, RTA_GATEWAY, bytes);
+    }
+    put_nlattr(&mut payload, RTA_OIF, &route.interface.0.to_ne_bytes());
+    put_nlattr(&mut payload, RTA_PRIORITY, &route.metric.to_ne_bytes());
+    wrap_nlmsg(RTM_NEWROUTE, NLM_F_MULTI, seq, pid, &payload)
+}
+
+fn build_ndmsg(neighbor: NeighborSnapshot, seq: u32, pid: u32) -> Vec<u8> {
+    let (family, address): (u8, &[u8]) = match &neighbor.address {
+        net::IpAddr::V4(address) => (AF_INET, &address.0),
+        net::IpAddr::V6(address) => (AF_INET6, &address.0),
+    };
+    let mut payload = Vec::with_capacity(64);
+    payload.push(family);
+    payload.push(0);
+    payload.extend_from_slice(&0u16.to_ne_bytes());
+    payload.extend_from_slice(&(neighbor.interface.0 as i32).to_ne_bytes());
+    payload.extend_from_slice(&neighbor.nud_state.to_ne_bytes());
+    payload.push(0); // flags
+    payload.push(0); // type
+    put_nlattr(&mut payload, NDA_DST, address);
+    put_nlattr(&mut payload, NDA_LLADDR, &neighbor.mac);
+    wrap_nlmsg(RTM_NEWNEIGH, NLM_F_MULTI, seq, pid, &payload)
 }
 
 fn put_nlattr(out: &mut Vec<u8>, attr_type: u16, data: &[u8]) {
@@ -411,6 +956,99 @@ fn build_nlmsg_error(seq: u32, local_pid: u32, error: i32) -> Vec<u8> {
     wrap_nlmsg(NLMSG_ERROR, 0, seq, local_pid, &payload)
 }
 
+// ── netlink sockopt ──────────────────────────────────────────────────────────
+
+pub fn netlink_getsockopt(
+    ops: &NetlinkSocketFileOps,
+    level: i32,
+    optname: i32,
+) -> Result<Vec<u8>, Errno> {
+    match level {
+        crate::socket::SOL_SOCKET => match optname {
+            crate::socket::SO_DOMAIN => Ok(16i32.to_ne_bytes().to_vec()),
+            crate::socket::SO_TYPE => Ok((crate::socket::SOCK_RAW as i32).to_ne_bytes().to_vec()),
+            crate::socket::SO_PROTOCOL => Ok(0i32.to_ne_bytes().to_vec()),
+            crate::socket::SO_SNDBUF => Ok(212992i32.to_ne_bytes().to_vec()),
+            crate::socket::SO_RCVBUF => Ok((ops.rx_limit.load(Ordering::Relaxed) as i32)
+                .to_ne_bytes()
+                .to_vec()),
+            crate::socket::SO_ERROR => Ok(0i32.to_ne_bytes().to_vec()),
+            crate::socket::SO_PASSCRED => {
+                Ok((i32::from(ops.passcred.load(Ordering::Acquire))).to_ne_bytes().to_vec())
+            }
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        SOL_NETLINK => match optname {
+            NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP => {
+                Ok(ops.groups.load(Ordering::Acquire).to_ne_bytes().to_vec())
+            }
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        _ => Err(Errno::ENOPROTOOPT),
+    }
+}
+
+pub fn netlink_setsockopt(
+    ops: &NetlinkSocketFileOps,
+    level: i32,
+    optname: i32,
+    value: &[u8],
+) -> Result<(), Errno> {
+    match level {
+        crate::socket::SOL_SOCKET => match optname {
+            crate::socket::SO_SNDBUF => {
+                if value.len() < 4 {
+                    return Err(Errno::EINVAL);
+                }
+                // netlink 发送无内核侧缓冲队列，接受请求值作为语义确认。
+                let _ = i32::from_ne_bytes(value[..4].try_into().unwrap());
+                Ok(())
+            }
+            crate::socket::SO_RCVBUF => {
+                if value.len() < 4 {
+                    return Err(Errno::EINVAL);
+                }
+                let requested = i32::from_ne_bytes(value[..4].try_into().unwrap()).max(0) as u32;
+                // Linux 语义：内核将请求值加倍后作为实际缓冲。
+                let doubled = requested.saturating_mul(2).max(4096);
+                ops.rx_limit.store(doubled, Ordering::Relaxed);
+                Ok(())
+            }
+            crate::socket::SO_PASSCRED => {
+                if value.len() < 4 {
+                    return Err(Errno::EINVAL);
+                }
+                let enabled = i32::from_ne_bytes(value[..4].try_into().unwrap()) != 0;
+                ops.passcred.store(enabled, Ordering::Release);
+                Ok(())
+            }
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        SOL_NETLINK => match optname {
+            NETLINK_ADD_MEMBERSHIP => {
+                if value.len() < 4 {
+                    return Err(Errno::EINVAL);
+                }
+                let group = u32::from_ne_bytes(value[..4].try_into().unwrap());
+                let current = ops.groups.load(Ordering::Acquire);
+                ops.groups.store(current | group, Ordering::Release);
+                Ok(())
+            }
+            NETLINK_DROP_MEMBERSHIP => {
+                if value.len() < 4 {
+                    return Err(Errno::EINVAL);
+                }
+                let group = u32::from_ne_bytes(value[..4].try_into().unwrap());
+                let current = ops.groups.load(Ordering::Acquire);
+                ops.groups.store(current & !group, Ordering::Release);
+                Ok(())
+            }
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        _ => Err(Errno::ENOPROTOOPT),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,9 +1065,11 @@ mod tests {
         }
     }
 
-    fn attributes(message: &[u8]) -> Vec<(u16, &[u8])> {
+    /// 解析 nlmsg 载荷中的属性。header_len 为 rtnetlink 消息头长度
+    /// （ifaddrmsg=8，rtmsg/ndmsg=12）。
+    fn attributes_from(message: &[u8], header_len: usize) -> Vec<(u16, &[u8])> {
         let mut attributes = Vec::new();
-        let mut offset = 16 + 8;
+        let mut offset = 16 + header_len;
         while offset + 4 <= message.len() {
             let length =
                 u16::from_ne_bytes(message[offset..offset + 2].try_into().unwrap()) as usize;
@@ -474,7 +1114,7 @@ mod tests {
         assert_eq!(&message[16..20], &[AF_INET, 8, 0, RT_SCOPE_HOST]);
         assert_eq!(u32::from_ne_bytes(message[20..24].try_into().unwrap()), 7);
 
-        let attributes = attributes(&message);
+        let attributes = attributes_from(&message, 8);
         assert!(attributes.contains(&(IFA_ADDRESS, &[127, 0, 0, 1][..])));
         assert!(attributes.contains(&(IFA_LOCAL, &[127, 0, 0, 1][..])));
         assert!(attributes.contains(&(IFA_LABEL, b"lo\0")));
@@ -496,9 +1136,197 @@ mod tests {
             &[AF_INET6, 64, IFA_F_SECONDARY, RT_SCOPE_UNIVERSE]
         );
         assert_eq!(u32::from_ne_bytes(message[20..24].try_into().unwrap()), 2);
-        let attributes = attributes(&message);
+        let attributes = attributes_from(&message, 8);
         assert!(attributes.contains(&(IFA_ADDRESS, &address[..])));
         assert!(attributes.contains(&(IFA_LOCAL, &address[..])));
         assert!(attributes.contains(&(IFA_LABEL, b"eth0\0")));
+    }
+
+    #[test]
+    fn parse_attributes_handles_padding() {
+        let mut payload = Vec::new();
+        put_nlattr(&mut payload, RTA_DST, &[10, 0, 2, 0]);
+        put_nlattr(&mut payload, RTA_GATEWAY, &[10, 0, 2, 2]);
+        let attrs = parse_attributes(&payload);
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0], (RTA_DST, &[10, 0, 2, 0][..]));
+        assert_eq!(attrs[1], (RTA_GATEWAY, &[10, 0, 2, 2][..]));
+    }
+
+    #[test]
+    fn route_request_decodes_and_returns_eopnotsupp_without_handler() {
+        let mut payload = Vec::new();
+        payload.push(AF_INET);
+        payload.push(0); // dst_len
+        payload.push(0); // src_len
+        payload.push(0); // tos
+        payload.push(254); // table = main
+        payload.push(0); // protocol
+        payload.push(0); // scope
+        payload.push(1); // type = unicast
+        payload.extend_from_slice(&0u32.to_ne_bytes()); // flags
+        put_nlattr(&mut payload, RTA_DST, &[0, 0, 0, 0]);
+        put_nlattr(&mut payload, RTA_GATEWAY, &[10, 0, 2, 2]);
+        put_nlattr(&mut payload, RTA_OIF, &1u32.to_ne_bytes());
+        put_nlattr(&mut payload, RTA_PRIORITY, &100u32.to_ne_bytes());
+
+        let responses = dispatch_message(RTM_NEWROUTE, NLM_F_REQUEST, 7, 3, &payload);
+        assert_eq!(responses.len(), 1);
+        let error = i32::from_ne_bytes(responses[0][16..20].try_into().unwrap());
+        assert_eq!(error, -i32::from(Errno::EOPNOTSUPP));
+    }
+
+    #[test]
+    fn addr_request_decodes_family_and_index() {
+        let mut payload = Vec::new();
+        payload.push(AF_INET);
+        payload.push(24);
+        payload.push(0); // flags
+        payload.push(0); // scope
+        payload.extend_from_slice(&2u32.to_ne_bytes()); // ifindex
+        put_nlattr(&mut payload, IFA_LOCAL, &[10, 0, 2, 100]);
+
+        let responses = dispatch_message(RTM_NEWADDR, NLM_F_REQUEST, 9, 5, &payload);
+        assert_eq!(responses.len(), 1);
+        let error = i32::from_ne_bytes(responses[0][16..20].try_into().unwrap());
+        assert_eq!(error, -i32::from(Errno::EOPNOTSUPP));
+    }
+
+    #[test]
+    fn link_change_decodes_up_flag_and_mtu() {
+        let mut payload = Vec::new();
+        payload.push(AF_UNSPEC);
+        payload.push(0);
+        payload.extend_from_slice(&1u16.to_ne_bytes());
+        payload.extend_from_slice(&2i32.to_ne_bytes()); // ifindex
+        payload.extend_from_slice(&(IFF_UP as u32).to_ne_bytes());
+        payload.extend_from_slice(&u32::MAX.to_ne_bytes());
+        put_nlattr(&mut payload, IFLA_MTU, &1400u32.to_ne_bytes());
+
+        let responses = dispatch_message(RTM_SETLINK, NLM_F_REQUEST, 3, 3, &payload);
+        assert_eq!(responses.len(), 1);
+        let error = i32::from_ne_bytes(responses[0][16..20].try_into().unwrap());
+        assert_eq!(error, -i32::from(Errno::EOPNOTSUPP));
+    }
+
+    #[test]
+    fn get_route_without_provider_returns_done_only() {
+        let responses = dispatch_message(RTM_GETROUTE, NLM_F_REQUEST, 1, 1, &[]);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            u16::from_ne_bytes(responses[0][4..6].try_into().unwrap()),
+            NLMSG_DONE
+        );
+    }
+
+    #[test]
+    fn rtmsg_contains_dst_gateway_and_oif() {
+        let route = net::control::RouteEntry {
+            table: 254,
+            network: net::IpAddr::V4(net::Ipv4Addr::UNSPECIFIED),
+            prefix_len: 0,
+            gateway: Some(net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 2))),
+            interface: net::InterfaceId(2),
+            metric: 100,
+            mtu: Some(1500),
+        };
+        let message = build_rtmsg(route, 11, 22);
+        assert_eq!(message[16], AF_INET);
+        assert_eq!(message[17], 0); // dst_len
+        assert_eq!(message[20], 254); // table
+        let attrs = attributes_from(&message, 12);
+        assert!(attrs.contains(&(RTA_DST, &[0, 0, 0, 0][..])));
+        assert!(attrs.contains(&(RTA_GATEWAY, &[10, 0, 2, 2][..])));
+        assert!(attrs.contains(&(RTA_OIF, &2u32.to_ne_bytes()[..])));
+        assert!(attrs.contains(&(RTA_PRIORITY, &100u32.to_ne_bytes()[..])));
+    }
+
+    #[test]
+    fn ndmsg_contains_lladdr() {
+        let neighbor = NeighborSnapshot {
+            interface: net::InterfaceId(2),
+            address: net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 2)),
+            mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56],
+            nud_state: NUD_REACHABLE,
+        };
+        let message = build_ndmsg(neighbor, 5, 6);
+        assert_eq!(message[16], AF_INET);
+        let attrs = attributes_from(&message, 12);
+        assert!(attrs.contains(&(NDA_DST, &[10, 0, 2, 2][..])));
+        assert!(attrs.contains(&(NDA_LLADDR, &[0x52, 0x54, 0, 0x12, 0x34, 0x56][..])));
+    }
+
+    #[test]
+    fn rcvbuf_setsockopt_doubles_and_clamps() {
+        let ops = NetlinkSocketFileOps::new(0, false);
+        netlink_setsockopt(
+            &ops,
+            crate::socket::SOL_SOCKET,
+            crate::socket::SO_RCVBUF,
+            &4096i32.to_ne_bytes(),
+        )
+        .unwrap();
+        assert_eq!(ops.rx_limit.load(Ordering::Relaxed), 8192);
+        netlink_setsockopt(
+            &ops,
+            crate::socket::SOL_SOCKET,
+            crate::socket::SO_RCVBUF,
+            &0i32.to_ne_bytes(),
+        )
+        .unwrap();
+        assert_eq!(ops.rx_limit.load(Ordering::Relaxed), 4096);
+    }
+
+    #[test]
+    fn membership_setsockopt_toggles_groups() {
+        let ops = NetlinkSocketFileOps::new(0, false);
+        netlink_setsockopt(
+            &ops,
+            SOL_NETLINK,
+            NETLINK_ADD_MEMBERSHIP,
+            &RTMGRP_LINK.to_ne_bytes(),
+        )
+        .unwrap();
+        assert_eq!(ops.groups.load(Ordering::Acquire), RTMGRP_LINK);
+        netlink_setsockopt(
+            &ops,
+            SOL_NETLINK,
+            NETLINK_ADD_MEMBERSHIP,
+            &RTMGRP_IPV4_ROUTE.to_ne_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            ops.groups.load(Ordering::Acquire),
+            RTMGRP_LINK | RTMGRP_IPV4_ROUTE
+        );
+        netlink_setsockopt(
+            &ops,
+            SOL_NETLINK,
+            NETLINK_DROP_MEMBERSHIP,
+            &RTMGRP_LINK.to_ne_bytes(),
+        )
+        .unwrap();
+        assert_eq!(ops.groups.load(Ordering::Acquire), RTMGRP_IPV4_ROUTE);
+    }
+
+    #[test]
+    fn broadcast_delivers_only_to_subscribed_sockets() {
+        let subscribed = create_netlink_socket(0, false);
+        netlink_setsockopt(
+            &subscribed,
+            SOL_NETLINK,
+            NETLINK_ADD_MEMBERSHIP,
+            &RTMGRP_IPV4_ROUTE.to_ne_bytes(),
+        )
+        .unwrap();
+        let unsubscribed = create_netlink_socket(0, false);
+
+        netlink_event_broadcast(RTM_NEWROUTE, vec![1, 2, 3, 4]);
+        assert_eq!(subscribed.rx_buf.lock().len(), 1);
+        assert_eq!(unsubscribed.rx_buf.lock().len(), 0);
+
+        // 不匹配的组播类型不投递
+        netlink_event_broadcast(RTM_NEWLINK, vec![5, 6, 7, 8]);
+        assert_eq!(subscribed.rx_buf.lock().len(), 1);
     }
 }

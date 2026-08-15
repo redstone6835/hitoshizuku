@@ -514,7 +514,7 @@ fn new_net_socket_file(ops: NetSocketFileOps, cred: Arc<Credentials>, nonblock: 
 }
 
 fn new_netlink_socket_file(
-    ops: crate::netlink_socket::NetlinkSocketFileOps,
+    ops: Box<crate::netlink_socket::NetlinkSocketFileOps>,
     cred: Arc<Credentials>,
     nonblock: bool,
 ) -> Arc<File> {
@@ -528,7 +528,7 @@ fn new_netlink_socket_file(
         inode,
         flags,
         cred,
-        Box::new(ops),
+        ops,
         dentry,
         Arc::clone(&mount),
     );
@@ -1155,11 +1155,8 @@ pub fn getsockopt(fdt: &FdTable, fd: Fd, level: i32, optname: i32) -> Result<Vec
     let file = file_from_fd(fdt, fd)?;
 
     // AF_NETLINK socket
-    if file
-        .downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>()
-        .is_some()
-    {
-        return netlink_getsockopt(level, optname);
+    if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
+        return crate::netlink_socket::netlink_getsockopt(nl_ops, level, optname);
     }
     // AF_INET/AF_INET6 socket
     if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
@@ -1218,11 +1215,8 @@ pub fn setsockopt(
 ) -> Result<(), Errno> {
     let file = file_from_fd(fdt, fd)?;
 
-    if file
-        .downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>()
-        .is_some()
-    {
-        return netlink_setsockopt(level, optname, value);
+    if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
+        return crate::netlink_socket::netlink_setsockopt(nl_ops, level, optname, value);
     }
     if file.downcast_ops::<NetSocketFileOps>().is_some() {
         let net_ops = file.downcast_ops::<NetSocketFileOps>().unwrap();
@@ -2004,43 +1998,7 @@ fn inet_setsockopt(
     }
 }
 
-// ── AF_NETLINK sockopt ──────────────────────────────────────────────────────
-
-const SOL_NETLINK: i32 = 270;
-const NETLINK_ADD_MEMBERSHIP: i32 = 1;
-const NETLINK_DROP_MEMBERSHIP: i32 = 2;
-
-fn netlink_getsockopt(level: i32, optname: i32) -> Result<Vec<u8>, Errno> {
-    match level {
-        SOL_SOCKET => match optname {
-            SO_DOMAIN => Ok(16i32.to_ne_bytes().to_vec()), // AF_NETLINK
-            SO_TYPE => Ok((SOCK_RAW as i32).to_ne_bytes().to_vec()),
-            SO_PROTOCOL => Ok(0i32.to_ne_bytes().to_vec()),
-            SO_SNDBUF | SO_RCVBUF => Ok(212992i32.to_ne_bytes().to_vec()),
-            SO_ERROR => Ok(0i32.to_ne_bytes().to_vec()),
-            _ => Err(Errno::ENOPROTOOPT),
-        },
-        SOL_NETLINK => match optname {
-            NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP => Ok(0i32.to_ne_bytes().to_vec()),
-            _ => Err(Errno::ENOPROTOOPT),
-        },
-        _ => Err(Errno::ENOPROTOOPT),
-    }
-}
-
-fn netlink_setsockopt(level: i32, optname: i32, _value: &[u8]) -> Result<(), Errno> {
-    match level {
-        SOL_SOCKET => match optname {
-            SO_SNDBUF | SO_RCVBUF | SO_PASSCRED => Ok(()), // TODO: netlink SO_SNDBUF/SO_RCVBUF 应调整内核缓冲区大小；SO_PASSCRED 应开启凭证传递
-            _ => Err(Errno::ENOPROTOOPT),
-        },
-        SOL_NETLINK => match optname {
-            NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP => Ok(()), // TODO: 实现 netlink 组播组加入/退出，影响接收哪些广播消息
-            _ => Err(Errno::ENOPROTOOPT),
-        },
-        _ => Err(Errno::ENOPROTOOPT),
-    }
-}
+// ── AF_NETLINK sockopt 已移至 netlink_socket.rs（真实实现）───────────────
 
 pub fn validate_send_flags(flags: usize) -> Result<(), Errno> {
     let allowed =
