@@ -7,8 +7,8 @@ use ktest::ktest;
 use super::test_thread_metadata::make_task;
 use crate::ArchDeadlineTimerOps;
 use crate::scheduler::{
-    cancel_sleep_deadline, earliest_deadline_for_test, register_sleep_deadline,
-    register_sleep_deadline_for_test, reprogram_current_deadline,
+    cached_state_deadline_call_count_for_test, cancel_sleep_deadline, earliest_deadline_for_test,
+    register_sleep_deadline, register_sleep_deadline_for_test, reprogram_current_deadline,
     reset_timer_event_scan_counts_for_test, service_expired_timer_events_for_test,
     set_realtime_itimer, take_expired_sleepers_for_test, timer_event_scan_counts_for_test,
     timer_fired_for_test,
@@ -138,4 +138,13 @@ fn future_deadline_skips_event_table_scans_until_expiry() {
     assert_eq!(timer_event_scan_counts_for_test(), (0, 0));
 
     let _ = set_realtime_itimer(&sleeper, 0, 0);
+}
+
+#[ktest]
+fn timer_tick_without_deadline_skips_cached_deadline_lookup() {
+    let _test_guard = DEADLINE_TEST_LOCK.lock();
+    reset_timer_event_scan_counts_for_test();
+
+    assert!(!service_expired_timer_events_for_test(100, 0));
+    assert_eq!(cached_state_deadline_call_count_for_test(), 0);
 }

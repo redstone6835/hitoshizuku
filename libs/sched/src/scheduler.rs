@@ -140,6 +140,8 @@ static TIMED_SLEEPERS: Spinlock<Vec<TimedSleeper>> = Spinlock::new(Vec::new());
 static HAS_TIMED_SLEEPERS: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static SLEEPER_EVENT_SCAN_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static CACHED_STATE_DEADLINE_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// 由调度定时器在指定 deadline 到期后定向通知的对象。
 pub trait DeadlineObserver: Send + Sync {
@@ -2305,6 +2307,8 @@ fn earliest_state_deadline_uncached(cpu_id: usize) -> Option<u64> {
 }
 
 fn cached_state_deadline(cpu_id: usize) -> Option<u64> {
+    #[cfg(test)]
+    CACHED_STATE_DEADLINE_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
     loop {
         let generation = DEADLINE_STATE_GENERATION.load(Ordering::Acquire);
         if DEADLINE_CACHE_GENERATION[cpu_id].load(Ordering::Acquire) == generation {
@@ -3446,8 +3450,15 @@ fn on_timer_tick_inner(now_ns: u64) -> bool {
 
 fn service_expired_timer_events(now_ns: u64, cpu_id: usize) -> bool {
     fire_expired_deadline_observers(now_ns);
-    let state_deadline_due = cached_state_deadline(cpu_id.min(NR_CPUS - 1))
-        .is_some_and(|deadline_ns| deadline_ns <= now_ns);
+    // 没有软件睡眠任务或实时计时器时，不必进入缓存截止时间路径。
+    let state_deadline_due = if HAS_TIMED_SLEEPERS.load(Ordering::Acquire)
+        || HAS_REALTIME_ITIMERS.load(Ordering::Acquire)
+    {
+        cached_state_deadline(cpu_id.min(NR_CPUS - 1))
+            .is_some_and(|deadline_ns| deadline_ns <= now_ns)
+    } else {
+        false
+    };
     let (deadline_fired, realtime_fired) = if state_deadline_due {
         (
             wake_expired_sleepers(now_ns, cpu_id),
@@ -3475,6 +3486,7 @@ pub(crate) fn service_expired_timer_events_for_test(now_ns: u64, cpu_id: usize) 
 pub(crate) fn reset_timer_event_scan_counts_for_test() {
     SLEEPER_EVENT_SCAN_COUNT.store(0, Ordering::Release);
     REALTIME_EVENT_SCAN_COUNT.store(0, Ordering::Release);
+    CACHED_STATE_DEADLINE_CALL_COUNT.store(0, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -3483,6 +3495,11 @@ pub(crate) fn timer_event_scan_counts_for_test() -> (usize, usize) {
         SLEEPER_EVENT_SCAN_COUNT.load(Ordering::Acquire),
         REALTIME_EVENT_SCAN_COUNT.load(Ordering::Acquire),
     )
+}
+
+#[cfg(test)]
+pub(crate) fn cached_state_deadline_call_count_for_test() -> usize {
+    CACHED_STATE_DEADLINE_CALL_COUNT.load(Ordering::Acquire)
 }
 
 /// 周期性负载均衡的最小间隔。
