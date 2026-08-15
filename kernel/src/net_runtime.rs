@@ -2261,6 +2261,107 @@ const SIOCGIFMTU: u32 = 0x8921;
 const SIOCSIFMTU: u32 = 0x8922;
 const SIOCGIFHWADDR: u32 = 0x8927;
 const SIOCGIFINDEX: u32 = 0x8933;
+const SIOCADDRT: u32 = 0x890b;
+const SIOCDELRT: u32 = 0x890c;
+
+// struct rtentry 的 64 位布局（musl/Linux 一致，112 字节）：
+// rt_pad1(8) rt_dst(16) rt_gateway(16) rt_genmask(16) rt_flags(2) rt_pad2(2)
+// rt_pad3(8) rt_tos(1) rt_class(1) rt_pad4(6) rt_metric(2) pad(2) rt_dev(8)
+// rt_mtu(8) rt_window(8) rt_irtt(2) pad(6)
+const RTENTRY_LEN: usize = 112;
+const RTF_UP: u16 = 0x0001;
+const RTF_GATEWAY: u16 = 0x0002;
+const RTF_HOST: u16 = 0x0004;
+
+/// 从 rtentry 的 sockaddr 字段解析 IPv4 地址（family 校验；AF_UNSPEC=0.0.0.0）。
+fn rtentry_sockaddr_ipv4(rt: &[u8; RTENTRY_LEN], offset: usize) -> Result<Ipv4Addr, Errno> {
+    let family = u16::from_ne_bytes(rt[offset..offset + 2].try_into().unwrap());
+    if family == 0 {
+        // AF_UNSPEC：默认路由（0.0.0.0）。
+        return Ok(Ipv4Addr::UNSPECIFIED);
+    }
+    if family != AF_INET {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    Ok(Ipv4Addr(rt[offset + 2..offset + 6].try_into().unwrap()))
+}
+
+fn ipv4_mask_prefix_len(mask: Ipv4Addr) -> Option<u8> {
+    let value = mask.as_u32();
+    let prefix = value.leading_ones() as u8;
+    let expected = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    (value == expected).then_some(prefix)
+}
+
+/// SIOCADDRT / SIOCDELRT：经典 route(8) 接口（仅 IPv4，与 Linux rtentry 语义一致）。
+fn ioctl_route_entry(cmd: u32, arg: usize) -> Result<usize, Errno> {
+    let mut rt = [0u8; RTENTRY_LEN];
+    copy_from_user(arg, &mut rt).map_err(|error| error.as_errno())?;
+    let dst = rtentry_sockaddr_ipv4(&rt, 8)?;
+    let gateway = rtentry_sockaddr_ipv4(&rt, 24)?;
+    let genmask = rtentry_sockaddr_ipv4(&rt, 40)?;
+    let flags = u16::from_ne_bytes(rt[56..58].try_into().unwrap());
+    let metric = i16::from_ne_bytes(rt[76..78].try_into().unwrap());
+    let dev_ptr = usize::from_ne_bytes(rt[80..88].try_into().unwrap());
+    // 接口名（rt_dev 是用户空间指针，读 IFNAMSIZ 字节并截断到 NUL）。
+    let interface = if dev_ptr == 0 {
+        // Linux 允许 rt_dev 为空并按路由推断；busybox route 总是提供，
+        // 这里要求显式 dev 以避免歧义。
+        return Err(Errno::EINVAL);
+    } else {
+        let mut name = [0u8; IFNAMSIZ];
+        copy_from_user(dev_ptr, &mut name).map_err(|error| error.as_errno())?;
+        let end = name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(IFNAMSIZ);
+        if end == 0 {
+            return Err(Errno::EINVAL);
+        }
+        net::interface_by_name(&name[..end]).map_err(|_| Errno::ENODEV)?
+    };
+    let prefix_len = ipv4_mask_prefix_len(genmask).ok_or(Errno::EINVAL)?;
+    let gateway = (flags & RTF_GATEWAY != 0)
+        .then_some(IpAddr::V4(gateway));
+    if cmd == SIOCADDRT {
+        // 重复路由 → EEXIST（Linux rtnetlink/ioctl 语义）。
+        let store = CONFIG_STORE
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or(Errno::ENODEV)?;
+        let current = store.snapshot();
+        let duplicate = current.routes.entries().iter().any(|route| {
+            route.table == 0
+                && route.network == IpAddr::V4(dst)
+                && route.prefix_len == prefix_len
+                && route.gateway == gateway
+                && route.interface == interface
+        });
+        if duplicate {
+            return Err(Errno::EEXIST);
+        }
+        let request = vfs::netlink_socket::NetlinkConfigRequest::AddRoute {
+            table: 0,
+            network: IpAddr::V4(dst),
+            prefix_len,
+            gateway,
+            interface,
+            metric: metric.max(0) as u32,
+        };
+        netlink_config_update(&request).map_err(|code| Errno::from_i32(-code))?;
+    } else {
+        let request = vfs::netlink_socket::NetlinkConfigRequest::DelRoute {
+            table: 0,
+            network: IpAddr::V4(dst),
+            prefix_len,
+            gateway,
+            interface,
+        };
+        netlink_config_update(&request).map_err(|code| Errno::from_i32(-code))?;
+    }
+    Ok(0)
+}
 
 #[derive(Clone, Copy)]
 enum InterfaceConfigUpdate {
@@ -2276,6 +2377,9 @@ fn net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
     }
     if cmd == SIOCGIFCONF {
         return ioctl_get_interface_config(arg);
+    }
+    if cmd == SIOCADDRT || cmd == SIOCDELRT {
+        return ioctl_route_entry(cmd, arg);
     }
     let mut ifreq = [0u8; IFREQ_LEN];
     copy_from_user(arg, &mut ifreq).map_err(|error| error.as_errno())?;
