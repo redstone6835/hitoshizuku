@@ -68,6 +68,12 @@ if [ -x /bin/mount-test ]; then
     status=$?
     echo "[init][fs-tests] mount tests exit=$status"
 fi
+if [ -x /bin/mount-api-test ]; then
+    echo "[init][fs-tests] running mount-api tests"
+    /bin/mount-api-test
+    status=$?
+    echo "[init][fs-tests] mount-api tests exit=$status"
+fi
 if [ -x /bin/loongarch-sxe-test ]; then
     echo "[init][lazy-sxe-tests] running LoongArch FP/LSX state tests"
     /bin/loongarch-sxe-test

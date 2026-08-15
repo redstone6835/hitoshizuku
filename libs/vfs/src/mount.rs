@@ -542,6 +542,14 @@ impl MountNamespace {
         Ok(new_mount)
     }
 
+    /// 把已构造的 Mount 挂到 `parent` 下（fs_context/open_tree 落位用），
+    /// 并触发挂载事件传播。
+    pub fn attach_mount(&self, mount: Arc<Mount>, parent: &Arc<Mount>) {
+        parent.add_child(Arc::clone(&mount));
+        self.data.lock().add(&mount);
+        self.propagate_mount_event(parent, &mount);
+    }
+
     /// bind 挂载：把 `superblock` 的 `mount_root` 子树挂到 `mountpoint`
     /// （`mount --bind`；源与目标共享同一文件系统实例）。
     ///
@@ -739,7 +747,6 @@ impl MountNamespace {
         if !force && !mount.children.lock().is_empty() {
             return Err(VfsError::DeviceBusy);
         }
-
         if force {
             let mut to_remove: Vec<Arc<Mount>> = Vec::new();
             let mut queue: alloc::collections::VecDeque<Arc<Mount>> =

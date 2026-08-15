@@ -22,6 +22,7 @@ pub mod fanotify;
 pub mod fdtable;
 pub mod file;
 pub mod flock;
+pub mod fs_context;
 pub mod fsnotify;
 pub mod inode;
 pub mod inotify;

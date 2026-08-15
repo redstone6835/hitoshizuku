@@ -6,6 +6,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::{ControlFlow, Deref};
 
+use log::printk;
+
 use errno::Errno;
 use general::mm::{VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
@@ -3539,28 +3541,192 @@ pub(super) fn sys_io_uring_register(_ctx: &mut SyscallContext<'_>) -> Result<usi
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_open_tree(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// `fsopen(2)`：按文件系统类型创建 fs_context 并返回其 fd。
+pub(super) fn sys_fsopen(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fs_name = copy_cstr_from_user(ctx.args[0], 64).map_err(|e| e.as_errno())?;
+    let flags = ctx.args[1] as u32;
+    if flags & !vfs::fs_context::FSOPEN_CLOEXEC != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    if vfs::FS_REGISTRY.find(&fs_name).is_none() {
+        return Err(Errno::ENODEV);
+    }
+    let fsc = vfs::fs_context::FsContext::new(fs_name);
+    let fd = vfs::fs_context::create_fs_context_fd(
+        &fdt,
+        vfs_ctx.cred(),
+        fsc,
+        (flags & vfs::fs_context::FSOPEN_CLOEXEC) != 0,
+    )?;
+    Ok(fd.as_raw() as usize)
 }
 
-pub(super) fn sys_move_mount(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// `fsconfig(2)`：配置 fs_context（SET_FLAG / SET_STRING / CMD_CREATE）。
+pub(super) fn sys_fsconfig(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd = fd_arg(ctx.args[0])?;
+    let cmd = ctx.args[1] as u32;
+    let file = file_for_fd(fd)?;
+    let fsc = vfs::fs_context::FsContextFileOps::from_file(&file).ok_or(Errno::EBADF)?;
+    match cmd {
+        vfs::fs_context::FSCONFIG_SET_FLAG => {
+            let key = copy_cstr_from_user(ctx.args[2], 64).map_err(|e| e.as_errno())?;
+            fsc.set_flag(&key)?;
+        }
+        vfs::fs_context::FSCONFIG_SET_STRING => {
+            let key = copy_cstr_from_user(ctx.args[2], 64).map_err(|e| e.as_errno())?;
+            let value = copy_optional_cstr_from_user(ctx.args[3], 4096)?;
+            fsc.set_string(&key, &value)?;
+        }
+        vfs::fs_context::FSCONFIG_CMD_CREATE => {
+            fsc.create_superblock()?;
+        }
+        vfs::fs_context::FSCONFIG_CMD_RECONFIGURE => {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        _ => return Err(Errno::EINVAL),
+    }
+    Ok(0)
 }
 
-pub(super) fn sys_fsopen(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// `fsmount(2)`：校验 fs_context 已 CREATE，标记挂载就绪并返回挂载 fd。
+pub(super) fn sys_fsmount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd = fd_arg(ctx.args[0])?;
+    let flags = ctx.args[1] as u32;
+    let _mount_flags = ctx.args[2];
+    if flags & !vfs::fs_context::FSMOUNT_CLOEXEC != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let file = file_for_fd(fd)?;
+    let fsc = vfs::fs_context::FsContextFileOps::from_file(&file).ok_or(Errno::EBADF)?;
+    fsc.mark_mount_ready()?;
+    Ok(fd.as_raw() as usize)
 }
 
-pub(super) fn sys_fsconfig(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// `move_mount(2)`：MOVE_MOUNT_F_EMPTY_PATH 时把 fs_context 挂载落到目标
+/// 路径；否则把 from 路径上的挂载迁移到 to。
+pub(super) fn sys_move_mount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let from_fd = ctx.args[0];
+    let from_path_user = ctx.args[1];
+    let to_fd = ctx.args[2];
+    let to_path_user = ctx.args[3];
+    let flags = ctx.args[4] as u32;
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+
+    if flags & vfs::fs_context::MOVE_MOUNT_F_EMPTY_PATH != 0 {
+        // fromfd 是 fsmount 后的 fs_context fd（或 open_tree 克隆 fd）。
+        let file = file_for_fd(fd_arg(from_fd)?)?;
+        let fsc = vfs::fs_context::FsContextFileOps::from_file(&file).ok_or(Errno::EBADF)?;
+        if !fsc.is_mount_ready() && fsc.clone_root().is_none() {
+            return Err(Errno::EINVAL);
+        }
+        let to_path = copy_path_from_user(to_path_user)?;
+        let to_dirfd = dirfd_arg(to_fd, &fdt)?;
+        let target = vfs::path::lookup(
+            &vfs_ctx,
+            &to_dirfd,
+            &to_path,
+            LookupFlags::DIRECTORY.with(LookupFlags::NO_MOUNT_LAST),
+        )
+        .map_err(|e| e.to_errno())?;
+        vfs::fs_context::land_mount(
+            &vfs_ctx.mount_ns,
+            &fsc,
+            Arc::clone(&target.dentry),
+            &target.mount,
+        )
+        .map_err(|e| e.to_errno())?;
+        return Ok(0);
+    }
+
+    // 普通路径迁移（mount --move 语义）。
+    let from_path = copy_path_from_user(from_path_user)?;
+    let to_path = copy_path_from_user(to_path_user)?;
+    let from_dirfd = dirfd_arg(from_fd, &fdt)?;
+    let to_dirfd = dirfd_arg(to_fd, &fdt)?;
+    let src = vfs::path::lookup(
+        &vfs_ctx,
+        &from_dirfd,
+        &from_path,
+        LookupFlags::NO_MOUNT_LAST,
+    )
+    .map_err(|e| e.to_errno())?;
+    let m = vfs_ctx
+        .mount_ns
+        .lookup_mount(&src.dentry)
+        .ok_or(Errno::ENOENT)?;
+    let dst = vfs::path::lookup(
+        &vfs_ctx,
+        &to_dirfd,
+        &to_path,
+        LookupFlags::DIRECTORY.with(LookupFlags::NO_MOUNT_LAST),
+    )
+    .map_err(|e| e.to_errno())?;
+    vfs_ctx
+        .mount_ns
+        .move_mount_at(&m, Arc::clone(&dst.dentry), Arc::clone(&dst.mount))
+        .map_err(|e| e.to_errno())?;
+    Ok(0)
 }
 
-pub(super) fn sys_fsmount(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// `open_tree(2)`：OPEN_TREE_CLONE 时创建目标挂载的克隆上下文 fd
+/// （move_mount 可将其挂到新位置）。
+pub(super) fn sys_open_tree(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let dirfd = ctx.args[0];
+    let path_user = ctx.args[1];
+    let flags = ctx.args[2] as u32;
+    // asm-generic（LoongArch/RISC-V）O_CLOEXEC=0x80000；x86 为 0o200000。
+    const OPEN_TREE_CLOEXEC_ANY: u32 = 0o200000 | 0x80000;
+    if flags & !(vfs::fs_context::OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC_ANY) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let cloexec = (flags & (0o200000 | 0x80000)) != 0;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let path = copy_path_from_user(path_user)?;
+    let dirfd = dirfd_arg(dirfd, &fdt)?;
+    let result = vfs::path::lookup(&vfs_ctx, &dirfd, &path, LookupFlags::DIRECTORY)
+        .map_err(|e| e.to_errno())?;
+    // 目标路径所在挂载（若路径本身是挂载点则取覆盖其上的挂载）。
+    let m = match vfs_ctx.mount_ns.lookup_mount(&result.dentry) {
+        Some(m) => m,
+        None => Arc::clone(&result.mount),
+    };
+    let fsc = vfs::fs_context::FsContext::from_mount(&m);
+    let fd = vfs::fs_context::create_fs_context_fd(&fdt, vfs_ctx.cred(), fsc, cloexec)?;
+    Ok(fd.as_raw() as usize)
 }
 
-pub(super) fn sys_fspick(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// `fspick(2)`：从已挂载路径创建 fs_context（供重新配置）。
+pub(super) fn sys_fspick(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let dirfd = ctx.args[0];
+    let path_user = ctx.args[1];
+    let flags = ctx.args[2] as u32;
+    const FSPICK_CLOEXEC: u32 = 1;
+    const FSPICK_EMPTY_PATH: u32 = 8;
+    if flags & !(FSPICK_CLOEXEC | FSPICK_EMPTY_PATH) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let path = copy_path_from_user(path_user)?;
+    let dirfd = dirfd_arg(dirfd, &fdt)?;
+    let result = vfs::path::lookup(&vfs_ctx, &dirfd, &path, LookupFlags::DIRECTORY)
+        .map_err(|e| e.to_errno())?;
+    let m = match vfs_ctx.mount_ns.lookup_mount(&result.dentry) {
+        Some(m) => m,
+        None => Arc::clone(&result.mount),
+    };
+    let fsc = vfs::fs_context::FsContext::from_mount(&m);
+    let fd = vfs::fs_context::create_fs_context_fd(
+        &fdt,
+        vfs_ctx.cred(),
+        fsc,
+        (flags & FSPICK_CLOEXEC) != 0,
+    )?;
+    Ok(fd.as_raw() as usize)
 }
 
 pub(super) fn sys_openat2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
