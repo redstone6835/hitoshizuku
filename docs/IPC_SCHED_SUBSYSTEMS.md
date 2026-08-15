@@ -114,3 +114,40 @@
 - 用户/网络命名空间；keyring 的 DH/PKEY/WATCH_KEY；`NT_FPREGSET` 真
   浮点状态（架构未保存）；`USER_NOTIF` 的完整通知通道（RECV/SEND 待
   listener 集成）。
+
+## QEMU 冒烟验证（loongarch64）
+
+`scripts/tests/smoke_ipc_sched.c`（静态链接，注入 compat-initramfs 由
+`test.sh` 直接执行）：**85/85 通过**，覆盖 §3/§7 全部新功能：
+
+- SysV msg（含 MSG_COPY/qbytes 阻塞唤醒/NOERROR）、sem（GETPID/SEM_UNDO
+  回滚）、shm（SHM_LOCK/UNLOCK）、POSIX mq（优先级序/满队列
+  ETIMEDOUT）；
+- ptrace（TRACEME/SETOPTIONS/SYSCALL 持续模式/TRACESYSGOOD/GETREGSET/
+  PEEK/POKE/EVENT_EXIT）、prctl（NAME/DUMPABLE/THP/TSC/CAPBSET）、
+  seccomp（ERRNO 过滤）、unshare/setns（UTS/IPC/PID/TIME）、pid ns
+  getpid==1、adjtimex、keyring（add/request/read/describe/revoke/unlink）。
+
+修复要点（随验证发现）：
+
+- `PTRACE_SYSCALL` 是**持续模式**（entry+exit 都停，CONT 才退出模式）；
+- `PTRACE_EVENT_EXIT=6`（5 是 VFORK_DONE）；PEEK/POKE 的 arg4 直通值；
+- syscall 入口由 arch 保存 trap frame 快照供 GETREGSET/PEEKUSR；
+- `seccomp_data` 是 72 字节（8+4+4+8+6*8）；BPF 条件跳转 +jt/+jf；
+- `PR_SET_SECCOMP` 用 `SECCOMP_MODE_*`（1/2），`seccomp(2)` 用
+  `SECCOMP_SET_MODE_*`（0/1），两套语义分开换算；
+- `CLONE_NEWTIME=0x80`（0x0080_0000 是 NEWCGROUP 位）；
+- Task::new 启动期占位 pid ns；clone/fork/kthread 全部路径
+  `set_pid_ns`（CLONE_NEWPID 在 fork 时生效）；
+- ns proxy 切换 remove+install（通用 ext 同 key 重复挂载取首项）；
+- `mq_timedsend/receive` 的 timeout 是 CLOCK_REALTIME **绝对时间**；
+- keyring：`KEY_SPEC_PROCESS_KEYRING` 按需创建；permission 用
+  `KEY_POS_*` 位；`KEYCTL_LINK/UNLINK` 解析 KEY_SPEC_*；
+- adjtimex 返回时钟状态（TIME_OK/TIME_ERROR 等，非恒 0）；
+  `timex_state()` 不得在 `CLOCK_DISCIPLINE` 持锁期调用。
+
+本工具链 glibc 的 `mq_open/mq_unlink` 包装会剥掉 name 首字符 `/`、
+`ptrace` 包装对 PEEKDATA 返回值处理异常，冒烟测试对这两处使用
+raw syscall 直通内核语义。`NT_FPREGSET` 按计划返回全零集。
+
+RISC-V64 同样完成内核构建与 QEMU 启动验证（rcS 完整运行）。
