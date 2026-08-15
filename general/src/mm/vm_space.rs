@@ -69,6 +69,27 @@ struct FileFaultAroundWindow {
     file_offset: u64,
 }
 
+/// NUMA 内存策略（单节点语义）。
+///
+/// 目标架构当前只有 node 0，因此策略只记录"模式 + 节点掩码"，不参与页分配。
+/// 模式取值与 Linux `MPOL_*` 一致：DEFAULT=0、PREFERRED=1、BIND=2、
+/// INTERLEAVE=3、LOCAL=4。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mempolicy {
+    pub mode: u32,
+    /// 节点位图（本内核只有 node 0，合法掩码只能是 0 或 1）。
+    pub node_mask: u64,
+}
+
+/// 地址空间级内存策略状态：进程默认策略 + `mbind` 区域覆盖。
+///
+/// 区域表以 `(start, end)` 为键（`Range` 未实现 `Ord`，用元组代替）。
+#[derive(Default, Clone)]
+struct MempolicyState {
+    default_policy: Option<Mempolicy>,
+    ranges: BTreeMap<(usize, usize), Mempolicy>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PrivateFileBatchPlan {
     pages: usize,
@@ -2661,6 +2682,8 @@ pub struct VmSpace {
     ///
     /// 口径与 Linux `mm->locked_vm` 一致：带 `LOCKED` 标记的 VMA 几何页数。
     locked_pages: AtomicUsize,
+    /// NUMA 内存策略（单节点语义；`set_mempolicy`/`mbind` 状态）。
+    mempolicy: Spinlock<MempolicyState>,
     /// `membarrier(2)` expedited 命令的地址空间级注册位。
     membarrier_registration: AtomicUsize,
     /// 诊断辅助：记录当前已建立页表映射的用户页数。
@@ -2694,6 +2717,7 @@ impl VmSpace {
             mlock_future: AtomicBool::new(false),
             committed_pages: AtomicUsize::new(0),
             locked_pages: AtomicUsize::new(0),
+            mempolicy: Spinlock::new(MempolicyState::default()),
             membarrier_registration: AtomicUsize::new(0),
             mapped_pages: AtomicUsize::new(0),
             #[cfg(feature = "performance-profile")]
@@ -4147,6 +4171,214 @@ impl VmSpace {
         }
     }
 
+    /// `remap_file_pages(2)` 实现：把 `[addr, addr+size)` 内**已驻留**的页
+    /// 重新映射为文件内自 `pgoff*page_size` 起的内容。
+    ///
+    /// 与 Linux 语义一致：只有调用时已驻留的页被重映射；未驻留页不受影响，
+    /// 后续缺页仍按 VMA 线性偏移读取（Linux 文档化的历史行为）。
+    ///
+    /// 限制与取舍：`prot`/`flags` 必须为 0（调用方校验）；范围必须整体落在单个
+    /// file-backed VMA 内。重映射后的页不发布到共享页缓存——同一文件的其它
+    /// 映射仍看到旧内容（与 Linux 共享页语义有细微差异，见注释）。
+    pub fn remap_file_pages(&self, addr: usize, size: usize, pgoff: usize) -> Result<(), Errno> {
+        if size == 0 {
+            return Ok(());
+        }
+        let page_size = page_size();
+        if addr % page_size != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let len = align_up(size, page_size).ok_or(Errno::EINVAL)?;
+        let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+        let (file, flags) = {
+            let set = self.vmas.lock();
+            let area = set.find(addr).ok_or(Errno::EINVAL)?;
+            if end > area.range.end {
+                return Err(Errno::EINVAL);
+            }
+            let VmBacking::File { file, .. } = &area.backing else {
+                return Err(Errno::EINVAL);
+            };
+            (Arc::clone(file), area.flags)
+        };
+        let new_start_off = (pgoff as u64)
+            .checked_mul(page_size as u64)
+            .ok_or(Errno::EINVAL)?;
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EINVAL)?;
+        let file_size = file.size();
+        let mut va = addr;
+        while va < end {
+            let present = { self.pages.lock().get(va).is_some() };
+            if !present {
+                va += page_size;
+                continue;
+            }
+            let file_off = new_start_off
+                .checked_add((va - addr) as u64)
+                .ok_or(Errno::EINVAL)?;
+            // 锁外分配并读入新内容（I/O 不持 VM 锁）。
+            let new_paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(virt_fn(new_paddr) as *mut u8, page_size)
+            };
+            if file_off < file_size {
+                let read_len = usize::try_from(file_size - file_off)
+                    .unwrap_or(page_size)
+                    .min(page_size);
+                let mut done = 0usize;
+                while done < read_len {
+                    let n = file.read_at(file_off + done as u64, &mut buf[done..read_len])?;
+                    if n == 0 {
+                        break;
+                    }
+                    done += n;
+                }
+            }
+            // 锁内换页：页仍驻留才替换，否则丢弃新页。
+            let new_page = if flags.has(VmFlags::SHARED) {
+                ResidentPage::new_shared_file(new_paddr, Arc::clone(&file), file_off)
+            } else {
+                ResidentPage::new_private_file(new_paddr)
+            };
+            let mut pages = self.pages.lock();
+            let Some(mapping) = pages.get_mut(va) else {
+                drop(pages);
+                free_user_page(new_paddr);
+                va += page_size;
+                continue;
+            };
+            let access = mapping.access;
+            let paddr = new_page.paddr();
+            self.replace_page_no_flush(va, paddr, pte_flags_for(flags, access))?;
+            mapping.page = new_page;
+            drop(pages);
+            self.invalidate_user_range(va, page_size);
+            va += page_size;
+        }
+        Ok(())
+    }
+
+    /// 设置进程默认 NUMA 内存策略（`set_mempolicy(2)` 单节点语义）。
+    pub fn set_task_mempolicy(&self, policy: Option<Mempolicy>) {
+        self.mempolicy.lock().default_policy = policy;
+    }
+
+    /// 读取进程默认 NUMA 内存策略。
+    pub fn task_mempolicy(&self) -> Option<Mempolicy> {
+        self.mempolicy.lock().default_policy
+    }
+
+    /// `mbind(2)` 单节点语义：把区域策略写入策略表，替换被覆盖的旧区域。
+    /// 范围必须已被 VMA 连续覆盖（否则 `ENOMEM`）。
+    pub fn mbind_range(&self, range: Range<usize>, policy: Mempolicy) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        {
+            let set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(Errno::ENOMEM);
+            }
+        }
+        let mut state = self.mempolicy.lock();
+        state
+            .ranges
+            .retain(|(start, end), _| !(*start < range.end && range.start < *end));
+        state.ranges.insert((range.start, range.end), policy);
+        Ok(())
+    }
+
+    /// 查询 `addr` 生效的 NUMA 内存策略（`get_mempolicy(MPOL_F_ADDR)`）。
+    /// 返回 `(策略, 是否命中区域覆盖)`；未命中区域覆盖时返回默认策略。
+    pub fn mempolicy_at(&self, addr: usize) -> (Option<Mempolicy>, bool) {
+        let state = self.mempolicy.lock();
+        for ((start, end), policy) in &state.ranges {
+            if *start <= addr && addr < *end {
+                return (Some(*policy), true);
+            }
+        }
+        (state.default_policy, false)
+    }
+
+    /// 确保远程地址空间（其它进程的 `VmSpace`）的 `addr` 页可访问。
+    ///
+    /// `process_vm_readv/writev` 使用：缺页、COW 通过目标地址空间自己的
+    /// `handle_fault` 完成（所有页表操作都以 `self.pgd` 为句柄，不依赖当前
+    /// 任务的地址空间）。无法修复返回 `EFAULT`。
+    pub fn ensure_remote_page(&self, addr: usize, kind: FaultKind) -> Result<(), Errno> {
+        match self.handle_fault(addr, kind) {
+            FaultOutcome::Fixed => Ok(()),
+            FaultOutcome::Segv | FaultOutcome::OutOfMemory | FaultOutcome::Kernel(_) => {
+                Err(Errno::EFAULT)
+            }
+        }
+    }
+
+    /// 把远程地址空间 `[range.start, range.start+out.len())` 的驻留页内容拷入
+    /// `out`。要求范围内每页都已驻留（调用方先用 [`Self::ensure_remote_page`]
+    /// 逐页解析）；缺失页返回 `EFAULT`。起点允许落在页内。
+    pub fn copy_resident_bytes_out(
+        &self,
+        range: Range<usize>,
+        out: &mut [u8],
+    ) -> Result<(), Errno> {
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EFAULT)?;
+        let pages = self.pages.lock();
+        let mut written = 0usize;
+        let mut va = page_base(range.start);
+        let mut skip = range.start - va;
+        while written < out.len() {
+            let mapping = pages.get(va).ok_or(Errno::EFAULT)?;
+            let copy_len = out.len().saturating_sub(written).min(page_size() - skip);
+            let src = virt_fn(mapping.page.paddr()) + skip;
+            // Safety: 页由 pages 锁内的 Arc 保活；copy_len 不越过页边界。
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src as *const u8,
+                    out[written..].as_mut_ptr(),
+                    copy_len,
+                );
+            }
+            written += copy_len;
+            va += page_size();
+            skip = 0;
+        }
+        Ok(())
+    }
+
+    /// 把 `input` 拷入远程地址空间的 `[range.start, range.start+input.len())`。
+    /// 要求范围内每页已驻留且 PTE 可写（调用方先用
+    /// [`Self::ensure_remote_page`](addr, Store) 完成 COW）；成功后标脏。
+    /// 起点允许落在页内。
+    pub fn copy_resident_bytes_in(&self, range: Range<usize>, input: &[u8]) -> Result<(), Errno> {
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EFAULT)?;
+        let pages = self.pages.lock();
+        let mut written = 0usize;
+        let mut va = page_base(range.start);
+        let mut skip = range.start - va;
+        while written < input.len() {
+            let mapping = pages.get(va).ok_or(Errno::EFAULT)?;
+            if !mapping.access.pte_writable() {
+                return Err(Errno::EFAULT);
+            }
+            let copy_len = input.len().saturating_sub(written).min(page_size() - skip);
+            let dst = virt_fn(mapping.page.paddr()) + skip;
+            // Safety: 页由 pages 锁内的 Arc 保活；copy_len 不越过页边界。
+            unsafe {
+                core::ptr::copy_nonoverlapping(input[written..].as_ptr(), dst as *mut u8, copy_len);
+            }
+            mapping.page.mark_dirty();
+            written += copy_len;
+            va += page_size();
+            skip = 0;
+        }
+        Ok(())
+    }
+
     pub fn sync_range(&self, range: Range<usize>) -> Result<(), Errno> {
         self.validate_range(&range)?;
         {
@@ -4339,6 +4571,8 @@ impl VmSpace {
             mlock_future: AtomicBool::new(self.mlock_future.load(Ordering::Acquire)),
             committed_pages: AtomicUsize::new(inherited_committed),
             locked_pages: AtomicUsize::new(inherited_locked),
+            // fork 继承内存策略（Linux 语义：mempolicy 随 mm 复制）。
+            mempolicy: Spinlock::new(self.mempolicy.lock().clone()),
             // fork 创建独立 mm，按 Linux 语义不继承 expedited 注册状态。
             membarrier_registration: AtomicUsize::new(0),
             mapped_pages: AtomicUsize::new(mapped_pages),
@@ -6430,6 +6664,47 @@ fn remove_cached_file_page(cache: &WeakFilePageCache, key: FilePageKey, page: &R
     {
         pages.remove(&key);
     }
+}
+
+/// `cachestat(2)` 计数：统计文件 `[off, off+len)` 内处于"页缓存"状态的页。
+///
+/// 本内核的页缓存由两部分构成：私有干净文件页强缓存（`PRIVATE_FILE_PAGES`，
+/// 含未映射的缓存页）与共享文件页缓存（`SHARED_FILE_PAGES`，驻留页的弱引用表）。
+/// 返回 `(cached_pages, dirty_pages)`；写回中/最近回收的计数没有对应状态，
+/// 恒为 0。`file_key` 来自 [`FileLike::cache_key`]。
+pub fn file_cache_stat(file_key: usize, off: u64, len: u64) -> (u64, u64) {
+    let end = off.saturating_add(len);
+    let mut cached = 0u64;
+    let mut dirty = 0u64;
+    {
+        let pages = SHARED_FILE_PAGES.lock();
+        for (key, weak) in pages.iter() {
+            if key.file_key != file_key || key.offset < off || key.offset >= end {
+                continue;
+            }
+            if let Some(page) = weak.upgrade() {
+                cached += 1;
+                if page.is_dirty() {
+                    dirty += 1;
+                }
+            }
+        }
+    }
+    for shard in &PRIVATE_FILE_PAGES.shards {
+        let shard = shard.lock();
+        for (key, entry) in shard.pages.entries.iter() {
+            if key.file_key != file_key || key.offset < off || key.offset >= end {
+                continue;
+            }
+            if let PrivateFilePageCacheEntry::Ready(ready) = entry {
+                cached += 1;
+                if ready.page.is_dirty() {
+                    dirty += 1;
+                }
+            }
+        }
+    }
+    (cached, dirty)
 }
 
 fn shared_anon_page(
