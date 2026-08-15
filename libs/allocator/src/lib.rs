@@ -1234,7 +1234,7 @@ impl KernelMemorySubsystem {
         {
             let record = physical_record_from_allocation(request, allocation, accounting_owner);
             match self.registry.register_result(&self.boot, record) {
-                Ok(()) => match self.owner_index.track(record) {
+                Ok(()) => match self.owner_index.track(&record) {
                     Ok(()) => Ok(allocation),
                     Err(owner_err) => {
                         match self.registry.remove_result(record.ptr) {
@@ -1432,7 +1432,7 @@ impl KernelMemorySubsystem {
             Err(RegistryError::UnknownPointer) => return Err(PhysicalFreeError::UnknownPointer),
             Err(err) => return Err(PhysicalFreeError::Registry(err)),
         };
-        if let Err(err) = self.owner_index.untrack(record) {
+        if let Err(err) = self.owner_index.untrack(&record) {
             panic!(
                 "[alloc][invariant] owner index rejected physical free: paddr={:#x} owner={} err={:?}",
                 paddr,
@@ -1497,7 +1497,7 @@ impl KernelMemorySubsystem {
             Err(err) => return Err(PhysicalFreeError::Registry(err)),
         };
 
-        if let Err(err) = self.owner_index.untrack(record) {
+        if let Err(err) = self.owner_index.untrack(&record) {
             panic!(
                 "[alloc][invariant] owner index rejected physical free: paddr={:#x} owner={} err={:?}",
                 allocation.paddr,
@@ -1894,7 +1894,7 @@ impl KernelMemorySubsystem {
             .registry
             .get(ptr)
             .ok_or(DeallocationError::UnknownPointer)?;
-        if let Err(err) = self.owner_index.untrack(record) {
+        if let Err(err) = self.owner_index.untrack(&record) {
             panic!(
                 "[alloc][invariant] owner index rejected tracked free: ptr={:#x} owner={} err={:?}",
                 ptr,
@@ -1905,7 +1905,7 @@ impl KernelMemorySubsystem {
         let record = match self.registry.remove_result(ptr) {
             Ok(record) => record,
             Err(err) => {
-                if let Err(restore_err) = self.owner_index.track(record) {
+                if let Err(restore_err) = self.owner_index.track(&record) {
                     panic!(
                         "[alloc][invariant] failed to restore owner index after registry remove failure: ptr={:#x} remove={:?} restore={:?}",
                         ptr, err, restore_err
@@ -2651,7 +2651,7 @@ impl KernelMemorySubsystem {
     ) where
         F: FnOnce(),
     {
-        if let Err(err) = self.owner_index.untrack(expected) {
+        if let Err(err) = self.owner_index.untrack(&expected) {
             cleanup_new();
             panic!(
                 "[alloc][invariant] reallocate could not remove old owner range: ptr={:#x} err={:?}",
@@ -2661,7 +2661,7 @@ impl KernelMemorySubsystem {
         let removed = match self.registry.remove_result(ptr) {
             Ok(record) => record,
             Err(err) => {
-                if let Err(restore_err) = self.owner_index.track(expected) {
+                if let Err(restore_err) = self.owner_index.track(&expected) {
                     cleanup_new();
                     panic!(
                         "[alloc][invariant] reallocate owner range restore failed: ptr={:#x} remove={:?} restore={:?}",
@@ -2711,7 +2711,7 @@ impl KernelMemorySubsystem {
             let _ = try_resize_accounting(record.accounting_owner(), new_size, record.size);
             return Err(err);
         }
-        if let Err(err) = self.owner_index.update(record, updated) {
+        if let Err(err) = self.owner_index.update(&record, &updated) {
             let _ = self.registry.update_existing_result(ptr, record);
             let _ = try_resize_accounting(record.accounting_owner(), new_size, record.size);
             panic!(
@@ -2743,7 +2743,7 @@ impl KernelMemorySubsystem {
     }
 
     fn restore_owner_index_or_panic(&self, record: AllocationRecord, context: &str) {
-        if let Err(err) = self.owner_index.track(record) {
+        if let Err(err) = self.owner_index.track(&record) {
             panic!(
                 "[alloc][invariant] {}: owner index restore failed ptr={:#x} owner={} err={:?}",
                 context,
@@ -2773,7 +2773,7 @@ impl KernelMemorySubsystem {
         F: FnOnce(),
     {
         match self.registry.register_result(&self.boot, record) {
-            Ok(()) => match self.owner_index.track(record) {
+            Ok(()) => match self.owner_index.track(&record) {
                 Ok(()) => Ok(()),
                 Err(err) => {
                     if let Err(remove_err) = self.registry.remove_result(record.ptr) {
