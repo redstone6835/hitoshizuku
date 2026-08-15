@@ -1970,7 +1970,15 @@ fn send_inet_stream_file_from_user(
 ) -> Result<usize, Errno> {
     vfs_socket::validate_send_flags(flags)?;
     if (flags & vfs_socket::MSG_OOB) != 0 {
-        return Err(Errno::EOPNOTSUPP);
+        // Linux 语义：MSG_OOB 只发送缓冲的最后一个字节作为紧急数据，返回 1。
+        if len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let mut byte = [0u8; 1];
+        let urgent_ptr = user.checked_add(len - 1).ok_or(Errno::EFAULT)?;
+        copy_from_user(urgent_ptr, &mut byte).map_err(|e| e.as_errno())?;
+        let nonblocking = file.flags().nonblock || (flags & vfs_socket::MSG_DONTWAIT) != 0;
+        return socket.send_oob(byte[0], nonblocking);
     }
     // 内部分页会临时设置 MSG_MORE；若后续用户页缺页失败或发送只完成一部分，
     // 仍须发布已经接受的数据。应用显式传入 MSG_MORE 时则保留其 cork 语义。
@@ -2257,6 +2265,7 @@ pub(super) fn sys_sendmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     if hdr.iovlen <= 1024
         && hdr.controllen == 0
         && (hdr.name == 0 || hdr.namelen == 0)
+        && (ctx.args[2] & vfs_socket::MSG_OOB) == 0
         && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
         && let Some(vm) = current_vm_space()
         && let Some(file) = fdt.get_file(fd)
@@ -2354,7 +2363,12 @@ pub(super) fn sys_recvmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
         && hdr.controllen == 0
         && (hdr.name == 0 || hdr.namelen == 0)
         && total != 0
-        && (ctx.args[2] & (vfs_socket::MSG_PEEK | vfs_socket::MSG_WAITALL)) == 0
+        && (ctx.args[2]
+            & (vfs_socket::MSG_PEEK
+                | vfs_socket::MSG_WAITALL
+                | vfs_socket::MSG_OOB
+                | vfs_socket::MSG_ERRQUEUE))
+            == 0
         && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
         && let Some(vm) = current_vm_space()
         && let Some(file) = fdt.get_file(fd)

@@ -362,6 +362,8 @@ pub struct TcpTransmit {
     pub acknowledgement: TcpSequence,
     pub flags: TcpFlags,
     pub window: u16,
+    /// 紧急指针（URG 段的偏移；无紧急数据为 0）。
+    pub urgent_pointer: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -501,6 +503,7 @@ impl TcpStateMachine {
             acknowledgement: TcpSequence(0),
             flags: TcpFlags::SYN,
             window: self.receive_window,
+            urgent_pointer: 0,
         })
     }
 
@@ -676,6 +679,7 @@ impl TcpStateMachine {
             acknowledgement: self.receive_next,
             flags,
             window: self.receive_window,
+            urgent_pointer: 0,
         }
     }
 

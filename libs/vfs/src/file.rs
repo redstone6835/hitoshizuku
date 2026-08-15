@@ -617,6 +617,7 @@ impl File {
     pub fn set_owner(&self, owner_type: i32, owner_pid: i32) {
         self.owner_type.store(owner_type, Ordering::Release);
         self.owner_pid.store(owner_pid, Ordering::Release);
+        self.ops.set_owner(owner_type, owner_pid);
     }
 
     pub fn owner_sig(&self) -> i32 {
@@ -1226,6 +1227,11 @@ pub trait FileOps {
 
     /// 动态状态位（`F_SETFL`）发生变化时通知底层驱动。
     fn set_status_flags(&self, _flags: OpenOptions) {}
+
+    /// `F_SETOWN[_EX]` 注册异步通知接收者时通知底层驱动。
+    ///
+    /// socket 驱动用它登记紧急数据（SIGURG）接收者；默认无操作。
+    fn set_owner(&self, _owner_type: i32, _owner_pid: i32) {}
 
     /// 某个 fd 号从 fdtable 中关闭或被替换时调用。
     ///

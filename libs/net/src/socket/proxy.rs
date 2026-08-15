@@ -465,6 +465,49 @@ impl NetSocketProxy {
         )
     }
 
+    pub fn send_urgent(
+        &self,
+        byte: u8,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<usize, SocketError> {
+        self.ensure_backend()?;
+        self.facade.send_urgent(byte, nonblocking, deadline_ns)
+    }
+
+    pub fn recv_oob(
+        &self,
+        peek: bool,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<u8, SocketError> {
+        self.ensure_backend()?;
+        self.facade.recv_oob(peek, nonblocking, deadline_ns)
+    }
+
+    pub fn set_oob_inline(&self, inline: bool) {
+        self.facade.set_oob_inline(inline);
+    }
+
+    pub fn oob_inline(&self) -> bool {
+        self.facade.oob_inline()
+    }
+
+    /// F_SETOWN：注册紧急数据（SIGURG）接收者。
+    pub fn set_urgent_owner(&self, owner_type: i32, owner_pid: i32) {
+        self.facade.set_urgent_owner(owner_type, owner_pid);
+    }
+
+    /// SIOCATMARK：读指针是否位于 OOB 标记处。
+    pub fn at_oob_mark(&self) -> bool {
+        self.facade.at_oob_mark()
+    }
+
+    /// 是否存在未读取的紧急数据。
+    pub fn oob_pending(&self) -> bool {
+        self.facade.oob_pending()
+    }
+
     pub fn recv_stream_to(
         &self,
         output_len: usize,

@@ -67,6 +67,8 @@ pub struct PreparedTcpTx {
     pub acknowledgement: TcpSequence,
     pub flags: TcpFlags,
     pub window: u16,
+    /// 紧急指针（URG 段；否则为 0）。
+    pub urgent_pointer: u16,
     pub options: [u8; 40],
     pub options_len: u8,
     pub parsed_options: crate::transport::TcpOptions,
@@ -123,6 +125,8 @@ struct SentSegment {
     stream_start: Option<u64>,
     payload_len: u16,
     flags: TcpFlags,
+    /// 紧急指针（URG 段携带；重传时原样恢复）。
+    urgent_pointer: u16,
     sent_ns: u64,
     first_sent_ns: u64,
     transmissions: u8,
@@ -193,6 +197,67 @@ impl IngressPayload<'_> {
                 flush,
                 ..
             } => facade.push_stream_rx_lease(lease, *offset + payload_offset, len, *flush),
+        }
+    }
+
+    /// 把 [offset, offset+len) 子区间复制到 socket 接收流（紧急拆分用）。
+    fn copy_range_to_socket(
+        &mut self,
+        facade: &SocketFacade,
+        offset: usize,
+        len: usize,
+    ) -> Result<StreamRxCommit, SocketError> {
+        match self {
+            Self::Empty => Ok(StreamRxCommit {
+                len: 0,
+                storage: StreamRxStorageKind::Discarded,
+                low_water_fallback: false,
+            }),
+            #[cfg(test)]
+            Self::Owned(bytes) => facade.push_stream_rx_compact(&bytes[offset..offset + len]),
+            Self::Packet {
+                chain,
+                offset: base,
+                pressure,
+                ..
+            } => facade.push_stream_rx_packet(chain, *base + offset, len, *pressure),
+            Self::Lease {
+                lease,
+                offset: base,
+                flush,
+                ..
+            } => facade.push_stream_rx_lease(lease, *base + offset, len, *flush),
+        }
+    }
+
+    /// 读取单个字节（紧急字节提取用）。
+    fn byte_at(&mut self, offset: usize) -> Result<u8, TcpIngressError> {
+        match self {
+            Self::Empty => Err(TcpIngressError::Malformed),
+            #[cfg(test)]
+            Self::Owned(bytes) => Ok(bytes[offset]),
+            Self::Packet {
+                chain,
+                offset: base,
+                ..
+            } => {
+                let mut byte = [0u8; 1];
+                chain
+                    .copy_out(*base + offset, &mut byte)
+                    .map_err(|_| TcpIngressError::Malformed)?;
+                Ok(byte[0])
+            }
+            Self::Lease {
+                lease,
+                offset: base,
+                ..
+            } => {
+                let mut byte = [0u8; 1];
+                lease
+                    .copy_range(*base + offset, &mut byte)
+                    .map_err(|_| TcpIngressError::Malformed)?;
+                Ok(byte[0])
+            }
         }
     }
 
@@ -395,6 +460,8 @@ struct TcpFlow {
     output_blocked: bool,
     local_transport: bool,
     local_peer_hint: Option<LocalTcpPeerHint>,
+    /// 当前紧急字节的绝对序列号（URG 标记；递送时据此剔除/记录）。
+    urgent_byte_seq: Option<TcpSequence>,
 }
 
 impl TcpFlow {
@@ -546,6 +613,7 @@ impl TcpEndpointTable {
             pending_connect: Some(control_sequence),
             accept_group: None,
             accept_reserved: false,
+            urgent_byte_seq: None,
             retransmit: VecDeque::new(),
             unacknowledged_segments: 0,
             retransmitted_segments: 0,
@@ -1140,7 +1208,16 @@ impl TcpEndpointTable {
             if allowance == 0 {
                 break;
             }
-            let Some(payload) = flow.facade.take_stream_tx_deferred(allowance as usize) else {
+            // 紧急字节必须独占一个 URG 段（Linux 语义：send(MSG_OOB) 只发送
+            // 一个字节，紧急指针指向该字节）：先排空前面的普通数据，保留最后
+            // 一个字节单独以 URG 标志发出。
+            let urgent_pending = flow.facade.urgent_tx_pending();
+            let take_len = if urgent_pending {
+                unsent.saturating_sub(1).min(allowance as usize)
+            } else {
+                allowance as usize
+            };
+            let Some(payload) = flow.facade.take_stream_tx_deferred(take_len.max(1)) else {
                 break;
             };
             queued_bytes = queued_bytes.saturating_add(usize::from(payload.len));
@@ -1149,7 +1226,10 @@ impl TcpEndpointTable {
             let Some(sequence) = flow.machine.reserve_send(u32::from(payload.len)) else {
                 break;
             };
-            let flags = if remaining_unsent == 0 {
+            let urgent_segment = urgent_pending && unsent == 1;
+            let flags = if urgent_segment {
+                TcpFlags::ACK | TcpFlags::PSH | TcpFlags::URG
+            } else if remaining_unsent == 0 {
                 TcpFlags::ACK | TcpFlags::PSH
             } else {
                 TcpFlags::ACK
@@ -1159,7 +1239,11 @@ impl TcpEndpointTable {
                 acknowledgement: flow.machine.receive_next(),
                 flags,
                 window: advertised_window(&flow.facade, flow.local_window_scale),
+                urgent_pointer: if urgent_segment { 1 } else { 0 },
             };
+            if urgent_segment {
+                flow.facade.clear_urgent_tx_pending();
+            }
             self.queue_transmit(id, transmit, Some(payload), now_ns, false, true);
             if let Some(flow) = self.flows.get_mut(id) {
                 flow.cork_force = false;
@@ -1239,6 +1323,7 @@ impl TcpEndpointTable {
             acknowledgement: flow.machine.receive_next(),
             flags: TcpFlags::RST | TcpFlags::ACK,
             window: 0,
+            urgent_pointer: 0,
         };
         self.queue_transmit(id, transmit, None, now_ns, true, false);
         self.reap(id, None);
@@ -1297,6 +1382,7 @@ impl TcpEndpointTable {
                     acknowledgement: flow.machine.receive_next(),
                     flags,
                     window: advertised_window(&flow.facade, flow.local_window_scale),
+                    urgent_pointer: 0,
                 };
                 persist = Some((transmit, payload));
             } else if flow.facade.stream_unsent_len() != 0
@@ -1308,6 +1394,7 @@ impl TcpEndpointTable {
                     acknowledgement: flow.machine.receive_next(),
                     flags: TcpFlags::ACK,
                     window: advertised_window(&flow.facade, flow.local_window_scale),
+                    urgent_pointer: 0,
                 };
                 persist = Some((transmit, Some(payload)));
             }
@@ -1370,6 +1457,7 @@ impl TcpEndpointTable {
                     acknowledgement: flow.machine.receive_next(),
                     flags: TcpFlags::ACK,
                     window: advertised_window(&flow.facade, flow.local_window_scale),
+                    urgent_pointer: 0,
                 }
             };
             self.queue_transmit(id, transmit, None, now_ns, true, false);
@@ -1495,6 +1583,7 @@ impl TcpEndpointTable {
             pending_connect: None,
             accept_group: Some(Arc::clone(&group)),
             accept_reserved: false,
+            urgent_byte_seq: None,
             retransmit: VecDeque::new(),
             unacknowledged_segments: 0,
             retransmitted_segments: 0,
@@ -1616,6 +1705,22 @@ impl TcpEndpointTable {
                 .tcp_keepalive_enabled()
                 .then(|| now_ns.saturating_add(flow.facade.tcp_keepidle_ns()));
         }
+        // URG 标记处理（Linux tcp_check_urg）：记录紧急字节位置、唤醒接收端并
+        // 触发 SIGURG。非内联模式紧急指针指向紧急数据之后的首字节（RFC 793），
+        // 因此紧急字节为 seq + ptr - 1；内联模式按 Linux 语义直接指向该字节。
+        if tcp.flags.contains(TcpFlags::URG) && tcp.urgent_pointer != 0 {
+            let inline = self.flows.get(id).unwrap().facade.oob_inline();
+            let ptr = u32::from(tcp.urgent_pointer);
+            let byte_seq = if inline {
+                tcp.sequence + ptr
+            } else {
+                // 紧急指针至少为 1（调用处已排除 0），ptr - 1 不会下溢。
+                tcp.sequence + (ptr - 1)
+            };
+            self.flows.get_mut(id).unwrap().urgent_byte_seq = Some(byte_seq);
+            self.flows.get(id).unwrap().facade.mark_urgent(byte_seq.0);
+        }
+
         let peer_window_after = self.flows.get(id).unwrap().peer_window;
         let peer_window_changed = peer_window_after != peer_window_before;
         let peer_window_increased = peer_window_after > peer_window_before;
@@ -1722,6 +1827,63 @@ impl TcpEndpointTable {
         Ok(())
     }
 
+    /// 按紧急字节边界递送 [offset, offset+len) 窗口：非内联剔除紧急字节并存入
+    /// oob 缓存；内联保留在流中并保存镜像。窗口的起始绝对序列号为 `start`。
+    fn deliver_urgent_window(
+        &mut self,
+        id: FlowId,
+        start: TcpSequence,
+        payload: &mut IngressPayload<'_>,
+        offset: usize,
+        len: usize,
+    ) -> Result<(), TcpIngressError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let (facade, urgent) = {
+            let flow = self.flows.get(id).unwrap();
+            (Arc::clone(&flow.facade), flow.urgent_byte_seq)
+        };
+        let boundary = urgent
+            .filter(|seq| !seq.before(start))
+            .map(|seq| seq.distance_from(start) as usize)
+            .filter(|pos| *pos < len);
+        let Some(pos) = boundary else {
+            let commit = payload
+                .copy_range_to_socket(&facade, offset, len)
+                .map_err(|_| TcpIngressError::ReceiveBufferFull)?;
+            self.record_rx_commit(commit);
+            return Ok(());
+        };
+        let inline = facade.oob_inline();
+        let byte = payload.byte_at(offset + pos)?;
+        let byte_seq = start + pos as u32;
+        if inline {
+            // 内联：紧急字节留在流中，镜像存入 oob 缓存供 MSG_OOB 读取。
+            let commit = payload
+                .copy_range_to_socket(&facade, offset, len)
+                .map_err(|_| TcpIngressError::ReceiveBufferFull)?;
+            self.record_rx_commit(commit);
+            facade.stash_oob_byte(byte, byte_seq.0);
+        } else {
+            // 非内联：紧急字节从流中剔除（普通 recv 看不到），仅 MSG_OOB 可读。
+            if pos != 0 {
+                let commit = payload
+                    .copy_range_to_socket(&facade, offset, pos)
+                    .map_err(|_| TcpIngressError::ReceiveBufferFull)?;
+                self.record_rx_commit(commit);
+            }
+            facade.stash_oob_byte(byte, byte_seq.0);
+            if pos + 1 < len {
+                let commit = payload
+                    .copy_range_to_socket(&facade, offset + pos + 1, len - pos - 1)
+                    .map_err(|_| TcpIngressError::ReceiveBufferFull)?;
+                self.record_rx_commit(commit);
+            }
+        }
+        Ok(())
+    }
+
     fn receive_payload(
         &mut self,
         id: FlowId,
@@ -1736,13 +1898,14 @@ impl TcpEndpointTable {
             .unwrap_or(0);
         if sequence.before_or_equal(expected) && payload_start < payload.len() {
             let accepted = payload.len() - payload_start;
-            let commit = {
-                let flow = self.flows.get_mut(id).unwrap();
-                payload
-                    .copy_to_socket(&flow.facade, payload_start)
-                    .map_err(|_| TcpIngressError::ReceiveBufferFull)?
-            };
-            self.record_rx_commit(commit);
+            // 接收流基址在首次数据递送时补记（握手期间已记录则忽略）。
+            self.flows
+                .get(id)
+                .unwrap()
+                .facade
+                .set_stream_base_seq(expected.0);
+            // 按紧急字节边界递送（非内联剔除 / 内联镜像）。
+            self.deliver_urgent_window(id, expected, &mut payload, payload_start, accepted)?;
             let flow = self.flows.get_mut(id).unwrap();
             if sequence.before(expected) {
                 flow.machine.advance_receive(accepted as u32);
@@ -1809,9 +1972,38 @@ impl TcpEndpointTable {
             flow.reassembly_bytes = flow.reassembly_bytes.saturating_sub(fragment.bytes.len());
             let offset = expected.distance_from(fragment.sequence) as usize;
             let accepted = &fragment.bytes[offset..];
-            flow.facade
-                .push_stream_rx(accepted)
-                .map_err(|_| TcpIngressError::ReceiveBufferFull)?;
+            let urgent = flow.urgent_byte_seq;
+            let inline = flow.facade.oob_inline();
+            let boundary = urgent
+                .filter(|seq| !seq.before(expected))
+                .map(|seq| seq.distance_from(expected) as usize)
+                .filter(|pos| *pos < accepted.len());
+            if let Some(pos) = boundary {
+                let byte = accepted[pos];
+                let byte_seq = expected + pos as u32;
+                if inline {
+                    flow.facade
+                        .push_stream_rx(accepted)
+                        .map_err(|_| TcpIngressError::ReceiveBufferFull)?;
+                    flow.facade.stash_oob_byte(byte, byte_seq.0);
+                } else {
+                    if pos != 0 {
+                        flow.facade
+                            .push_stream_rx(&accepted[..pos])
+                            .map_err(|_| TcpIngressError::ReceiveBufferFull)?;
+                    }
+                    flow.facade.stash_oob_byte(byte, byte_seq.0);
+                    if pos + 1 < accepted.len() {
+                        flow.facade
+                            .push_stream_rx(&accepted[pos + 1..])
+                            .map_err(|_| TcpIngressError::ReceiveBufferFull)?;
+                    }
+                }
+            } else {
+                flow.facade
+                    .push_stream_rx(accepted)
+                    .map_err(|_| TcpIngressError::ReceiveBufferFull)?;
+            }
             self.stats.rx_compact_copy_bytes = self
                 .stats
                 .rx_compact_copy_bytes
@@ -1955,6 +2147,7 @@ impl TcpEndpointTable {
             acknowledgement: flow.machine.receive_next(),
             flags: segment.flags,
             window: advertised_window(&flow.facade, flow.local_window_scale),
+            urgent_pointer: segment.urgent_pointer,
         };
         segment.sent_ns = now_ns;
         if segment.transmissions == 1 {
@@ -2091,6 +2284,10 @@ impl TcpEndpointTable {
     fn on_established(&mut self, id: FlowId, now_ns: u64) -> bool {
         let flow = self.flows.get_mut(id).unwrap();
         flow.listener_key.take();
+        // 记录接收流基址（首个流字节的绝对序列号）：紧急字节位置、SIOCATMARK 等
+        // 都以该基址折算为流偏移。此时 receive_next 尚未推进，恒等于 ISN+1。
+        flow.facade
+            .set_stream_base_seq(flow.machine.receive_next().0);
         flow.facade.publish_connected();
         flow.deadlines.keepalive = flow
             .facade
@@ -2123,6 +2320,7 @@ impl TcpEndpointTable {
                 acknowledgement: flow.machine.receive_next(),
                 flags: TcpFlags::RST | TcpFlags::ACK,
                 window: 0,
+                urgent_pointer: 0,
             };
             self.queue_transmit(id, transmit, None, now_ns, true, false);
             self.reap(id, Some(SocketError::ConnectionReset));
@@ -2158,6 +2356,7 @@ impl TcpEndpointTable {
             acknowledgement: flow.machine.receive_next(),
             flags: TcpFlags::RST | TcpFlags::ACK,
             window: 0,
+            urgent_pointer: 0,
         };
         self.queue_transmit(id, transmit, None, now_ns, true, false);
         self.reap(id, Some(SocketError::ConnectionReset));
@@ -2230,6 +2429,7 @@ impl TcpEndpointTable {
                 stream_start: payload.as_ref().map(|payload| payload.start),
                 payload_len,
                 flags: transmit.flags,
+                urgent_pointer: transmit.urgent_pointer,
                 sent_ns: now_ns,
                 first_sent_ns: now_ns,
                 transmissions: 1,
@@ -2275,6 +2475,7 @@ impl TcpEndpointTable {
             acknowledgement: transmit.acknowledgement,
             flags: transmit.flags,
             window: wire_window,
+            urgent_pointer: transmit.urgent_pointer,
             options,
             options_len,
             parsed_options,
@@ -2411,6 +2612,7 @@ fn ack_for(flow: &TcpFlow) -> TcpTransmit {
         acknowledgement: flow.machine.receive_next(),
         flags: TcpFlags::ACK,
         window: advertised_window(&flow.facade, flow.local_window_scale),
+        urgent_pointer: 0,
     }
 }
 
@@ -2764,6 +2966,9 @@ pub fn build_tcp_packet(
     tcp[12] = ((tcp_header_len / 4) as u8) << 4 | u8::from(work.flags.contains(TcpFlags::NS));
     tcp[13] = work.flags.bits() as u8;
     tcp[14..16].copy_from_slice(&work.window.to_be_bytes());
+    // 紧急指针：URG 段携带偏移（从序列号起），无紧急数据时为 0。
+    tcp[16..18].copy_from_slice(&0u16.to_be_bytes());
+    tcp[18..20].copy_from_slice(&work.urgent_pointer.to_be_bytes());
     tcp[20..20 + options_len].copy_from_slice(&work.options[..options_len]);
 
     match (work.path.route.source, work.remote.addr) {
@@ -4783,5 +4988,423 @@ mod tests {
                 assert!(table.take_output().unwrap().flags.contains(TcpFlags::RST));
             }
         }
+    }
+
+    fn packet_urgent(
+        source_port: u16,
+        destination_port: u16,
+        sequence: u32,
+        acknowledgement: u32,
+        flags: TcpFlags,
+        payload_len: u32,
+        urgent_pointer: u16,
+    ) -> TcpPacket {
+        let mut packet = packet(
+            source_port,
+            destination_port,
+            sequence,
+            acknowledgement,
+            flags,
+            payload_len,
+        );
+        packet.urgent_pointer = urgent_pointer;
+        packet
+    }
+
+    #[test]
+    fn urgent_data_excluded_from_stream_and_readable_via_oob() {
+        // 非内联（默认）：紧急字节从普通流中剔除，仅 recv(MSG_OOB) 可读。
+        let mut table = TcpEndpointTable::new([7; 40], [9; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let seq = table
+            .flows
+            .get(pair.server_flow)
+            .unwrap()
+            .machine
+            .receive_next()
+            .0;
+
+        // 普通数据 "ab"
+        table
+            .process_segment(
+                pair.server_flow,
+                packet(
+                    41_000,
+                    9_100,
+                    seq,
+                    table
+                        .flows
+                        .get(pair.server_flow)
+                        .unwrap()
+                        .machine
+                        .send_next()
+                        .0,
+                    TcpFlags::ACK | TcpFlags::PSH,
+                    2,
+                ),
+                b"ab".to_vec(),
+                5_000,
+            )
+            .unwrap();
+
+        // 紧急段：单字节 X，URG + 紧急指针 1（紧急字节为 seq + 1 - 1 = seq）。
+        table
+            .process_segment(
+                pair.server_flow,
+                packet_urgent(
+                    41_000,
+                    9_100,
+                    seq + 2,
+                    table
+                        .flows
+                        .get(pair.server_flow)
+                        .unwrap()
+                        .machine
+                        .send_next()
+                        .0,
+                    TcpFlags::ACK | TcpFlags::PSH | TcpFlags::URG,
+                    1,
+                    1,
+                ),
+                b"X".to_vec(),
+                6_000,
+            )
+            .unwrap();
+
+        // 普通读只看到 "ab"；紧急字节通过 MSG_OOB 读取。
+        let mut stream = [0u8; 8];
+        assert_eq!(
+            pair.server
+                .recv_stream(&mut stream, false, false, false, true, None)
+                .unwrap(),
+            2,
+        );
+        assert_eq!(&stream[..2], b"ab");
+        assert_eq!(pair.server.recv_oob(false, true, None), Ok(b'X'));
+        // 消费后再次读取返回 EINVAL（InvalidState）。
+        assert_eq!(
+            pair.server.recv_oob(false, true, None),
+            Err(SocketError::InvalidState),
+        );
+    }
+
+    #[test]
+    fn urgent_peek_does_not_consume() {
+        let mut table = TcpEndpointTable::new([7; 40], [9; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let seq = table
+            .flows
+            .get(pair.server_flow)
+            .unwrap()
+            .machine
+            .receive_next()
+            .0;
+        table
+            .process_segment(
+                pair.server_flow,
+                packet_urgent(
+                    41_000,
+                    9_100,
+                    seq,
+                    table
+                        .flows
+                        .get(pair.server_flow)
+                        .unwrap()
+                        .machine
+                        .send_next()
+                        .0,
+                    TcpFlags::ACK | TcpFlags::PSH | TcpFlags::URG,
+                    1,
+                    1,
+                ),
+                b"X".to_vec(),
+                5_000,
+            )
+            .unwrap();
+        assert_eq!(pair.server.recv_oob(true, true, None), Ok(b'X'));
+        assert_eq!(pair.server.recv_oob(true, true, None), Ok(b'X'));
+        assert_eq!(pair.server.recv_oob(false, true, None), Ok(b'X'));
+        assert_eq!(
+            pair.server.recv_oob(false, true, None),
+            Err(SocketError::InvalidState),
+        );
+    }
+
+    #[test]
+    fn urgent_inline_keeps_byte_in_stream() {
+        // SO_OOBINLINE=1：紧急字节留在普通流中，MSG_OOB 读取镜像副本。
+        let mut table = TcpEndpointTable::new([7; 40], [9; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        pair.server.set_oob_inline(true);
+        let seq = table
+            .flows
+            .get(pair.server_flow)
+            .unwrap()
+            .machine
+            .receive_next()
+            .0;
+        table
+            .process_segment(
+                pair.server_flow,
+                packet_urgent(
+                    41_000,
+                    9_100,
+                    seq,
+                    table
+                        .flows
+                        .get(pair.server_flow)
+                        .unwrap()
+                        .machine
+                        .send_next()
+                        .0,
+                    TcpFlags::ACK | TcpFlags::PSH | TcpFlags::URG,
+                    3,
+                    1,
+                ),
+                b"abX".to_vec(),
+                5_000,
+            )
+            .unwrap();
+        // 紧急字节（seq + 1 - 1 = seq，即 "a"）留在流中；MSG_OOB 返回镜像。
+        let mut stream = [0u8; 8];
+        assert_eq!(
+            pair.server
+                .recv_stream(&mut stream, false, false, false, true, None)
+                .unwrap(),
+            3,
+        );
+        assert_eq!(&stream[..3], b"abX");
+        // 流已越过紧急位置：MSG_OOB 不再可用（Linux 语义）。
+        assert_eq!(
+            pair.server.recv_oob(false, true, None),
+            Err(SocketError::InvalidState),
+        );
+    }
+
+    #[test]
+    fn late_urgent_marker_skips_already_delivered_byte() {
+        // 紧急字节先于 URG 标记到达（标记迟到）：普通读跳过该字节，
+        // MSG_OOB 仍可读取（Linux tcp_recvmsg 的读时剔除语义）。
+        let mut table = TcpEndpointTable::new([7; 40], [9; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let seq = table
+            .flows
+            .get(pair.server_flow)
+            .unwrap()
+            .machine
+            .receive_next()
+            .0;
+        // 普通段 "abX"（无 URG）。
+        table
+            .process_segment(
+                pair.server_flow,
+                packet(
+                    41_000,
+                    9_100,
+                    seq,
+                    table
+                        .flows
+                        .get(pair.server_flow)
+                        .unwrap()
+                        .machine
+                        .send_next()
+                        .0,
+                    TcpFlags::ACK | TcpFlags::PSH,
+                    3,
+                ),
+                b"abX".to_vec(),
+                5_000,
+            )
+            .unwrap();
+        // 迟到的 URG 标记：空载荷段，指针指向已递送的 "X"（seq+2）。
+        table
+            .process_segment(
+                pair.server_flow,
+                packet_urgent(
+                    41_000,
+                    9_100,
+                    seq + 2,
+                    table
+                        .flows
+                        .get(pair.server_flow)
+                        .unwrap()
+                        .machine
+                        .send_next()
+                        .0,
+                    TcpFlags::ACK | TcpFlags::URG,
+                    0,
+                    1,
+                ),
+                Vec::new(),
+                6_000,
+            )
+            .unwrap();
+        // 先读紧急字节（迟到的标记也能恢复它）。
+        assert_eq!(pair.server.recv_oob(false, true, None), Ok(b'X'));
+        // 紧急数据被消费后，"X" 恢复为普通流字节（Linux：不再剔除）。
+        let mut stream = [0u8; 8];
+        assert_eq!(
+            pair.server
+                .recv_stream(&mut stream, false, false, false, true, None)
+                .unwrap(),
+            3,
+        );
+        assert_eq!(&stream[..3], b"abX");
+    }
+
+    #[test]
+    fn late_urgent_marker_stream_read_first_skips_byte_then_oob_fails() {
+        // 流先于 MSG_OOB 读取：普通读跳过紧急字节，之后紧急数据失效。
+        let mut table = TcpEndpointTable::new([7; 40], [9; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let seq = table
+            .flows
+            .get(pair.server_flow)
+            .unwrap()
+            .machine
+            .receive_next()
+            .0;
+        table
+            .process_segment(
+                pair.server_flow,
+                packet(
+                    41_000,
+                    9_100,
+                    seq,
+                    table
+                        .flows
+                        .get(pair.server_flow)
+                        .unwrap()
+                        .machine
+                        .send_next()
+                        .0,
+                    TcpFlags::ACK | TcpFlags::PSH,
+                    3,
+                ),
+                b"abX".to_vec(),
+                5_000,
+            )
+            .unwrap();
+        table
+            .process_segment(
+                pair.server_flow,
+                packet_urgent(
+                    41_000,
+                    9_100,
+                    seq + 2,
+                    table
+                        .flows
+                        .get(pair.server_flow)
+                        .unwrap()
+                        .machine
+                        .send_next()
+                        .0,
+                    TcpFlags::ACK | TcpFlags::URG,
+                    0,
+                    1,
+                ),
+                Vec::new(),
+                6_000,
+            )
+            .unwrap();
+        // 普通读跳过 "X"（只看到 "ab"）。
+        let mut stream = [0u8; 8];
+        assert_eq!(
+            pair.server
+                .recv_stream(&mut stream, false, false, false, true, None)
+                .unwrap(),
+            2,
+        );
+        assert_eq!(&stream[..2], b"ab");
+        // 读指针越过紧急位置后紧急数据失效（Linux after(copied_seq, urg_seq)）。
+        assert_eq!(
+            pair.server.recv_oob(false, true, None),
+            Err(SocketError::InvalidState),
+        );
+    }
+
+    #[test]
+    fn send_urgent_queues_urg_segment_and_receiver_gets_oob() {
+        // send(MSG_OOB) 端到端：紧急字节独占 URG 段（指针 1），接收端剔除后
+        // 仅 MSG_OOB 可读。
+        let mut table = TcpEndpointTable::new([7; 40], [9; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        assert_eq!(pair.client.send_urgent(b'Q', true, None), Ok(1));
+        assert!(table.drain_send(pair.client_flow, 5_000));
+        let work = table.take_output().unwrap();
+        assert!(work.flags.contains(TcpFlags::URG));
+        assert_eq!(work.urgent_pointer, 1);
+        assert_eq!(work.payload.as_ref().unwrap().len, 1);
+        table
+            .process_segment(
+                pair.server_flow,
+                packet_urgent(
+                    41_000,
+                    9_100,
+                    work.sequence.0,
+                    work.acknowledgement.0,
+                    work.flags,
+                    1,
+                    work.urgent_pointer,
+                ),
+                b"Q".to_vec(),
+                6_000,
+            )
+            .unwrap();
+        // 流中无字节，紧急字节仅 MSG_OOB 可读。
+        let mut stream = [0u8; 4];
+        assert_eq!(
+            pair.server
+                .recv_stream(&mut stream, false, false, false, true, None),
+            Err(SocketError::WouldBlock),
+        );
+        assert_eq!(pair.server.recv_oob(false, true, None), Ok(b'Q'));
+    }
+
+    #[test]
+    fn urgent_byte_in_multi_byte_segment_per_rfc() {
+        // 多字节段带 URG（指针 1）：紧急窗口是段首字节（RFC 793 语义：
+        // 紧急数据为 [seq, seq+ptr)）。
+        let mut table = TcpEndpointTable::new([7; 40], [9; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let seq = table
+            .flows
+            .get(pair.server_flow)
+            .unwrap()
+            .machine
+            .receive_next()
+            .0;
+        table
+            .process_segment(
+                pair.server_flow,
+                packet_urgent(
+                    41_000,
+                    9_100,
+                    seq,
+                    table
+                        .flows
+                        .get(pair.server_flow)
+                        .unwrap()
+                        .machine
+                        .send_next()
+                        .0,
+                    TcpFlags::ACK | TcpFlags::PSH | TcpFlags::URG,
+                    3,
+                    1,
+                ),
+                b"Xbc".to_vec(),
+                5_000,
+            )
+            .unwrap();
+        // 非内联：紧急字节 "X"（seq）被剔除，流中只剩 "bc"。
+        let mut stream = [0u8; 8];
+        assert_eq!(
+            pair.server
+                .recv_stream(&mut stream, false, false, false, true, None)
+                .unwrap(),
+            2,
+        );
+        assert_eq!(&stream[..2], b"bc");
+        assert_eq!(pair.server.recv_oob(false, true, None), Ok(b'X'));
     }
 }

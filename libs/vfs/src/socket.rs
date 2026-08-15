@@ -911,7 +911,16 @@ pub fn send(
             return Err(Errno::ENOPROTOOPT);
         }
         if (flags & MSG_OOB) != 0 {
-            return Err(Errno::EOPNOTSUPP);
+            // Linux：MSG_OOB 只把缓冲的最后一个字节作为紧急数据发送（TCP）；
+            // UDP 的 MSG_OOB 返回 EOPNOTSUPP。
+            if net_ops.sock_type() != crate::net_socket::SOCK_STREAM_PUB {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            let Some(&byte) = data.last() else {
+                return Err(Errno::EINVAL);
+            };
+            let nonblocking = file.flags().nonblock || (flags & MSG_DONTWAIT) != 0;
+            return net_ops.send_oob(byte, nonblocking);
         }
         let result = net_ops.sendto(
             data,
@@ -937,6 +946,10 @@ pub fn send(
         return packet_ops.sendto(data, dest);
     }
     let socket = socket_from_file(&file)?;
+    // Linux：AF_UNIX 不支持带外数据，MSG_OOB 返回 EOPNOTSUPP。
+    if (flags & MSG_OOB) != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
     let decoded = decode_send_control(ctx, fdt, &file, &socket, control)?;
     let address = match raw_addr {
         Some(raw) => Some(resolve_connect_address(ctx, raw)?),
@@ -1091,7 +1104,22 @@ fn recv_inner(
 
     if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
         if (flags & MSG_OOB) != 0 {
-            return Err(Errno::EOPNOTSUPP);
+            // Linux：MSG_OOB 读取紧急字节（TCP）；UDP 的 MSG_OOB 返回 EOPNOTSUPP。
+            if net_ops.sock_type() != crate::net_socket::SOCK_STREAM_PUB {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            if data.is_empty() {
+                return Err(Errno::EINVAL);
+            }
+            let nonblocking = file.flags().nonblock || (flags & MSG_DONTWAIT) != 0;
+            let byte = net_ops.recv_oob((flags & MSG_PEEK) != 0, nonblocking, deadline_ns)?;
+            data[0] = byte;
+            return Ok(RecvOutput {
+                len: 1,
+                address: None,
+                control: Vec::new(),
+                msg_flags: 0,
+            });
         }
         if (flags & MSG_ERRQUEUE) != 0 {
             let record = net_ops.take_error_record()?;
@@ -1157,6 +1185,10 @@ fn recv_inner(
     }
 
     let socket = socket_from_file(&file)?;
+    // Linux：AF_UNIX 不支持带外数据，MSG_OOB 返回 EOPNOTSUPP。
+    if (flags & MSG_OOB) != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
     let nonblocking = file.flags().nonblock || (flags & MSG_DONTWAIT) != 0;
     let peek = (flags & MSG_PEEK) != 0;
     let wait_all = (flags & MSG_WAITALL) != 0
@@ -1571,6 +1603,9 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
                     .to_ne_bytes()
                     .to_vec())
             }
+            SO_OOBINLINE if net_ops.sock_type() == SOCK_STREAM as u16 => {
+                Ok((net_ops.proxy().oob_inline() as i32).to_ne_bytes().to_vec())
+            }
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_IP => match optname {
@@ -1762,13 +1797,12 @@ fn inet_setsockopt(
                     .set_tcp_keepalive(parse_int_opt(value)? != 0);
                 Ok(())
             }
-            SO_OOBINLINE => {
-                if parse_int_opt(value)? == 0 {
-                    Ok(())
-                } else {
-                    Err(Errno::EOPNOTSUPP)
-                }
+            SO_OOBINLINE if net_ops.sock_type() == SOCK_STREAM as u16 => {
+                // 紧急字节保留在普通字节流中（Linux 语义）；非 TCP 返回 ENOPROTOOPT。
+                net_ops.proxy().set_oob_inline(parse_int_opt(value)? != 0);
+                Ok(())
             }
+            SO_OOBINLINE => Err(Errno::ENOPROTOOPT),
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_IP => match optname {
@@ -2099,7 +2133,10 @@ pub fn socket_lock_filter(fdt: &FdTable, fd: Fd) -> Result<(), Errno> {
 }
 
 /// SO_GET_FILTER：读取已安装过滤器指令（未安装为空）。
-pub fn socket_get_filter(fdt: &FdTable, fd: Fd) -> Result<alloc::vec::Vec<net::bpf::CbpfInsn>, Errno> {
+pub fn socket_get_filter(
+    fdt: &FdTable,
+    fd: Fd,
+) -> Result<alloc::vec::Vec<net::bpf::CbpfInsn>, Errno> {
     let file = file_from_fd(fdt, fd)?;
     if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
         return Ok(net_ops.get_filter());

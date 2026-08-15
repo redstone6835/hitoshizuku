@@ -441,6 +441,25 @@ impl NetSocketFileOps {
             .map_err(map_socket_error)
     }
 
+    /// send(MSG_OOB)：发送单个紧急字节（仅 TCP；UDP 在调用方拒绝）。
+    pub fn send_oob(&self, byte: u8, nonblocking: bool) -> Result<usize, Errno> {
+        self.proxy
+            .send_urgent(byte, nonblocking, self.send_deadline())
+            .map_err(map_socket_error)
+    }
+
+    /// recv(MSG_OOB)：读取紧急字节（仅 TCP）。
+    pub fn recv_oob(
+        &self,
+        peek: bool,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<u8, Errno> {
+        self.proxy
+            .recv_oob(peek, nonblocking, deadline_ns)
+            .map_err(map_socket_error)
+    }
+
     pub fn stream_send_deadline(&self) -> Option<u64> {
         self.send_deadline()
     }
@@ -796,6 +815,10 @@ impl FileOps for NetSocketFileOps {
         if readiness.contains(net::Readiness::READ_HANGUP) {
             ready = ready.with(PollEvents::POLLRDHUP);
         }
+        // 紧急数据到达：Linux 以 POLLPRI 上报（无论 SO_OOBINLINE）。
+        if self.proxy.oob_pending() {
+            ready = ready.with(PollEvents::POLLPRI);
+        }
         ready.intersect(
             interest
                 .with(PollEvents::POLLERR)
@@ -842,6 +865,11 @@ impl FileOps for NetSocketFileOps {
         self.nonblock.store(flags.nonblock, Ordering::Relaxed);
     }
 
+    /// F_SETOWN：登记紧急数据（SIGURG）接收者。
+    fn set_owner(&self, owner_type: i32, owner_pid: i32) {
+        self.proxy.set_urgent_owner(owner_type, owner_pid);
+    }
+
     fn release(&self) {
         let options = self.options.lock().clone();
         if self.sock_type() == SOCK_STREAM && options.linger_enabled && options.linger_seconds == 0
@@ -869,6 +897,13 @@ impl FileOps for NetSocketFileOps {
     }
 
     fn ioctl(&self, cmd: IoctlCmd, arg: usize) -> Result<usize, Errno> {
+        // Linux SIOCATMARK（0x8905）：读指针是否位于 OOB 标记处。
+        const SIOCATMARK: usize = 0x8905;
+        if cmd.raw() == SIOCATMARK {
+            // 读指针是否位于 OOB 标记处（仅 TCP 有语义；其他 socket 返回 0）。
+            let at_mark = self.sock_type() == SOCK_STREAM as u16 && self.proxy.at_oob_mark();
+            return Ok(usize::from(at_mark));
+        }
         dispatch_net_ioctl(cmd.raw() as u32, arg)
     }
 

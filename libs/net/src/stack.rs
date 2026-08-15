@@ -3859,7 +3859,7 @@ fn process_local_tcp_work(
         acknowledgement: work.acknowledgement,
         flags: work.flags,
         window: work.window,
-        urgent_pointer: 0,
+        urgent_pointer: work.urgent_pointer,
         header_len: 20 + u16::from(work.options_len),
         payload_offset: 0,
         payload_len: work
@@ -5352,6 +5352,7 @@ mod tests {
         let source = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let destination = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let plan = build_tcp_tx_plan(PreparedTcpTx {
+            urgent_pointer: 0,
             flow: FlowId(1),
             flow_generation: 1,
             facade_generation: 1,
