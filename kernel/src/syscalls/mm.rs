@@ -6,7 +6,7 @@ use alloc::sync::Arc;
 use errno::Errno;
 use general::mm::{
     FaultKind, Mempolicy, VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user,
-    file_cache_stat,
+    file_cache_stat, memstat,
 };
 use general::syscall::SyscallContext;
 use general::vfs::{current_fdtable, current_vfs_context, pidfd};
@@ -1216,8 +1216,32 @@ pub(super) fn sys_map_shadow_stack(_ctx: &mut SyscallContext<'_>) -> Result<usiz
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_userfaultfd(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_userfaultfd(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    const O_CLOEXEC: usize = 0x80000;
+    const O_NONBLOCK: usize = 0x800;
+    // UFFD_USER_MODE_ONLY：仅拦截用户态缺页。本实现只服务于用户态访问，
+    // 接受该标志（内核态 uaccess 命中的行为与未置位时一致）。
+    const UFFD_USER_MODE_ONLY: usize = 1 << 0;
+    let flags = ctx.args[0];
+    if flags & !(O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // vm.unprivileged_userfaultfd：非特权进程默认不允许（Linux 6.x 语义）。
+    let creds = ctx.task().credentials();
+    let privileged =
+        creds.has_cap(sched::Capability::SysPtrace) || creds.has_cap(sched::Capability::SysAdmin);
+    if !memstat::userfaultfd_allowed(privileged) {
+        return Err(Errno::EPERM);
+    }
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fd = general::mm::uffd::create_uffd_fd(
+        &fdt,
+        vfs_ctx.cred(),
+        (flags & O_NONBLOCK) != 0,
+        (flags & O_CLOEXEC) != 0,
+    )?;
+    Ok(fd.as_raw() as usize)
 }
 
 fn task_vm(ctx: &SyscallContext<'_>) -> Option<Arc<VmSpace>> {

@@ -22,6 +22,10 @@ use crate::mm::fault::{FaultKind, FaultOutcome, KernelFaultReason};
 use crate::mm::memstat;
 use crate::mm::ops::{PgdHandle, UserPteUpdate, UserVmLayoutOps, user_pgd_ops, user_vm_layout};
 use crate::mm::resident_map::RadixPageMap;
+use crate::mm::uffd::{
+    UFFD_PAGEFAULT_FLAG_WP, UFFD_PAGEFAULT_FLAG_WRITE, UFFDIO_REGISTER_MODE_MISSING,
+    UFFDIO_REGISTER_MODE_WP, UffdRegion, UffdState,
+};
 
 /// 顺序只读文件缺页一次最多预装的页数（包含硬件实际命中的页）。
 ///
@@ -2684,6 +2688,8 @@ pub struct VmSpace {
     locked_pages: AtomicUsize,
     /// NUMA 内存策略（单节点语义；`set_mempolicy`/`mbind` 状态）。
     mempolicy: Spinlock<MempolicyState>,
+    /// userfaultfd 登记区域。fork 不继承（Linux 语义：子进程不带 uffd 状态）。
+    uffd_regions: Spinlock<Vec<UffdRegion>>,
     /// `membarrier(2)` expedited 命令的地址空间级注册位。
     membarrier_registration: AtomicUsize,
     /// 诊断辅助：记录当前已建立页表映射的用户页数。
@@ -2718,6 +2724,7 @@ impl VmSpace {
             committed_pages: AtomicUsize::new(0),
             locked_pages: AtomicUsize::new(0),
             mempolicy: Spinlock::new(MempolicyState::default()),
+            uffd_regions: Spinlock::new(Vec::new()),
             membarrier_registration: AtomicUsize::new(0),
             mapped_pages: AtomicUsize::new(0),
             #[cfg(feature = "performance-profile")]
@@ -4379,6 +4386,361 @@ impl VmSpace {
         Ok(())
     }
 
+    // ── userfaultfd ──────────────────────────────────────────────────────────
+
+    /// `UFFDIO_REGISTER`：登记一段私有匿名区域交给用户态处理缺页。
+    ///
+    /// 校验：页对齐、长度非零、范围被私有匿名 VMA 连续覆盖（否则 `EINVAL`）、
+    /// 与既有登记不重叠（否则 `EEXIST`）。shmem/hugetlb/file 区域不支持。
+    pub(crate) fn uffd_register(
+        &self,
+        start: usize,
+        len: usize,
+        mode: u64,
+        state: &Arc<UffdState>,
+    ) -> Result<Range<usize>, Errno> {
+        let page_size = page_size();
+        if start % page_size != 0 || len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+        let end = start.checked_add(len).ok_or(Errno::EINVAL)?;
+        let range = start..end;
+        {
+            let set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(Errno::EINVAL);
+            }
+            for area in set.iter_overlap(&range) {
+                if !matches!(area.backing, VmBacking::Anon { .. })
+                    || area.flags.has(VmFlags::SHARED)
+                {
+                    return Err(Errno::EINVAL);
+                }
+            }
+        }
+        let mut regions = self.uffd_regions.lock();
+        if regions
+            .iter()
+            .any(|region| region.range.start < end && start < region.range.end)
+        {
+            return Err(Errno::EEXIST);
+        }
+        regions.push(UffdRegion {
+            range: range.clone(),
+            mode,
+            state: Arc::clone(state),
+        });
+        Ok(range)
+    }
+
+    /// `UFFDIO_UNREGISTER`：摘除与范围相交、且属于指定状态对象的登记。
+    pub(crate) fn uffd_unregister(
+        &self,
+        start: usize,
+        len: usize,
+        state: &Arc<UffdState>,
+    ) -> Result<(), Errno> {
+        let page_size = page_size();
+        if start % page_size != 0 || len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+        let end = start.checked_add(len).ok_or(Errno::EINVAL)?;
+        let mut regions = self.uffd_regions.lock();
+        regions.retain(|region| {
+            !(Arc::ptr_eq(&region.state, state)
+                && region.range.start < end
+                && start < region.range.end)
+        });
+        Ok(())
+    }
+
+    /// fd 关闭时由 `UffdState::release` 调用：摘除指定状态对象的登记。
+    pub(crate) fn uffd_remove_state(&self, state: &Arc<UffdState>, range: &Range<usize>) {
+        let mut regions = self.uffd_regions.lock();
+        regions.retain(|region| {
+            !(Arc::ptr_eq(&region.state, state) && ranges_overlap(&region.range, range))
+        });
+    }
+
+    /// `UFFDIO_COPY`：把调用者用户内存拷入目标地址空间并安装为匿名页。
+    ///
+    /// 要求目标范围逐页都未驻留（存在任何已驻留页返回 `EEXIST`，Linux 语义）；
+    /// `wp` 对应 `UFFDIO_COPY_MODE_WP`（安装为只读页）。返回安装字节数。
+    pub(crate) fn uffd_copy(
+        &self,
+        dst: usize,
+        src: usize,
+        len: usize,
+        wp: bool,
+    ) -> Result<u64, Errno> {
+        let page_size = page_size();
+        if dst % page_size != 0 || src % page_size != 0 || len == 0 || len % page_size != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = dst.checked_add(len).ok_or(Errno::EINVAL)?;
+        {
+            let pages = self.pages.lock();
+            let mut va = dst;
+            while va < end {
+                if pages.contains_key(va) {
+                    return Err(Errno::EEXIST);
+                }
+                va += page_size;
+            }
+        }
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EINVAL)?;
+        let mut va = dst;
+        while va < end {
+            let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+            let buf =
+                unsafe { core::slice::from_raw_parts_mut(virt_fn(paddr) as *mut u8, page_size) };
+            if crate::mm::copy_from_user(src + (va - dst), buf).is_err() {
+                free_user_page(paddr);
+                return Err(Errno::EFAULT);
+            }
+            let page = ResidentPage::new_anon(paddr);
+            self.uffd_install_page(va, page, wp)?;
+            va += page_size;
+        }
+        Ok(len as u64)
+    }
+
+    /// `UFFDIO_ZEROPAGE`：在目标地址空间安装零页。返回安装字节数。
+    pub(crate) fn uffd_zeropage(&self, start: usize, len: usize) -> Result<u64, Errno> {
+        let page_size = page_size();
+        if start % page_size != 0 || len == 0 || len % page_size != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = start.checked_add(len).ok_or(Errno::EINVAL)?;
+        {
+            let pages = self.pages.lock();
+            let mut va = start;
+            while va < end {
+                if pages.contains_key(va) {
+                    return Err(Errno::EEXIST);
+                }
+                va += page_size;
+            }
+        }
+        let mut va = start;
+        while va < end {
+            let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+            let page = ResidentPage::new_anon(paddr);
+            self.uffd_install_page(va, page, false)?;
+            va += page_size;
+        }
+        Ok(len as u64)
+    }
+
+    /// `UFFDIO_WRITEPROTECT`：设置/清除范围内驻留页的写保护。
+    ///
+    /// 要求范围命中登记了 WP 模式且属于 `state` 的区域（否则 `EINVAL`）。
+    /// 清除写保护时直接把页置为可写并唤醒等待者——这是 userfaultfd WP 协议
+    /// 的语义（页面是否做 COW 由用户态自行管理）。
+    pub(crate) fn uffd_writeprotect(
+        &self,
+        start: usize,
+        len: usize,
+        wp: bool,
+        state: &Arc<UffdState>,
+    ) -> Result<(), Errno> {
+        let page_size = page_size();
+        if start % page_size != 0 || len == 0 || len % page_size != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = start.checked_add(len).ok_or(Errno::EINVAL)?;
+        {
+            let regions = self.uffd_regions.lock();
+            let covered = regions.iter().any(|region| {
+                Arc::ptr_eq(&region.state, state)
+                    && region.mode & UFFDIO_REGISTER_MODE_WP != 0
+                    && region.range.start < end
+                    && start < region.range.end
+            });
+            if !covered {
+                return Err(Errno::EINVAL);
+            }
+        }
+        let mut set = self.vmas.lock();
+        let mut pages = self.pages.lock();
+        let mut batch: Option<(usize, usize, VmFlags)> = None;
+        let mut protect_error = None;
+        pages.for_each_range_mut(start..end, |va, mapping| {
+            if protect_error.is_some() {
+                return;
+            }
+            let Some(area) = set.find(va) else {
+                return;
+            };
+            let new_access = if wp {
+                PageAccess::ReadOnly
+            } else {
+                PageAccess::Writable
+            };
+            if new_access == mapping.access {
+                return;
+            }
+            mapping.access = new_access;
+            let pte_flags = pte_flags_for(area.flags, new_access);
+            if let Some((batch_start, batch_end, batch_flags)) = batch {
+                if va == batch_end && batch_flags == pte_flags {
+                    batch = Some((batch_start, batch_end + page_size, batch_flags));
+                    return;
+                }
+                if let Err(error) =
+                    self.protect_pages_no_flush(batch_start, batch_end - batch_start, batch_flags)
+                {
+                    protect_error = Some(error);
+                    return;
+                }
+            }
+            batch = Some((va, va + page_size, pte_flags));
+        });
+        if let Some(error) = protect_error {
+            return Err(error);
+        }
+        if let Some((batch_start, batch_end, batch_flags)) = batch {
+            self.protect_pages_no_flush(batch_start, batch_end - batch_start, batch_flags)?;
+        }
+        drop(pages);
+        drop(set);
+        self.invalidate_user_range(start, end - start);
+        Ok(())
+    }
+
+    /// 把用户态准备好的匿名页安装到 `va`（UFFDIO_COPY/ZEROPAGE 的公共步骤）。
+    ///
+    /// 要求 `va` 属于私有匿名 VMA 且页未驻留；成功后发布新映射（当前 CPU
+    /// 收敛即可，其它 CPU 会在缺页重试路径自行收敛）。
+    fn uffd_install_page(&self, va: usize, page: Arc<ResidentPage>, wp: bool) -> Result<(), Errno> {
+        let (access, flags) = {
+            let set = self.vmas.lock();
+            let area = set.find(va).ok_or(Errno::EINVAL)?;
+            if !matches!(area.backing, VmBacking::Anon { .. }) || area.flags.has(VmFlags::SHARED) {
+                return Err(Errno::EINVAL);
+            }
+            let access = if wp {
+                PageAccess::ReadOnly
+            } else {
+                access_for_new_page(area.flags, &page)
+            };
+            (access, area.flags)
+        };
+        let mut pages = self.pages.lock();
+        if pages.contains_key(va) {
+            return Err(Errno::EEXIST);
+        }
+        self.map_page_no_flush(va, page.paddr(), pte_flags_for(flags, access))?;
+        pages.insert(va, PageMapping { page, access });
+        let mapped = pages.len();
+        self.mapped_pages.store(mapped, Ordering::Release);
+        drop(pages);
+        self.publish_new_user_range(va, page_size());
+        Ok(())
+    }
+
+    /// MISSING 拦截：`page` 命中 MISSING 登记区域且未驻留时，入队事件并挂起
+    /// 当前任务，直到页面被用户态安装或登记失效。返回 true 表示缺页已解决。
+    fn uffd_missing_intercept(&self, page: usize, kind: FaultKind) -> bool {
+        let region = {
+            let regions = self.uffd_regions.lock();
+            if regions.is_empty() {
+                return false;
+            }
+            let Some(region) = regions.iter().find(|region| {
+                region.range.contains(&page) && region.mode & UFFDIO_REGISTER_MODE_MISSING != 0
+            }) else {
+                return false;
+            };
+            region.clone()
+        };
+        if self.pages.lock().contains_key(page) {
+            return false;
+        }
+        // 注册后 VMA 可能被替换；只拦截仍属于私有匿名的区域。
+        {
+            let set = self.vmas.lock();
+            let Some(area) = set.find(page) else {
+                return false;
+            };
+            if !matches!(area.backing, VmBacking::Anon { .. }) || area.flags.has(VmFlags::SHARED) {
+                return false;
+            }
+        }
+        let state = Arc::clone(&region.state);
+        let flags = if matches!(kind, FaultKind::Store | FaultKind::PermWrite) {
+            UFFD_PAGEFAULT_FLAG_WRITE
+        } else {
+            0
+        };
+        state.enqueue_fault(flags, page);
+        let page_present = || self.pages.lock().contains_key(page);
+        let region_alive = || {
+            if !state.alive() {
+                return false;
+            }
+            self.uffd_regions
+                .lock()
+                .iter()
+                .any(|region| region.range.contains(&page) && Arc::ptr_eq(&region.state, &state))
+        };
+        state.wait_fault(|| page_present() || !region_alive());
+        page_present()
+    }
+
+    /// WP 拦截：`page` 命中 WP 登记区域、已驻留但不可写，且本次是写访问时，
+    /// 入队 WP 事件并挂起，直到页面被 `UFFDIO_WRITEPROTECT` 解除保护。
+    fn uffd_wp_intercept(&self, page: usize, kind: FaultKind) -> bool {
+        if !matches!(kind, FaultKind::Store | FaultKind::PermWrite) {
+            return false;
+        }
+        let region = {
+            let regions = self.uffd_regions.lock();
+            if regions.is_empty() {
+                return false;
+            }
+            let Some(region) = regions.iter().find(|region| {
+                region.range.contains(&page) && region.mode & UFFDIO_REGISTER_MODE_WP != 0
+            }) else {
+                return false;
+            };
+            region.clone()
+        };
+        let writable_now = {
+            let pages = self.pages.lock();
+            let Some(mapping) = pages.get(page) else {
+                return false;
+            };
+            mapping.access.pte_writable()
+        };
+        if writable_now {
+            return false;
+        }
+        let state = Arc::clone(&region.state);
+        state.enqueue_fault(UFFD_PAGEFAULT_FLAG_WRITE | UFFD_PAGEFAULT_FLAG_WP, page);
+        let page_writable = || {
+            self.pages
+                .lock()
+                .get(page)
+                .is_some_and(|mapping| mapping.access.pte_writable())
+        };
+        let region_alive = || {
+            if !state.alive() {
+                return false;
+            }
+            self.uffd_regions
+                .lock()
+                .iter()
+                .any(|region| region.range.contains(&page) && Arc::ptr_eq(&region.state, &state))
+        };
+        state.wait_fault(|| page_writable() || !region_alive());
+        page_writable()
+    }
+
     pub fn sync_range(&self, range: Range<usize>) -> Result<(), Errno> {
         self.validate_range(&range)?;
         {
@@ -4573,6 +4935,8 @@ impl VmSpace {
             locked_pages: AtomicUsize::new(inherited_locked),
             // fork 继承内存策略（Linux 语义：mempolicy 随 mm 复制）。
             mempolicy: Spinlock::new(self.mempolicy.lock().clone()),
+            // fork 不继承 userfaultfd 登记（Linux 语义）。
+            uffd_regions: Spinlock::new(Vec::new()),
             // fork 创建独立 mm，按 Linux 语义不继承 expedited 注册状态。
             membarrier_registration: AtomicUsize::new(0),
             mapped_pages: AtomicUsize::new(mapped_pages),
@@ -4634,6 +4998,14 @@ impl VmSpace {
             return FaultOutcome::Kernel(KernelFaultReason::NotInitialized);
         }
         let page = page_base(addr);
+        // userfaultfd 拦截：MISSING 区域的缺页与 WP 区域的写保护缺页先入队
+        // 事件并挂起本任务，由用户态解决后返回 Fixed 让硬件重试。
+        if self.uffd_missing_intercept(page, kind) {
+            return FaultOutcome::Fixed;
+        }
+        if self.uffd_wp_intercept(page, kind) {
+            return FaultOutcome::Fixed;
+        }
         #[cfg(feature = "performance-profile")]
         let vma_profile =
             profile_phases.then(|| profiling::scope(profiling::Event::PageFaultVmaLookup));

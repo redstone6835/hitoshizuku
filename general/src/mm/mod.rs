@@ -21,6 +21,7 @@ pub mod ops;
 mod resident_map;
 pub mod smoketest;
 pub mod swap;
+pub mod uffd;
 pub mod user_access;
 pub mod vm_space;
 
