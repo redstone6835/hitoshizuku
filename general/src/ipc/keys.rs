@@ -22,6 +22,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use errno::Errno;
+use sched::current_task;
 use spin::Mutex;
 use vfs::cred::{Credentials, Gid, Uid};
 
@@ -483,7 +484,7 @@ impl KeyManager {
         if !keyring.is_keyring() {
             return None;
         }
-        if !permission_ok(&keyring, cred, KEY_USR_SEARCH) {
+        if !permission_ok(&keyring, cred, KEY_POS_SEARCH) {
             return None;
         }
         let want = format!("{}:{description}", key_type.name());
@@ -522,6 +523,11 @@ impl KeyManager {
     ///
     /// `spec == 0` 表示"当前线程的默认 keyring"（Linux `KEY_SPEC_REQKEY_AUTH_KEY`
     /// 之后的默认链：thread → process → session → user-session → user）。
+    /// 当前任务的根 ns pid（process keyring 描述用）。
+    fn current_pid_for_keyring(&self) -> u32 {
+        sched::current_task().pid_root_cached().unwrap_or(0) as u32
+    }
+
     pub fn resolve_spec(
         &self,
         spec: i32,
@@ -531,7 +537,29 @@ impl KeyManager {
     ) -> Result<Arc<Key>, Errno> {
         let id: KeyId = match spec {
             KEY_SPEC_THREAD_KEYRING => process.thread.lock().ok_or(Errno::ENOKEY)?,
-            KEY_SPEC_PROCESS_KEYRING => process.process.lock().ok_or(Errno::ENOKEY)?,
+            KEY_SPEC_PROCESS_KEYRING => {
+                // Linux `install_process_keyring`：进程没有显式 process keyring
+                // 时按需创建（描述 `_pid.<pid>`，权限走默认）。
+                let mut guard = process.process.lock();
+                if let Some(id) = *guard {
+                    id
+                } else {
+                    drop(guard);
+                    let pid = self.current_pid_for_keyring();
+                    let key = self.create_key(
+                        KeyType::Keyring,
+                        &format!("_pid.{pid}"),
+                        Vec::new(),
+                        cred.euid.0,
+                        0,
+                        KEY_DEFAULT_PERM,
+                        KeyState::Instantiated,
+                        0,
+                    )?;
+                    *process.process.lock() = Some(key.id);
+                    key.id
+                }
+            }
             KEY_SPEC_SESSION_KEYRING => {
                 if let Some(id) = *process.session.lock() {
                     id
@@ -627,7 +655,7 @@ impl KeyManager {
         if !keyring.is_keyring() {
             return Err(Errno::ENOTDIR);
         }
-        if !permission_ok(&keyring, cred, KEY_USR_WRITE) {
+        if !permission_ok(&keyring, cred, KEY_POS_WRITE) {
             return Err(Errno::EACCES);
         }
         let existing = self
@@ -654,11 +682,11 @@ impl KeyManager {
         if !keyring.is_keyring() {
             return Err(Errno::ENOTDIR);
         }
-        if !permission_ok(&keyring, cred, KEY_USR_WRITE) {
+        if !permission_ok(&keyring, cred, KEY_POS_WRITE) {
             return Err(Errno::EACCES);
         }
         let key = self.key(key_id)?;
-        if !permission_ok(&key, cred, KEY_USR_LINK) {
+        if !permission_ok(&key, cred, KEY_POS_LINK) {
             return Err(Errno::EACCES);
         }
         let (type_name, desc) = {
@@ -675,7 +703,7 @@ impl KeyManager {
         if !keyring.is_keyring() {
             return Err(Errno::ENOTDIR);
         }
-        if !permission_ok(&keyring, cred, KEY_USR_WRITE) {
+        if !permission_ok(&keyring, cred, KEY_POS_WRITE) {
             return Err(Errno::EACCES);
         }
         if keyring.remove_member(key_id) {
@@ -694,7 +722,7 @@ impl KeyManager {
         cred: &Credentials,
     ) -> Result<(), Errno> {
         let key = self.key(key_id)?;
-        if !permission_ok(&key, cred, KEY_USR_WRITE) {
+        if !permission_ok(&key, cred, KEY_POS_WRITE) {
             return Err(Errno::EACCES);
         }
         let inner = key.inner.lock();
@@ -718,7 +746,7 @@ impl KeyManager {
     /// `keyctl(KEYCTL_REVOKE)`。
     pub fn revoke(&self, key_id: KeyId, cred: &Credentials) -> Result<(), Errno> {
         let key = self.key(key_id)?;
-        if !permission_ok(&key, cred, KEY_USR_WRITE) {
+        if !permission_ok(&key, cred, KEY_POS_WRITE) {
             return Err(Errno::EACCES);
         }
         key.set_state(KeyState::Revoked);
@@ -729,7 +757,7 @@ impl KeyManager {
     /// 相同 uid）；`KEY_USR_SETATTR` 权限。
     pub fn chown(&self, key_id: KeyId, uid: Option<u32>, gid: Option<u32>, cred: &Credentials) -> Result<(), Errno> {
         let key = self.key(key_id)?;
-        if !permission_ok(&key, cred, KEY_USR_SETATTR) {
+        if !permission_ok(&key, cred, KEY_POS_SETATTR) {
             return Err(Errno::EACCES);
         }
         let current = {
@@ -748,7 +776,7 @@ impl KeyManager {
     /// `keyctl(KEYCTL_SETPERM)`。
     pub fn setperm(&self, key_id: KeyId, perm: u32, cred: &Credentials) -> Result<(), Errno> {
         let key = self.key(key_id)?;
-        if !permission_ok(&key, cred, KEY_USR_SETATTR) {
+        if !permission_ok(&key, cred, KEY_POS_SETATTR) {
             return Err(Errno::EACCES);
         }
         key.set_perm(perm);
@@ -761,7 +789,7 @@ impl KeyManager {
         if !keyring.is_keyring() {
             return Err(Errno::ENOTDIR);
         }
-        if !permission_ok(&keyring, cred, KEY_USR_WRITE) {
+        if !permission_ok(&keyring, cred, KEY_POS_WRITE) {
             return Err(Errno::EACCES);
         }
         for member in keyring.member_ids() {
@@ -774,7 +802,7 @@ impl KeyManager {
     /// `keyctl(KEYCTL_SET_TIMEOUT)`：设置到期时间（相对秒）。
     pub fn set_timeout(&self, key_id: KeyId, seconds: u64, cred: &Credentials, now_sec: u64) -> Result<(), Errno> {
         let key = self.key(key_id)?;
-        if !permission_ok(&key, cred, KEY_USR_SETATTR) {
+        if !permission_ok(&key, cred, KEY_POS_SETATTR) {
             return Err(Errno::EACCES);
         }
         key.set_expiry(if seconds == 0 {
@@ -788,7 +816,7 @@ impl KeyManager {
     /// `keyctl(KEYCTL_INVALIDATE)`。
     pub fn invalidate(&self, key_id: KeyId, cred: &Credentials) -> Result<(), Errno> {
         let key = self.key(key_id)?;
-        if !permission_ok(&key, cred, KEY_USR_WRITE) {
+        if !permission_ok(&key, cred, KEY_POS_WRITE) {
             return Err(Errno::EACCES);
         }
         key.set_state(KeyState::Revoked);
@@ -897,9 +925,10 @@ pub fn permission_ok(key: &Key, cred: &Credentials, mask: u32) -> bool {
     drop(inner);
 
     // possessor：拥有者（简化：uid 匹配即 possessor，与 Linux 的"持有引用"
-    // 语义在单用户系统等价）。
+    // 语义在单用户系统等价）。mask 是 KEY_POS_* 位（0x3f 内）；按
+    // Linux `key_task_permission` 的语义逐级检查 possessor/USR/GRP/OTH。
     if euid == uid {
-        return perm & (mask & 0x3f) != 0 || perm & (mask << 8) != 0;
+        return perm & mask != 0 || perm & (mask << 8) != 0;
     }
     if cred.groups.iter().any(|g| g.0 == gid) || cred.egid.0 == gid {
         return perm & (mask << 16) != 0;

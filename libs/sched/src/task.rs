@@ -1048,7 +1048,11 @@ impl Task {
                 thread_group,
                 process_group,
                 pid_in_ns: Vec::new(),
-                pid_ns: crate::root_pid_ns(),
+                // 占位 ns：sched::init() 完成前 ROOT_PID_NS 未发布，不能在此
+                // 调用 root_pid_ns()；所有创建路径随后 set_pid_ns 覆盖
+                // （init 任务在 sched::init 内绑定根 ns，spawn_child 等用
+                // child_pid_ns(parent)）。
+                pid_ns: crate::boot_pid_ns(),
             }),
             native_owner: Spinlock::new(None),
             kstack: Spinlock::new(None),
@@ -3317,6 +3321,9 @@ pub const TASKEXT_VFS_FDTABLE: TaskExtKey = 0x0001_0001;
 pub const TASKEXT_VM_SPACE: TaskExtKey = 0x0001_0002;
 /// 已保存的用户 trap frame（kernel/hal 通过此键挂在 Task 的 ext 表上）。
 pub const TASKEXT_USER_TRAP_FRAME: TaskExtKey = 0x0001_0003;
+/// syscall 入口的用户 trap frame 快照（arch 在 syscall 分发前保存，
+/// ptrace 的 GETREGSET/PEEKUSR 在 syscall-stop 期间读取）。
+pub const TASKEXT_PTRACE_FRAME: TaskExtKey = 0x0001_0006;
 /// RISC-V64 用户态 Vector 上下文（arch 专用，按线程独立保存）。
 pub const TASKEXT_RISCV_VECTOR_STATE: TaskExtKey = 0x0001_0004;
 /// RISC-V64 信号投递期间暂存的 Vector 上下文栈。

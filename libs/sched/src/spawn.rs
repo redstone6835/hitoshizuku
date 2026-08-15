@@ -267,6 +267,7 @@ pub fn spawn_native_thread(
         Arc::clone(&group),
         Arc::clone(&process_group),
     );
+    child.set_pid_ns(child_pid_ns(parent));
     child.set_exit_signal(0);
     child.set_credentials(parent.credentials());
     child.inherit_timer_slack_from(parent);
@@ -428,6 +429,9 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
         Arc::clone(&new_tg),
         Arc::clone(&pg),
     );
+    // 4.1) pid 命名空间：子进程按 pending/父进程 ns 链注册（CLONE_NEWPID
+    //      在 fork 时对子进程生效）。
+    child.set_pid_ns(child_pid_ns(parent));
     child.inherit_timer_slack_from(parent);
     #[cfg(feature = "performance-profile")]
     child.inherit_profile_session_from(parent);
@@ -661,7 +665,7 @@ fn reparent_native_children_to_init(owner: &Arc<ThreadGroup>) {
 /// `PTRACE_O_TRACEEXIT` 选项位。
 pub const PTRACE_O_TRACEEXIT: u64 = 0x0000_0040;
 /// `PTRACE_EVENT_EXIT` 事件号。
-pub const PTRACE_EVENT_EXIT: u16 = 5;
+pub const PTRACE_EVENT_EXIT: u16 = 6;
 
 #[kernel_symbols::export(name = "sched.spawn.exit_task", contract = "kernel.sched.task-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
@@ -866,6 +870,8 @@ pub fn kthread_create(entry: KernelEntry, arg: usize, params: SchedParams) -> Ar
     );
     child.mark_kernel_thread();
     child.set_exit_signal(0);
+    // 内核线程注册进根 pid 命名空间（kthread_create 开头已取 root_ns）。
+    child.set_pid_ns(Arc::clone(&root_ns));
 
     let Ok(pid) = register_pid_chain(&child) else {
         log::warning!("[sched][kthread] pid allocation failed");

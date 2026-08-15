@@ -487,6 +487,15 @@ unsafe fn loongarch64_handle_exception_inner(
             // 汇编入口已保存完整现场，内核态嵌套 trap 会继续使用当前
             // 内核栈。在可能长时间阻塞或处理大数据的 syscall 期间恢复中断，
             // 确保 timer、reschedule 和 TLB shootdown 不会被拖到 syscall 返回。
+            // 被 ptrace 跟踪的任务：保存用户 trap frame 快照，供 tracer 的
+            // PTRACE_GETREGSET/PEEKUSR 在 syscall-stop 期间读取。
+            if sched::is_ready() && sched::current_task().is_ptrace_traced() {
+                let task = sched::current_task();
+                let erased: alloc::sync::Arc<dyn core::any::Any + Send + Sync> =
+                    alloc::sync::Arc::new(*tf);
+                let _ = task.ext_remove(sched::TASKEXT_PTRACE_FRAME);
+                task.ext_install(sched::TASKEXT_PTRACE_FRAME, erased);
+            }
             unsafe { LoongArch64InterruptOps::enable_interrupts() };
         }
         general::syscall::dispatch(general::TrapFramePtr::new(arg4));

@@ -10,7 +10,7 @@ mod fs;
 pub(crate) mod ipc;
 mod mm;
 mod nr;
-mod process;
+pub(crate) mod process;
 mod signal;
 mod syslog;
 

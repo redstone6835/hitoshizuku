@@ -40,6 +40,7 @@ impl SemUndoTable {
         self.inner.lock().is_empty()
     }
 
+
     /// 整批 `semop` 成功提交后调用：把带 `SEM_UNDO` 标志的操作累计为撤销值。
     ///
     /// 调用方必须保证 `operations` 就是刚被原子提交的那一批。
@@ -93,8 +94,10 @@ impl SemUndoTable {
                 if delta == 0 {
                     continue;
                 }
-                // 调整值超出 i16 范围：Linux 对 undo 应用同样返回 ERANGE 并放弃。
-                let Ok(sem_op) = i16::try_from(-delta) else {
+                // 撤销值 = -原操作；应用时执行与撤销值等价的 semop：
+                // 原 +1 记 delta=-1，退出时执行 -1 使值还原。调整值超出
+                // i16 范围时 Linux 对 undo 应用同样返回 ERANGE 并放弃。
+                let Ok(sem_op) = i16::try_from(delta) else {
                     overflow = true;
                     break;
                 };

@@ -120,7 +120,7 @@ pub fn unshare(task: &Arc<Task>, flags: u64) -> Result<(), Errno> {
     const CLONE_NEWUSER: u64 = 0x1000_0000;
     const CLONE_NEWPID: u64 = 0x2000_0000;
     const CLONE_NEWNET: u64 = 0x4000_0000;
-    const CLONE_NEWTIME: u64 = 0x0080_0000;
+    const CLONE_NEWTIME: u64 = 0x0000_0080;
     const SUPPORTED: u64 = CLONE_NEWNS
         | CLONE_NEWCGROUP
         | CLONE_NEWUTS
@@ -261,6 +261,9 @@ impl NsProxy {
 
 fn install_proxy(task: &Arc<Task>, proxy: NsProxy) {
     let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(proxy);
+    // 通用 ext 的 install 不允许同 key 重复挂载（debug 断言 + lookup 取首项），
+    // 命名空间切换必须先把旧 proxy 摘掉再装新的。
+    let _ = task.ext_remove(TASKEXT_NS);
     task.ext_install(TASKEXT_NS, erased);
 }
 

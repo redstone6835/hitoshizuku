@@ -4,7 +4,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use errno::Errno;
 use general::firmware::power;
 use general::mm::{VmFutexKey, VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
@@ -88,8 +88,11 @@ static UTS_DOMAINNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_F
 
 pub(super) fn sys_getpid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let task = ctx.task();
-    // Linux：getpid 返回调用者 pid 命名空间中的 pid。
-    let ns = Arc::clone(&crate::ns::task_ns(task).pid);
+    // Linux：getpid 返回调用者 pid 命名空间中的 pid。任务的权威 ns 是
+    // sched 侧 `task.pid_ns()`（spawn 时由 register_pid_chain 按
+    // pending/父 ns 设置）；NsProxy.pid 只反映 fork 时的快照，unshare
+    // (CLONE_NEWPID) 后子进程会得到新 ns，必须用任务自身 ns 查询。
+    let ns = task.pid_ns();
     if let Some(pid) = task.pid_in(&ns) {
         return Ok(pid as usize);
     }
@@ -2219,12 +2222,14 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             install_credentials(task, new);
             Ok(0)
         }
-        PR_GET_TSC => Ok(0), // 无 RDTSC 限制需求：保持 enable 状态（Linux 返回 1 = PR_TSC_ENABLE）
+        PR_GET_TSC => Ok(prctl_misc(ctx.task()).tsc_mode.load(Ordering::Acquire) as usize),
         PR_SET_TSC => {
             let flag = ctx.args[1];
-            if flag > 1 {
+            // PR_TSC_ENABLE=1 / PR_TSC_SIGSEGV=2。
+            if flag != 1 && flag != 2 {
                 return Err(Errno::EINVAL);
             }
+            prctl_misc(ctx.task()).tsc_mode.store(flag as u8, Ordering::Release);
             Ok(0)
         }
         PR_GET_SECUREBITS => Ok(task.credentials().securebits as usize),
@@ -2278,24 +2283,64 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         PR_GET_NO_NEW_PRIVS => Ok(task.no_new_privs() as usize),
         PR_SET_THP_DISABLE => {
-            if ctx.args[1] > 1 {
+            let value = ctx.args[1];
+            if value > 1 {
                 return Err(Errno::EINVAL);
             }
+            prctl_misc(ctx.task()).thp_disable.store(value as u8, Ordering::Release);
             Ok(0)
         }
-        PR_GET_THP_DISABLE => Ok(0),
+        PR_GET_THP_DISABLE => Ok(prctl_misc(ctx.task()).thp_disable.load(Ordering::Acquire) as usize),
         PR_GET_SECCOMP => Ok(0),
         PR_SET_SECCOMP => {
-            // 老式 PR_SET_SECCOMP：等价 seccomp(2)。
-            crate::syscalls::process::seccomp_filter_setup(
-                ctx.task(),
-                ctx.args[1],
-                ctx.args[2],
-            )?;
+            // 老式 PR_SET_SECCOMP：arg2 是 SECCOMP_MODE_*（STRICT=1 / FILTER=2），
+            // 与 seccomp(2) 的 SECCOMP_SET_MODE_*（STRICT=0 / FILTER=1）不同，
+            // 先换算成 SET 语义再走公共安装路径。
+            use general::seccomp::{SECCOMP_MODE_FILTER, SECCOMP_MODE_STRICT};
+            let mode = match ctx.args[1] as i32 {
+                SECCOMP_MODE_STRICT => general::seccomp::SECCOMP_SET_MODE_STRICT as usize,
+                SECCOMP_MODE_FILTER => general::seccomp::SECCOMP_SET_MODE_FILTER as usize,
+                _ => return Err(Errno::EINVAL),
+            };
+            crate::syscalls::process::seccomp_filter_setup(ctx.task(), mode, ctx.args[2])?;
             Ok(0)
         }
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// 每个任务/进程的 `prctl` 杂项状态（TSC 模式、THP 开关）。
+pub(crate) const TASKEXT_PRCTL_MISC: sched::TaskExtKey = 0x0004_0005;
+
+/// `prctl` 持久化的进程级杂项状态（Linux `PR_SET_TSC`/`PR_SET_THP_DISABLE`）。
+pub(crate) struct PrctlMiscState {
+    /// `PR_TSC_ENABLE=1` / `PR_TSC_SIGSEGV=2`。
+    pub(crate) tsc_mode: AtomicU8,
+    /// `PR_SET_THP_DISABLE` 的 0/1。
+    pub(crate) thp_disable: AtomicU8,
+}
+
+impl PrctlMiscState {
+    pub(crate) fn new() -> Self {
+        Self {
+            tsc_mode: AtomicU8::new(1), // 默认 PR_TSC_ENABLE
+            thp_disable: AtomicU8::new(0),
+        }
+    }
+}
+
+/// 取任务的 prctl 杂项状态（惰性创建并挂载）。
+fn prctl_misc(task: &Arc<Task>) -> Arc<PrctlMiscState> {
+    if let Some(state) = task
+        .ext_lookup(TASKEXT_PRCTL_MISC)
+        .and_then(|payload| payload.downcast::<PrctlMiscState>().ok())
+    {
+        return state;
+    }
+    let state = Arc::new(PrctlMiscState::new());
+    let erased: Arc<dyn core::any::Any + Send + Sync> = state.clone();
+    task.ext_install(TASKEXT_PRCTL_MISC, erased);
+    state
 }
 
 /// `PR_SET_SECCOMP`：老式 seccomp 入口，等价 `seccomp(2)`。
@@ -4822,18 +4867,18 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(0)
         }
         PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
+            // Linux：PEEKDATA/POKEDATA 的第四个参数直接携带数据（word），
+            // 不做指针解引用——PEEK 以系统调用返回值回传。
             let target = ptrace_target_task(pid)?;
             let vm = ptrace_target_vm(&target)?;
             let mut raw = [0u8; 8];
             vm.copy_user_bytes_in(addr, &mut raw)?;
-            copy_to_user(data, &raw).map_err(|e| e.as_errno())?;
-            Ok(0)
+            Ok(usize::from_ne_bytes(raw))
         }
         PTRACE_POKETEXT | PTRACE_POKEDATA => {
             let target = ptrace_target_task(pid)?;
             let vm = ptrace_target_vm(&target)?;
-            let mut raw = [0u8; 8];
-            copy_from_user(data, &mut raw).map_err(|e| e.as_errno())?;
+            let raw = (data as u64).to_ne_bytes();
             vm.copy_user_bytes_out(addr, &raw)?;
             if request == PTRACE_POKETEXT {
                 <arch::CurrentTaskOps as general::TaskOps>::sync_icache();
@@ -4843,14 +4888,11 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         PTRACE_PEEKUSR => {
             let target = ptrace_target_task(pid)?;
             let value = ptrace_peek_usr(&target, addr)?;
-            copy_to_user(data, &value.to_ne_bytes()).map_err(|e| e.as_errno())?;
-            Ok(0)
+            Ok(value)
         }
         PTRACE_POKEUSR => {
             let target = ptrace_target_task(pid)?;
-            let mut raw = [0u8; 8];
-            copy_from_user(data, &mut raw).map_err(|e| e.as_errno())?;
-            ptrace_poke_usr(&target, addr, usize::from_ne_bytes(raw))?;
+            ptrace_poke_usr(&target, addr, data)?;
             Ok(0)
         }
         PTRACE_GETREGSET | PTRACE_SETREGSET => {
@@ -4963,6 +5005,21 @@ fn ptrace_target_vm(target: &Arc<Task>) -> Result<Arc<VmSpace>, Errno> {
 
 /// 取目标停止时保存的用户 trap frame。
 fn ptrace_target_frame(target: &Arc<Task>) -> Result<hal::user_context::UserTrapFrame, Errno> {
+    // 优先取 syscall 入口的 arch 快照（arch 在 syscall 分发前保存）；
+    // 回退到恢复/写回路径保存的 UserTrapFrame（POKEUSR 写回后、以及
+    // 信号/单步场景）。
+    #[cfg(target_arch = "loongarch64")]
+    let arch_frame = target
+        .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
+        .and_then(|payload| payload.downcast::<arch::loongarch64::TrapFrame>().ok());
+    #[cfg(target_arch = "riscv64")]
+    let arch_frame = target
+        .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
+        .and_then(|payload| payload.downcast::<arch::riscv64::TrapFrame>().ok());
+    if let Some(frame) = arch_frame {
+        let raw = Arc::as_ptr(&frame) as usize;
+        return Ok(hal::user_context::UserTrapFrame::from_context(raw));
+    }
     let frame = target
         .ext_lookup(sched::TASKEXT_USER_TRAP_FRAME)
         .and_then(|payload| payload.downcast::<hal::user_context::UserTrapFrame>().ok())
@@ -5459,6 +5516,8 @@ const TIMEX_TIME: usize = 72; // struct timeval { tv_sec, tv_usec }
 const TIMEX_STATE: usize = 88;
 
 const ADJ_OFFSET: u32 = 0x0001;
+/// `ADJ_OFFSET_SINGLESHOT`（0x8001）的 0x8000 标志位：老式 adjtime 语义。
+const ADJ_OFFSET_SINGLESHOT_BIT: u32 = 0x8000;
 const ADJ_FREQUENCY: u32 = 0x0002;
 const ADJ_MAXERROR: u32 = 0x0004;
 const ADJ_ESTERROR: u32 = 0x0008;
@@ -5518,7 +5577,8 @@ fn clock_adjtime_common(
         | ADJ_SETOFFSET
         | ADJ_MICRO
         | ADJ_NANO
-        | ADJ_TICK)
+        | ADJ_TICK
+        | ADJ_OFFSET_SINGLESHOT_BIT)
         != 0
     {
         return Err(Errno::EINVAL);
@@ -5595,9 +5655,9 @@ fn clock_adjtime_common(
         guard.status &= !STA_UNSYNC;
     }
 
-    // 写回当前状态。
+    // 写回当前状态。timex_state() 内部会对 CLOCK_DISCIPLINE 重新加锁，
+    // 必须在 drop(guard) 之后调用，否则自旋锁自死锁。
     let mut out = raw;
-    let state = timex_state();
     write_i64(&mut out, TIMEX_OFFSET, guard.offset_usec);
     write_i64(&mut out, TIMEX_FREQ, guard.freq_ppm);
     write_u64(&mut out, TIMEX_MAXERROR, guard.maxerror);
@@ -5606,8 +5666,9 @@ fn clock_adjtime_common(
     write_i64(&mut out, TIMEX_CONSTANT, guard.constant);
     write_u64(&mut out, TIMEX_PRECISION, guard.precision);
     write_i64(&mut out, TIMEX_TICK, guard.tick_usec);
-    write_i32(&mut out, TIMEX_STATE, state);
     drop(guard);
+    let state = timex_state();
+    write_i32(&mut out, TIMEX_STATE, state);
     write_timex(user, &out)?;
     Ok(state as usize)
 }

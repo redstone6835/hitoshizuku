@@ -1180,14 +1180,27 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         KEYCTL_LINK => {
             let key_id = KeyId(ctx.args[1] as i32);
-            let keyring_id = KeyId(ctx.args[2] as i32);
-            manager.link(keyring_id, key_id, &cred)?;
+            // keyring 参数支持 KEY_SPEC_*（-1..-8）与显式 id（Linux 语义）。
+            let keyring = resolve_keyring(
+                &manager,
+                &process_keyrings(ctx),
+                ctx.args[2] as i32,
+                &cred,
+                now,
+            )?;
+            manager.link(keyring, key_id, &cred)?;
             Ok(0)
         }
         KEYCTL_UNLINK => {
             let key_id = KeyId(ctx.args[1] as i32);
-            let keyring_id = KeyId(ctx.args[2] as i32);
-            manager.unlink(keyring_id, key_id, &cred)?;
+            let keyring = resolve_keyring(
+                &manager,
+                &process_keyrings(ctx),
+                ctx.args[2] as i32,
+                &cred,
+                now,
+            )?;
+            manager.unlink(keyring, key_id, &cred)?;
             Ok(0)
         }
         KEYCTL_SEARCH => {
@@ -1577,13 +1590,14 @@ fn sys_semop_common(
 }
 
 /// 成功提交一批 `semop` 后，把带 `SEM_UNDO` 标志的操作登记进撤销表。
+///
+/// 表不存在时惰性创建并挂载（Linux `find_alloc_undo`：首次 SEM_UNDO 操作
+/// 建立进程自己的撤销表）。
 fn record_sem_undo(ctx: &SyscallContext<'_>, id: SemId, operations: &[SemOperation]) {
     if !operations.iter().any(|op| op.sem_flg & SEM_UNDO != 0) {
         return;
     }
-    if let Some(table) = sem_undo_table_opt(ctx) {
-        table.record(id, operations);
-    }
+    sem_undo_table(ctx).record(id, operations);
 }
 
 /// 取当前任务的 `SEM_UNDO` 表；不存在时惰性创建并挂载。
@@ -1679,11 +1693,15 @@ fn read_sem_deadline(user: usize) -> Result<Option<u64>, Errno> {
     if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
         return Err(Errno::EINVAL);
     }
-    let duration = (seconds as u64)
+    let abs_realtime = (seconds as u64)
         .checked_mul(1_000_000_000)
         .and_then(|value| value.checked_add(nanoseconds as u64))
         .ok_or(Errno::EINVAL)?;
-    Ok(Some(sched::now_ns_direct().saturating_add(duration)))
+    // mq_timedsend/mq_timedreceive 的 timeout 是 CLOCK_REALTIME 绝对时间；
+    // 换算成单调时钟的 deadline：delta = 目标 - 当前 realtime。
+    let now_realtime = crate::vdso::realtime_ns();
+    let delta = abs_realtime.saturating_sub(now_realtime);
+    Ok(Some(sched::now_ns_direct().saturating_add(delta)))
 }
 
 fn task_vm(ctx: &SyscallContext<'_>) -> Option<Arc<VmSpace>> {
@@ -1745,11 +1763,15 @@ fn read_mq_deadline(user: usize) -> Result<Option<u64>, Errno> {
     if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
         return Err(Errno::EINVAL);
     }
-    let duration = (seconds as u64)
+    let abs_realtime = (seconds as u64)
         .checked_mul(1_000_000_000)
         .and_then(|value| value.checked_add(nanoseconds as u64))
         .ok_or(Errno::EINVAL)?;
-    Ok(Some(sched::now_ns_direct().saturating_add(duration)))
+    // mq_timedsend/mq_timedreceive 的 timeout 是 CLOCK_REALTIME 绝对时间；
+    // 换算成单调时钟的 deadline：delta = 目标 - 当前 realtime。
+    let now_realtime = crate::vdso::realtime_ns();
+    let delta = abs_realtime.saturating_sub(now_realtime);
+    Ok(Some(sched::now_ns_direct().saturating_add(delta)))
 }
 
 fn write_u16(raw: &mut [u8], off: usize, val: u16) {

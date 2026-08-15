@@ -491,7 +491,12 @@ fn ptrace_syscall_entry(ctx: &SyscallContext<'_>) -> bool {
     if !task.is_ptrace_traced() || !task.ptrace_syscall_stop_enabled() {
         return false;
     }
-    task.set_ptrace_syscall_stop(false);
+    // 重入路径：上一个 entry-stop 已产生（reenable=true），PTRACE_SYSCALL
+    // 恢复后本任务重新进入 syscall 分发；此时放行执行 syscall 主体，
+    // 完成后的 exit-stop 由 ptrace_syscall_exit 产生。
+    if task.ptrace_syscall_reenable() {
+        return false;
+    }
     task.set_ptrace_syscall_reenable(true);
     task.record_syscall_entry(ctx.nr, ctx.args);
     task.set_ptrace_stop_event(0);
@@ -578,7 +583,7 @@ fn seccomp_filter_syscall(ctx: &mut SyscallContext<'_>) -> bool {
     #[cfg(target_arch = "riscv64")]
     const AUDIT_ARCH: u32 = 0x4000_00f3;
 
-    let mut data = [0u8; 64];
+    let mut data = [0u8; crate::seccomp::SECCOMP_DATA_SIZE];
     data[SECCOMP_DATA_NR..SECCOMP_DATA_NR + 8]
         .copy_from_slice(&(ctx.nr as i64).to_le_bytes());
     data[SECCOMP_DATA_ARCH..SECCOMP_DATA_ARCH + 4]

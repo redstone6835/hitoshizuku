@@ -440,6 +440,15 @@ fn handle_user_syscall(tf_ptr: usize) -> usize {
         let tf = unsafe { trap_frame_ref(tf_ptr) };
         (tf.a7, tf.satp)
     };
+    // 被 ptrace 跟踪的任务：保存用户 trap frame 快照，供 tracer 的
+    // PTRACE_GETREGSET/PEEKUSR 在 syscall-stop 期间读取。
+    if sched::current_task().is_ptrace_traced() {
+        let task = sched::current_task();
+        let erased: alloc::sync::Arc<dyn core::any::Any + Send + Sync> =
+            alloc::sync::Arc::new(*unsafe { trap_frame_ref(tf_ptr) });
+        let _ = task.ext_remove(sched::TASKEXT_PTRACE_FRAME);
+        task.ext_install(sched::TASKEXT_PTRACE_FRAME, erased);
+    }
     #[cfg(feature = "syscall-model-markers")]
     let _syscall_model = {
         let task = sched::current_task();
@@ -736,6 +745,15 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
         let tf = unsafe { trap_frame_ref(tf_ptr) };
         (tf.a7, [tf.a0, tf.a1, tf.a2, tf.a3, tf.a4, tf.a5], tf.satp)
     };
+    // 被 ptrace 跟踪的任务：保存用户 trap frame 快照，供 tracer 的
+    // PTRACE_GETREGSET/PEEKUSR 在 syscall-stop 期间读取。
+    if task.as_arc().is_ptrace_traced() {
+        let erased: alloc::sync::Arc<dyn core::any::Any + Send + Sync> =
+            alloc::sync::Arc::new(*unsafe { trap_frame_ref(tf_ptr) });
+        let _ = task.as_arc().ext_remove(sched::TASKEXT_PTRACE_FRAME);
+        task.as_arc()
+            .ext_install(sched::TASKEXT_PTRACE_FRAME, erased);
+    }
     #[cfg(feature = "syscall-model-markers")]
     let _syscall_model = profiling::syscall_model_scope(
         task.as_arc().profile_session_id(),

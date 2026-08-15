@@ -35,6 +35,8 @@ pub const SECCOMP_DATA_NR: usize = 0;
 pub const SECCOMP_DATA_ARCH: usize = 8;
 pub const SECCOMP_DATA_IP: usize = 16;
 pub const SECCOMP_DATA_ARGS: usize = 24;
+/// `struct seccomp_data` 总大小（Linux：8+4+4+8+6*8=72 字节）。
+pub const SECCOMP_DATA_SIZE: usize = 72;
 
 /// `seccomp(2)` 操作。
 pub const SECCOMP_SET_MODE_STRICT: u32 = 0;
@@ -112,7 +114,7 @@ impl SeccompState {
     }
 
     /// 在 syscall 入口运行过滤器链，返回最终动作（含 data）。
-    pub fn run(&self, data: &[u8; 64]) -> u32 {
+    pub fn run(&self, data: &[u8; SECCOMP_DATA_SIZE]) -> u32 {
         let filters = self.filters.lock();
         let mut action = SECCOMP_RET_ALLOW;
         for filter in filters.iter() {
@@ -169,7 +171,7 @@ impl SeccompFilter {
     }
 
     /// 运行过滤器，返回动作值。
-    pub fn run(&self, data: &[u8; 64]) -> u32 {
+    pub fn run(&self, data: &[u8; SECCOMP_DATA_SIZE]) -> u32 {
         run_bpf(&self.insns, data)
     }
 }
@@ -235,7 +237,7 @@ fn validate_program(insns: &[SockFilter]) -> Result<(), Errno> {
                         }
                     }
                     BPF_ABS | BPF_IND => {
-                        // seccomp_data 共 64 字节；H/B 模式不能越过末尾。
+                        // seccomp_data 共 SECCOMP_DATA_SIZE 字节；H/B 模式不能越过末尾。
                         let max = if size == BPF_W {
                             4
                         } else if size == BPF_H {
@@ -243,7 +245,7 @@ fn validate_program(insns: &[SockFilter]) -> Result<(), Errno> {
                         } else {
                             1
                         };
-                        if insn.k as usize > 64 - max {
+                        if insn.k as usize > SECCOMP_DATA_SIZE - max {
                             return Err(Errno::EINVAL);
                         }
                     }
@@ -302,7 +304,7 @@ fn validate_program(insns: &[SockFilter]) -> Result<(), Errno> {
 ///
 /// 寄存器：`A`（累加器）、`X`（索引）、`M[0..15]`（内存）。`data` 是
 /// 64 字节的 `struct seccomp_data`。
-pub fn run_bpf(insns: &[SockFilter], data: &[u8; 64]) -> u32 {
+pub fn run_bpf(insns: &[SockFilter], data: &[u8; SECCOMP_DATA_SIZE]) -> u32 {
     let mut a: u32 = 0;
     let mut x: u32 = 0;
     let mut mem = [0u32; 16];
@@ -363,7 +365,7 @@ pub fn run_bpf(insns: &[SockFilter], data: &[u8; 64]) -> u32 {
                 }
             }
             BPF_JMP => {
-                let (condition, offset) = match op {
+                let (condition, _offset) = match op {
                     BPF_JA => (true, insn.k as i32),
                     BPF_JEQ => (a == if insn.code & 0x08 != 0 { x } else { insn.k }, insn.jt as i32 - insn.jf as i32),
                     BPF_JGT => (a > if insn.code & 0x08 != 0 { x } else { insn.k }, insn.jt as i32 - insn.jf as i32),
@@ -371,20 +373,16 @@ pub fn run_bpf(insns: &[SockFilter], data: &[u8; 64]) -> u32 {
                     BPF_JSET => (a & if insn.code & 0x08 != 0 { x } else { insn.k } != 0, insn.jt as i32 - insn.jf as i32),
                     _ => return SECCOMP_RET_KILL_THREAD,
                 };
-                let base = if condition {
+                // 跳转语义：JA 相对 +k；条件跳转真分支 +jt、假分支 +jf
+                // （均相对下一条指令）。
+                let offset = if op == BPF_JA {
+                    insn.k as i32
+                } else if condition {
                     insn.jt as i32
                 } else {
                     insn.jf as i32
                 };
-                // 统一：真分支 +jt，假分支 +jf（JA 无分支）。
-                let step = if op == BPF_JA {
-                    offset
-                } else if condition {
-                    base
-                } else {
-                    -(insn.jf as i32)
-                };
-                let next = pc as i64 + 1 + step as i64;
+                let next = pc as i64 + 1 + offset as i64;
                 if next < 0 || next >= insns.len() as i64 {
                     return SECCOMP_RET_KILL_THREAD;
                 }
@@ -404,17 +402,17 @@ pub fn run_bpf(insns: &[SockFilter], data: &[u8; 64]) -> u32 {
     SECCOMP_RET_KILL_THREAD
 }
 
-fn load_word(data: &[u8; 64], offset: u32, size: u16) -> u32 {
+fn load_word(data: &[u8; SECCOMP_DATA_SIZE], offset: u32, size: u16) -> u32 {
     let offset = offset as usize;
     match size {
         BPF_W => {
-            if offset + 4 > 64 {
+            if offset + 4 > SECCOMP_DATA_SIZE {
                 return 0;
             }
             u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
         }
         BPF_H => {
-            if offset + 2 > 64 {
+            if offset + 2 > SECCOMP_DATA_SIZE {
                 return 0;
             }
             u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as u32
