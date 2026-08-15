@@ -48,6 +48,14 @@ pub(super) fn vfs_cred_from_sched(src: &SchedCredentials) -> VfsCredentials {
         (SchedCapability::SysAdmin, VfsCapability::SysAdmin),
         (SchedCapability::SysBoot, VfsCapability::SysAdmin),
         (SchedCapability::SysResource, VfsCapability::SysResource),
+        (SchedCapability::Mknod, VfsCapability::MkNod),
+        (SchedCapability::IpcOwner, VfsCapability::IpcOwner),
+        (SchedCapability::IpcLock, VfsCapability::IpcLock),
+        (SchedCapability::SysPtrace, VfsCapability::SysPtrace),
+        (
+            SchedCapability::CheckpointRestore,
+            VfsCapability::CheckpointRestore,
+        ),
     ] {
         if src.has_cap(sched_cap) {
             caps = caps.with(vfs_cap);
