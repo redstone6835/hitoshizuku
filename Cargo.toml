@@ -65,6 +65,14 @@ exclude = [
     "drivers/virtio",
     "drivers/virtio-blk",
     "drivers/virtio-net",
+    "drivers/jh7110-uart",
+    "drivers/jh7110-crg",
+    "drivers/jh7110-pinctrl",
+    "drivers/jh7110-mmc",
+    "drivers/designware-i2c",
+    "drivers/pl022",
+    "drivers/dwmac",
+    "drivers/cdns-usb3",
     "tests/elm/kernel-mixin",
 ]
 

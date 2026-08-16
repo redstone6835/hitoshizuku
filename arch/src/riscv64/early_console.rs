@@ -35,11 +35,14 @@ const UART_STATE_READY: usize = 2;
 
 const FALLBACK_EARLY_UART_CONFIG: EarlyUartConfig = EarlyUartConfig {
     phys_base: 0x1000_0000,
-    clock_hz: 1_843_200,
+    // 24MHz：JH7110 UART0 核心时钟（VF2 实机）；QEMU 会在 DTB 配置阶段覆盖。
+    // reg-shift=2 + 32 位访问是 JH7110 DW_APB UART 的布局：LSR 位于 0x14，
+    // 若按 16550 的字节布局轮询（偏移 5）会永远等不到 THRE 而挂死。
+    clock_hz: 24_000_000,
     baud: 115_200,
     reg_offset: 0,
-    reg_shift: 0,
-    io_width: RegisterIoWidth::U8,
+    reg_shift: 2,
+    io_width: RegisterIoWidth::U32,
     endian: RegisterEndian::Little,
 };
 

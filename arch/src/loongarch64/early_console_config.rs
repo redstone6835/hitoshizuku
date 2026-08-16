@@ -364,7 +364,16 @@ fn node_is_available(node: Node<'_>) -> Result<bool, EarlyUartConfigError> {
 }
 
 fn node_is_16550(node: Node<'_>) -> Result<bool, EarlyUartConfigError> {
-    node_has_compatible(node, &["ns16550", "ns16550a"])
+    // JH7110/DW_APB 与 8250 共享同一寄存器子集，一并接受。
+    node_has_compatible(
+        node,
+        &[
+            "ns16550",
+            "ns16550a",
+            "starfive,jh7110-uart",
+            "snps,dw-apb-uart",
+        ],
+    )
 }
 
 fn node_has_compatible(node: Node<'_>, expected: &[&str]) -> Result<bool, EarlyUartConfigError> {
@@ -556,7 +565,32 @@ fn uart_clock_hz(fdt: Fdt<'_>, uart: Node<'_>) -> Result<u32, EarlyUartConfigErr
         .ok_or(EarlyUartConfigError::MissingClock)?;
     let index = baud_clock_index(uart)?;
     let provider = clock_provider_at(fdt, clocks.value(), index)?;
+    // JH7110 syscrg：按 #clock-cells=<1> 的时钟 ID 查内建速率表。VF2 固件
+    // 设备树的串口时钟引用指向 syscrg 而非 fixed-clock，若不内建查表，早期
+    // 控制台会退回 QEMU 兜底配置并以错误 divisor 编程波特率。
+    if node_has_compatible(provider, &["starfive,jh7110-syscrg"])? {
+        let arg = clock_specifier_arg(fdt, clocks.value(), index)?;
+        // 节点 clock-frequency 属性（测试环境）覆盖 OSC 基准。
+        let osc = optional_u32(provider, "clock-frequency")?.filter(|rate| *rate != 0);
+        return jh7110_uart_clock_rate(arg, osc).ok_or(EarlyUartConfigError::InvalidClock);
+    }
     resolve_fixed_clock_rate(fdt, provider, 0)
+}
+
+/// JH7110 syscrg 中与 UART 相关的时钟 ID 的内建速率（Hz）。
+///
+/// 数值来源：板载 Debian 6.12 /sys/kernel/debug/clk/clk_summary 实测，
+/// 与 Linux clk-starfive-jh7110-sys.c 树结构一致。
+fn jh7110_uart_clock_rate(clock_id: u32, osc_override: Option<u32>) -> Option<u32> {
+    match clock_id {
+        // UARTx_APB
+        145 | 147 | 149 | 151 | 153 | 155 => Some(49_500_000),
+        // UART0-2_CORE（OSC 门控，baudclk 来源）
+        146 | 148 | 150 | 190 => Some(osc_override.unwrap_or(24_000_000)),
+        // UART3-5_CORE（perh_root gdiv）
+        152 | 154 | 156 => Some(59_400_000),
+        _ => None,
+    }
 }
 
 fn baud_clock_index(node: Node<'_>) -> Result<usize, EarlyUartConfigError> {
@@ -577,6 +611,43 @@ fn baud_clock_index(node: Node<'_>) -> Result<usize, EarlyUartConfigError> {
     baud_index
         .or_else(|| (count == 1).then_some(0))
         .ok_or(EarlyUartConfigError::InvalidClock)
+}
+
+/// 返回 clocks 属性中第 wanted_index 个引用条目的第一个 specifier 参数。
+///
+/// 与 clock_provider_at 使用相同的遍历逻辑，只是额外保留目标条目的参数。
+fn clock_specifier_arg(
+    fdt: Fdt<'_>,
+    clocks: &[u8],
+    wanted_index: usize,
+) -> Result<u32, EarlyUartConfigError> {
+    if clocks.is_empty() || !clocks.len().is_multiple_of(4) {
+        return Err(EarlyUartConfigError::InvalidProperty);
+    }
+    let mut offset = 0usize;
+    let mut index = 0usize;
+    let mut selected = None;
+    while offset < clocks.len() {
+        let phandle = read_be_u32(&clocks[offset..])?;
+        if phandle == 0 {
+            return Err(EarlyUartConfigError::InvalidClock);
+        }
+        offset += 4;
+        let provider = find_node_by_phandle(fdt, phandle)?;
+        let argument_cells = required_cell_count(provider, "#clock-cells")?;
+        let argument_bytes = argument_cells
+            .checked_mul(4)
+            .ok_or(EarlyUartConfigError::AddressOverflow)?;
+        if argument_bytes != 0 && index == wanted_index {
+            selected = Some(read_be_u32(&clocks[offset..])?);
+        }
+        offset = offset
+            .checked_add(argument_bytes)
+            .filter(|end| *end <= clocks.len())
+            .ok_or(EarlyUartConfigError::InvalidProperty)?;
+        index += 1;
+    }
+    selected.ok_or(EarlyUartConfigError::InvalidClock)
 }
 
 fn clock_provider_at<'a>(

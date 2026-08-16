@@ -3467,7 +3467,17 @@ impl PnpDriverRegistry {
                 Some((best_key, _)) if key > *best_key => {
                     best = Some((key, candidate));
                 }
-                Some((best_key, _)) if key == *best_key => return Err(PnpError::DriverAmbiguous),
+                Some((best_key, _)) if key == *best_key => {
+                    log::warning!(
+                        "[pnp] DriverAmbiguous for {}: '{}' vs '{}' (bus_rank={}, priority={:?})",
+                        dev.id,
+                        best.as_ref().unwrap().1.driver.name(),
+                        candidate.driver.name(),
+                        bus_rank,
+                        driver.priority(),
+                    );
+                    return Err(PnpError::DriverAmbiguous);
+                }
                 _ => {}
             }
         }

@@ -2173,10 +2173,19 @@ fn mmp_check(backend: &dyn BlockBackend, sb: &ExtSb) -> Result<(), BlockBackendE
 }
 
 fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
-    let ext_sb = sb::load(backend.as_ref()).map_err(map_err)?;
+    let ext_sb = sb::load(backend.as_ref()).map_err(|e| {
+        log::warning!("[extfs] mount step sb::load failed: {:?}", e);
+        map_err(e)
+    })?;
     // MMP 检查:只读操作,先于一切写路径。
-    mmp_check(backend.as_ref(), &ext_sb).map_err(map_err)?;
-    let group_desc = bgd::load_all(backend.as_ref(), &ext_sb).map_err(map_err)?;
+    mmp_check(backend.as_ref(), &ext_sb).map_err(|e| {
+        log::warning!("[extfs] mount step mmp_check failed: {:?}", e);
+        map_err(e)
+    })?;
+    let group_desc = bgd::load_all(backend.as_ref(), &ext_sb).map_err(|e| {
+        log::warning!("[extfs] mount step bgd::load_all failed: {:?}", e);
+        map_err(e)
+    })?;
     let group_counts = group_desc
         .iter()
         .map(|g| GroupCounts {
@@ -2231,16 +2240,28 @@ fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
 
     // 孤儿 inode 清理(s_last_orphan 链表 + orphan file)。
     if !state.is_read_only() {
-        crate::orphan::cleanup(&state).map_err(map_err)?;
+        crate::orphan::cleanup(&state).map_err(|e| {
+            log::warning!("[extfs] mount step orphan::cleanup failed: {:?}", e);
+            map_err(e)
+        })?;
     }
 
     // 挂载记账:清/置 VALID_FS、s_mnt_count+1、s_mtime。
-    crate::alloc_mod::mark_mounted(&state, state.is_read_only()).map_err(map_err)?;
+    crate::alloc_mod::mark_mounted(&state, state.is_read_only()).map_err(|e| {
+        log::warning!("[extfs] mount step mark_mounted failed: {:?}", e);
+        map_err(e)
+    })?;
     // 恢复 + 孤儿清理 + 记账的结果先落盘,再开始对外服务。
-    state.sync_all().map_err(map_err)?;
+    state.sync_all().map_err(|e| {
+        log::warning!("[extfs] mount step sync_all failed: {:?}", e);
+        map_err(e)
+    })?;
 
     // 加载根 inode(2 号)
-    let (root_meta_on_disk, root_raw) = load_inode(&state, EXT4_ROOT_INO).map_err(map_err)?;
+    let (root_meta_on_disk, root_raw) = load_inode(&state, EXT4_ROOT_INO).map_err(|e| {
+        log::warning!("[extfs] mount step load_inode(root) failed: {:?}", e);
+        map_err(e)
+    })?;
     let fs_id = FsId::new(EXTFS_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed));
 
     let kind_hint = match state.ext_sb.kind {

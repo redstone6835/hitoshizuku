@@ -712,6 +712,15 @@ impl BlockDevice {
         self.driver.drain();
     }
 
+    /// 把已通过上层校验的 Bio 原样转发给本设备底层驱动队列。
+    ///
+    /// 供分区/栈叠块设备转发 BIO 使用：转发层在把 LBA 偏移调整为父设备
+    /// 坐标后调用此方法，绕过父设备针对"父设备自身几何"的校验（这部分
+    /// 校验已由转发层按自身几何完成）。Flush 等不携带范围的命令原样透传。
+    pub fn queue_bio_forward(&self, bio: Bio) -> Result<(), (SubmitError, Bio)> {
+        self.driver.queue_bio(bio)
+    }
+
     /// 通知底层驱动该块设备节点被打开。
     ///
     /// VFS 兼容层只在成功创建文件对象前调用一次；失败时打开操作返回给上层。

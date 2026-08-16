@@ -1,0 +1,11 @@
+[elm]
+name = "platform.jh7110-crg"
+version = "0.1.0"
+kind = "driver"
+source = "kernel-tree:drivers.jh7110-crg"
+mode = "m"
+integrated_phase = "device"
+
+[[profiles]]
+id = "contest-2026"
+priority = "100"

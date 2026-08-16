@@ -1,0 +1,11 @@
+[elm]
+name = "bus.arm-pl022"
+version = "0.1.0"
+kind = "driver"
+source = "kernel-tree:drivers.pl022"
+mode = "m"
+integrated_phase = "device"
+
+[[profiles]]
+id = "contest-2026"
+priority = "100"

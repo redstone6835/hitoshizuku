@@ -272,3 +272,68 @@ prompt = "VirtIO 网络驱动"
 default = "m"
 depends = "virtio.framework"
 after = "virtio.framework"
+
+[[modules]]
+name = "platform.jh7110-uart"
+path = "jh7110-uart"
+config = "CONFIG_JH7110_UART"
+prompt = "StarFive JH7110 / DesignWare APB UART 驱动"
+default = "y"
+after = "platform.firmware-bus,platform.plic"
+
+[[modules]]
+name = "platform.jh7110-crg"
+path = "jh7110-crg"
+config = "CONFIG_JH7110_CRG"
+prompt = "StarFive JH7110 Clock / CRG 驱动"
+default = "y"
+after = "platform.firmware-bus"
+
+[[modules]]
+name = "platform.jh7110-pinctrl"
+path = "jh7110-pinctrl"
+config = "CONFIG_JH7110_PINCTRL"
+prompt = "StarFive JH7110 pinctrl / GPIO 驱动"
+default = "y"
+after = "platform.firmware-bus"
+
+[[modules]]
+name = "platform.jh7110-mmc"
+path = "jh7110-mmc"
+config = "CONFIG_JH7110_MMC"
+prompt = "StarFive JH7110 MMC/eMMC/SD 驱动"
+default = "y"
+after = "platform.firmware-bus,platform.jh7110-crg,platform.jh7110-pinctrl"
+
+[[modules]]
+name = "bus.designware-i2c"
+path = "designware-i2c"
+config = "CONFIG_DESIGNWARE_I2C"
+prompt = "Synopsys DesignWare I2C 控制器 驱动"
+default = "y"
+after = "platform.firmware-bus"
+
+[[modules]]
+name = "bus.arm-pl022"
+path = "pl022"
+config = "CONFIG_PL022_SPI"
+prompt = "ARM pl022 SPI 控制器 驱动"
+default = "m"
+after = "platform.firmware-bus"
+
+[[modules]]
+name = "bus.dwmac"
+path = "dwmac"
+config = "CONFIG_DWMAC"
+prompt = "Synopsys DW MAC 以太网 控制器 驱动"
+default = "m"
+after = "platform.firmware-bus"
+
+[[modules]]
+name = "bus.cdns-usb3"
+path = "cdns-usb3"
+config = "CONFIG_CDNS_USB3"
+prompt = "Cadence USB3 (cdns,usb3) 驱动"
+default = "m"
+after = "platform.firmware-bus"
+

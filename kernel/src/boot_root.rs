@@ -87,6 +87,21 @@ pub(crate) fn prepare(
         }
     }
 
+    // 实机无串口验证：cmdline mygo.mmclog=<start_lba>[,count] 时，把内核启动
+    // 日志写到块设备指定扇区（eMMC FAT 分区尾部未分配区，Debian 侧 dd 读取）。
+    export_boot_log_to_mmc(command_line);
+
+    // 根文件系统可能位于分区上（如 mmcblk0p3 / vda4）：先为所有 whole 盘
+    // 扫描 MBR/GPT 分区表并注册分区设备，再解析 root= 或自动探测。
+    let partitions = general::dev::partition::scan_and_register_all();
+    if partitions != 0 {
+        printk!(
+            "[kernel-start][{}] registered {} partition device(s)",
+            tag,
+            partitions
+        );
+    }
+
     let (superblock, source) = mount_real_root(tag, command_line);
     new_root(superblock, source, false)
 }
@@ -224,3 +239,60 @@ fn mount_first_block_root(tag: &str) -> Result<(Arc<Superblock>, &'static str), 
 
     Err("no active block device contains a supported root filesystem")
 }
+
+/// 把内核启动日志写入第一个可用块设备的指定扇区区间。
+///
+/// 用途：实机 bringup 无串口时的 SSH 侧信道验证——MyGO 原生引导后把日志写到
+/// eMMC 的 FAT 分区尾部未分配扇区，回到 Debian 后用 dd 读取。
+/// 命令行格式：mygo.mmclog=<start_lba>[,<sector_count>]（默认 64 扇区 = 32 KiB）。
+fn export_boot_log_to_mmc(command_line: Option<&[u8]>) {
+    use general::dev::block_sync::FsBlockAdapter;
+
+    let cmdline = general::cmdline::Cmdline::new(command_line.unwrap_or_default());
+    let Some(spec) = cmdline.find("mygo.mmclog") else {
+        return;
+    };
+    let mut parts = spec.split(',');
+    let Some(lba_text) = parts.next() else {
+        return;
+    };
+    let Ok(start_lba) = lba_text.trim().parse::<u64>() else {
+        log::warning!("[mygo-mmclog] invalid start lba: {}", lba_text);
+        return;
+    };
+    let sector_count = parts
+        .next()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(64)
+        .clamp(1, 256);
+
+    let text = log::LOGGER.export_text_limited(false, sector_count.saturating_mul(512));
+    let mut buffer = alloc::vec![0u8; sector_count * 512];
+    let copy_len = text.len().min(buffer.len());
+    buffer[..copy_len].copy_from_slice(&text[..copy_len]);
+
+    for dev in active_block_devices(&DEVICES.functions) {
+        let adapter = match FsBlockAdapter::new(Arc::clone(&dev)) {
+            Ok(adapter) => adapter,
+            Err(_) => continue,
+        };
+        let blocks = u32::try_from(sector_count).unwrap_or(64);
+        match adapter.write(start_lba, blocks, &buffer) {
+            Ok(()) => {
+                log::printk!(
+                    "[mygo-mmclog] boot log written to {} at lba={} sectors={} bytes={}",
+                    dev.name(),
+                    start_lba,
+                    sector_count,
+                    copy_len
+                );
+                return;
+            }
+            Err(error) => {
+                log::debug!("[mygo-mmclog] write to {} failed: {:?}", dev.name(), error);
+            }
+        }
+    }
+    log::warning!("[mygo-mmclog] no writable block device for boot log");
+}
+

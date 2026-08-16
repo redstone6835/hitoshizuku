@@ -3147,14 +3147,16 @@ pub fn start_workers() {
     *CONFIG_STORE.lock() = Some(Arc::clone(&config));
     drop(devices);
     let control_plane = crate::net_stack::ElmControlPlane::new();
-    assert!(
-        control_plane.configure_active_shards(protocol_shards),
-        "net.stack 有效 shard 数配置失败"
-    );
-    assert!(
-        control_plane.initialize_autoconfig(&config.snapshot(), sched::now_ns_direct()),
-        "net.stack 自动配置状态初始化失败"
-    );
+    // 实机无网卡引导时（或集成组件调用路径不可用）协议 shard 可能无法配置；
+    // 网络栈不是引导必要条件，失败时降级为仅 host 模式并继续启动 init。
+    if !control_plane.configure_active_shards(protocol_shards) {
+        log::warning!("[net-runtime] 有效 shard 数配置失败；跳过协议 worker 启动");
+        return;
+    }
+    if !control_plane.initialize_autoconfig(&config.snapshot(), sched::now_ns_direct()) {
+        log::warning!("[net-runtime] 自动配置状态初始化失败；跳过协议 worker 启动");
+        return;
+    }
     let runtimes = protocol_cpus
         .iter()
         .enumerate()

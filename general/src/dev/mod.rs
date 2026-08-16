@@ -34,6 +34,7 @@ pub mod msi;
 pub mod naming;
 pub mod net;
 pub mod numa;
+pub mod partition;
 pub mod pci;
 pub mod platform;
 pub mod pm_qos;

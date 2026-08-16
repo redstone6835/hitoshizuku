@@ -683,6 +683,31 @@ pub extern "C" fn __kernel_arch_loader(
         };
         log::bind_log_sink(&SINK);
     }
+    // 先快照 DTB 并按板级 DTB 配置早期控制台，保证第一条日志即以正确
+    // 波特率输出（实机 UART0 核心时钟 24MHz；QEMU 取 QEMU DTB 的配置）。
+    let dtb = store_kernel_dtb(dtb_addr, dtb_snapshot_len)
+        .unwrap_or_else(|e| panic!("[loader] DTB: {}", e));
+    configure_early_console_from_dtb(&dtb);
+
+    // 串口带宽有限时用 cmdline 过滤日志级别（mygo.loglevel=warn 等）。
+    if let Some(level) = dtb
+        .chosen_bootargs()
+        .ok()
+        .flatten()
+        .and_then(|bootargs| general::cmdline::Cmdline::new(bootargs.as_bytes()).find("mygo.loglevel"))
+    {
+        let parsed = match level.trim() {
+            "emerg" => log::LogLevel::Emergency,
+            "crit" => log::LogLevel::Critical,
+            "error" | "err" => log::LogLevel::Error,
+            "warn" | "warning" => log::LogLevel::Warning,
+            "notice" => log::LogLevel::Notice,
+            "debug" => log::LogLevel::Debug,
+            _ => log::LogLevel::Info,
+        };
+        log::set_log_level(parsed);
+    }
+
     log::info!(
         "[loader] RISC-V64 boot: hart={} dtb={:#x}",
         hart_id,
@@ -734,9 +759,6 @@ pub extern "C" fn __kernel_arch_loader(
         );
     }
 
-    // 快照 DTB 到内核缓冲区
-    let dtb = store_kernel_dtb(dtb_addr, dtb_snapshot_len)
-        .unwrap_or_else(|e| panic!("[loader] DTB: {}", e));
     log::info!("[loader] DTB: {} bytes", dtb.as_bytes().len());
     log::info!(
         "[loader] usable RAM handoff constrained to direct map {:#x}..{:#x}",
@@ -750,8 +772,6 @@ pub extern "C" fn __kernel_arch_loader(
         log::info!("[loader] command line from DTB: {}", command_line);
     }
     let command_line = command_line_text.map(str::as_bytes);
-
-    configure_early_console_from_dtb(&dtb);
 
     // 页表、定时器和可迁移用户任务都依赖全 hart 能力。先取全部 CPU 的
     // MMU 能力交集，再尝试从早期 Sv39 页表升级到 Sv48。
