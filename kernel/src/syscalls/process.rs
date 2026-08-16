@@ -1402,25 +1402,29 @@ fn write_timeval_pair(out: &mut [u8], off: usize, ns: u64) {
     put_i64(out, off + 8, usec);
 }
 
+fn encode_sysinfo(uptime: i64, totalram: u64, freeram: u64) -> [u8; 112] {
+    let mut out = [0u8; 112];
+    put_i64(&mut out, 0, uptime);
+    put_u64(&mut out, 32, totalram);
+    put_u64(&mut out, 40, freeram);
+    // 暂无可靠统计来源的共享内存、缓存、swap 和 highmem 字段保持为零。
+    put_u16(&mut out, 80, 0);
+    put_u64(&mut out, 88, 0);
+    put_u64(&mut out, 96, 0);
+    // RISC-V 与 LoongArch64 的用户态 ABI 使用 64 位 struct sysinfo。
+    put_u32(&mut out, 104, 1);
+    out
+}
+
 pub(super) fn sys_sysinfo(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let info = ctx.args[0];
     if info != 0 {
-        let mut out = [0u8; 112];
-        put_i64(&mut out, 0, sched::now_ns_direct() as i64 / 1_000_000_000);
-        put_u64(&mut out, 8, 0);
-        put_u64(&mut out, 16, 0);
-        put_u64(&mut out, 24, 0);
-        put_u64(&mut out, 32, 256 * 1024 * 1024);
-        put_u64(&mut out, 40, 128 * 1024 * 1024);
-        put_u64(&mut out, 48, 256 * 1024 * 1024);
-        put_u16(&mut out, 56, 0);
-        put_u16(&mut out, 58, 0);
-        put_u16(&mut out, 60, 0);
-        put_u16(&mut out, 62, 0);
-        put_u32(&mut out, 64, 1);
-        put_u32(&mut out, 68, 65536);
-        put_u32(&mut out, 72, 65536);
-        put_u32(&mut out, 76, 0);
+        let memory = allocator::KERNEL_ALLOCATOR.detailed_stats();
+        let out = encode_sysinfo(
+            sched::now_ns_direct() as i64 / 1_000_000_000,
+            memory.total_physical as u64,
+            memory.free_physical as u64,
+        );
         copy_to_user(info, &out).map_err(|e| e.as_errno())?;
     }
     Ok(0)
@@ -6920,5 +6924,41 @@ mod riscv_flush_icache_tests {
             validate_riscv_flush_icache_flags(usize::MAX),
             Err(Errno::EINVAL)
         ));
+    }
+}
+
+#[cfg(feature = "kernel-tests")]
+mod sysinfo_tests {
+    use ktest::ktest;
+
+    use super::encode_sysinfo;
+
+    fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
+
+    #[ktest]
+    fn sysinfo_uses_linux_64bit_layout() {
+        let bytes = encode_sysinfo(7, 0x1122_3344_5566_7788, 0x8877_6655_4433_2211);
+
+        assert_eq!(read_u64(&bytes, 0), 7);
+        assert_eq!(read_u64(&bytes, 32), 0x1122_3344_5566_7788);
+        assert_eq!(read_u64(&bytes, 40), 0x8877_6655_4433_2211);
+        assert_eq!(read_u64(&bytes, 48), 0);
+        assert_eq!(read_u64(&bytes, 56), 0);
+        assert_eq!(read_u64(&bytes, 64), 0);
+        assert_eq!(read_u64(&bytes, 72), 0);
+        assert_eq!(read_u16(&bytes, 80), 0);
+        assert_eq!(read_u64(&bytes, 88), 0);
+        assert_eq!(read_u64(&bytes, 96), 0);
+        assert_eq!(read_u32(&bytes, 104), 1);
     }
 }
