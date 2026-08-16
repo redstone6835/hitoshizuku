@@ -595,7 +595,7 @@ impl Scheduler {
             stats[domain_id] = SchedDomainStats {
                 generation: snapshot.generation,
                 active: snapshot.active,
-                capacity: snapshot.topology.capacity_of(cpus),
+                capacity: snapshot.topology().capacity_of(cpus),
                 load,
             };
         }

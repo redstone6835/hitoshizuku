@@ -181,7 +181,7 @@ fn local_interrupt() -> Option<&'static ArchLocalInterruptOps> {
 
 /// 把中断状态与当前任务的调度调用栈绑定，在任务恢复执行时自动还原。
 #[must_use]
-pub(crate) struct LocalInterruptGuard {
+pub struct LocalInterruptGuard {
     state: usize,
     restore: Option<fn(usize)>,
 }
@@ -214,7 +214,7 @@ impl Drop for LocalInterruptGuard {
 }
 
 /// 关闭本地中断并返回随当前任务调用栈保存的恢复保护器。
-pub(crate) fn disable_local_interrupts() -> LocalInterruptGuard {
+pub fn disable_local_interrupts() -> LocalInterruptGuard {
     LocalInterruptGuard::new()
 }
 

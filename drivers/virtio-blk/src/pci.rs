@@ -259,6 +259,8 @@ impl VirtioBlkPci {
         // 启用队列
         transport.enable_selected_queue();
 
+        pci.disable_interrupts();
+
         // 6. DRIVER_OK
         transport.add_status(VIRTIO_STATUS_DRIVER_OK);
 

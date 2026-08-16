@@ -330,6 +330,7 @@ impl IrqRegistry {
         if !configure_irq_line(request.line, request.trigger, request.polarity) {
             return Err(IrqError::NotFound);
         }
+        let _irq_guard = sched::arch_hooks::disable_local_interrupts();
         let mut handlers = self.handlers.lock();
         if handlers.iter().any(|entry| {
             entry.line == request.line
@@ -384,6 +385,7 @@ impl IrqRegistry {
     }
 
     fn unregister_inner(&self, handle: IrqHandle, allow_prepared: bool) -> Result<bool, IrqError> {
+        let _irq_guard = sched::arch_hooks::disable_local_interrupts();
         let mut handlers = self.handlers.lock();
         let Some(index) = handlers
             .iter()
@@ -417,6 +419,7 @@ impl IrqRegistry {
     }
 
     fn prepare_unregister(&self, handle: IrqHandle) -> Option<IrqLine> {
+        let _irq_guard = sched::arch_hooks::disable_local_interrupts();
         let mut handlers = self.handlers.lock();
         let entry = handlers
             .iter_mut()
@@ -429,6 +432,7 @@ impl IrqRegistry {
     }
 
     fn cancel_unregister(&self, handle: IrqHandle) {
+        let _irq_guard = sched::arch_hooks::disable_local_interrupts();
         let mut handlers = self.handlers.lock();
         if let Some(entry) = handlers
             .iter_mut()
@@ -439,6 +443,7 @@ impl IrqRegistry {
     }
 
     fn finish_call(&self, id: u64, line: IrqLine) {
+        let _irq_guard = sched::arch_hooks::disable_local_interrupts();
         let mut handlers = self.handlers.lock();
         if let Some(entry) = handlers
             .iter_mut()
@@ -454,6 +459,7 @@ impl IrqRegistry {
 
         loop {
             let next = {
+                let _irq_guard = sched::arch_hooks::disable_local_interrupts();
                 let mut handlers = self.handlers.lock();
                 handlers
                     .iter_mut()
@@ -488,6 +494,7 @@ impl IrqRegistry {
 
         if handled {
             let cpu = sched::current_cpu_id().min(sched::NR_CPUS - 1);
+            let _irq_guard = sched::arch_hooks::disable_local_interrupts();
             if let Some(entry) = self
                 .handlers
                 .lock()
@@ -502,6 +509,7 @@ impl IrqRegistry {
     }
 
     fn snapshot(&self) -> Vec<IrqLineSnapshot> {
+        let _irq_guard = sched::arch_hooks::disable_local_interrupts();
         let handlers = self.handlers.lock();
         let mut snapshot: Vec<IrqLineSnapshot> = Vec::new();
         if snapshot.try_reserve(handlers.len()).is_err() {
