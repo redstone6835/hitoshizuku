@@ -233,6 +233,8 @@ pub fn register_all() {
     register_syscall(nr::SYS_CLONE, process::sys_clone);
     register_syscall(nr::SYS_CLONE3, process::sys_clone3);
     register_syscall(nr::SYS_EXECVE, process::sys_execve);
+    #[cfg(target_arch = "riscv64")]
+    register_syscall(nr::SYS_RISCV_FLUSH_ICACHE, process::sys_riscv_flush_icache);
     register_syscall(nr::SYS_WAIT4, process::sys_wait4);
     register_syscall(nr::SYS_WAITID, process::sys_waitid);
     register_syscall(nr::SYS_SET_TID_ADDRESS, process::sys_set_tid_address);

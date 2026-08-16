@@ -48,6 +48,9 @@ const UTS_FIELD_LEN: usize = 65;
 const UTS_NAME_MAX: usize = UTS_FIELD_LEN - 1;
 const EXEC_PATH_MAX: usize = 4096;
 
+#[cfg(target_arch = "riscv64")]
+const SYS_RISCV_FLUSH_ICACHE_LOCAL: usize = 1;
+
 const PTRACE_TRACEME: usize = 0;
 const PTRACE_PEEKTEXT: usize = 1;
 const PTRACE_PEEKDATA: usize = 2;
@@ -85,6 +88,29 @@ const PTRACE_SET_SYSCALL_INFO: usize = 0x4212;
 
 static UTS_HOSTNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_FIELD_LEN]);
 static UTS_DOMAINNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_FIELD_LEN]);
+
+#[cfg(target_arch = "riscv64")]
+fn validate_riscv_flush_icache_flags(flags: usize) -> Result<(), Errno> {
+    if flags & !SYS_RISCV_FLUSH_ICACHE_LOCAL != 0 {
+        Err(Errno::EINVAL)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(super) fn sys_riscv_flush_icache(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    validate_riscv_flush_icache_flags(ctx.args[2])?;
+
+    // Linux 当前保留并忽略 start/end，因为 RISC-V 不支持按范围失效 I-cache。
+    let _start = ctx.args[0];
+    let _end = ctx.args[1];
+
+    // TODO(riscv64): 为 LOCAL=1 增加仅本地执行 fence.i 的路径。当前全局同步
+    // 在语义上正确，但会产生不必要的远端 hart RFENCE 开销。
+    <arch::CurrentTaskOps as general::TaskOps>::sync_icache();
+    Ok(0)
+}
 
 pub(super) fn sys_getpid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let task = ctx.task();
@@ -6865,4 +6891,34 @@ fn put_u64(out: &mut [u8], off: usize, v: u64) {
 
 fn put_i64(out: &mut [u8], off: usize, v: i64) {
     out[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+#[cfg(all(feature = "kernel-tests", target_arch = "riscv64"))]
+mod riscv_flush_icache_tests {
+    use errno::Errno;
+    use ktest::ktest;
+
+    use super::validate_riscv_flush_icache_flags;
+
+    #[ktest]
+    fn riscv_flush_icache_accepts_linux_flags() {
+        assert!(validate_riscv_flush_icache_flags(0).is_ok());
+        assert!(validate_riscv_flush_icache_flags(1).is_ok());
+    }
+
+    #[ktest]
+    fn riscv_flush_icache_rejects_unknown_flag_bits() {
+        assert!(matches!(
+            validate_riscv_flush_icache_flags(2),
+            Err(Errno::EINVAL)
+        ));
+        assert!(matches!(
+            validate_riscv_flush_icache_flags(3),
+            Err(Errno::EINVAL)
+        ));
+        assert!(matches!(
+            validate_riscv_flush_icache_flags(usize::MAX),
+            Err(Errno::EINVAL)
+        ));
+    }
 }
