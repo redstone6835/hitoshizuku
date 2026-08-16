@@ -306,6 +306,15 @@ default = "y"
 after = "platform.firmware-bus,platform.jh7110-crg,platform.jh7110-pinctrl"
 
 [[modules]]
+name = "platform.jh7110-trng"
+path = "jh7110-trng"
+config = "CONFIG_JH7110_TRNG"
+prompt = "StarFive JH7110 TRNG 驱动"
+default = "y"
+targets = "riscv64gc-unknown-none-elf"
+after = "platform.firmware-bus,platform.jh7110-crg,kernel.random"
+
+[[modules]]
 name = "bus.designware-i2c"
 path = "designware-i2c"
 config = "CONFIG_DESIGNWARE_I2C"
