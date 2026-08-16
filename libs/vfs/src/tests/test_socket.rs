@@ -325,6 +325,20 @@ fn vfs_exec_lease_blocks_shared_context_mutation() {
     changer.join().unwrap();
 }
 
+/// exec 提交必须复用已经持有的租约更新凭据，不能再次获取变更门而自锁。
+#[ktest]
+fn vfs_exec_lease_updates_credentials_without_relocking() {
+    let fixture = fixture();
+    let initial = fixture.ctx.generation();
+    let new_cred = Arc::new(Credentials::unprivileged(Uid(1000), Gid(1000)));
+
+    let lease = fixture.ctx.lock_for_exec();
+    lease.set_cred(Arc::clone(&new_cred));
+
+    assert!(Arc::ptr_eq(&fixture.ctx.cred(), &new_cred));
+    assert!(fixture.ctx.generation() > initial);
+}
+
 fn abstract_addr(name: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(3 + name.len());
     out.extend_from_slice(&vsock::AF_UNIX.to_ne_bytes());

@@ -8,7 +8,7 @@ use core::mem::size_of;
 use errno::Errno;
 use general::TaskOps;
 use general::mm::{VmSpace, copy_cstr_bytes_from_user, copy_cstr_from_user, copy_from_user};
-use general::vfs::{FdTable, VfsContext};
+use general::vfs::{FdTable, VfsContext, VfsExecLease};
 use hal::user_context::UserTrapFrame;
 use native_abi::ExecPhase;
 use native_abi::UserAbiKind;
@@ -919,7 +919,7 @@ pub(crate) fn commit_exec(
             }
             InstallStep::Credentials => {
                 if let Some(credentials) = prepared.image.exec_credentials.as_ref() {
-                    install_exec_credentials(task, Arc::clone(credentials))?;
+                    install_exec_credentials(task, Arc::clone(credentials), vfs_lease.as_ref())?;
                 }
             }
             InstallStep::ExecPath => {
@@ -1095,12 +1095,12 @@ fn compute_exec_credentials(
 fn install_exec_credentials(
     task: &Arc<Task>,
     credentials: Arc<sched::ids::Credentials>,
+    vfs_lease: Option<&VfsExecLease<'_>>,
 ) -> Result<(), Errno> {
     task.set_credentials(Arc::clone(&credentials));
-    if let Some(vfs_ctx) = general::vfs::current_vfs_context() {
-        vfs_ctx.set_cred(Arc::new(crate::syscalls::vfs_cred_from_sched(&credentials)));
+    if let Some(vfs_lease) = vfs_lease {
+        vfs_lease.set_cred(Arc::new(crate::syscalls::vfs_cred_from_sched(&credentials)));
     }
-    let _ = task;
     Ok(())
 }
 
