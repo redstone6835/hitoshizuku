@@ -1002,6 +1002,8 @@ impl Uart16550PlatformDriver {
     }
 
     fn matches_platform(info: &PlatformDeviceInfo) -> bool {
+        // DW_APB 串口（JH7110 等）由 platform-jh7110-uart 专属驱动接管，
+        // 避免两个内建驱动同时匹配同一节点触发 DriverAmbiguous。
         info.has_id("ns16550")
             || info.has_id("ns16550a")
             || info.has_id("PNP0500")

@@ -45,4 +45,8 @@ kernel-rv.lock
 kernel-la-kcsan.lock
 kernel-rv-kcsan.lock
 kernel-la-profile.lock
+
+# 本地交叉编译工具链（clang 包装 + 容器提取的 riscv64 binutils）与 Linux 参考源码
+tools-cross/
 kernel-rv-profile.lock
+>>>>>>> origin/feat/boards

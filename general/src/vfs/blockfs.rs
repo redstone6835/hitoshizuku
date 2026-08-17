@@ -173,7 +173,10 @@ fn mount_block_backend_auto(
             }
             match adapter.driver.mount_block(Arc::clone(&backend), data) {
                 Ok(sb) => return Ok((sb, driver.name())),
-                Err(err) => last_error = err,
+                Err(err) => {
+                    log::warning!("[blockfs] {} mount failed: {:?}", driver.name(), err);
+                    last_error = err;
+                }
             }
         }
     }
@@ -219,7 +222,18 @@ impl BlockFsDriver for ExtBlockFsDriver {
         let mut magic = [0u8; 2];
         match read_backend_bytes(backend, 1024 + 56, &mut magic) {
             Ok(()) if magic == [0x53, 0xef] => BlockFsProbe::Strong,
-            _ => BlockFsProbe::None,
+            Ok(()) => {
+                log::warning!(
+                    "[blockfs] ext probe magic mismatch: {:02x}{:02x}",
+                    magic[0],
+                    magic[1]
+                );
+                BlockFsProbe::None
+            }
+            Err(error) => {
+                log::warning!("[blockfs] ext probe read failed: {:?}", error);
+                BlockFsProbe::None
+            }
         }
     }
 

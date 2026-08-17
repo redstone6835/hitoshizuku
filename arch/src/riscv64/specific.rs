@@ -348,6 +348,56 @@ pub static CBO_BLOCK_SIZE: AtomicUsize = AtomicUsize::new(0);
 /// `cbo.clean/flush/inval` 的 cache block 大小（字节）。
 pub static CBOM_BLOCK_SIZE: AtomicUsize = AtomicUsize::new(0);
 
+/// 设备读取前对整段虚拟地址执行 cbo.clean（非 coherent DMA 的 CPU→设备同步）。
+///
+/// # Safety
+///
+/// `[vaddr, vaddr + len)` 必须是有效映射且当前 hart 可访问的内核内存。
+/// Zicbom 缺失时只能空转——非 coherent 平台无 cbo 无法安全维护 DMA 一致性。
+pub unsafe fn clean_dcache_range(mut vaddr: usize, len: usize) {
+    if !HAS_ZICBOM.load(Ordering::Acquire) {
+        return;
+    }
+    let block = CBOM_BLOCK_SIZE.load(Ordering::Relaxed);
+    debug_assert!(block.is_power_of_two());
+    let end = vaddr.checked_add(len).expect("dcache range overflow");
+    while vaddr < end {
+        unsafe {
+            core::arch::asm!(
+                ".insn i 0x0f, 0x2, x0, {addr}, 0x001",
+                addr = in(reg) vaddr,
+                options(nostack, preserves_flags),
+            );
+        }
+        vaddr += block;
+    }
+}
+
+/// 设备写入后对整段虚拟地址执行 cbo.inval（非 coherent DMA 的设备→CPU 同步）。
+///
+/// # Safety
+///
+/// 与 [`clean_dcache_range`] 相同：范围必须有效映射。调用方还需保证范围内没有
+/// 尚未写回设备的 CPU 脏数据（否则会被丢弃）。
+pub unsafe fn invalidate_dcache_range(mut vaddr: usize, len: usize) {
+    if !HAS_ZICBOM.load(Ordering::Acquire) {
+        return;
+    }
+    let block = CBOM_BLOCK_SIZE.load(Ordering::Relaxed);
+    debug_assert!(block.is_power_of_two());
+    let end = vaddr.checked_add(len).expect("dcache range overflow");
+    while vaddr < end {
+        unsafe {
+            core::arch::asm!(
+                ".insn i 0x0f, 0x2, x0, {addr}, 0x000",
+                addr = in(reg) vaddr,
+                options(nostack, preserves_flags),
+            );
+        }
+        vaddr += block;
+    }
+}
+
 /// `prefetch.*` 的 cache block 大小（字节）。
 pub static CBOP_BLOCK_SIZE: AtomicUsize = AtomicUsize::new(0);
 
