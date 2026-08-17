@@ -137,7 +137,16 @@ pub struct VfsContext {
 
 /// exec 持有期间禁止共享 `CLONE_FS` 方修改 VFS 上下文。
 pub struct VfsExecLease<'a> {
+    context: &'a VfsContext,
     _gate: sync::SpinlockGuard<'a, ()>,
+}
+
+impl VfsExecLease<'_> {
+    /// 在已持有 exec 变更门时替换凭据，避免重复获取同一把锁。
+    pub fn set_cred(&self, new_cred: Arc<Credentials>) {
+        *self.context.cred.lock() = new_cred;
+        self.context.bump_generation();
+    }
 }
 
 #[kernel_symbols::export]
@@ -212,6 +221,7 @@ impl VfsContext {
 
     pub fn lock_for_exec(&self) -> VfsExecLease<'_> {
         VfsExecLease {
+            context: self,
             _gate: self.mutation_gate.lock(),
         }
     }
