@@ -218,6 +218,15 @@ pub struct ThreadGroup {
     rlimits: Spinlock<Rlimits>,
     /// 已退出线程的 usage 累计，供进程记账在最后一个线程退出时汇总。
     exited_usage: Spinlock<TaskUsage>,
+    /// 线程组累计 CPU 时间（`CLOCK_PROCESS_CPUTIME_ID` 定时器与
+    /// `ITIMER_PROF` 的 CPU 时间域基准；由成员任务记账时原子累加）。
+    pub(crate) cpu_runtime_ns: AtomicU64,
+    /// 线程组累计用户态 CPU 时间（`ITIMER_VIRTUAL` 基准；tick 记账）。
+    pub(crate) user_cpu_ns: AtomicU64,
+    /// `ITIMER_VIRTUAL` 定时器状态。
+    pub(crate) itimer_virtual: Spinlock<Option<crate::cpu_itimer::CpuItimer>>,
+    /// `ITIMER_PROF` 定时器状态。
+    pub(crate) itimer_prof: Spinlock<Option<crate::cpu_itimer::CpuItimer>>,
     /// 尚未执行退出清理的成员数，保证最后一个线程汇总时其余 usage 已经入账。
     acct_live_members: AtomicUsize,
     /// 防止并发退出路径重复输出同一条 acct 记录。
@@ -325,6 +334,10 @@ impl ThreadGroup {
             shared_signal: Arc::new(SharedSignal::new()),
             rlimits: Spinlock::new(Rlimits::new_with_defaults()),
             exited_usage: Spinlock::new(TaskUsage::default()),
+            cpu_runtime_ns: AtomicU64::new(0),
+            user_cpu_ns: AtomicU64::new(0),
+            itimer_virtual: Spinlock::new(None),
+            itimer_prof: Spinlock::new(None),
             acct_live_members: AtomicUsize::new(0),
             acct_emitted: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -355,6 +368,10 @@ impl ThreadGroup {
             shared_signal: shared,
             rlimits: Spinlock::new(Rlimits::new_with_defaults()),
             exited_usage: Spinlock::new(TaskUsage::default()),
+            cpu_runtime_ns: AtomicU64::new(0),
+            user_cpu_ns: AtomicU64::new(0),
+            itimer_virtual: Spinlock::new(None),
+            itimer_prof: Spinlock::new(None),
             acct_live_members: AtomicUsize::new(0),
             acct_emitted: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -617,6 +634,16 @@ impl ThreadGroup {
         &self.rlimits
     }
 
+    /// 线程组累计 CPU 时间（ns）。
+    pub fn cpu_runtime_ns(&self) -> u64 {
+        self.cpu_runtime_ns.load(Ordering::Acquire)
+    }
+
+    /// 线程组累计用户态 CPU 时间（ns）。
+    pub fn user_cpu_ns(&self) -> u64 {
+        self.user_cpu_ns.load(Ordering::Acquire)
+    }
+
     pub fn tgid(&self) -> PidT {
         self.tgid.load(Ordering::Acquire)
     }
@@ -804,6 +831,10 @@ impl Default for ThreadGroup {
             shared_signal: Arc::new(SharedSignal::new()),
             rlimits: Spinlock::new(Rlimits::new_with_defaults()),
             exited_usage: Spinlock::new(TaskUsage::default()),
+            cpu_runtime_ns: AtomicU64::new(0),
+            user_cpu_ns: AtomicU64::new(0),
+            itimer_virtual: Spinlock::new(None),
+            itimer_prof: Spinlock::new(None),
             acct_live_members: AtomicUsize::new(0),
             acct_emitted: AtomicBool::new(false),
             closing: AtomicBool::new(false),

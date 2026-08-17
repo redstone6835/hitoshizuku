@@ -206,9 +206,9 @@ impl FsDriver for TmpfsDriver {
                 blocks: 0,
             };
 
-            let root_ops = Arc::new(TmpfsInodeOps {
-                data: Spinlock::new(TmpfsInodeData::Directory(BTreeMap::new())),
-            });
+            let root_ops = Arc::new(TmpfsInodeOps::new(TmpfsInodeData::Directory(
+                BTreeMap::new(),
+            )));
 
             let root_inode = Inode::new(
                 InodeId { fs_id, ino: 1 },
@@ -1024,9 +1024,49 @@ fn rename_entry(
 
 struct TmpfsInodeOps {
     data: Spinlock<TmpfsInodeData>,
+    /// 扩展属性存储（tmpfs 为纯内存；BTreeMap 保证 listxattr 有序）。
+    xattrs: Spinlock<BTreeMap<Vec<u8>, Vec<u8>>>,
+}
+
+impl TmpfsInodeOps {
+    fn new(data: TmpfsInodeData) -> Self {
+        Self {
+            data: Spinlock::new(data),
+            xattrs: Spinlock::new(BTreeMap::new()),
+        }
+    }
 }
 
 impl InodeOps for TmpfsInodeOps {
+    fn getxattr(&self, name: &[u8]) -> VfsResult<Option<Vec<u8>>> {
+        Ok(self.xattrs.lock().get(name).cloned())
+    }
+
+    fn setxattr(&self, name: &[u8], value: &[u8], flags: u32) -> VfsResult<()> {
+        let mut map = self.xattrs.lock();
+        let exists = map.contains_key(name);
+        if flags & vfs::xattr::XATTR_CREATE != 0 && exists {
+            return Err(VfsError::AlreadyExists);
+        }
+        if flags & vfs::xattr::XATTR_REPLACE != 0 && !exists {
+            return Err(VfsError::NoData);
+        }
+        map.insert(name.to_vec(), value.to_vec());
+        Ok(())
+    }
+
+    fn listxattr(&self) -> VfsResult<Vec<Vec<u8>>> {
+        Ok(self.xattrs.lock().keys().cloned().collect())
+    }
+
+    fn removexattr(&self, name: &[u8]) -> VfsResult<()> {
+        let mut map = self.xattrs.lock();
+        if map.remove(name).is_none() {
+            return Err(VfsError::NoData);
+        }
+        Ok(())
+    }
+
     fn lookup(&self, dir: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
         if dir.kind() != FileType::Directory {
             return Err(VfsError::NotADirectory);
@@ -1097,9 +1137,7 @@ impl InodeOps for TmpfsInodeOps {
             4096,
             sb.dev_id,
             meta,
-            Arc::new(TmpfsInodeOps {
-                data: Spinlock::new(TmpfsInodeData::File(TmpfsFileData::new())),
-            }),
+            Arc::new(TmpfsInodeOps::new(TmpfsInodeData::File(TmpfsFileData::new()))),
             sb.self_weak.clone(),
         );
 
@@ -1163,9 +1201,7 @@ impl InodeOps for TmpfsInodeOps {
             4096,
             sb.dev_id,
             meta,
-            Arc::new(TmpfsInodeOps {
-                data: Spinlock::new(TmpfsInodeData::Directory(BTreeMap::new())),
-            }),
+            Arc::new(TmpfsInodeOps::new(TmpfsInodeData::Directory(BTreeMap::new()))),
             sb.self_weak.clone(),
         );
 
@@ -1298,9 +1334,7 @@ impl InodeOps for TmpfsInodeOps {
             4096,
             sb.dev_id,
             meta,
-            Arc::new(TmpfsInodeOps {
-                data: Spinlock::new(TmpfsInodeData::Symlink(target.to_string())),
-            }),
+            Arc::new(TmpfsInodeOps::new(TmpfsInodeData::Symlink(target.to_string()))),
             sb.self_weak.clone(),
         );
 
@@ -1371,9 +1405,7 @@ impl InodeOps for TmpfsInodeOps {
             4096,
             sb.dev_id,
             meta,
-            Arc::new(TmpfsInodeOps {
-                data: Spinlock::new(inode_data),
-            }),
+            Arc::new(TmpfsInodeOps::new(inode_data)),
             sb.self_weak.clone(),
         );
 

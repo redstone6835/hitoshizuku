@@ -69,7 +69,12 @@ sig_const!(
     SIGTTIN = 21,
     SIGTTOU = 22,
     SIGURG = 23,
+    SIGXCPU = 24,
+    SIGXFSZ = 25,
+    SIGVTALRM = 26,
+    SIGPROF = 27,
     SIGWINCH = 28,
+    SIGSYS = 31,
 );
 
 /// 64 位信号位集。Linux/POSIX sigset 编码用 bit(signo - 1) 表示信号 signo。

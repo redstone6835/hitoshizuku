@@ -119,6 +119,21 @@ impl RawInode {
             self.bytes[35],
         ])
     }
+    /// `i_file_acl`：xattr 块号（低 32 位 @104 + 高 16 位 @120）。
+    pub fn file_acl(&self) -> u64 {
+        let lo = u32::from_le_bytes([
+            self.bytes[104],
+            self.bytes[105],
+            self.bytes[106],
+            self.bytes[107],
+        ]);
+        let hi = u16::from_le_bytes([self.bytes[120], self.bytes[121]]) as u32;
+        (lo as u64) | ((hi as u64) << 32)
+    }
+    pub fn set_file_acl(&mut self, block: u64) {
+        self.bytes[104..108].copy_from_slice(&(block as u32).to_le_bytes());
+        self.bytes[120..122].copy_from_slice(&((block >> 32) as u16).to_le_bytes());
+    }
     pub fn set_flags(&mut self, f: u32) {
         self.bytes[32..36].copy_from_slice(&f.to_le_bytes());
     }

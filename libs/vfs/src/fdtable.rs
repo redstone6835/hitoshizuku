@@ -381,6 +381,22 @@ pub struct FdTable {
     inner: Spinlock<FdTableInner>,
 }
 
+/// 当前任务 VFS 状态钩子（由上层（general/kernel）注册；fanotify 读事件
+/// 时分配对象 fd 用）。libs/vfs 无法反向依赖 general，因此用函数指针注入。
+pub type CurrentVfsStateFn = fn() -> Option<(Arc<FdTable>, Arc<crate::vfs::cred::Credentials>)>;
+
+static CURRENT_VFS_STATE: Spinlock<Option<CurrentVfsStateFn>> = Spinlock::new(None);
+
+/// 注册当前任务 VFS 状态获取函数（general 初始化时调用一次）。
+pub fn set_current_vfs_state_hook(f: CurrentVfsStateFn) {
+    *CURRENT_VFS_STATE.lock() = Some(f);
+}
+
+/// 取当前任务的 (fd 表, 凭据)；未注册或不在任务上下文时返回 None。
+pub fn current_vfs_state() -> Option<(Arc<FdTable>, Arc<crate::vfs::cred::Credentials>)> {
+    CURRENT_VFS_STATE.lock().and_then(|f| f())
+}
+
 impl FdTable {
     /// 构造一个空的描述符表，从 `limits` 中读取初始软硬限制。
     pub fn new(limits: &VfsLimits) -> Self {

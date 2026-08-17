@@ -45,7 +45,8 @@
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::vfs::cred::{Credentials, Gid, Uid};
 use crate::vfs::error::{VfsError, VfsResult};
@@ -253,6 +254,13 @@ pub struct Inode {
     /// 在 Superblock 被卸载后自动失效，upgrade() 会返回 None。
     pub(crate) superblock: Weak<Superblock>,
 
+    /// 该 inode 是否可能携带扩展属性（xattr 快速路径提示）。
+    ///
+    /// 为 `false` 时权限检查无需读取 xattr 块；由驱动在装载（如 extfs 的
+    /// `i_file_acl != 0`）或首次 setxattr 时置位。对象随 inode 生命周期
+    /// 失效，无陈旧风险。
+    has_xattrs: AtomicBool,
+
     /// 生命周期状态：
     /// - LIVE: 仍在命名空间中可达；
     /// - ORPHANED: 已从命名空间摘除，等待最后一个强引用释放；
@@ -311,6 +319,7 @@ impl Inode {
             cached_nlink: AtomicU32::new(meta.nlink),
             data_state: AtomicU64::new(data_state(1, 0, false)),
             exec_write_state: AtomicIsize::new(0),
+            has_xattrs: AtomicBool::new(false),
             ops,
             superblock,
             lifecycle: AtomicU8::new(STATE_LIVE),
@@ -325,6 +334,21 @@ impl Inode {
     /// 返回该 Inode 的文件类型，无需获取任何锁。
     pub fn kind(&self) -> FileType {
         self.kind
+    }
+
+    /// 是否可能携带扩展属性（快速路径提示；`false` 保证无 xattr）。
+    pub fn has_xattrs(&self) -> bool {
+        self.has_xattrs.load(Ordering::Acquire)
+    }
+
+    /// 标记该 inode 可能携带扩展属性（驱动在装载/写入时调用）。
+    pub fn mark_has_xattrs(&self) {
+        self.has_xattrs.store(true, Ordering::Release);
+    }
+
+    /// 清除 xattr 存在标记（驱动在删除最后一个属性后调用）。
+    pub(crate) fn clear_has_xattrs(&self) {
+        self.has_xattrs.store(false, Ordering::Release);
     }
 
     /// 返回可跨打开文件描述复用、且不会因对象地址复用而冲突的缓存身份。
@@ -979,6 +1003,27 @@ pub trait InodeOps {
     /// 对于纯内存文件系统，默认的空实现即可。
     fn sync_metadata(&self, _inode: &Inode) -> VfsResult<()> {
         Ok(())
+    }
+
+    /// 读取扩展属性；`None` 表示属性不存在（`ENODATA`）。
+    /// 默认实现表示该文件系统不支持 xattr（`EOPNOTSUPP`）。
+    fn getxattr(&self, _name: &[u8]) -> VfsResult<Option<Vec<u8>>> {
+        Err(VfsError::NotSupported)
+    }
+
+    /// 设置扩展属性；`flags` 为 `XATTR_CREATE`/`XATTR_REPLACE`。
+    fn setxattr(&self, _name: &[u8], _value: &[u8], _flags: u32) -> VfsResult<()> {
+        Err(VfsError::NotSupported)
+    }
+
+    /// 列出全部扩展属性名。
+    fn listxattr(&self) -> VfsResult<Vec<Vec<u8>>> {
+        Err(VfsError::NotSupported)
+    }
+
+    /// 删除扩展属性；属性不存在返回 `ENODATA`。
+    fn removexattr(&self, _name: &[u8]) -> VfsResult<()> {
+        Err(VfsError::NotSupported)
     }
 
     /// 返回 &dyn Any 引用，用于支持从 trait object 向下转型到具体的驱动类型。
