@@ -29,38 +29,35 @@ const PLIC_CONTEXT_STRIDE: usize = 0x1000;
 const RISCV_SUPERVISOR_EXTERNAL_IRQ: u32 = 9;
 const PLIC_DEFAULT_PRIORITY: u32 = 1;
 
-struct PlicInner {
+struct Plic {
+    /// MMIO 基址、源数量和 context 在 probe 后不会变化；claim/complete 位于
+    /// 硬中断热路径，不能为读取这些只读字段获取配置锁。
     mmio_base: usize,
     ndev: u32,
-}
-
-struct Plic {
-    inner: Spinlock<PlicInner>,
     context: usize,
+    config_lock: Spinlock<()>,
 }
 
 impl Plic {
     fn claim(&self) -> u32 {
-        let inner = self.inner.lock();
-        let addr = inner.mmio_base + PLIC_CLAIM_BASE + PLIC_CONTEXT_STRIDE * self.context;
+        let addr = self.mmio_base + PLIC_CLAIM_BASE + PLIC_CONTEXT_STRIDE * self.context;
         // Safety: PLIC 实例由 platform probe 在固件声明的 MMIO 窗口上映射创建，
         // `context` 来自已校验的 supervisor 中断上下文。
         unsafe { core::ptr::read_volatile(addr as *const u32) }
     }
 
     fn complete(&self, hwirq: u32) {
-        let inner = self.inner.lock();
-        let addr = inner.mmio_base + PLIC_CLAIM_BASE + PLIC_CONTEXT_STRIDE * self.context;
+        let addr = self.mmio_base + PLIC_CLAIM_BASE + PLIC_CONTEXT_STRIDE * self.context;
         // Safety: 安全条件与 `claim` 相同，claim/complete 寄存器允许 32 位易失写入。
         unsafe { core::ptr::write_volatile(addr as *mut u32, hwirq) };
     }
 
     fn set_priority(&self, hwirq: u32, priority: u32) -> bool {
-        let inner = self.inner.lock();
-        if hwirq == 0 || hwirq > inner.ndev {
+        let _config = self.config_lock.lock();
+        if hwirq == 0 || hwirq > self.ndev {
             return false;
         }
-        let addr = inner.mmio_base + PLIC_PRIORITY_BASE + 4 * hwirq as usize;
+        let addr = self.mmio_base + PLIC_PRIORITY_BASE + 4 * hwirq as usize;
         // Safety: `hwirq` 已验证处于固件声明的 PLIC 中断源范围，所得优先级寄存器
         // 地址位于已映射窗口内并按 32 位对齐。
         unsafe { core::ptr::write_volatile(addr as *mut u32, priority) };
@@ -68,14 +65,14 @@ impl Plic {
     }
 
     fn set_enabled(&self, hwirq: u32, enabled: bool) -> bool {
-        let inner = self.inner.lock();
-        if hwirq == 0 || hwirq > inner.ndev {
+        let _config = self.config_lock.lock();
+        if hwirq == 0 || hwirq > self.ndev {
             return false;
         }
         let reg_idx = hwirq as usize / 32;
         let bit = hwirq % 32;
         let addr =
-            inner.mmio_base + PLIC_ENABLE_BASE + PLIC_ENABLE_STRIDE * self.context + 4 * reg_idx;
+            self.mmio_base + PLIC_ENABLE_BASE + PLIC_ENABLE_STRIDE * self.context + 4 * reg_idx;
         // Safety: `hwirq` 和 `context` 已校验，地址指向当前上下文的对齐使能寄存器。
         let mut val = unsafe { core::ptr::read_volatile(addr as *const u32) };
         if enabled {
@@ -83,14 +80,14 @@ impl Plic {
         } else {
             val &= !(1u32 << bit);
         }
-        // Safety: 与上面的读取访问同一有效使能寄存器，并由 `inner` 锁串行化修改。
+        // Safety: 与上面的读取访问同一有效使能寄存器，并由配置锁串行化修改。
         unsafe { core::ptr::write_volatile(addr as *mut u32, val) };
         true
     }
 
     fn set_threshold(&self, threshold: u32) {
-        let inner = self.inner.lock();
-        let addr = inner.mmio_base + PLIC_THRESHOLD_BASE + PLIC_CONTEXT_STRIDE * self.context;
+        let _config = self.config_lock.lock();
+        let addr = self.mmio_base + PLIC_THRESHOLD_BASE + PLIC_CONTEXT_STRIDE * self.context;
         // Safety: `context` 已校验，地址指向已映射窗口内的对齐阈值寄存器。
         unsafe { core::ptr::write_volatile(addr as *mut u32, threshold) };
     }
@@ -250,8 +247,10 @@ impl PnpDriver for PlicDriver {
         let context = Self::supervisor_context(info, self.boot_hart_id)?;
 
         let plic = Arc::new(Plic {
-            inner: Spinlock::new(PlicInner { mmio_base, ndev }),
+            mmio_base,
+            ndev,
             context,
+            config_lock: Spinlock::new(()),
         });
 
         // 初始化：所有源 priority=0（禁用），threshold=0

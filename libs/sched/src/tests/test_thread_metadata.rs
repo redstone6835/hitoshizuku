@@ -1921,6 +1921,18 @@ fn runqueue_accounts_current_cpu_runtime() {
     assert_eq!(current.usage_snapshot(400).user_ns, 100);
 }
 
+/// 独占 CPU 的 fair current 到期后不应触发无意义的同任务切换。
+#[ktest]
+fn runqueue_fair_tick_without_peer_does_not_reschedule() {
+    let task = make_task();
+    let rq = Runqueue::new();
+    assert!(rq.enqueue(Arc::clone(&task), 0));
+    let current = rq.pick_next(0).expect("fair task should become current");
+
+    assert!(!rq.tick(crate::eevdf::DEFAULT_BASE_SLICE_NS + 1));
+    assert!(rq.dequeue(&current, crate::eevdf::DEFAULT_BASE_SLICE_NS + 2));
+}
+
 #[ktest]
 fn runqueue_rt_bandwidth_throttles_fifo_and_replenishes_next_period() {
     let realtime = make_task();

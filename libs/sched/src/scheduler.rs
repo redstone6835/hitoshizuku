@@ -3543,10 +3543,10 @@ fn request_periodic_balance(cpu_id: usize, now_ns: u64) {
     {
         return;
     }
-    // 只置本地标志位，不发 IPI：请求的目标就是本 CPU，它马上就会走到自己的
-    // 调度边界。发自 IPI 只会在 idle 唤醒路径上制造额外往返。
+    // 只置本地标志位，不发 IPI，也不因为一个独占 current 的 CPU 强制重调度。
+    // idle 循环会消费该标志并执行一次受限 balance；忙 CPU 则等已有的安全调度
+    // 边界处理，避免每个周期都把同一个任务重新入队再取回。
     cpu_state.request_balance();
-    cpu_state.request_resched();
 }
 
 /// 读取当前任务真实 CPU 时间的无分配回调。

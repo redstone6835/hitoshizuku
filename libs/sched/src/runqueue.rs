@@ -521,6 +521,13 @@ impl Runqueue {
         let Some(curr) = inner.current.as_ref().map(Arc::clone) else {
             return replenished;
         };
+        // 时间片到期本身不要求切换：当本 rq 没有其它可运行任务时，把 current
+        // 重新插入再从同一棵树取回只会制造锁、引用计数和上下文切换开销。真正的
+        // 竞争者到达时，入队路径会单独发布重调度请求。
+        let has_runnable_peer = !inner.deadline_tree.is_empty()
+            || !inner.rt_tree.is_empty()
+            || !inner.fair_tree.is_empty()
+            || !inner.idle_tree.is_empty();
         replenished
             || match curr.sched.policy() {
                 SchedPolicy::Deadline => {
@@ -535,7 +542,7 @@ impl Runqueue {
                 }
                 SchedPolicy::RtFifo => inner.rt_throttled && !curr.pi_is_boosted(),
                 SchedPolicy::Fair | SchedPolicy::Idle => {
-                    curr.sched.vruntime() >= curr.sched.deadline()
+                    has_runnable_peer && curr.sched.vruntime() >= curr.sched.deadline()
                 }
             }
     }

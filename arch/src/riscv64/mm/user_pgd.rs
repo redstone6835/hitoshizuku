@@ -42,6 +42,8 @@ static ASID_ALLOCATOR: Mutex<AsidAllocator> = Mutex::new(AsidAllocator {
     generation: 1,
 });
 static CURRENT_ASID_GENERATION: AtomicUsize = AtomicUsize::new(1);
+static CURRENT_USER_PGD: [AtomicUsize; sched::NR_CPUS] =
+    [const { AtomicUsize::new(0) }; sched::NR_CPUS];
 
 #[inline]
 const fn make_asid_tag(generation: usize, asid: usize) -> usize {
@@ -106,8 +108,8 @@ struct UserPgdInner {
     pgd_phys: usize,
     pgd_virt: usize,
     asid_tag: AtomicUsize,
-    /// 曾经激活过本地址空间的逻辑 CPU。位图在 PGD 生命周期内单调增长，
-    /// 保证已经缓存过该 ASID translation 的 hart 不会被后续 shootdown 遗漏。
+    /// 当前仍可能缓存本地址空间 ASID translation 的逻辑 CPU。调度器切离用户
+    /// 地址空间时清除对应位，页表修改只向仍 resident 的 hart 发起 shootdown。
     active_cpus: AtomicUsize,
     needs_page_table_fence: AtomicBool,
     needs_asid_fence: AtomicBool,
@@ -253,6 +255,19 @@ unsafe fn activate(pgd: PgdHandle) {
         .checked_shl(cpu as u32)
         .expect("[arch][mm] logical CPU exceeds active mask width");
     let current = Riscv64Paging::current_satp();
+    let current_slot = &CURRENT_USER_PGD[cpu];
+    let previous = current_slot.load(Ordering::Acquire);
+    if previous != pgd.as_usize() {
+        if previous != 0 {
+            // Safety: the scheduler's VM switch callback clears this CPU's slot
+            // before the previous PGD can be reclaimed.
+            let previous_inner = unsafe { &*(previous as *const UserPgdInner) };
+            previous_inner
+                .active_cpus
+                .fetch_and(!cpu_bit, Ordering::AcqRel);
+        }
+        current_slot.store(pgd.as_usize(), Ordering::Release);
+    }
     let needs_page_table_fence = inner.needs_page_table_fence.load(Ordering::Acquire);
     let needs_asid_fence = inner.needs_asid_fence.load(Ordering::Acquire);
     if current == Riscv64Paging::satp_value(root, asid)
@@ -277,6 +292,18 @@ unsafe fn activate(pgd: PgdHandle) {
 }
 
 unsafe fn activate_kernel() {
+    let cpu = crate::riscv64::specific::current_cpu_id();
+    let previous = CURRENT_USER_PGD[cpu].swap(0, Ordering::AcqRel);
+    if previous != 0 {
+        // Safety: activate_kernel runs at the scheduler VM switch boundary.
+        let previous_inner = unsafe { &*(previous as *const UserPgdInner) };
+        let cpu_bit = 1usize
+            .checked_shl(cpu as u32)
+            .expect("[arch][mm] logical CPU exceeds active mask width");
+        previous_inner
+            .active_cpus
+            .fetch_and(!cpu_bit, Ordering::AcqRel);
+    }
     let root = crate::riscv64::heap_vm::kernel_page_table_root();
     unsafe {
         // ASID 0 专用于内核页表；activate_with_asid 会在切根后刷新
@@ -411,9 +438,15 @@ unsafe fn publish_new_mapping(pgd: PgdHandle, vaddr: usize, len: usize) {
         .checked_add(len)
         .is_some_and(|end| end.saturating_sub(aligned_start) <= page_size);
     let address = targeted.then(|| VirtAddr::new(aligned_start));
-    // Safety: sfence.vma 同时排序先前 PTE store 并清除本 hart 的旧无效状态；
-    // needs_page_table_fence 保留为 true，使以后首次激活该 PGD 的其它 hart 仍会 fence。
-    unsafe { Riscv64Paging::flush_tlb_local_with_asid(inner.asid(), address) };
+    // 严格的 invalid->valid fresh map 在 Svvptc 上不需要失效旧 TLB 项；
+    // 破坏性更新仍由 invalidate/protect 路径显式 flush。能力只在所有启用 hart
+    // 共同支持时发布，未知或不完整 DTB 默认走保守路径。
+    if !crate::riscv64::loader::has_svvptc() {
+        // Safety: 无 Svvptc 时 sfence.vma 同时排序先前 PTE store 并清除本 hart
+        // 的旧无效状态；needs_page_table_fence 保留为 true，使以后首次激活其它
+        // hart 的 PGD 仍会执行必要的 fence。
+        unsafe { Riscv64Paging::flush_tlb_local_with_asid(inner.asid(), address) };
+    }
 }
 
 unsafe fn unmap_user_pages(pgd: PgdHandle, vaddr: usize, len: usize) {
