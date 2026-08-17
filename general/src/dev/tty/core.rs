@@ -12,8 +12,8 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use errno::Errno;
 use sched::operation;
@@ -665,18 +665,16 @@ impl crate::vfs::user_api::tty::TtyIoctlState for TtyCore {
     }
 
     fn control(&self, req: TtyControlRequest) -> Result<TtyControlResponse, Errno> {
-        self.driver
-            .control(req)
-            .map_err(|err| match err {
-                TtyIoError::WouldBlock | TtyIoError::TimedOut => Errno::EAGAIN,
-                TtyIoError::Interrupted => Errno::EINTR,
-                TtyIoError::NoSpace => Errno::ENOMEM,
-                TtyIoError::Io => Errno::EIO,
-                TtyIoError::NoDevice => Errno::ENODEV,
-                TtyIoError::Unsupported => Errno::ENOTTY,
-                TtyIoError::Busy => Errno::EBUSY,
-                TtyIoError::Invalid => Errno::EINVAL,
-            })
+        self.driver.control(req).map_err(|err| match err {
+            TtyIoError::WouldBlock | TtyIoError::TimedOut => Errno::EAGAIN,
+            TtyIoError::Interrupted => Errno::EINTR,
+            TtyIoError::NoSpace => Errno::ENOMEM,
+            TtyIoError::Io => Errno::EIO,
+            TtyIoError::NoDevice => Errno::ENODEV,
+            TtyIoError::Unsupported => Errno::ENOTTY,
+            TtyIoError::Busy => Errno::EBUSY,
+            TtyIoError::Invalid => Errno::EINVAL,
+        })
     }
 }
 
@@ -859,7 +857,10 @@ static TTY_CORES_BY_COOKIE: Spinlock<BTreeMap<u64, Weak<TtyCore>>> = Spinlock::n
 
 /// 按控制终端 cookie 解析行规程实例(会话 ctty 引用)。
 pub fn resolve_ctty_cookie(cookie: u64) -> Option<Arc<TtyCore>> {
-    TTY_CORES_BY_COOKIE.lock().get(&cookie).and_then(Weak::upgrade)
+    TTY_CORES_BY_COOKIE
+        .lock()
+        .get(&cookie)
+        .and_then(Weak::upgrade)
 }
 
 /// 按节点名(fw_name)查询共享行规程实例。

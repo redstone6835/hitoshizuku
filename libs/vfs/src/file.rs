@@ -1126,6 +1126,25 @@ impl ::mm::FileLike for File {
         // 同一份原子快照，无需为每个候选窗口重新构造完整 stat。
         self.inode.size()
     }
+
+    fn writable_hint(&self) -> Option<bool> {
+        Some(self.flags().writable())
+    }
+
+    fn is_shmem(&self) -> bool {
+        self.inode.is_shmem_fs()
+    }
+
+    fn punch_hole(&self, offset: u64, len: u64) -> Result<(), errno::Errno> {
+        File::fallocate(
+            self,
+            crate::vfs::file::FallocateMode::PUNCH_HOLE
+                .with(crate::vfs::file::FallocateMode::KEEP_SIZE),
+            offset,
+            len,
+        )
+        .map_err(|error| error.to_errno())
+    }
 }
 
 // ── 文件操作接口 ──────────────────────────────────────────────────────────────

@@ -464,10 +464,7 @@ where
             } else {
                 units.saturating_mul(TTY_BREAK_UNIT_MS)
             };
-            control_done_ignore_unsupported(
-                state,
-                TtyControlRequest::SendBreak { duration_ms },
-            )?;
+            control_done_ignore_unsupported(state, TtyControlRequest::SendBreak { duration_ms })?;
             Ok(0)
         }
         TCFLSH => match arg {

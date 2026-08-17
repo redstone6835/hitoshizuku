@@ -8,6 +8,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use general::dev::char::CharDevice;
 use general::dev::enumerate::DEVICES;
 use general::dev::pnp::{DevInitContext, set_dev_init_context};
@@ -21,7 +22,6 @@ use general::vfs::stat::FileMode;
 use general::vfs::superblock::Superblock;
 use general::vfs::{FS_REGISTRY, VfsContext, ensure_dir, mount_standard_shm_tmpfs};
 use log::{LogRecord, LogSink, printk};
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use sched::sync::Spinlock;
 use sched::{TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, Task};
@@ -259,7 +259,10 @@ fn activate_vt_console(
     if stash_for_boot_init {
         crate::sched::stash_boot_console_name(String::from("/dev/console"));
     }
-    printk!("[kernel-start][{}] bound /dev/console -> tty0 (VT console)", tag);
+    printk!(
+        "[kernel-start][{}] bound /dev/console -> tty0 (VT console)",
+        tag
+    );
     true
 }
 
@@ -550,12 +553,7 @@ fn mount_devpts_on_pts(tag: &str, ctx: &VfsContext) -> Arc<Mount> {
         .find("devpts")
         .expect("[kernel-start] devpts driver not found")
         .mount(None, "mode=0620,ptmxmode=0666")
-        .unwrap_or_else(|err| {
-            panic!(
-                "[kernel-start][{}] failed to mount devpts: {:?}",
-                tag, err
-            )
-        });
+        .unwrap_or_else(|err| panic!("[kernel-start][{}] failed to mount devpts: {:?}", tag, err));
     let mount = ctx.mount_ns.mount_at(
         Arc::clone(&mountpoint.dentry),
         Arc::clone(&mountpoint.mount),

@@ -94,6 +94,10 @@ const SYS_SCHED_RR_TIMESLICE_INO: u64 = 26;
 const SYS_PIPE_MAX_SIZE_INO: u64 = 27;
 const SYS_TAINTED_INO: u64 = 28;
 const TASK_SNAPSHOT_INO: u64 = 29;
+const SYS_VM_INO: u64 = 30;
+const SWAPS_INO: u64 = 31;
+/// /proc/sys/vm 参数文件的 inode 基址（每个参数一个）。
+const SYS_VM_PARAM_BASE: u64 = 100;
 
 const PROC_DYNAMIC_BASE: u64 = 1_000_000;
 const PROC_FD_BASE: u64 = 10_000_000_000;
@@ -236,6 +240,7 @@ enum RootFileKind {
     Version,
     CpuInfo,
     MemInfo,
+    Swaps,
     Uptime,
     Stat,
     Interrupts,
@@ -269,6 +274,7 @@ enum ProcFileKind {
     SysSchedRrTimeslice,
     SysPipeMaxSize,
     SysTainted,
+    SysVm(crate::mm::memstat::VmParam),
 }
 
 /// 返回当前内核故障污染位图。
@@ -390,6 +396,7 @@ fn root_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, now: Timespec) -> Arc<Ino
         ("version", mk_root_file(VERSION_INO, RootFileKind::Version)),
         ("cpuinfo", mk_root_file(CPUINFO_INO, RootFileKind::CpuInfo)),
         ("meminfo", mk_root_file(MEMINFO_INO, RootFileKind::MemInfo)),
+        ("swaps", mk_root_file(SWAPS_INO, RootFileKind::Swaps)),
         ("uptime", mk_root_file(UPTIME_INO, RootFileKind::Uptime)),
         ("stat", mk_root_file(STAT_INO, RootFileKind::Stat)),
         (
@@ -1177,6 +1184,7 @@ impl InodeOps for ProcSysDirOps {
         match name {
             "kernel" => Ok(proc_sys_kernel_dir_inode(self.fs_id, &self.weak_sb)),
             "fs" => Ok(proc_sys_fs_dir_inode(self.fs_id, &self.weak_sb)),
+            "vm" => Ok(proc_sys_vm_dir_inode(self.fs_id, &self.weak_sb)),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -1197,6 +1205,11 @@ impl InodeOps for ProcSysDirOps {
                 DirEntry {
                     ino: SYS_FS_INO,
                     name: SmallStr::new("fs"),
+                    kind: FileType::Directory,
+                },
+                DirEntry {
+                    ino: SYS_VM_INO,
+                    name: SmallStr::new("vm"),
                     kind: FileType::Directory,
                 },
             ],
@@ -1281,6 +1294,121 @@ fn proc_sys_pipe_max_size_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<
         1,
         Arc::new(ProcRegularInodeOps {
             kind: ProcFileKind::SysPipeMaxSize,
+        }),
+    )
+}
+
+fn proc_sys_vm_dir_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_VM_INO,
+        FileType::Directory,
+        0o555,
+        2,
+        Arc::new(ProcSysVmDirOps {
+            fs_id,
+            weak_sb: weak_sb.clone(),
+        }),
+    )
+}
+
+struct ProcSysVmDirOps {
+    fs_id: FsId,
+    weak_sb: Weak<Superblock>,
+}
+
+impl InodeOps for ProcSysVmDirOps {
+    fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
+        let Some(param) = crate::mm::memstat::VmParam::from_name(name) else {
+            return Err(VfsError::NotFound);
+        };
+        Ok(proc_sys_vm_param_inode(self.fs_id, &self.weak_sb, param))
+    }
+
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        use crate::mm::memstat::VmParam;
+        let params = [
+            VmParam::OvercommitMemory,
+            VmParam::OvercommitRatio,
+            VmParam::OvercommitKbytes,
+            VmParam::MaxMapCount,
+            VmParam::MinFreeKbytes,
+            VmParam::Swappiness,
+            VmParam::PanicOnOom,
+            VmParam::OomDumpTasks,
+            VmParam::OomKillAllocatingTask,
+            VmParam::PageCluster,
+            VmParam::DirtyRatio,
+            VmParam::DirtyBackgroundRatio,
+            VmParam::DirtyWritebackCentisecs,
+            VmParam::DirtyExpireCentisecs,
+            VmParam::VfsCachePressure,
+            VmParam::UnprivilegedUserfaultfd,
+            VmParam::DropCaches,
+        ];
+        Ok(Box::new(ProcDirFile {
+            snapshot: params
+                .into_iter()
+                .enumerate()
+                .map(|(index, param)| DirEntry {
+                    ino: SYS_VM_PARAM_BASE + index as u64,
+                    name: SmallStr::new(param.name()),
+                    kind: FileType::Regular,
+                })
+                .collect(),
+        }))
+    }
+
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn proc_sys_vm_param_inode(
+    fs_id: FsId,
+    weak_sb: &Weak<Superblock>,
+    param: crate::mm::memstat::VmParam,
+) -> Arc<Inode> {
+    use crate::mm::memstat::VmParam;
+    let ino = SYS_VM_PARAM_BASE
+        + match param {
+            VmParam::OvercommitMemory => 0,
+            VmParam::OvercommitRatio => 1,
+            VmParam::OvercommitKbytes => 2,
+            VmParam::MaxMapCount => 3,
+            VmParam::MinFreeKbytes => 4,
+            VmParam::Swappiness => 5,
+            VmParam::PanicOnOom => 6,
+            VmParam::OomDumpTasks => 7,
+            VmParam::OomKillAllocatingTask => 8,
+            VmParam::PageCluster => 9,
+            VmParam::DirtyRatio => 10,
+            VmParam::DirtyBackgroundRatio => 11,
+            VmParam::DirtyWritebackCentisecs => 12,
+            VmParam::DirtyExpireCentisecs => 13,
+            VmParam::VfsCachePressure => 14,
+            VmParam::UnprivilegedUserfaultfd => 15,
+            VmParam::DropCaches => 16,
+        };
+    mk_inode(
+        fs_id,
+        weak_sb,
+        ino,
+        FileType::Regular,
+        0o644,
+        1,
+        Arc::new(ProcRegularInodeOps {
+            kind: ProcFileKind::SysVm(param),
         }),
     )
 }
@@ -2032,6 +2160,8 @@ impl InodeOps for ProcRegularInodeOps {
             ProcFileKind::SysFileMax => Err(VfsError::InvalidArgument),
             ProcFileKind::SysPipeMaxSize if size == 0 => Ok(()),
             ProcFileKind::SysPipeMaxSize => Err(VfsError::InvalidArgument),
+            ProcFileKind::SysVm(_) if size == 0 => Ok(()),
+            ProcFileKind::SysVm(_) => Err(VfsError::InvalidArgument),
             _ => Err(VfsError::ReadOnlyFilesystem),
         }
     }
@@ -2104,6 +2234,7 @@ impl FileOps for ProcRegularFile {
                 })?;
                 Ok(buf.len())
             }
+            ProcFileKind::SysVm(param) => write_vm_sysctl(param, buf, offset),
             _ => Err(VfsError::ReadOnlyFilesystem),
         }
     }
@@ -2145,6 +2276,7 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
             RootFileKind::Version => render_version().into_bytes(),
             RootFileKind::CpuInfo => render_cpuinfo().into_bytes(),
             RootFileKind::MemInfo => render_meminfo().into_bytes(),
+            RootFileKind::Swaps => render_swaps().into_bytes(),
             RootFileKind::Uptime => render_uptime().into_bytes(),
             RootFileKind::Stat => render_stat().into_bytes(),
             RootFileKind::Interrupts => render_interrupts().into_bytes(),
@@ -2183,7 +2315,76 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
         ProcFileKind::SysPipeMaxSize => {
             Ok(format!("{}\n", vfs::pipe::pipe_max_size()).into_bytes())
         }
+        ProcFileKind::SysVm(param) => {
+            use crate::mm::memstat::VmParam;
+            let value = match param {
+                VmParam::OomDumpTasks
+                | VmParam::OomKillAllocatingTask
+                | VmParam::UnprivilegedUserfaultfd => {
+                    u64::from(crate::mm::memstat::get_vm_bool(param))
+                }
+                VmParam::DropCaches => u64::from(crate::mm::memstat::drop_caches_request()),
+                _ => crate::mm::memstat::get_vm_u64(param),
+            };
+            Ok(format!("{value}\n").into_bytes())
+        }
     }
+}
+
+/// 写入 `/proc/sys/vm/<param>`。取值范围校验与 Linux proc_dointvec 一致：
+/// 越界值返回 EINVAL。`drop_caches` 写入后立即执行清缓存动作。
+fn write_vm_sysctl(
+    param: crate::mm::memstat::VmParam,
+    buf: &[u8],
+    offset: u64,
+) -> VfsResult<usize> {
+    use crate::mm::memstat::VmParam;
+    if offset != 0 {
+        return Err(VfsError::InvalidArgument);
+    }
+    let text = core::str::from_utf8(buf).map_err(|_| VfsError::InvalidArgument)?;
+    let raw = text
+        .trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == '\0')
+        .parse::<u64>()
+        .map_err(|_| VfsError::InvalidArgument)?;
+    let valid = match param {
+        VmParam::OvercommitMemory => raw <= 2,
+        VmParam::OvercommitRatio => raw <= 100,
+        VmParam::OvercommitKbytes => true,
+        VmParam::MaxMapCount => raw >= 1,
+        VmParam::MinFreeKbytes => true,
+        VmParam::Swappiness => raw <= 200,
+        VmParam::PanicOnOom => raw <= 2,
+        VmParam::OomDumpTasks
+        | VmParam::OomKillAllocatingTask
+        | VmParam::UnprivilegedUserfaultfd => raw <= 1,
+        VmParam::PageCluster => true,
+        VmParam::DirtyRatio | VmParam::DirtyBackgroundRatio => raw <= 100,
+        VmParam::DirtyWritebackCentisecs | VmParam::DirtyExpireCentisecs => true,
+        VmParam::VfsCachePressure => raw <= 1000,
+        VmParam::DropCaches => raw >= 1 && raw <= 3,
+    };
+    if !valid {
+        return Err(VfsError::InvalidArgument);
+    }
+    if param == VmParam::DropCaches {
+        if crate::mm::memstat::accept_drop_caches(raw as u32) {
+            let (drop_page, _drop_dentry) = crate::mm::memstat::perform_drop_caches();
+            if drop_page {
+                crate::mm::drop_private_file_cache();
+            }
+        }
+        return Ok(buf.len());
+    }
+    match param {
+        VmParam::OomDumpTasks
+        | VmParam::OomKillAllocatingTask
+        | VmParam::UnprivilegedUserfaultfd => {
+            crate::mm::memstat::set_vm_bool(param, raw != 0);
+        }
+        _ => crate::mm::memstat::set_vm_u64(param, raw),
+    }
+    Ok(buf.len())
 }
 
 fn write_sched_sysctl(
@@ -2540,8 +2741,11 @@ fn render_task_status(task: &Arc<Task>) -> String {
         .map(|fdt| fdt.snapshot_fds().len())
         .unwrap_or(0);
     let (vsize, rss, data) = task_memory_usage(task);
+    let vm_locked_kb = task_vm_space(task)
+        .map(|vm| vm.locked_pages() as u64 * page_size() as u64 / 1024)
+        .unwrap_or(0);
     format!(
-        "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nVmData:\t{} kB\nThreads:\t{}\n",
+        "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nVmLck:\t{} kB\nVmData:\t{} kB\nThreads:\t{}\n",
         name,
         task_state_char(state),
         task_state_name(state),
@@ -2559,6 +2763,7 @@ fn render_task_status(task: &Arc<Task>) -> String {
         fd_count,
         vsize / 1024,
         rss / 1024,
+        vm_locked_kb,
         data / 1024,
         task_thread_count(task),
     )
@@ -2871,8 +3076,35 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
         .saturating_add(slab_reclaimable_bytes);
     let mem_available = overview.free_physical.saturating_add(allocator_reclaimable);
     let slab_bytes = layers.slab.active_pages.saturating_mul(page_size());
-    let swap_total_kb = 0usize;
-    let swap_free_kb = 0usize;
+    let (swap_total_pages, swap_free_pages) = crate::mm::swap::swap_totals();
+    let page_size_kb = page_size() / 1024;
+    let swap_total_kb = (swap_total_pages * page_size_kb as u64) as usize;
+    let swap_free_kb = (swap_free_pages * page_size_kb as u64) as usize;
+    let anon_pages = crate::mm::memstat::ANON_PAGES.load(core::sync::atomic::Ordering::Relaxed);
+    let shared_anon_pages =
+        crate::mm::memstat::SHARED_ANON_PAGES.load(core::sync::atomic::Ordering::Relaxed);
+    let private_file_pages =
+        crate::mm::memstat::PRIVATE_FILE_PAGES.load(core::sync::atomic::Ordering::Relaxed);
+    let shared_file_pages =
+        crate::mm::memstat::SHARED_FILE_PAGES.load(core::sync::atomic::Ordering::Relaxed);
+    let locked_pages = crate::mm::memstat::locked_pages();
+    let kb_pages = |pages: u64| (pages * page_size_kb as u64) as usize;
+    // Linux 口径: Cached = 文件页缓存(私有文件缓存 + 共享文件驻留页);
+    // Shmem = 共享匿名; Mapped = 全部驻留用户页; Mlocked = 锁页总数。
+    let cached_kb = kb_pages(private_file_pages.saturating_add(shared_file_pages));
+    let shmem_kb = kb_pages(shared_anon_pages);
+    let mapped_kb = kb_pages(
+        anon_pages
+            .saturating_add(shared_anon_pages)
+            .saturating_add(private_file_pages)
+            .saturating_add(shared_file_pages),
+    );
+    let mlocked_kb = kb_pages(locked_pages);
+    let committed_as_kb = kb_pages(crate::mm::memstat::committed_pages());
+    let commit_limit_kb = crate::mm::memstat::commit_limit_kb(
+        (overview.total_physical / allocator::PAGE_SIZE) as u64,
+        swap_total_pages,
+    );
     let mut out = FixedBuf::new(buf);
     let _ = write!(
         out,
@@ -3001,12 +3233,12 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
         kb(overview.total_physical),
         kb(overview.free_physical),
         kb(mem_available),
-        0usize, // TODO: 实现 Buffers（块设备缓冲区统计）
-        0usize, // TODO: 汇总文件页缓存与块缓存后实现标准 Cached 字段
-        0usize, // TODO: 实现 SwapCached
+        0usize, // Buffers：无块设备缓冲
+        cached_kb,
+        0usize, // SwapCached：无换出
         kb(slab_bytes),
-        0usize, // TODO: 实现 KernelStack（内核栈统计）
-        0usize, // TODO: 实现 PageTables（页表统计）
+        0usize, // KernelStack
+        0usize, // PageTables
         kb(overview.kernel_vmem_total),
         kb(overview.kernel_vmem_allocated),
         kb(overview.kernel_vmem_free),
@@ -3121,6 +3353,65 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
         anon_store_shadow_diag.would_save,
         anon_store_shadow_diag.migration_interleave_resets,
     );
+    let _ = write!(
+        out,
+        "AnonPages:      {:>8} kB\n\
+         Mapped:         {:>8} kB\n\
+         Shmem:          {:>8} kB\n\
+         Active:         {:>8} kB\n\
+         Inactive:       {:>8} kB\n\
+         Mlocked:        {:>8} kB\n\
+         Unevictable:    {:>8} kB\n\
+         Dirty:          {:>8} kB\n\
+         Writeback:      {:>8} kB\n\
+         NFS_Unstable:   {:>8} kB\n\
+         Bounce:         {:>8} kB\n\
+         WritebackTmp:   {:>8} kB\n\
+         CommitLimit:    {:>8} kB\n\
+         Committed_AS:   {:>8} kB\n\
+         KReclaimable:   {:>8} kB\n\
+         SReclaimable:   {:>8} kB\n\
+         SUnreclaim:     {:>8} kB\n\
+         AnonHugePages:  {:>8} kB\n\
+         ShmemHugePages: {:>8} kB\n\
+         ShmemPmdMapped: {:>8} kB\n\
+         FileHugePages:  {:>8} kB\n\
+         FilePmdMapped:  {:>8} kB\n\
+         HugePages_Total:{:>8}\n\
+         HugePages_Free: {:>8}\n\
+         HugePages_Rsvd: {:>8}\n\
+         HugePages_Surp: {:>8}\n\
+         Hugepagesize:   {:>8} kB\n\
+         Hugetlb:        {:>8} kB\n",
+        kb_pages(anon_pages),
+        mapped_kb,
+        shmem_kb,
+        0usize, // Active：无 LRU 统计
+        0usize, // Inactive
+        mlocked_kb,
+        mlocked_kb, // Unevictable = Mlocked
+        0usize,     // Dirty：无回写统计
+        0usize,     // Writeback
+        0usize,     // NFS_Unstable
+        0usize,     // Bounce
+        0usize,     // WritebackTmp
+        commit_limit_kb as usize,
+        committed_as_kb,
+        kb(slab_reclaimable_bytes),
+        kb(slab_reclaimable_bytes), // SReclaimable
+        kb(slab_bytes.saturating_sub(slab_reclaimable_bytes)), // SUnreclaim
+        0usize,                     // AnonHugePages：无 THP
+        0usize,                     // ShmemHugePages
+        0usize,                     // ShmemPmdMapped
+        0usize,                     // FileHugePages
+        0usize,                     // FilePmdMapped
+        0usize,                     // HugePages_Total
+        0usize,                     // HugePages_Free
+        0usize,                     // HugePages_Rsvd
+        0usize,                     // HugePages_Surp
+        2048usize,                  // Hugepagesize（默认 2 MiB，仅呈现）
+        0usize,                     // Hugetlb
+    );
     #[cfg(feature = "performance-profile")]
     {
         let traps = profiling::loongarch_user_trap_snapshot();
@@ -3207,6 +3498,26 @@ impl core::fmt::Write for FixedBuf<'_> {
         }
         Ok(())
     }
+}
+
+/// `/proc/swaps`：swap 设备表视图（Size/Used 以 KiB 计，与 Linux 一致）。
+fn render_swaps() -> String {
+    let mut out = String::from("Filename\t\t\t\tType\t\tSize\tUsed\tPriority\n");
+    for entry in crate::mm::swap::swap_entries() {
+        let page_size_kb = page_size() / 1024;
+        let size_kb = entry.size_pages * page_size_kb as u64;
+        let used_kb = entry.used_pages * page_size_kb as u64;
+        let _ = write!(
+            out,
+            "{}\t\t\t\t{}\t\t{}\t{}\t{}\n",
+            entry.name,
+            entry.kind.as_str(),
+            size_kb,
+            used_kb,
+            entry.priority
+        );
+    }
+    out
 }
 
 fn render_uptime() -> String {

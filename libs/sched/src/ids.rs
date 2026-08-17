@@ -76,7 +76,12 @@ pub enum Capability {
     Setgid = 6,
     Setuid = 7,
     Setpcap = 8,
+    /// 绕过 `RLIMIT_MEMLOCK` 上限（`mlock`/`mlockall`/`MAP_LOCKED` 检查）。
+    IpcLock = 9,
     NetBindService = 10,
+    /// 对其它进程执行 ptrace 级访问（`process_vm_readv`/`writev`、
+    /// `process_madvise`、`move_pages` 权限检查）。
+    SysPtrace = 19,
     SysPacct = 20,
     SysAdmin = 21,
     SysBoot = 22,

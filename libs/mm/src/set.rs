@@ -465,13 +465,21 @@ impl VmaSet {
     ///
     /// 文件对象和共享匿名对象仍由 `Arc` 共享；本方法不复制或修改物理页。调用后
     /// 任一地址空间新建的匿名映射都不会与继承区域跨边界合并。
+    ///
+    /// 带 `DONTFORK`（`madvise(MADV_DONTFORK)`）标记的 VMA 按 Linux `VM_DONTCOPY`
+    /// 语义不进入子进程；`WIPEONFORK` VMA 保留元数据但由调用方在页级清零。
     #[kernel_symbols::export(name = "mm.set.VmaSet.fork_clone_metadata", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn fork_clone_metadata(&mut self) -> Self {
         for area in &mut self.areas {
             area.backing.mark_fork_inherited();
         }
         Self {
-            areas: self.areas.clone(),
+            areas: self
+                .areas
+                .iter()
+                .filter(|area| !area.flags.has(VmFlags::DONTFORK))
+                .cloned()
+                .collect(),
             last_find: Cell::new(None),
         }
     }

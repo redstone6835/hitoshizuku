@@ -16,9 +16,12 @@
 //! - [`smoketest`] —— 启动期自检（debug 模式下编入）。
 
 pub mod fault;
+pub mod memstat;
 pub mod ops;
 mod resident_map;
 pub mod smoketest;
+pub mod swap;
+pub mod uffd;
 pub mod user_access;
 pub mod vm_space;
 
@@ -32,6 +35,6 @@ pub use user_access::{
     copy_cstr_bytes_from_user, copy_cstr_from_user, copy_from_user, copy_to_user,
 };
 pub use vm_space::{
-    UserReadWindows, VmFutexKey, VmSpace, page_size, read_shared_anon, vm_space_diag,
-    write_shared_anon,
+    Mempolicy, UserReadWindows, VmFutexKey, VmSpace, drop_private_file_cache, file_cache_stat,
+    page_size, read_shared_anon, vm_space_diag, write_shared_anon,
 };

@@ -55,11 +55,11 @@ use crate::dev::bio::{BioBuffer, BioError, BioOp, BlockRange};
 use crate::dev::block::{BlockDevice, BlockFeatures};
 use crate::dev::char::{CharDevice, CharIoError};
 use crate::dev::control::{BlockControlRequest, BlockControlResponse, BlockIoHints, ControlError};
-use crate::dev::tty::{self, TtyCore};
 use crate::dev::enumerate::{
     DEVICES, DeviceFunctionEvent, DeviceFunctionEventKind, subscribe_function_events,
 };
 use crate::dev::function::DeviceFunction;
+use crate::dev::tty::{self, TtyCore};
 use crate::vfs::device_files::projection::{
     devnodes_for_function, forget_published_devnodes, mark_projection_bound,
     mark_projection_failed, mark_projection_pending, mark_projection_unbound,
@@ -69,9 +69,7 @@ use crate::vfs::device_files::spec::{
     CustomDevNodeKind, CustomDevNodeNumbering, CustomDevNodeSpec, DevNodeSet, DevNodeSpec,
 };
 use crate::vfs::user_api::block_device::{BlockDeviceIoctlContext, handle_block_ioctl};
-use crate::vfs::user_api::tty::{
-    TtyIoctlContext, TtyIoctlState, UserTermios, handle_tty_ioctl,
-};
+use crate::vfs::user_api::tty::{TtyIoctlContext, TtyIoctlState, UserTermios, handle_tty_ioctl};
 
 // ───────── 全局实例计数器 ─────────
 
@@ -764,10 +762,16 @@ impl CharDevFileOps {
         buf: &mut [u8],
         termios: UserTermios,
     ) -> VfsResult<usize> {
-        tty.read_tty_canonical(buf, termios).map_err(Self::map_tty_err)
+        tty.read_tty_canonical(buf, termios)
+            .map_err(Self::map_tty_err)
     }
 
-    fn read_tty_raw(&self, tty: &TtyCore, buf: &mut [u8], termios: UserTermios) -> VfsResult<usize> {
+    fn read_tty_raw(
+        &self,
+        tty: &TtyCore,
+        buf: &mut [u8],
+        termios: UserTermios,
+    ) -> VfsResult<usize> {
         tty.read_tty_raw(buf, termios).map_err(Self::map_tty_err)
     }
 
@@ -2045,17 +2049,26 @@ impl DevTmpfsSuperblockOps {
             nlink,
             // 设备节点优先使用按名登记的节点策略(如 ptmx 0666);目录/普通
             // 文件保持标准策略。
-            mode: if matches!(spec.kind(), CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice) {
+            mode: if matches!(
+                spec.kind(),
+                CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice
+            ) {
                 policy.mode
             } else {
                 DEVTMPFS_STANDARD_POLICY.custom_mode(spec.kind())
             },
-            uid: if matches!(spec.kind(), CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice) {
+            uid: if matches!(
+                spec.kind(),
+                CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice
+            ) {
                 policy.uid
             } else {
                 DEVTMPFS_STANDARD_POLICY.uid
             },
-            gid: if matches!(spec.kind(), CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice) {
+            gid: if matches!(
+                spec.kind(),
+                CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice
+            ) {
                 policy.gid
             } else {
                 DEVTMPFS_STANDARD_POLICY.gid
@@ -2864,7 +2877,9 @@ fn vt_zero_node_build(
 ) -> VfsResult<Option<Arc<dyn InodeOps + Send + Sync>>> {
     // 适配器按注册顺序逐个尝试;不属于自己的 spec 返回 None 交给下一个。
     let payload = spec.payload();
-    let Some(manager) = payload.as_ref().downcast_ref::<&'static crate::dev::tty::VtManager>()
+    let Some(manager) = payload
+        .as_ref()
+        .downcast_ref::<&'static crate::dev::tty::VtManager>()
     else {
         return Ok(None);
     };
@@ -2992,9 +3007,7 @@ fn map_pty_open_err(err: Errno) -> VfsError {
     }
 }
 
-fn ptmx_node_build(
-    spec: &CustomDevNodeSpec,
-) -> VfsResult<Option<Arc<dyn InodeOps + Send + Sync>>> {
+fn ptmx_node_build(spec: &CustomDevNodeSpec) -> VfsResult<Option<Arc<dyn InodeOps + Send + Sync>>> {
     if spec.name() != "ptmx" {
         return Ok(None);
     }

@@ -114,6 +114,32 @@ pub trait FileLike: Send + Sync {
         false
     }
 
+    /// 底层文件句柄是否可写（对应 Linux `file->f_mode & FMODE_WRITE`）。
+    ///
+    /// 返回 `None` 表示实现无法提供该信息（如纯内存伪文件），VMA 层按"无附加
+    /// 约束"处理。`mprotect(PROT_WRITE)` 对 `MAP_SHARED` 映射要求底层句柄可写，
+    /// 否则返回 `EACCES`——这就是 Linux `mprotect` 的 `EACCES` 语义来源。
+    fn writable_hint(&self) -> Option<bool> {
+        None
+    }
+
+    /// 该文件是否为 shmem/tmpfs 文件（Linux `shmem_file_setup` 家族）。
+    ///
+    /// `MADV_REMOVE` 只对 shmem 文件映射有效，普通文件映射返回 `EINVAL`；
+    /// userfaultfd 也以该属性区分匿名/shmem 区与普通文件区。
+    fn is_shmem(&self) -> bool {
+        false
+    }
+
+    /// 在文件中打洞（Linux `fallocate(PUNCH_HOLE|KEEP_SIZE)`）。
+    ///
+    /// `MADV_REMOVE` 的底层动作：把 `[offset, offset+len)` 的数据释放并读回零。
+    /// 默认返回 `EOPNOTSUPP`；tmpfs/shmem 类实现覆盖本方法。
+    fn punch_hole(&self, offset: u64, len: u64) -> Result<(), Errno> {
+        let _ = (offset, len);
+        Err(Errno::EOPNOTSUPP)
+    }
+
     /// SysV shm 对象的全局 id。普通文件返回 None；VM 层只通过这个通用 hook
     /// 识别 shm VMA，不依赖具体的 `general::ipc` 类型，保持依赖方向不反转。
     fn sysv_shm_id(&self) -> Option<i32> {

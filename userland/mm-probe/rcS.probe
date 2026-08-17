@@ -1,0 +1,30 @@
+#!/bin/sh
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+echo "[probe] boot ok, mounting..."
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mkdir -p /mnt
+mount -t ext4 /dev/vd0 /mnt 2>/dev/null || true
+echo "===PROBE-START==="
+echo "--- /proc/meminfo ---"
+cat /proc/meminfo
+echo "--- /proc/swaps ---"
+cat /proc/swaps
+echo "--- /proc/sys/vm ---"
+for f in overcommit_memory overcommit_ratio max_map_count swappiness panic_on_oom oom_dump_tasks unprivileged_userfaultfd page-cluster; do
+    printf '%s=' "$f"; cat "/proc/sys/vm/$f" 2>/dev/null
+done
+echo "--- /sys/kernel/mm ---"
+cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
+cat /sys/kernel/mm/transparent_hugepage/khugepaged/scan_sleep_millisecs 2>/dev/null
+cat /sys/kernel/mm/ksm/run 2>/dev/null
+cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null
+echo "--- busybox free (sysinfo) ---"
+free 2>/dev/null || echo "no free applet"
+echo "--- mm_probe ---"
+/mm_probe
+echo "===PROBE-END==="
+poweroff -f 2>/dev/null || reboot -f 2>/dev/null || true
+sleep 5
