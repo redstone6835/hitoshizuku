@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """重做答辩稿中的 ELM 与网络栈专题，并接入正式全量稿。
 
-专题共 25 页：ELM 19 页、网络栈 6 页。所有专题页可见文字均不小于 14 pt，
+精简专题共 6 页：ELM 4 页、网络栈 2 页。所有专题页可见文字均不小于 14 pt，
 并删除正文模板右下角的章节数字。内容以 docs/chapters/chapter-12.typ 与
 chapter-13.typ 以及对应实现为事实来源。
 """
@@ -52,6 +52,8 @@ CONTENT_RIGHT = 12.60
 CONTENT_W = CONTENT_RIGHT - CONTENT_X
 TOP_Y = 1.80
 BOTTOM_Y = 6.78
+TOPIC_START_TITLE = "设备抽象能力闭环"
+TOPIC_END_TITLE = "第四章 · 调试方法"
 
 OLD_TOPIC_TITLES = {
     "可拓展内核单元（ELM）的概念定位",
@@ -69,6 +71,9 @@ OLD_TOPIC_TITLES = {
     "FlowShard 数据通路",
     "套接字兼容与控制边界",
     "网络生命周期与性能边界",
+    # Titles retained by the immediately preceding full-deck version.
+    "Busy 拒绝记录样例",
+    "数据通路与受管调用边界",
 }
 
 TOPIC_TITLES = OLD_TOPIC_TITLES | {
@@ -101,10 +106,12 @@ TOPIC_TITLES = OLD_TOPIC_TITLES | {
     "装载提交：镜像准备与唯一公开点",
     "装载提交：镜像准备与一次性提交",
     "装载提交：两级门禁与失败回滚",
+    "装载提交：一次性公开",
     "ELM 运行证据的五种视角",
     "ELM 的五类运行证据",
     "Busy 拒绝的逐项复核",
     "ElmModule 与 y / m / n 构建形态",
+    "实现接入策略与边界",
     "当前接入范围与未完成边界",
     "完整接收路径：VirtIO DMA 到 recvmsg",
     "完整发送路径：sendmsg 到 VirtIO completion",
@@ -184,15 +191,31 @@ def remove_slide(prs: Presentation, slide) -> None:
     raise RuntimeError("没有找到待删除幻灯片关系")
 
 
-def remove_existing_topic(prs: Presentation) -> None:
-    for slide in list(prs.slides):
-        texts = {
+def existing_topic_slides(prs: Presentation) -> list:
+    slides = list(prs.slides)
+    try:
+        start = slides.index(find_slide(prs, TOPIC_START_TITLE))
+        end = slides.index(find_slide(prs, TOPIC_END_TITLE))
+    except (RuntimeError, ValueError):
+        start = end = -1
+    if 0 <= start < end:
+        return slides[start + 1 : end]
+
+    return [
+        slide
+        for slide in slides
+        if {
             shape.text.strip()
             for shape in slide.shapes
             if getattr(shape, "has_text_frame", False) and shape.text.strip()
         }
-        if texts & TOPIC_TITLES:
-            remove_slide(prs, slide)
+        & TOPIC_TITLES
+    ]
+
+
+def remove_existing_topic(prs: Presentation) -> None:
+    for slide in existing_topic_slides(prs):
+        remove_slide(prs, slide)
 
 
 def is_page_marker(shape) -> bool:
@@ -1462,7 +1485,7 @@ def draw_15(slide) -> None:
 
 def explain_01(slide) -> None:
     set_title(slide, "可拓展内核单元（ELM）的概念定位")
-    lead(slide, "ELM（Extensible Loadable Module，可拓展内核单元）把扩展代码、公开入口、活动引用、长期资源和故障挂到同一条 Cell 记录；装载、调用和退出都以这条记录作准入依据。")
+    lead(slide, "ELM 把扩展从一段可装入代码提升为可治理的责任单元：身份、能力、资源、故障和退出都围绕同一条 Cell 记录组织。")
 
     panel(
         slide,
@@ -1471,7 +1494,7 @@ def explain_01(slide) -> None:
         4.42,
         2.45,
         "Cell · 一项扩展的运行记录",
-        "Core 持有 Cell 记录，保存 ElmId、当前 Generation、状态、管理父级、公开能力、资源账本和故障事实。镜像可更换，Cell 仍表示同一项逻辑服务；它不是文件、地址或 Rust 句柄。",
+        "Cell 是一项逻辑服务的稳定责任边界；实现可以替换，但身份、准入和退出责任保持可追踪。所有公开能力、资源和故障都归属于该边界。",
         fill=PALE_BLUE,
         accent=BLUE,
         title_size=20,
@@ -1483,7 +1506,7 @@ def explain_01(slide) -> None:
         4.85,
         2.45,
         "LKM / KLD · 约束分散在不同机制",
-        "传统模块同样具备装载、依赖、签名和引用保护；但镜像状态、子系统注册、活动回调、长期资源和诊断信息分别由不同机制保存，安全退出依赖各子系统按自己的规则完成收束。",
+        "传统模块的装载、注册、回调和资源往往由不同机制分别管理，状态难以统一复核，安全退出也依赖各子系统自行约定。",
         fill=PALE_PURPLE,
         accent=PURPLE,
         title_size=20,
@@ -1492,7 +1515,7 @@ def explain_01(slide) -> None:
         slide,
         5.22,
         "Cell 记录的运行事实",
-        "ElmId / Generation · 当前状态 · Port / Binding / Lease · 活动执行 · 资源归属 · 具名退役阻断项",
+        "身份与代际 · 能力关系 · 活动引用 · 资源归属 · 退役阻断项",
         fill=PALE_TEAL,
         accent=TEAL,
         h=0.70,
@@ -1500,14 +1523,14 @@ def explain_01(slide) -> None:
     )
     boundary(
         slide,
-        "net.stack Cell 登记镜像和 Provider；FlowShard 由 net.stack 持有，活动 turn 与资源登记携带同一 ElmId / Generation。",
+        "网络示例：net.stack Cell 统一持有协议状态与资源责任，FlowShard 的运行活动可被同一责任边界追踪。",
         label="net.stack 例",
     )
 
 
 def explain_02(slide) -> None:
     set_title(slide, "常驻 Core、elm-mgr 与格式解析器")
-    lead(slide, "Core 是常驻的权威状态持有者；elm-mgr（ElmId 1）编排管理请求；eki（ElmId 2）把 EKI 投影为 EBI。三者的身份和越权边界都由 Core 记录。")
+    lead(slide, "管理自举的关键是分层：常驻 Core 保持不变量，管理器组织意图，格式解析器提供输入投影；每一层都受同一责任拓扑约束。")
 
     panel(
         slide,
@@ -1516,7 +1539,7 @@ def explain_02(slide) -> None:
         2.90,
         2.62,
         "Core · 常驻事实与提交",
-        "常驻、不可被普通 Cell 替换。保存 Cell、关系、策略、预算和事务；分配身份、核对前置条件并提交状态，不解释网络或设备业务载荷。",
+        "Core 是不可替换的最小可信根，统一持有关系、策略和事务不变量，只负责核验与提交，不承载具体子系统业务。",
         fill=NAVY,
         accent=BLUE,
         title_size=19,
@@ -1528,7 +1551,7 @@ def explain_02(slide) -> None:
         2.85,
         2.62,
         "elm-mgr · ElmId 1",
-        "具有 Cell 身份的根管理单元。接收装载、暂停、替换和策略请求，整理为 Core 操作；只能请求提交，不能直接改写权威状态。请求参数非法时在 Core 预检阶段拒绝。",
+        "elm-mgr 是受管的管理入口，负责把外部意图整理为 Core 可验证的操作；它不能绕过 Core 直接改写权威状态。",
         fill=PALE_BLUE,
         accent=BLUE,
         title_size=19,
@@ -1540,7 +1563,7 @@ def explain_02(slide) -> None:
         3.17,
         2.62,
         "eki · ElmId 2",
-        "具有 Cell 身份的内建格式解析器。EKI 是当前 ELM 镜像文件格式；读取已密封文件并生成候选 EBI。EBI 是 Core 接收的内存装载说明，不是文件；格式错误在投影阶段拒绝。",
+        "eki 是受管的格式投影器，把某种镜像表示转换为统一的候选装载对象；格式解释与是否允许执行由 Core 分离判断。",
         fill=PALE_PURPLE,
         accent=PURPLE,
         title_size=19,
@@ -1551,7 +1574,7 @@ def explain_02(slide) -> None:
         slide,
         5.42,
         "外部管理请求路径",
-        "elmctl → sys_elm_ctl → elm-mgr 组织参数 → Core 预检 / 提交 → 返回状态与阻断项（blocker）",
+        "管理意图 → 统一预检 → 原子提交 → 返回状态与阻断原因",
         fill=PALE_GRAY,
         accent=MUTED,
         h=0.70,
@@ -1559,14 +1582,14 @@ def explain_02(slide) -> None:
     )
     boundary(
         slide,
-        "elm-mgr 与 eki 也有 Cell / Generation；它们不能绕过 Core 提交状态。不可替换部分只有保存全局不变量的常驻 Core。",
+        "管理器与解析器也受 Cell 生命周期管理；只有保存全局不变量的常驻 Core 不可被普通扩展替换。",
         label="不可替换部分",
     )
 
 
 def explain_03(slide) -> None:
     set_title(slide, "Cell 身份与实现代际")
-    lead(slide, "ElmId 标识逻辑服务，Generation 标识当前实现代次。只有新实现提交成功后代次才递增；代次不匹配时调用被拒绝，旧网络 fd 返回 NetworkDown。")
+    lead(slide, "稳定身份与可替换实现分离：Cell 表示逻辑服务，Generation 表示当前实现；只有新实现完整通过验证并提交后才切换代次。")
 
     panel(
         slide,
@@ -1575,7 +1598,7 @@ def explain_03(slide) -> None:
         4.05,
         2.74,
         "一条 Cell 记录保存的关键事实",
-        "ElmId：本次启动中的强类型编号\nGeneration：当前实现代际\nstate：当前是否允许调用\nparent：管理归属\npolicy / budget：权限与额度\nsource：镜像来源和证明结果",
+        "逻辑身份\n实现代际\n当前状态\n管理归属\n权限与额度\n来源证明",
         fill=PALE_BLUE,
         accent=BLUE,
         title_size=19,
@@ -1591,7 +1614,7 @@ def explain_03(slide) -> None:
     flow(slide, 10.65, 3.63, 10.92, 3.63, color=PURPLE)
     body(
         slide,
-        "逻辑 ElmId 始终相同；只有新实现成功提交后 Generation 才递增。句柄 (Cell N, G1) 在 G2 公开后明确失效，即使旧地址尚未复用。此图说明 Core 的事务语义，不代表网络连接已完成原位迁移。",
+        "同一逻辑服务的身份保持稳定；新代成功提交后才递增，旧引用随之失效，避免新旧实现同时接收调用。",
         7.42,
         4.48,
         5.18,
@@ -1605,7 +1628,7 @@ def explain_03(slide) -> None:
         slide,
         5.52,
         "强类型 ID",
-        "ElmId、PortId、BindingId、LeaseId 底层均为 u64，但不能互换；零值保留，ID 也不等于内核地址。",
+        "不同对象使用不同的强类型身份，不能相互混用，也不把身份等同于实现地址。",
         fill=PALE_TEAL,
         accent=TEAL,
         h=0.62,
@@ -1613,14 +1636,14 @@ def explain_03(slide) -> None:
     )
     boundary(
         slide,
-        "长期引用保存 ElmId + Generation 并在使用时重新匹配；各类 ID 仅在本次启动和对象生命周期内有效。",
+        "长期引用必须与当前 Cell 和 Generation 重新匹配；代际变化自动形成清晰的失效边界。",
         label="失效规则",
     )
 
 
 def explain_04(slide) -> None:
     set_title(slide, "关系图中的四种责任")
-    lead(slide, "BindingGraph 是 Core 持有的关系表：父子边表示管理归属，依赖边表示声明的服务依赖，拓展边表示允许插入的位置，Binding 表示已经提交的调用许可；四类边分别检查，不能相互冒充。")
+    lead(slide, "关系图把不同责任分开表达：管理归属、服务依赖、允许拓展的位置和已提交的调用许可各自有边界，避免用一种关系代替另一种权限。")
 
     panel(
         slide,
@@ -1629,7 +1652,7 @@ def explain_04(slide) -> None:
         4.48,
         1.48,
         "父子关系",
-        "记录管理归属和预算委派。父级给出权限与额度上限；成为子单元不等于取得父级业务接口。",
+        "表达管理归属与额度委派；父子关系本身不授予业务调用权。",
         fill=PALE_BLUE,
         accent=BLUE,
         title_size=19,
@@ -1641,7 +1664,7 @@ def explain_04(slide) -> None:
         4.80,
         1.48,
         "依赖关系",
-        "记录提供者与完整契约。装载时检查目标、契约和依赖环；被依赖者退役时成为阻断项。不授予管理权限或调用资格。",
+        "表达服务依赖与兼容关系；依赖可被追踪并成为安全退出的约束，但不授予管理权限。",
         fill=PALE_TEAL,
         accent=TEAL,
         title_size=19,
@@ -1653,7 +1676,7 @@ def explain_04(slide) -> None:
         4.48,
         1.48,
         "拓展点与拓展项",
-        "目标 Cell 先声明允许附加行为的位置和契约，拓展项再按该契约挂入；不能对任意函数或局部变量加钩子。",
+        "目标先公开受控的拓展位置和契约，实现只能按声明挂接，避免任意修改核心行为。",
         fill=PALE_PURPLE,
         accent=PURPLE,
         title_size=19,
@@ -1665,122 +1688,122 @@ def explain_04(slide) -> None:
         4.80,
         1.48,
         "能力绑定",
-        "Binding 保存消费者、目标 Port、契约、消费者代次和 Lease；提供者由 Port owner 与后端追溯。它是调用许可，不是函数指针。",
+        "Binding 表示已经提交的能力连接；调用许可可审计、可撤销，而不是暴露裸函数入口。",
         fill=PALE_GRAY,
         accent=MUTED,
         title_size=19,
     )
     boundary(
         slide,
-        "父子、依赖、拓展边检查端点与非法环；Binding 检查消费者、Port、契约和重复项。关系记录先被撤销，相关对象才允许回收。",
+        "关系在提交前统一校验，撤销时先解除连接再回收对象；图一致性成为可复核的不变量。",
         label="图一致性",
     )
 
 
 def explain_05(slide) -> None:
     set_title(slide, "能力发布：Contract、Port 与 Provider")
-    lead(slide, "ELM 将一项动态服务拆为契约、端口和执行后端：契约给调用双方解释字节和错误的共同名称，Port 保存发现与访问属性，Provider 保存真正执行请求的后端。")
+    lead(slide, "ELM 将服务拆成契约、端口和执行后端：契约稳定语义，端口表达可发现的能力，Provider 承担具体执行，使核心与实现解耦。")
 
-    process_box(slide, 3.00, 2.58, 2.92, 2.05, "1", "流契约（Contract）", "Core 比对 name@version；业务规范据此解释载荷布局、返回值和错误码。", fill=PALE_PURPLE, accent=PURPLE)
-    process_box(slide, 6.26, 2.58, 2.92, 2.05, "2", "连接点（Port）", "Core 持有 PortId、owner、Contract、方向、访问范围和后端状态；它不是函数地址。", fill=PALE_BLUE, accent=BLUE)
-    process_box(slide, 9.52, 2.58, 3.08, 2.05, "3", "执行者（Provider）", "Port 对应的执行记录：常驻回调或原生 ELM handler。无后端时返回“未实现”。", fill=PALE_TEAL, accent=TEAL)
+    process_box(slide, 3.00, 2.58, 2.92, 2.05, "1", "流契约（Contract）", "统一命名版本和语义，约束双方对数据与错误的共同理解。", fill=PALE_PURPLE, accent=PURPLE)
+    process_box(slide, 6.26, 2.58, 2.92, 2.05, "2", "连接点（Port）", "公开方向、访问范围和发现属性，隔离调用者与实现地址。", fill=PALE_BLUE, accent=BLUE)
+    process_box(slide, 9.52, 2.58, 3.08, 2.05, "3", "执行者（Provider）", "承载真实服务，可由常驻能力或受管 ELM 提供；缺少后端时明确返回未实现。", fill=PALE_TEAL, accent=TEAL)
     flow(slide, 5.92, 3.49, 6.22, 3.49, color=PURPLE)
     flow(slide, 9.18, 3.49, 9.48, 3.49, color=BLUE)
-    compact_row(slide, 4.92, "mgr.action.invoke@1", "管理动作帧；Port 4 是 elm-mgr 控制入口；Provider 按 action_id 执行并返回固定回复。", fill=PALE_GRAY, accent=MUTED, h=0.66, title_w=2.74)
-    compact_row(slide, 5.57, "当前运行时契约", "专用 Runtime：core.log、core.event；通用 Provider：mgr.action.invoke；mgr.menu.item 绑定后登记菜单项。", fill=PALE_TEAL, accent=TEAL, h=0.66, title_w=2.74)
+    compact_row(slide, 4.92, "管理能力", "管理请求也通过版本化契约和受控 Provider 进入统一治理。", fill=PALE_GRAY, accent=MUTED, h=0.66, title_w=2.74)
+    compact_row(slide, 5.57, "调用优势", "契约稳定、实现可替换；调用前检查状态与权限，避免悬空或越权连接。", fill=PALE_TEAL, accent=TEAL, h=0.66, title_w=2.74)
     boundary(
         slide,
-        "Port 不固定 Generation；通用调用时读取 owner 当前代次，并检查 Binding / Lease、双方状态和后端是否存在。",
+        "连接只有在契约、状态、权限和后端同时满足时才生效；撤销可以沿同一责任链追踪。",
         label="调用门槛",
     )
 
 
 def explain_06(slide) -> None:
     set_title(slide, "能力连接：Binding 与 Lease")
-    lead(slide, "Binding 记录消费者获准使用的 Port；Lease 记录消费者身份、代次、权限和 active_refs。通用调用门、原生 Provider 与异步请求持有该引用；内建即时入口不持有。")
+    lead(slide, "Binding 表达已经批准的能力连接，Lease 表达仍在使用的责任；二者让动态调用可撤销、可追踪，并把短期引用与长期资源区分开。")
 
-    numbered_row(slide, 2.43, "1", "提出绑定", "消费者提交 ElmId、目标 PortId 和预期 Contract；Core 读取当前 Generation。", fill=PALE_BLUE, accent=BLUE, h=0.65)
-    numbered_row(slide, 3.16, "2", "Core 预检", "固定消费者代次；检查状态、策略、目标 Port、Contract、访问范围、额度和重复关系。", fill=PALE_PURPLE, accent=PURPLE, h=0.65)
-    numbered_row(slide, 3.89, "3", "提交使用权", "生成 BindingId 与 Active、active_refs=0 的 Lease；此后连接才对调用方可见。", fill=PALE_TEAL, accent=TEAL, h=0.65)
-    compact_row(slide, 4.64, "需持 Lease 的调用", "调用前核对 Binding、双方状态与代次；引用加一，结束或异步请求终止后释放。", fill=PALE_BLUE, accent=BLUE, h=0.66, title_w=2.30)
-    compact_row(slide, 5.39, "当前撤销语义", "引用非零：Busy 且不改对象；归零：删除 Binding，Lease 经 Revoking → Revoked 后移出。", fill=PALE_GRAY, accent=MUTED, h=0.66, title_w=2.30)
+    numbered_row(slide, 2.43, "1", "提出连接", "声明消费者、目标能力和预期契约，明确双方责任。", fill=PALE_BLUE, accent=BLUE, h=0.65)
+    numbered_row(slide, 3.16, "2", "资格预检", "统一核对状态、策略、契约、代际和资源边界，拒绝不一致关系。", fill=PALE_PURPLE, accent=PURPLE, h=0.65)
+    numbered_row(slide, 3.89, "3", "提交使用权", "预检成功后公开连接，并记录可撤销的使用责任。", fill=PALE_TEAL, accent=TEAL, h=0.65)
+    compact_row(slide, 4.64, "调用期间", "动态或异步调用持有引用；调用结束后释放，长期资源另由所属 Cell 负责清理。", fill=PALE_BLUE, accent=BLUE, h=0.66, title_w=2.30)
+    compact_row(slide, 5.39, "安全撤销", "仍有活动引用时返回 Busy 且不改变对象；引用归零后再撤销连接并回收。", fill=PALE_GRAY, accent=MUTED, h=0.66, title_w=2.30)
     boundary(
         slide,
-        "Provider 帧含 BindingId、CallId、opcode 和至多 256 B 内联载荷，不传内核裸指针；管理 ABI 的独立硬上限为 256 KiB。",
-        label="边界规格",
+        "连接只传递受约束的契约数据，不暴露内核裸地址；统一边界让撤销、审计和故障归属保持一致。",
+        label="设计优势",
     )
 
 
 def explain_07(slide) -> None:
     set_title(slide, "调用边界、核验位置与运行成本")
-    lead(slide, "调用路径按“每次要核验什么、调用者得到什么”分流：Provider 适合发现与撤销，managed import 适合代次敏感接口，direct-pinned 适合热路径，kernel-symbol 只指向常驻白名单。")
+    lead(slide, "调用路径按治理需求分层：动态 Provider 便于发现与撤销，受管导入强调代际安全，固定直连服务热路径，常驻符号保持最小可信面。")
 
-    definition_row(slide, 2.42, "Provider 枢纽", "每次查 Binding / Port、取得 Lease、校验固定帧；得到动态发现、异步、取消和审计。", "查表 + 引用 + 帧校验", fill=PALE_BLUE, accent=BLUE, h=0.76)
-    definition_row(slide, 3.31, "受管导入", "接口先暂存；每次调用核验双方状态与 Generation，任一变化即失效。", "逐次代次核验", fill=PALE_PURPLE, accent=PURPLE, h=0.76)
-    definition_row(slide, 4.20, "固定导入", "direct-pinned 在装载期固定 export、完整 Rust ABI 与代次；网络 PinnedNativeCall 仍逐次查状态、代次和 frame 范围。", "存活 importer 阻断替换", fill=PALE_TEAL, accent=TEAL, h=0.76)
-    definition_row(slide, 5.09, "内核符号", "kernel-symbol 只从常驻白名单解析名称、版本、权限与 Rust ABI，不按 ELM Generation 路由。", "登记目录内的常驻实现", fill=PALE_GRAY, accent=MUTED, h=0.76)
+    definition_row(slide, 2.42, "Provider 枢纽", "适合动态发现、授权、异步和审计；撤销边界清晰。", "治理完整、成本较高", fill=PALE_BLUE, accent=BLUE, h=0.76)
+    definition_row(slide, 3.31, "受管导入", "适合代际敏感接口；实现变化会让旧连接明确失效。", "逐次保持一致", fill=PALE_PURPLE, accent=PURPLE, h=0.76)
+    definition_row(slide, 4.20, "固定导入", "适合稳定热路径；装载时证明兼容，运行时仍保留必要门禁。", "性能高、替换受约束", fill=PALE_TEAL, accent=TEAL, h=0.76)
+    definition_row(slide, 5.09, "内核符号", "只连接常驻、明确登记的核心能力，缩小可信范围。", "不参与动态代际路由", fill=PALE_GRAY, accent=MUTED, h=0.76)
     boundary(
         slide,
-        "当前网络 Host 仅通过带逐次状态、代次和范围检查的 PinnedNativeCall 调用 shard-turn / local-turn；普通 Cell 不取得管理入口表。",
-        label="当前路径",
+        "网络热路径采用受管直连以避免通用分发开销，同时保留状态、代际和参数边界核验。",
+        label="网络创新",
     )
 
 
 def explain_08(slide) -> None:
     set_title(slide, "从 EKI 文件到候选 EBI")
-    lead(slide, "文件格式与装载规则彼此分离：格式解析器只把字节转换成候选装载说明，是否允许执行仍由 Core 按同一套规则判断。")
+    lead(slide, "格式解释与装载决策分离：解析器只产生统一的候选描述，Core 再独立判断来源、兼容性和执行资格。")
 
-    panel(slide, 3.00, 2.52, 2.88, 2.62, "EKI · 当前文件格式", "固定头部和块表；上传会话要求每片 offset 紧接已写内容，并检查总长度。Seal 后核对完整 SHA-256，输入不再可改。", fill=PALE_BLUE, accent=BLUE, title_size=19)
-    panel(slide, 6.24, 2.52, 2.92, 2.62, "投影源（Projection Source）", "当前由内建 eki Cell 提供；校验头部、块类型、必需块、块范围重叠和摘要，再输出候选 EBI。它不能激活模块。", fill=PALE_PURPLE, accent=PURPLE, title_size=18)
-    panel(slide, 9.52, 2.52, 3.08, 2.62, "EBI · 统一装载对象", "不是磁盘文件。它保存清单、段、符号、重定位、imports / exports、生命周期入口、Provider 声明和 ABI 指纹。", fill=PALE_TEAL, accent=TEAL, title_size=19)
+    panel(slide, 3.00, 2.52, 2.88, 2.62, "镜像表示", "描述代码、依赖和能力的来源；封存后保持不可变，便于复核。", fill=PALE_BLUE, accent=BLUE, title_size=19)
+    panel(slide, 6.24, 2.52, 2.92, 2.62, "投影源", "将不同格式转换为统一候选对象，只负责解释，不拥有激活权限。", fill=PALE_PURPLE, accent=PURPLE, title_size=18)
+    panel(slide, 9.52, 2.52, 3.08, 2.62, "统一装载对象", "集中表达清单、能力、生命周期和接口证明，供 Core 使用同一套规则审查。", fill=PALE_TEAL, accent=TEAL, title_size=19)
     flow(slide, 5.88, 3.83, 6.20, 3.83, color=BLUE)
     flow(slide, 9.16, 3.83, 9.48, 3.83, color=PURPLE)
-    compact_row(slide, 5.40, "新增格式接入", "新增格式只需提供新的投影源，Core 仍消费同一种 EBI；当前生产路径只接通 EKI，其他容器格式尚未接入。", fill=PALE_GRAY, accent=MUTED, h=0.70, title_w=2.28)
+    compact_row(slide, 5.40, "可演进性", "新增格式只需增加投影源，Core 无需理解具体文件细节；统一装载对象保持稳定。", fill=PALE_GRAY, accent=MUTED, h=0.70, title_w=2.28)
     boundary(
         slide,
-        "投影源没有激活权限；架构、来源、ABI、Policy、关系和 Budget 均由 Core 在候选 EBI 上复核。",
-        label="权限分界",
+        "投影与执行权限分离，所有候选都经过同一套来源、接口和策略审查。",
+        label="设计优势",
     )
 
 
 def explain_09(slide) -> None:
     set_title(slide, "装载证明：来源与接口兼容")
-    lead(slide, "所有候选都要证明内容与 ABI；签名来源额外核验信任链、撤销状态和发布代次，构建绑定来源则核验构建清单、镜像摘要与当前接口指纹。")
+    lead(slide, "候选实现必须证明来源、完整性与接口兼容，证明通过后才获得进入运行态的资格。")
 
-    numbered_row(slide, 2.46, "1", "镜像摘要", "上传会话 Seal 后核对整镜像 SHA-256；后续投影必须引用同一份不可变输入。", fill=PALE_BLUE, accent=BLUE, h=0.75)
-    numbered_row(slide, 3.35, "2", "签名来源", "校验签名者、受信公钥、撤销状态和单调发布代次；同一来源不能装回低于已接受代次的旧镜像。", fill=PALE_PURPLE, accent=PURPLE, h=0.75)
-    numbered_row(slide, 4.24, "3", "构建绑定来源", "另一条来源路径不依赖发布代次，而是要求构建清单、镜像摘要和当前内核接口指纹完全一致；其发布代次固定为 0。", fill=PALE_TEAL, accent=TEAL, h=0.75)
-    numbered_row(slide, 5.13, "4", "目标与 ABI", "核对架构、panic 策略、代码模型、target feature、接口摘要、入口范围和完整 Rust ABI。", fill=PALE_GRAY, accent=MUTED, h=0.75)
+    numbered_row(slide, 2.46, "1", "内容完整", "输入保持不可变且可追踪，保证后续判断针对同一份实现。", fill=PALE_BLUE, accent=BLUE, h=0.75)
+    numbered_row(slide, 3.35, "2", "来源可信", "来源与信任关系满足策略，避免未经授权的实现进入核心。", fill=PALE_PURPLE, accent=PURPLE, h=0.75)
+    numbered_row(slide, 4.24, "3", "构建一致", "实现与当前核心契约、依赖和发布状态一致，避免接口漂移。", fill=PALE_TEAL, accent=TEAL, h=0.75)
+    numbered_row(slide, 5.13, "4", "目标兼容", "架构、能力范围和执行边界兼容，才允许继续初始化。", fill=PALE_GRAY, accent=MUTED, h=0.75)
     boundary(
         slide,
-        "签名只证明来源与内容完整，不证明业务逻辑正确；任一证明不一致均在 create / initialize 前拒绝。",
+        "证明解决来源与接口风险，不替代业务正确性验证；任一不一致都在公开前拒绝。",
         label="证明范围",
     )
 
 
 def explain_09b(slide) -> None:
-    set_title(slide, "装载提交：两级门禁与失败回滚")
-    lead(slide, "原生装载分两次提交：initialize 后安装可观察拓扑，但独占执行令牌阻止外部调用；entry 成功后才提交信任、导入导出和镜像所有权。")
+    set_title(slide, "装载提交：一次性公开")
+    lead(slide, "装载采用准备、初始化、公开提交的事务结构；任何阶段失败都不让半成品进入公共拓扑。")
 
-    numbered_row(slide, 2.46, "1", "镜像准备", "分配分页、复制段、清零 BSS、完成重定位和 W^X；导入、导出与 Provider 先进入暂存记录。", fill=PALE_BLUE, accent=BLUE, h=0.75)
-    numbered_row(slide, 3.35, "2", "initialize", "锁外执行 initialize；失败时放弃信任与暂存导入，释放独占令牌，并把 Cell 隔离。", fill=PALE_PURPLE, accent=PURPLE, h=0.75)
-    numbered_row(slide, 4.24, "3", "拓扑门禁", "initialize 成功后，Core 安装关系与 Provider 并推进到 Active；独占执行令牌仍在，外部调用返回 Busy。", fill=PALE_TEAL, accent=TEAL, h=0.75)
-    numbered_row(slide, 5.13, "4", "entry 与最终提交", "entry 成功后提交信任、导入、导出与 native image 并释放令牌；失败则撤销已安装关系并进入 Quarantined。", fill=PALE_GRAY, accent=MUTED, h=0.75)
+    numbered_row(slide, 2.46, "1", "候选准备", "准备实现及其能力关系，保持外部不可见。", fill=PALE_BLUE, accent=BLUE, h=0.75)
+    numbered_row(slide, 3.35, "2", "初始化", "在受控上下文中完成初始化；失败时销毁候选并恢复原状态。", fill=PALE_PURPLE, accent=PURPLE, h=0.75)
+    numbered_row(slide, 4.24, "3", "公开门禁", "初始化成功后才开放关系和调用资格，避免半初始化服务被消费。", fill=PALE_TEAL, accent=TEAL, h=0.75)
+    numbered_row(slide, 5.13, "4", "原子提交", "一次性发布状态与所有权；失败回滚并留下可追踪的隔离事实。", fill=PALE_GRAY, accent=MUTED, h=0.75)
     boundary(
         slide,
-        "Active 在此处不等于立即可调用：exclusive_execution 在 entry 结束前构成第二道门禁；失败会留下可审计的隔离事实。",
+        "唯一公开点把状态、关系和所有权绑定在一起；调用者不会观察到半提交状态。",
         label="可见性边界",
     )
 
 
 def explain_10(slide) -> None:
     set_title(slide, "生命周期状态与调用门禁")
-    lead(slide, "状态表示 Core 已经把这项扩展处理到哪一步；实际准入还同时检查 Generation、策略版本、isolated、活动执行、Lease 与长期资源。")
+    lead(slide, "生命周期状态回答扩展是否可用、可暂停或可退出；调用门同时检查身份、权限、关系和资源责任。")
 
-    compact_row(slide, 2.42, "准备阶段", "Discovered：只有来源 → Verified：证明通过 → Loaded：镜像归运行时所有 → Linked：重定位和 import 完成", fill=PALE_BLUE, accent=BLUE, h=0.82, title_w=1.62)
-    compact_row(slide, 3.38, "激活阶段", "Ready：initialize 已成功，等待关系与调用入口公开提交 → Active：关系和 Provider 已安装；原生 entry 结束前仍持独占执行令牌，外部调用返回 Busy", fill=PALE_TEAL, accent=TEAL, h=0.82, title_w=1.62)
-    compact_row(slide, 4.34, "退出阶段", "Quiescing：拒绝新工作并排空 → Paused：保留镜像、可恢复 → Detached：从公开关系摘除 → Retired：完成回收", fill=PALE_PURPLE, accent=PURPLE, h=0.82, title_w=1.62)
-    compact_row(slide, 5.30, "故障处理", "记录 native fault 并置 isolated；生命周期钩子或资源收束失败时，再走 Faulted → Quarantined", fill=PALE_GRAY, accent=MUTED, h=0.82, title_w=1.62)
+    compact_row(slide, 2.42, "准备阶段", "从发现、验证到链接，逐步形成可运行的候选实现。", fill=PALE_BLUE, accent=BLUE, h=0.82, title_w=1.62)
+    compact_row(slide, 3.38, "激活阶段", "初始化成功后公开能力；只有满足调用门禁才进入 Active。", fill=PALE_TEAL, accent=TEAL, h=0.82, title_w=1.62)
+    compact_row(slide, 4.34, "退出阶段", "先停止新工作并排空，再选择可恢复的暂停或最终摘除。", fill=PALE_PURPLE, accent=PURPLE, h=0.82, title_w=1.62)
+    compact_row(slide, 5.30, "故障处理", "故障先隔离责任单元；无法安全收束时进入受控的终止状态。", fill=PALE_GRAY, accent=MUTED, h=0.82, title_w=1.62)
     boundary(
         slide,
         "Policy、Generation、关系、Lease、活动执行与长期资源同时满足后才提交状态迁移。",
@@ -1790,13 +1813,13 @@ def explain_10(slide) -> None:
 
 def explain_11(slide) -> None:
     set_title(slide, "Pause 与 Detach 的执行步骤")
-    lead(slide, "quiesce 表示停止接纳新调用并排空；Pause 可回滚，Detach 不可逆。两者都在锁内定计划、锁外执行钩子、再回锁核对，模块代码不持有 Core 全局锁。")
+    lead(slide, "Pause 与 Detach 是两种不同的退役策略：前者保留恢复可能，后者完成最终摘除；共同原则是先静默、再收束。")
 
-    numbered_row(slide, 2.42, "1", "锁内预检", "按请求类型读取 Cell / Generation、策略版本、活动调用、Lease、关系和资源状态，形成本次执行计划。", fill=PALE_BLUE, accent=BLUE, h=0.64)
-    numbered_row(slide, 3.18, "2", "锁外执行", "Pause：quiesce → suspend → pause；Detach：quiesce → cancel → drain → release。", fill=PALE_PURPLE, accent=PURPLE, h=0.64)
-    numbered_row(slide, 3.94, "3", "锁内复核", "比较代次、policy epoch、独占令牌和资源状态；任一变化，本次提交失败，不沿用旧计划。", fill=PALE_TEAL, accent=TEAL, h=0.64)
-    compact_row(slide, 4.76, "Pause · 可回滚", "suspend 或 pause 失败：恢复资源并调用 resume；状态不提交。", fill=PALE_BLUE, accent=BLUE, h=0.60, title_w=2.14)
-    compact_row(slide, 5.46, "Detach · 不可逆", "排空资源后才摘除关系与镜像；依赖者、子 Cell 和拓展项可阻断。", fill=PALE_GRAY, accent=MUTED, h=0.60, title_w=2.14)
+    numbered_row(slide, 2.42, "1", "资格判断", "确认当前状态、依赖和活动责任允许开始退役。", fill=PALE_BLUE, accent=BLUE, h=0.64)
+    numbered_row(slide, 3.18, "2", "停止接纳", "关闭新的调用入口，让在途工作自然收束。", fill=PALE_PURPLE, accent=PURPLE, h=0.64)
+    numbered_row(slide, 3.94, "3", "排空与回收", "清理活动引用和长期资源，再提交最终状态。", fill=PALE_TEAL, accent=TEAL, h=0.64)
+    compact_row(slide, 4.76, "Pause · 可回滚", "保留实现与关系，失败时恢复为可运行状态。", fill=PALE_BLUE, accent=BLUE, h=0.60, title_w=2.14)
+    compact_row(slide, 5.46, "Detach · 不可逆", "完成资源收束后摘除公开关系，后续可重新装载新代。", fill=PALE_GRAY, accent=MUTED, h=0.60, title_w=2.14)
     boundary(
         slide,
         "Pause 与 Detach 使用不同 blocker 集合；钩子或资源回滚失败时记录故障阶段并隔离 Cell。",
@@ -1806,14 +1829,14 @@ def explain_11(slide) -> None:
 
 def explain_12(slide) -> None:
     set_title(slide, "Replace 事务：ElmId 不变，Generation 递增")
-    lead(slide, "Replace 保留 ElmId，在影子区准备 Generation N+1，静默旧代并按需迁移；只有复核成功才切换代次。旧代恢复失败时不伪装成功，而是隔离 Cell。")
+    lead(slide, "Replace 保留逻辑身份，在新代准备完成后切换实现；提交失败不改变旧代，确保更新具有原子性。")
 
     stages = [
-        ("1", "影子装入 N+1", "完成证明、链接和 initialize"),
-        ("2", "静默旧代 N", "拒绝新工作并等待调用退出"),
-        ("3", "可选迁移", "默认不支持；export → ≤64 KiB → import"),
-        ("4", "一次提交", "切换代次、后端、导入导出与资源归属"),
-        ("5", "回收旧代", "旧代不可发现；finalize 后释放镜像"),
+        ("1", "准备新代", "完成来源、接口和初始化证明"),
+        ("2", "静默旧代", "停止新工作并等待活动责任结束"),
+        ("3", "处理迁移", "仅在明确支持时迁移可转移状态"),
+        ("4", "一次提交", "切换当前实现与能力关系"),
+        ("5", "回收旧代", "释放旧实现并保留更新事实"),
     ]
     x = 3.00
     widths = [1.72, 1.72, 1.72, 1.72, 1.72]
@@ -1822,41 +1845,41 @@ def explain_12(slide) -> None:
         if number != "5":
             flow(slide, x + widths[index], 3.37, x + widths[index] + 0.20, 3.37, color=PURPLE)
         x += widths[index] + 0.22
-    panel(slide, 3.00, 4.48, 4.56, 1.58, "失败发生的位置", "提交前销毁 N+1 并恢复旧代；恢复失败进入 Quarantined。提交后旧代 finalize 失败只记错，不撤回代次切换。", fill=PALE_BLUE, accent=BLUE, title_size=18)
-    panel(slide, 7.86, 4.48, 4.74, 1.58, "Replace 阻断项", "活动调用 / Lease、排队 Provider、固定 importer、不可迁移资源、动态分配，以及 ABI / 重定位不兼容。", fill=PALE_GRAY, accent=MUTED, title_size=18)
+    panel(slide, 3.00, 4.48, 4.56, 1.58, "失败处理", "提交前失败：销毁新代并恢复旧代；收束失败：隔离责任单元并保留失败事实。", fill=PALE_BLUE, accent=BLUE, title_size=18)
+    panel(slide, 7.86, 4.48, 4.74, 1.58, "替换阻断项", "仍在使用的连接、不可迁移的长期状态或接口不兼容都会阻止原位切换。", fill=PALE_GRAY, accent=MUTED, title_size=18)
     boundary(
         slide,
-        "依赖和拓展表面必须兼容，通常不随提交切换；网络仅验证 Detach + Reload，旧 socket 报 NetworkDown / HANGUP。",
-        label="实现范围",
+        "新旧代次之间保持清晰失效边界；不能安全迁移时宁可拒绝替换，也不破坏用户可见语义。",
+        label="设计优势",
     )
 
 
 def explain_13(slide) -> None:
     set_title(slide, "Policy、Budget、Lease 与长期资源")
-    lead(slide, "同一个 Cell 同时受四种不同约束：操作权限、资源上限、正在使用的短期引用、需要子系统清理的长期对象；四者分别记录，避免只靠引用计数猜测能否退出。")
+    lead(slide, "权限、容量、活动引用和长期资源是不同责任，分别建模后才能判断扩展能否安全运行与退出。")
 
-    panel(slide, 3.00, 2.46, 4.56, 1.56, "策略（Policy）· 能否执行", "按生命周期、绑定、Provider、原生执行、观测和管理动作授权。父级给上限，子级只能收窄；更新时递增策略版本。", fill=PALE_PURPLE, accent=PURPLE, title_size=19)
-    panel(slide, 7.86, 2.46, 4.74, 1.56, "预算（Budget）· 最多占用多少", "分别在端口登记、队列提交、镜像与原生栈分配、调用准入和动态分配时检查上限；父级为存活子级保留额度。", fill=PALE_BLUE, accent=BLUE, title_size=19)
-    panel(slide, 3.00, 4.24, 4.56, 1.56, "租约（Lease）· 是否仍被使用", "保存 owner / Generation、权限、Binding、状态和 active_refs；活动引用阻止端口、绑定或资源提前撤销。", fill=PALE_TEAL, accent=TEAL, title_size=19)
-    panel(slide, 7.86, 4.24, 4.74, 1.56, "长期资源（Owned Resource）· 谁回收", "任务、定时器、工作项、回调、IRQ、异步请求和设备按 Cell / Generation 登记；清理操作表位于常驻子系统。", fill=PALE_GRAY, accent=MUTED, title_size=19)
+    panel(slide, 3.00, 2.46, 4.56, 1.56, "策略（Policy）· 能否执行", "限定能力范围，父级给出上限，子级只能进一步收窄。", fill=PALE_PURPLE, accent=PURPLE, title_size=19)
+    panel(slide, 7.86, 2.46, 4.74, 1.56, "预算（Budget）· 最多占用多少", "限定并发、队列和内存等资源额度，防止局部扩展无界消耗。", fill=PALE_BLUE, accent=BLUE, title_size=19)
+    panel(slide, 3.00, 4.24, 4.56, 1.56, "租约（Lease）· 是否仍被使用", "记录短期活动引用；引用未归零时拒绝撤销，避免悬空调用。", fill=PALE_TEAL, accent=TEAL, title_size=19)
+    panel(slide, 7.86, 4.24, 4.74, 1.56, "长期资源（Owned Resource）· 谁回收", "记录需要异步清理的对象，并由常驻责任方执行收束。", fill=PALE_GRAY, accent=MUTED, title_size=19)
     boundary(
         slide,
-        "停止接纳 → 静默 → 取消 → 排空 → 逆序释放；CPU 时间目前仅记账与统计，不执行调度节流。",
+        "停止接纳 → 静默 → 取消 → 排空 → 逆序释放；资源归属清晰使局部故障不会扩散。",
         label="退役协议",
     )
 
 
 def explain_14(slide) -> None:
     set_title(slide, "原生调用门的故障收束边界")
-    lead(slide, "原生 ELM 与内核共享特权级和地址空间，因此不能承诺隔离恶意写入；调用门解决的是可恢复故障：为每次进入准备受控栈、执行记账和固定返回现场。")
+    lead(slide, "原生扩展与内核共享特权空间，不能承诺恶意写入隔离；调用门的创新在于把可恢复故障收束到固定责任边界。")
 
-    panel(slide, 3.00, 2.48, 2.92, 2.34, "进入前校验", "核对 Cell / Generation、Policy、Budget、入口地址和目标 feature；ElmGuard 保存阶段、期限、代码范围及恢复 PC / SP。", fill=PALE_BLUE, accent=BLUE, title_size=19)
-    panel(slide, 6.24, 2.48, 2.92, 2.34, "受控执行现场", "切换到两端带 Guard page 的 64 KiB 独立栈，再执行 hook、entry、Provider handler 或 managed call。", fill=PALE_PURPLE, accent=PURPLE, title_size=19)
-    panel(slide, 9.48, 2.48, 3.12, 2.34, "异常记录与固定出口", "trap / panic 保存 fault PC、访问地址、原因和阶段；改写 trap frame 回到固定出口，返回错误并释放执行记账。", fill=PALE_TEAL, accent=TEAL, title_size=19)
-    compact_row(slide, 5.02, "故障后的 Cell", "普通原生故障先置 isolated 并拒绝新调用；生命周期钩子或资源收束失败才进入 Faulted → Quarantined。", fill=PALE_BLUE, accent=BLUE, h=0.54, title_w=2.12)
+    panel(slide, 3.00, 2.48, 2.92, 2.34, "进入前校验", "核对身份、策略、入口和能力范围，确认调用属于当前责任单元。", fill=PALE_BLUE, accent=BLUE, title_size=19)
+    panel(slide, 6.24, 2.48, 2.92, 2.34, "受控执行现场", "在独立的受控上下文中执行扩展，避免故障状态直接污染调用者。", fill=PALE_PURPLE, accent=PURPLE, title_size=19)
+    panel(slide, 9.48, 2.48, 3.12, 2.34, "异常记录与固定出口", "记录故障位置、原因和责任归属，统一返回错误并释放执行责任。", fill=PALE_TEAL, accent=TEAL, title_size=19)
+    compact_row(slide, 5.02, "故障后的 Cell", "故障单元先隔离并拒绝新调用；无法安全收束时进入受控终止状态。", fill=PALE_BLUE, accent=BLUE, h=0.54, title_w=2.12)
     boundary(
         slide,
-        "内存写不能回滚，恶意代码仍共享地址空间；调用门只保存整数 ABI，未覆盖的 Float / Vector / SIMD 镜像在装载前拒绝。",
+        "调用门解决可恢复故障和责任归属，不把共享特权地址空间误称为安全沙箱。",
         label="恢复边界",
         label_w=1.72,
     )
@@ -1870,66 +1893,66 @@ def explain_15(slide) -> None:
     definition_row(slide, 3.14, "事件 Event", "一类状态变化的顺序记录；读取方可以从该事件流的 sequence 继续消费。", "还原该事件流顺序", fill=PALE_TEAL, accent=TEAL, h=0.66, rule_w=1.88, term_w=1.92)
     definition_row(slide, 3.90, "审计 Audit", "记录操作主体、管理动作、结果、拒绝码和具名阻断项。", "核对谁做了什么", fill=PALE_PURPLE, accent=PURPLE, h=0.66, rule_w=1.88, term_w=1.92)
     definition_row(slide, 4.66, "路径 Trace", "生命周期、Provider、拓展、Replace、策略和资源的操作级记录：动作、对象、结果、阻断项。", "定位失败类别", fill=PALE_BLUE, accent=BLUE, h=0.66, rule_w=1.88, term_w=1.92)
-    definition_row(slide, 5.42, "日志链 Journal", "240 B 记录以前后 SHA-256 哈希相连；默认仅保留 256 条内存环。", "检查顺序与完整性", fill=PALE_GRAY, accent=MUTED, h=0.66, rule_w=1.88, term_w=1.92)
+    definition_row(slide, 5.42, "日志链 Journal", "记录管理过程的连续证据，支持顺序和完整性复核。", "检查顺序与完整性", fill=PALE_GRAY, accent=MUTED, h=0.66, rule_w=1.88, term_w=1.92)
     boundary(
         slide,
-        "各视图独立排序，以对象 ID 或事务票据关联；Journal 默认易失，只恢复 trust epoch，不恢复 Cell、关系、队列或执行现场。",
+        "各视图以对象身份和事务关联；证据用于复核责任与顺序，不替代持久化状态或业务结果。",
         label="关联与持久性",
     )
 
 
 def explain_15b(slide) -> None:
     set_title(slide, "Busy 拒绝记录样例")
-    lead(slide, "示意编号，非实测编号：待替换 Cell 自身是 B4 的消费者，L7 是随 B4 创建、归该消费者代次所有的 Lease。预检发现 L7.active_refs > 0，返回 Busy；状态和 Generation 不变。")
+    lead(slide, "当替换或撤销遇到活动引用时，系统返回 Busy 并保持原状态；多类证据共同解释拒绝原因。")
 
-    numbered_row(slide, 2.46, "1", "审计记录", "Audit 给出发起主体、目标 ElmId、Replace 动作、Busy 结果和 blocker；audit sequence 只排序审计流。", fill=PALE_BLUE, accent=BLUE, h=0.75)
-    numbered_row(slide, 3.35, "2", "绑定查询", "Binding 记录给出 B4 的消费者、Port、Contract、Generation 和 L7；Port 查询再找到 owner 与后端。", fill=PALE_PURPLE, accent=PURPLE, h=0.75)
-    numbered_row(slide, 4.24, "3", "执行对照", "executions / diagnostics 给出 port、binding、lease、开始时间和后端代次；与 L7.active_refs 对照。", fill=PALE_TEAL, accent=TEAL, h=0.75)
-    numbered_row(slide, 5.13, "4", "状态复核", "Replace 预检未提交，Cell 状态和 Generation 保持原值；调用释放 L7 后，下一次预检才可能通过。", fill=PALE_GRAY, accent=MUTED, h=0.75)
+    numbered_row(slide, 2.46, "1", "请求事实", "记录谁发起了替换、目标是谁以及返回的阻断类别。", fill=PALE_BLUE, accent=BLUE, h=0.75)
+    numbered_row(slide, 3.35, "2", "关系事实", "指出哪条能力连接或活动引用仍然存在。", fill=PALE_PURPLE, accent=PURPLE, h=0.75)
+    numbered_row(slide, 4.24, "3", "执行事实", "把阻断引用关联到正在进行的调用或异步工作。", fill=PALE_TEAL, accent=TEAL, h=0.75)
+    numbered_row(slide, 5.13, "4", "状态事实", "证明拒绝没有半提交，引用归零后才允许再次尝试。", fill=PALE_GRAY, accent=MUTED, h=0.75)
     boundary(
         slide,
-        "需要同时存在的证据：Audit 解释谁请求、Binding / Lease 解释哪条连接仍在使用、Execution 解释引用由哪次调用持有、Cell 状态证明没有半提交。",
+        "请求、关系、执行和状态四类证据闭合后，Busy 不再是黑盒错误，而是可定位、可复核的安全决策。",
         label="本例所需记录",
     )
 
 
 def explain_16(slide) -> None:
-    set_title(slide, "ElmModule 与 y / m / n 构建形态")
-    lead(slide, "业务实现通过 ElmModule 声明生命周期入口；构建配置再决定它是常驻内核代码、受管动态 Cell，还是完全不进入镜像。")
+    set_title(slide, "实现接入策略与边界")
+    lead(slide, "同一业务能力可以选择受管扩展、常驻集成或暂不接入；选择决定它获得的治理能力和替换边界。")
 
-    panel(slide, 3.00, 2.48, 4.48, 2.32, "开发接口（ElmModule）", "必选 create / initialize / finalize；按需实现 quiesce、pause / resume、migrate 和 entry。属性宏生成描述符、生命周期入口和 ABI 材料，但不能替作者证明业务回滚。", fill=PALE_BLUE, accent=BLUE, title_size=20)
-    panel(slide, 7.80, 2.48, 4.80, 2.32, "构建选择（Modules.toml + .config）", "m：位置无关镜像 → EKI → 受管动态 Cell\ny：静态归档 → initcall，不具有动态 Cell / Generation\nn：不构建，也不打包\n最终模式以当前 .config 为准。", fill=PALE_PURPLE, accent=PURPLE, title_size=20)
-    compact_row(slide, 5.10, "mode = m", "获得装载证明、Cell / Generation、Policy / Budget、动态调用关系、Pause / Detach / Replace 和运行证据。", fill=PALE_TEAL, accent=TEAL, h=0.76, title_w=1.62)
-    compact_row(slide, 5.99, "mode = y", "同一业务实现作为常驻内核代码运行；有 initcall，但没有动态 Cell、Provider、Mixin 或代际替换语义。", fill=PALE_GRAY, accent=MUTED, h=0.64, title_w=1.62)
+    panel(slide, 3.00, 2.48, 4.48, 2.32, "受管扩展", "获得身份、能力关系、生命周期和故障证据；适合需要独立演进与可撤销的功能。", fill=PALE_BLUE, accent=BLUE, title_size=20)
+    panel(slide, 7.80, 2.48, 4.80, 2.32, "常驻集成", "直接成为核心的一部分，路径短、可信边界小，但不具备动态代际替换。", fill=PALE_PURPLE, accent=PURPLE, title_size=20)
+    compact_row(slide, 5.10, "选择原则", "把治理收益、热路径成本和替换需求放在同一决策中权衡。", fill=PALE_TEAL, accent=TEAL, h=0.76, title_w=1.62)
+    compact_row(slide, 5.99, "未接入能力", "尚未登记的能力不伪装成已完成；先保留清晰边界，再按同一契约接入。", fill=PALE_GRAY, accent=MUTED, h=0.64, title_w=1.62)
 
 
 def explain_16b(slide) -> None:
     set_title(slide, "当前接入范围与未完成边界")
     lead(slide, "把“代码已有”“生产已接通”和“仍需接入”分开列出；模块声明、运行时注册和真实数据路径不是同一件事。")
 
-    panel(slide, 3.00, 2.46, 4.56, 1.72, "通用代码已有", "Cell / Generation、EKI 投影、调用路径、生命周期、Policy / Budget、故障隔离和证据记录。", fill=PALE_TEAL, accent=TEAL, title_size=19)
-    panel(slide, 7.86, 2.46, 4.74, 1.72, "生产路径已接通", "net.stack、net.loopback、net.virtio 以私有 direct-pinned / PinnedNativeCall 接入真实网络路径。", fill=PALE_BLUE, accent=BLUE, title_size=19)
-    panel(slide, 3.00, 4.46, 4.56, 1.46, "仍需显式注册", "设备与 VFS Provider 不能从模块声明自动出现，必须由子系统在启动路径登记。", fill=PALE_PURPLE, accent=PURPLE, title_size=19)
-    panel(slide, 7.86, 4.46, 4.74, 1.46, "尚未接通", "通用 packet / IRQ / DMA / MMIO / block Provider；其他容器格式投影源；公共发布体系。", fill=PALE_GRAY, accent=MUTED, title_size=19)
+    panel(slide, 3.00, 2.46, 4.56, 1.72, "治理能力已具备", "身份、代际、能力关系、生命周期、资源归属、故障隔离和运行证据形成完整框架。", fill=PALE_TEAL, accent=TEAL, title_size=19)
+    panel(slide, 7.86, 2.46, 4.74, 1.72, "网络路径已接通", "协议状态与设备状态分别受管，热路径采用受控直连，用户接口保持稳定。", fill=PALE_BLUE, accent=BLUE, title_size=19)
+    panel(slide, 3.00, 4.46, 4.56, 1.46, "接入边界", "设备和 VFS 等能力仍需显式登记，不能由模块声明自动推断。", fill=PALE_PURPLE, accent=PURPLE, title_size=19)
+    panel(slide, 7.86, 4.46, 4.74, 1.46, "后续方向", "通用数据面 Provider、更多格式投影源和公共发布体系继续沿同一契约扩展。", fill=PALE_GRAY, accent=MUTED, title_size=19)
     boundary(
         slide,
-        "网络热路径使用专用 direct-pinned endpoint；通用 packet、IRQ、DMA、MMIO 与 block Provider 未接通。",
-        label="生产边界",
+        "创新已在网络路径落地；其他能力按需接入，避免把未完成范围误写成现状。",
+        label="完成边界",
     )
 
 
 def explain_17(slide) -> None:
     set_title(slide, "网络能力与责任结构")
-    lead(slide, "网络栈已经覆盖常用接口、协议与设备路径；这些通用能力只列出实现范围，后续集中说明 ELM 接入后形成的对象责任、代际门禁和退出语义。")
+    lead(slide, "网络栈作为 ELM 的真实实现，重点不在罗列协议，而在把用户可见语义与可退役的协议、设备责任分开。")
 
-    panel(slide, 3.00, 2.45, 4.55, 1.66, "用户接口与协议范围", "POSIX socket、bind、connect、listen、accept、sendmsg、recvmsg 与 poll / epoll 已进入 VFS 文件接口；支持 IPv4 / IPv6、TCP / UDP / ICMP / Raw。", fill=PALE_BLUE, accent=BLUE, title_size=19, detail_size=15)
-    panel(slide, 7.86, 2.45, 4.74, 1.66, "寻址、链路与设备范围", "路由、邻居、PMTU、IP 分片与重组已有运行路径；VirtIO-net 负责队列、DMA 缓冲和中断，回环设备由独立网络 ELM 承载。", fill=PALE_TEAL, accent=TEAL, title_size=19, detail_size=15)
-    compact_row(slide, 4.38, "常规实现", "协议解析、校验和、重传、拥塞控制、路由查找与设备收发属于操作系统网络栈的通用职责，本稿只证明其存在和接口覆盖。", fill=PALE_GRAY, accent=MUTED, h=0.68, title_w=1.76)
-    compact_row(slide, 5.20, "本工程重点", "常驻 fd 对象与可退役协议状态分离；网络热路径固定到受管代际；FlowShard 限定写入者；设备与协议分别退出。", fill=PALE_PURPLE, accent=PURPLE, h=0.68, title_w=1.76)
+    panel(slide, 3.00, 2.45, 4.55, 1.66, "稳定用户接口", "POSIX socket 与事件等待继续由常驻文件对象解释；协议实现可以演进，fd 语义不随代际漂移。", fill=PALE_BLUE, accent=BLUE, title_size=19, detail_size=15)
+    panel(slide, 7.86, 2.45, 4.74, 1.66, "可退役网络资源", "协议状态、设备队列和回环路径分别由网络 ELM 持有，退出时各自排空并释放。", fill=PALE_TEAL, accent=TEAL, title_size=19, detail_size=15)
+    compact_row(slide, 4.38, "解决的问题", "传统全局网络对象难以热替换、难以归因；责任拆分让故障、代际和资源都有明确归属。", fill=PALE_GRAY, accent=MUTED, h=0.68, title_w=1.76)
+    compact_row(slide, 5.20, "网络创新", "稳定 SocketFacade、代际 Broker、FlowShard 单写者和受控热路径共同兼顾可演进性与性能。", fill=PALE_PURPLE, accent=PURPLE, h=0.68, title_w=1.76)
     boundary(
         slide,
-        "配置写入目前主要覆盖 IPv4；通用 packet Provider 尚未接通，网络生产路径使用专用 PinnedNativeCall。",
-        label="实现边界",
+        "网络栈是 ELM 的生产案例：治理面负责代际和退役，数据面保持低开销固定入口。",
+        label="网络定位",
     )
 
 
@@ -1937,10 +1960,10 @@ def explain_18(slide) -> None:
     set_title(slide, "网络对象的所有权与退出责任")
     lead(slide, "网络状态不集中在一个全局对象中：常驻对象维持用户可见语义，可退役 Cell 持有协议或设备状态，代际路由器只把调用送往当前有效实现。")
 
-    compact_row(slide, 2.42, "SocketFacade", "常驻于 VFS；保存 fd 身份、端点、收发缓冲、就绪位、等待队列、错误与关闭状态，不保存 TCP 控制块。", fill=PALE_BLUE, accent=BLUE, h=0.76, title_w=2.12)
-    compact_row(slide, 3.31, "Host", "常驻网络协调者；保存设备注册表、配置快照、协议 worker、queue worker 与有界队列，负责推进和排空。", fill=PALE_GRAY, accent=MUTED, h=0.76, title_w=2.12)
-    compact_row(slide, 4.20, "Broker", "当前代际路由器；保存 StackHandle、Cell / Generation、shard / local endpoint 与每 CPU 调用槽，只选择 Active 且 ready 的 net.stack。", fill=PALE_PURPLE, accent=PURPLE, h=0.76, title_w=2.12)
-    compact_row(slide, 5.09, "网络 ELM", "net.stack 持有 FlowShard 与协议状态；net.virtio 持有 virtqueue、DMA pool 与 IRQ；net.loopback 持有回环队列。", fill=PALE_TEAL, accent=TEAL, h=0.76, title_w=2.12)
+    compact_row(slide, 2.42, "SocketFacade", "常驻于 VFS，维持 fd、缓冲、等待和错误等用户可见语义，不绑定具体协议实现。", fill=PALE_BLUE, accent=BLUE, h=0.76, title_w=2.12)
+    compact_row(slide, 3.31, "Host", "常驻协调网络配置、工作推进和排空，但不拥有可替换协议状态。", fill=PALE_GRAY, accent=MUTED, h=0.76, title_w=2.12)
+    compact_row(slide, 4.20, "Broker", "把调用路由到当前有效代际，只允许 Active 且就绪的网络实现接收工作。", fill=PALE_PURPLE, accent=PURPLE, h=0.76, title_w=2.12)
+    compact_row(slide, 5.09, "网络 ELM", "协议、设备和回环各自持有自己的状态与资源，形成可独立退役的责任单元。", fill=PALE_TEAL, accent=TEAL, h=0.76, title_w=2.12)
     boundary(
         slide,
         "退出时先关闭 Cell 入口并排空在途工作；SocketFacade 继续存在，负责把失效代际转换为稳定的 POSIX 错误与就绪状态。",
@@ -1950,16 +1973,16 @@ def explain_18(slide) -> None:
 
 def explain_19(slide) -> None:
     set_title(slide, "FlowShard 单写者模型与双执行路径")
-    lead(slide, "FlowShard 是协议状态的单写者分区：同一分区同时只有取得 FlowExecution 写入令牌的执行者可修改；它不是线程，也不是只查找的哈希桶。")
+    lead(slide, "FlowShard 是协议状态的单写者分区：同一分区同时只有一个执行者修改状态，把并发复杂度收束到清晰的所有权边界。")
 
-    panel(slide, 3.00, 2.46, 4.48, 2.42, "FlowShard 保存的协议状态", "TCP 连接按一致流哈希进入固定分区；IP 分片按分片组键归并。分区内保存传输状态、邻居与待解析队列、PMTU、重组、定时器和发送结果。UDP、Raw 与多数控制报文当前进入协调 shard。", fill=PALE_BLUE, accent=BLUE, title_size=20, detail_size=15)
-    panel(slide, 7.80, 2.46, 4.80, 2.42, "执行令牌（FlowExecution）", "Generation、BUSY、PENDING 与执行者 CPU 位于同一原子状态。owner worker 与短系统调用竞争同一写入权；失败方只留下 pending，不并发修改协议状态。它与 ELM 资源 Lease 不是同一对象。", fill=PALE_PURPLE, accent=PURPLE, title_size=20, detail_size=15)
-    compact_row(slide, 4.98, "shard-turn", "owner worker 按报文、字节和时间预算批量推进协议状态。", fill=PALE_TEAL, accent=TEAL, h=0.50, title_w=1.72)
-    compact_row(slide, 5.56, "local-turn", "短系统调用尝试同一令牌；失败只置 pending，由 owner worker 接管。", fill=PALE_BLUE, accent=BLUE, h=0.46, title_w=1.72)
+    panel(slide, 3.00, 2.46, 4.48, 2.42, "分区所有权", "相关流量进入固定分区，协议状态由该分区统一维护；状态、队列和定时责任不会散落到多个全局锁。", fill=PALE_BLUE, accent=BLUE, title_size=20, detail_size=15)
+    panel(slide, 7.80, 2.46, 4.80, 2.42, "双执行路径", "后台工作者负责持续推进，短调用在可行时直接加入；竞争失败的一方交给唯一所有者处理，不并发写入。", fill=PALE_PURPLE, accent=PURPLE, title_size=20, detail_size=15)
+    compact_row(slide, 4.98, "创新", "单写者模型同时保留批量推进和低延迟入口，减少锁竞争与状态交错。", fill=PALE_TEAL, accent=TEAL, h=0.50, title_w=1.72)
+    compact_row(slide, 5.56, "优势", "并行度由真实资源约束决定，避免用虚假线程数换取不可控竞争。", fill=PALE_BLUE, accent=BLUE, h=0.46, title_w=1.72)
     boundary(
         slide,
-        "活跃 Shard 数取在线 CPU、启动上限和可用 queue pair 的共同约束；单队列设备不制造虚假并行。",
-        label="并行上限",
+        "并行度与硬件队列和在线资源匹配，避免为网络状态制造无效并发。",
+        label="并行优势",
     )
 
 
@@ -1967,15 +1990,15 @@ def explain_19b(slide) -> None:
     set_title(slide, "数据通路与受管调用边界")
     lead(slide, "ELM 治理不要求每个报文经过 Core：Core 管理装载、关系和代际，收发数据沿固定入口流动，调用前仍核验目标是否有效。")
 
-    panel(slide, 3.00, 2.42, 4.56, 1.48, "管理面：Core 提交关系", "装载或 Reload 时建立 Cell、Generation、export 和 endpoint；Pause、Detach 与故障隔离改变调用门可见状态。", fill=PALE_PURPLE, accent=PURPLE, title_size=19, detail_size=15)
-    panel(slide, 7.86, 2.42, 4.74, 1.48, "数据面：Host 固定入口", "Broker 选取当前 StackHandle；Host 通过 PinnedNativeCall 进入 shard-turn 或 local-turn，不重复执行通用名称查找。", fill=PALE_TEAL, accent=TEAL, title_size=19, detail_size=15)
-    compact_row(slide, 4.12, "收发链路", "接收：VirtIO DMA → PacketBatch → FlowShard → SocketFacade → fd；发送沿相反责任链形成 TxPlan，并由设备完成回收。", fill=PALE_TEAL, accent=TEAL, h=0.54, title_w=1.72)
-    compact_row(slide, 4.77, "逐次门禁", "调用前核对 Cell 状态、Generation 与 frame 范围；旧代际、退出中或越界参数在进入协议代码前被拒绝。", fill=PALE_BLUE, accent=BLUE, h=0.54, title_w=1.72)
-    compact_row(slide, 5.42, "竞争回退", "local-turn 未取得 FlowExecution 时只置 pending；owner worker 随后以 shard-turn 批量推进，不产生第二个写入者。", fill=PALE_GRAY, accent=MUTED, h=0.54, title_w=1.72)
+    panel(slide, 3.00, 2.42, 4.56, 1.48, "管理面：Core 提交关系", "装载、更新、暂停和退役只改变责任关系与代际门禁，不把管理逻辑混入每个报文。", fill=PALE_PURPLE, accent=PURPLE, title_size=19, detail_size=15)
+    panel(slide, 7.86, 2.42, 4.74, 1.48, "数据面：固定入口", "收发沿稳定的数据路径进入当前有效网络实现，避免每个报文重复执行通用管理分发。", fill=PALE_TEAL, accent=TEAL, title_size=19, detail_size=15)
+    compact_row(slide, 4.12, "收发链路", "接收和发送都经过设备、协议分区、稳定用户代理和文件描述符之间的责任链。", fill=PALE_TEAL, accent=TEAL, h=0.54, title_w=1.72)
+    compact_row(slide, 4.77, "逐次门禁", "进入协议状态前核对当前代际和参数范围；失效实现不会继续接收数据。", fill=PALE_BLUE, accent=BLUE, h=0.54, title_w=1.72)
+    compact_row(slide, 5.42, "竞争回退", "短调用未取得分区所有权时转为待处理，由唯一所有者继续推进。", fill=PALE_GRAY, accent=MUTED, h=0.54, title_w=1.72)
     boundary(
         slide,
-        "普通 direct-pinned 不保证逐次经过 Core；网络 PinnedNativeCall 明确保留状态、Generation 和参数范围核验。",
-        label="适用边界",
+        "治理面与数据面分离，让 Core 保持轻量而不牺牲代际和参数安全。",
+        label="网络创新",
     )
 
 
@@ -1983,10 +2006,10 @@ def explain_20(slide) -> None:
     set_title(slide, "SocketFacade 的 POSIX 稳定边界")
     lead(slide, "SocketFacade 是常驻 VFS 代理：协议 Cell 可以退出，但 fd、等待关系和可观察错误仍由常驻对象解释；TCP 控制块仍归 net.stack 的 FlowShard。")
 
-    compact_row(slide, 2.42, "POSIX 与 VFS", "socket / bind / connect / sendmsg / recvmsg / poll 先进入 fd + FileOps；这里检查用户内存、阻塞模式和信号。", fill=PALE_BLUE, accent=BLUE, h=0.76, title_w=2.30)
-    compact_row(slide, 3.31, "SocketFacade", "保存栈代次、socket 身份与端点、收发缓冲、可读 / 可写 / 错误 / 挂断位、关闭状态和等待者；不保存 TCP 控制块。", fill=PALE_TEAL, accent=TEAL, h=0.76, title_w=2.30)
-    compact_row(slide, 4.20, "Broker / FlowShard", "Broker 保存当前栈实例句柄与代际路由；FlowShard 取得单写者令牌后推进协议状态，再写回 facade。", fill=PALE_PURPLE, accent=PURPLE, h=0.76, title_w=2.30)
-    compact_row(slide, 5.08, "等待与配置路径", "普通数据或发送容量只唤醒一名等待者；退出、关闭和错误唤醒全部等待者。SIOC 主要写 IPv4；netlink 只作结构化查询与列表导出。", fill=PALE_BLUE, accent=BLUE, h=0.92, title_w=2.38)
+    compact_row(slide, 2.42, "POSIX 与 VFS", "用户接口先进入稳定的文件对象，由边界层解释阻塞、错误和等待语义。", fill=PALE_BLUE, accent=BLUE, h=0.76, title_w=2.30)
+    compact_row(slide, 3.31, "SocketFacade", "保存用户可见的 fd、端点、缓冲、就绪和关闭状态，不把协议控制状态绑死在 fd 上。", fill=PALE_TEAL, accent=TEAL, h=0.76, title_w=2.30)
+    compact_row(slide, 4.20, "Broker / FlowShard", "Broker 选择当前代际，FlowShard 以单写者方式推进协议，再把结果交回稳定代理。", fill=PALE_PURPLE, accent=PURPLE, h=0.76, title_w=2.30)
+    compact_row(slide, 5.08, "等待与退出", "正常数据只唤醒必要的等待者；退出、关闭和错误会让所有相关等待者看到稳定的终止语义。", fill=PALE_BLUE, accent=BLUE, h=0.92, title_w=2.38)
     boundary(
         slide,
         "协议 Cell 退出后旧 fd 仍是有效 VFS 对象；网络调用返回 NetworkDown，poll / epoll 观察 ERROR 或 HANGUP。",
@@ -1998,39 +2021,20 @@ def explain_21(slide) -> None:
     set_title(slide, "网络退役协议、用户语义与成本归因")
     lead(slide, "net.stack 与 net.virtio 分别拥有协议状态和设备资源，因此有不同的退出顺序；共同原则是先关闭入口，再排空在途工作，最后回收本代对象。")
 
-    compact_row(slide, 2.42, "net.stack", "quiesce 拒绝新 turn → begin_remove 进入 drain → 使本代 proxy / facade 失效并清除 Broker 路由 → finish_remove → 销毁 FlowShard", fill=PALE_PURPLE, accent=PURPLE, h=0.88, title_w=1.58)
-    compact_row(slide, 3.44, "net.virtio", "quiesce_active 停止队列 → device begin_remove 摘除设备并排空 Host 引用 → 注销 PCI / MMIO 驱动 → 销毁 active device", fill=PALE_TEAL, accent=TEAL, h=0.88, title_w=1.58)
-    compact_row(slide, 4.46, "重新装载后", "旧 fd 仍是有效 VFS 对象，但网络操作返回 NetworkDown，poll / epoll 报告 ERROR / HANGUP；Reload 创建新的 Cell 与 StackHandle，只有新 socket 绑定新实例。", fill=PALE_BLUE, accent=BLUE, h=0.88, title_w=1.58)
-    compact_row(slide, 5.50, "可归因性能项", "用户复制 · 协议推进 · FlowExecution / 队列竞争 · 等待唤醒 · 设备 completion", fill=PALE_GRAY, accent=MUTED, h=0.52, title_w=2.42)
-    compact_row(slide, 6.12, "验证与实现边界", "已验证 Detach + Reload；原位 Replace、连接迁移和通用 packet Provider 未完成。", fill=PALE_PURPLE, accent=PURPLE, h=0.52, title_w=2.42)
+    compact_row(slide, 2.42, "协议 ELM", "关闭新入口、排空在途协议工作，再回收本代状态。", fill=PALE_PURPLE, accent=PURPLE, h=0.88, title_w=1.58)
+    compact_row(slide, 3.44, "设备 ELM", "停止设备数据流、排空队列并释放设备责任，避免协议层继续引用旧资源。", fill=PALE_TEAL, accent=TEAL, h=0.88, title_w=1.58)
+    compact_row(slide, 4.46, "用户语义", "旧 fd 仍是有效文件对象，但把失效代际转换为稳定的错误和挂断事件；新建对象进入新代。", fill=PALE_BLUE, accent=BLUE, h=0.88, title_w=1.58)
+    compact_row(slide, 5.50, "性能归因", "用户复制、协议推进、队列竞争、等待唤醒和设备完成分别计入责任边界。", fill=PALE_GRAY, accent=MUTED, h=0.52, title_w=2.42)
+    compact_row(slide, 6.12, "网络优势", "协议与设备可独立退役，POSIX 语义保持稳定；无法安全迁移时明确拒绝而非隐式破坏连接。", fill=PALE_PURPLE, accent=PURPLE, h=0.52, title_w=2.42)
 
 
 DRAWERS = [
     explain_01,
-    explain_02,
-    explain_03,
     explain_04,
-    explain_05,
-    explain_06,
-    explain_07,
-    explain_08,
-    explain_09,
-    explain_09b,
-    explain_10,
-    explain_11,
     explain_12,
-    explain_13,
     explain_14,
-    explain_15,
-    explain_15b,
-    explain_16,
-    explain_16b,
     explain_17,
-    explain_18,
     explain_19,
-    explain_19b,
-    explain_20,
-    explain_21,
 ]
 
 
@@ -2060,13 +2064,29 @@ def build_topic(base: Path, output: Path) -> None:
 
 
 def insert_topic(full: Presentation) -> None:
-    remove_existing_topic(full)
-    anchor = find_slide(full, "设备抽象能力闭环")
+    anchor = find_slide(full, TOPIC_START_TITLE)
     anchor_index = list(full.slides).index(anchor)
+    old_topic = existing_topic_slides(full)
+
+    # Create the replacement pages while the old pages are still present.  This
+    # keeps python-pptx from reusing the old slide part names, which can produce
+    # duplicate ppt/slides/slide*.xml members in the saved ZIP package.
     added = create_topic_slides(full, anchor)
+    added_parts = {slide.part for slide in added}
+
+    for slide in old_topic:
+        remove_slide(full, slide)
 
     slide_ids = full.slides._sldIdLst
-    added_ids = list(slide_ids)[-len(added) :]
+    added_ids = [
+        slide_id
+        for slide_id in list(slide_ids)
+        if full.part.related_part(slide_id.rId) in added_parts
+    ]
+    if len(added_ids) != len(added):
+        raise RuntimeError(
+            f"新专题页关系数量错误：expected={len(added)} actual={len(added_ids)}"
+        )
     for slide_id in added_ids:
         slide_ids.remove(slide_id)
     for offset, slide_id in enumerate(added_ids, 1):
@@ -2125,7 +2145,7 @@ def main() -> int:
     parser.add_argument(
         "--topic-output",
         type=Path,
-        default=root / "output/presentations/mygo-defense-elm-network-25pages.pptx",
+        default=root / "output/presentations/mygo-defense-elm-network-6pages.pptx",
     )
     parser.add_argument(
         "--full-output",

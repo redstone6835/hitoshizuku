@@ -112,6 +112,12 @@ struct GpioHardware {
 }
 
 impl GpioHardware {
+    fn has_irq_source(&self, line: u32) -> bool {
+        self.irq_map
+            .as_ref()
+            .is_some_and(|map| map.has_source_for_line(line))
+    }
+
     fn apply_updates(&self, updates: &[RegisterUpdate]) {
         let _guard = self.operation_lock.lock();
         for update in updates {
@@ -182,7 +188,7 @@ impl DtbResource for GpioResource {
                 Ok(DtbResourceReply::Done)
             }
             DtbResourceRequest::Disable => {
-                if self.hardware.irq_map.is_some() {
+                if self.hardware.has_irq_source(self.specifier.line) {
                     self.hardware
                         .configure_interrupt(self.specifier.line, false)?;
                 }
@@ -236,7 +242,7 @@ impl DtbResource for GpioResource {
 
 impl Drop for GpioResource {
     fn drop(&mut self) {
-        if self.hardware.irq_map.is_some() {
+        if self.hardware.has_irq_source(self.specifier.line) {
             let _ = self
                 .hardware
                 .configure_interrupt(self.specifier.line, false);
@@ -546,7 +552,7 @@ fn gpio_irq_map(info: &PlatformDeviceInfo, ngpios: u32) -> Result<Option<GpioIrq
         .map_err(|_| {
             PnpError::malformed(
                 PnpResourceKind::Irq,
-                "Loongson GPIO requires one IRQ source per line",
+                "Loongson GPIO IRQ source count exceeds its line count",
             )
         })
 }
@@ -621,8 +627,11 @@ fn gpio_acquire_error(error: GpioError) -> DtbProviderError {
     }
 }
 
-fn gpio_control_error(_error: GpioError) -> DtbProviderError {
-    DtbProviderError::HardwareFailure
+fn gpio_control_error(error: GpioError) -> DtbProviderError {
+    match error {
+        GpioError::InterruptsUnsupported => DtbProviderError::UnsupportedOperation,
+        _ => DtbProviderError::HardwareFailure,
+    }
 }
 
 struct Ls2kPinctrlFactory;

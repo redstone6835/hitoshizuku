@@ -75,8 +75,8 @@ fn nor_size_from_capacity(code: u8) -> Option<usize> {
 const XFER_TIMEOUT_LOOPS: u32 = 10_000;
 
 fn delay_ns(duration_ns: u64) {
-    let deadline = sched::now_ns_public().saturating_add(duration_ns);
-    while sched::now_ns_public() < deadline {
+    let deadline = hal::time::monotonic_ns().saturating_add(duration_ns);
+    while hal::time::monotonic_ns() < deadline {
         core::hint::spin_loop();
     }
 }

@@ -80,6 +80,7 @@ pub fn build_set(
         std::env::current_exe().map_err(|err| format!("定位 cargo-elm 可执行文件失败: {err}"))?;
     let mut managed = Vec::new();
     let mut integrated = Vec::new();
+    let mut shared_integrated_api_crates = BTreeSet::new();
 
     for (order, module) in ordered.iter().enumerate() {
         let mode = modes[&module.name];
@@ -109,6 +110,21 @@ pub fn build_set(
                 "ELM_KERNEL_INTERFACE_ROOT",
                 interface_repository_root(&interface)?,
             );
+        if mode == ElmBuildMode::Integrated {
+            let shared_api_crates = manifest
+                .dependencies
+                .iter()
+                .filter_map(|dependency| dependency.crate_name.as_ref())
+                .filter(|crate_name| shared_integrated_api_crates.contains(*crate_name))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !shared_api_crates.is_empty() {
+                command.env(
+                    "ELM_INTEGRATED_SHARED_API_CRATES",
+                    shared_api_crates.join(","),
+                );
+            }
+        }
         if mode == ElmBuildMode::Managed {
             command.arg("--unsigned");
         }
@@ -173,6 +189,13 @@ pub fn build_set(
                     )
                 })?;
                 integrated.push(destination);
+                for crate_name in manifest
+                    .dependencies
+                    .iter()
+                    .filter_map(|dependency| dependency.crate_name.as_ref())
+                {
+                    shared_integrated_api_crates.insert(crate_name.clone());
+                }
             }
             ElmBuildMode::Disabled => unreachable!(),
         }

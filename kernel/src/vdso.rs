@@ -74,7 +74,8 @@ pub fn set_realtime_ns(realtime_ns: u64) {
 pub(crate) fn adjust_realtime_offset(delta_ns: i64) {
     let mut offset = REALTIME_OFFSET_NS.load(Ordering::Relaxed);
     loop {
-        let next = (offset as i128 + delta_ns as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+        let next =
+            (offset as i128 + delta_ns as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
         match REALTIME_OFFSET_NS.compare_exchange_weak(
             offset,
             next,

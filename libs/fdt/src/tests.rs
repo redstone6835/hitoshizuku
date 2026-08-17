@@ -821,9 +821,20 @@ fn rejects_bad_structure_order_and_names() {
         Err(Error::InvalidPropertyName { .. })
     ));
 
+    // 数字开头的节点名被接受：真实固件 DTB 存在此类节点
+    // （如 2K1000 工厂内核内嵌 DTB 的 `2k1000-soc`），Linux libfdt 同样接受。
     let mut builder = StructureBuilder::new(17);
     builder.begin("");
     builder.begin("1device@0");
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    assert!(Fdt::parse_strict(&assemble(17, structure, strings, &[])).is_ok());
+
+    // 下划线开头的节点名仍被拒绝。
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("_device");
     builder.end_node();
     builder.end_node();
     let (structure, strings) = builder.end();

@@ -1288,10 +1288,13 @@ fn valid_node_component(name: &[u8]) -> bool {
         return false;
     };
     let unit_address = components.next();
+    // 首字符放宽为字母数字：DTSpec 严格要求字母开头，但真实固件 DTB
+    // 存在数字开头的节点（如 2K1000 工厂内核内嵌 DTB 的 `2k1000-soc`），
+    // Linux libfdt 同样接受；此处与真实世界固件保持一致。
     if components.next().is_some()
         || node_name.is_empty()
         || node_name.len() > 31
-        || (!node_name[0].is_ascii_alphabetic() && !is_overlay_metadata_node_name(node_name))
+        || (!node_name[0].is_ascii_alphanumeric() && !is_overlay_metadata_node_name(node_name))
         || !node_name
             .iter()
             .all(|&byte| valid_node_name_character(byte))

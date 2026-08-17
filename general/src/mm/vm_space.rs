@@ -3057,6 +3057,27 @@ impl VmSpace {
         Err(Errno::ENOMEM)
     }
 
+    /// 查询一个非 `MAP_FIXED` mmap 地址提示是否可以原样使用。
+    ///
+    /// Linux 把非零 `mmap` 地址当作 hint：区间空闲时优先使用该地址，冲突时
+    /// 才回退到普通的自动分配。调用方随后仍需在同一地址空间锁下登记 VMA，
+    /// 因此这里是一个可失败的乐观查询；若并发映射抢先占用，登记操作会返回
+    /// `EEXIST`，由 syscall 层回退到自动分配路径。
+    pub fn mmap_hint_range(&self, addr: usize, len: usize) -> Option<Range<usize>> {
+        let page_size = page_size();
+        if addr % page_size != 0 {
+            return None;
+        }
+        let len = align_up(len, page_size)?;
+        if len == 0 {
+            return None;
+        }
+        let end = addr.checked_add(len)?;
+        let range = addr..end;
+        self.validate_range(&range).ok()?;
+        self.vmas.lock().is_range_free(&range).then_some(range)
+    }
+
     /// 在地址空间内原子选择并登记一段满足对齐要求的匿名映射。
     pub fn map_anon_any_aligned(
         &self,

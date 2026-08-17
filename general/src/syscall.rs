@@ -582,6 +582,8 @@ fn seccomp_filter_syscall(ctx: &mut SyscallContext<'_>) -> bool {
     const AUDIT_ARCH: u32 = 0x4000_0102;
     #[cfg(target_arch = "riscv64")]
     const AUDIT_ARCH: u32 = 0x4000_00f3;
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH: u32 = 0xc000_003e;
 
     let mut data = [0u8; crate::seccomp::SECCOMP_DATA_SIZE];
     data[SECCOMP_DATA_NR..SECCOMP_DATA_NR + 8]

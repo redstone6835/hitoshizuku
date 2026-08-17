@@ -250,6 +250,33 @@ pub(super) fn sys_mmap(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(req_addr)
         }
     } else {
+        // 非零 `req_addr` 是 Linux mmap 的地址提示，而不是只能用于
+        // MAP_FIXED。若提示区间空闲，优先在该地址建立映射；HotSpot 的
+        // compressed class space 会依赖返回地址精确匹配这个 hint。这里的
+        // 查询与后续 VMA 登记之间允许有并发竞争，EEXIST 时回退到普通路径。
+        if req_addr != 0 {
+            let hint_addr = req_addr & !(page_size - 1);
+            if hint_addr != 0
+                && let Some(range) = vm.mmap_hint_range(hint_addr, len)
+            {
+                match map_range(
+                    ctx.task(),
+                    &vm,
+                    range.clone(),
+                    anonymous,
+                    fd_raw,
+                    offset,
+                    vm_flags,
+                    is_shared,
+                    prot,
+                ) {
+                    Ok(()) => return Ok(range.start),
+                    Err(Errno::EEXIST) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
         let mut result = Err(Errno::ENOMEM);
         for _ in 0..32 {
             let range = vm.alloc_mmap_range(len)?;

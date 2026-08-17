@@ -14,6 +14,11 @@ linker = "rust-lld"
 rustflags = [
     "-C", "link-arg=--fatal-warnings",
     "-C", "link-arg=--no-gc-sections",
+    # LA264（2K1000LA）不保证支持非对齐访存：关闭 LLVM 的 ual 特性，
+    # 让 packed 结构体走逐字节访问，避免硬件 ALE 异常。
+    "-C", "target-feature=-ual",
+    # LA264 不提供 LSX/LASX。禁止自动向量化，避免启动早期执行 vldi/vst。
+    "-C", "target-feature=-lsx,-lasx",
     "-A", "named_asm_labels",
     "-Z", "share-generics=no",
 ]

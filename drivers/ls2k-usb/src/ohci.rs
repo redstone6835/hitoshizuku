@@ -25,8 +25,8 @@ const TRANSFER_TIMEOUT_LOOPS: u32 = 400_000;
 const RESET_TIMEOUT_LOOPS: u32 = 100_000;
 
 fn delay_ns(duration_ns: u64) {
-    let deadline = sched::now_ns_public().saturating_add(duration_ns);
-    while sched::now_ns_public() < deadline {
+    let deadline = hal::time::monotonic_ns().saturating_add(duration_ns);
+    while hal::time::monotonic_ns() < deadline {
         core::hint::spin_loop();
     }
 }
@@ -338,7 +338,7 @@ impl OhciHcd {
 
     /// 轮询完成链表（HcDoneHead），回收 TD 并返回数据字节数。
     fn poll_completion(&self) -> Result<usize, &'static str> {
-        let deadline = sched::now_ns_public().saturating_add(2_000_000_000);
+        let deadline = hal::time::monotonic_ns().saturating_add(2_000_000_000);
         loop {
             let done_head = self.read32(OHCI_HcInterruptStatus);
             if done_head & OHCI_INTR_WDH != 0 {
@@ -396,7 +396,7 @@ impl OhciHcd {
                 }
                 return Ok(transferred);
             }
-            if sched::now_ns_public() >= deadline {
+            if hal::time::monotonic_ns() >= deadline {
                 return Err("OHCI transfer timeout");
             }
             delay_ns(5_000);

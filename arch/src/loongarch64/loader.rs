@@ -10,11 +10,10 @@
 //! `KERNEL_FIRMWARE_STATE` 和 `KERNEL_FIRMWARE_BUFFERS` 保存，供后续
 //! 构建 `StartContext` 时读取。
 //!
-//! 启动协议：只支持 U-Boot / 传统引导器直启（LoongArch Linux 协议：
-//! `$a0=efi_boot`、`$a1=cmdline 或 DTB`、`$a2=system table 或 DTB`）。
-//! QEMU `-kernel` 直启会经伪 EFI 配置表暴露 FDT；板载 fork U-Boot 的
-//! `bootm` 显式传 fdt 时 DTB 经 `$a1`/`$a2` 直传，这里用 FDT magic 探测
-//! 识别。EFI Boot Services / ACPI 路径已随 U-Boot 直启改造删除。
+//! 启动协议：只支持 U-Boot / 传统引导器直启。主线 LoongArch Linux 协议使用
+//! `$a0..$a2`，UHI 直启把 FDT 放在 `$a1`；2K1000 板载 Loongson U-Boot 的
+//! legacy ABI 则使用 `$a0=argc/$a1=argv/$a2=bootparam/$a3=FDT`。loader 对
+//! 这些通道做协议识别和 FDT 校验。EFI Boot Services / ACPI 路径已删除。
 
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, compiler_fence};
@@ -40,6 +39,22 @@ const SINK_LINE_BUFFER_SIZE: usize = 1280;
 const CMDLINE_BUF_SIZE: usize = 4096;
 /// DTB 快照缓冲区的最大容量（4 MiB）。
 const DTB_BUF_SIZE: usize = 4096 * 1024;
+/// Loongson U-Boot legacy ABI 支持的最大 argv 项数。
+const LEGACY_ARGV_MAX_COUNT: usize = 256;
+/// 2K1000 板载 U-Boot 为 legacy argv 指针表和字符串预留的内存大小。
+const LEGACY_ARGV_AREA_SIZE: usize = 64 * 1024;
+/// Loongson Boot Parameter Interface 签名前缀；末字节是版本 `0` 或 `1`。
+const LOONGSON_BPI_SIGNATURE_PREFIX: &[u8; 7] = b"BPI0100";
+
+/// 板级内置 DTB（2K1000LA 板 fork U-Boot 不通过寄存器传 DTB 时使用）。
+///
+/// 对应厂内核 CONFIG_BUILTIN_DTB 的同一机制：板载 fork U-Boot 的 `bootm`
+/// 不显式传 fdt（a1/a2 均非 DTB），内核必须自带设备树。该 DTB 提取自
+/// 厂内核 5.10 镜像内嵌的 LS2K1000-DP-V10 设备树。
+#[cfg(mygo_la_board_ls2k1000)]
+#[used]
+#[unsafe(link_section = ".builtin_dtb")]
+static BUILTIN_BOARD_DTB: &[u8] = include_bytes!("builtin/ls2k1000-dp.dtb");
 /// 启动期可保留的最大板级内存区域数（2K1000 两段 DDR）。
 const BOARD_MEMORY_REGION_CAPACITY: usize = 4;
 /// 空的启动内存区域，占位用于静态数组初始化。
@@ -71,7 +86,7 @@ struct LoaderFirmwareSnapshot {
     system_table: *mut EfiSystemTable,
     /// 最近一次从配置表读取的 FDT 物理地址。
     fdt_paddr: Option<usize>,
-    /// 交接寄存器直传的 DTB 物理地址（`$a1`/`$a2` FDT magic 探测结果）。
+    /// 交接寄存器直传的 DTB 地址（Loongson legacy `$a3` 或 UHI `$a1` 等）。
     handoff_fdt: Option<usize>,
 }
 
@@ -89,12 +104,29 @@ impl LoaderFirmwareSnapshot {
 
 impl FirmwareSnapshot for LoaderFirmwareSnapshot {
     fn snapshot_dtb_from_paddr(&mut self, paddr: usize) -> Result<(), &'static str> {
-        store_kernel_dtb_from_address(paddr).map(|_| ())
+        match store_kernel_dtb_from_address(paddr) {
+            Ok(_) => Ok(()),
+            Err(primary_error) => {
+                let fallback = (self.fdt_paddr == Some(paddr))
+                    .then_some(self.handoff_fdt)
+                    .flatten()
+                    .filter(|candidate| *candidate != paddr);
+                let Some(fallback) = fallback else {
+                    return Err(primary_error);
+                };
+                printk!(
+                    "[loader][dtb] EFI DTB rejected: {}; trying register handoff at {:#x}",
+                    primary_error,
+                    fallback,
+                );
+                store_kernel_dtb_from_address(fallback).map(|_| ())
+            }
+        }
     }
 
     fn efi_fdt_paddr(&self) -> Option<usize> {
-        // 优先 EFI 配置表暴露的 FDT（QEMU `-kernel` 直启）；否则使用交接
-        // 寄存器直传的 DTB（板载 fork U-Boot bootm 显式传 fdt）。
+        // 优先 EFI 配置表暴露的 FDT（QEMU `-kernel` 直启）；否则使用启动
+        // 寄存器中按协议识别出的 DTB。
         self.fdt_paddr.or(self.handoff_fdt)
     }
 
@@ -112,8 +144,8 @@ impl FirmwareSnapshot for LoaderFirmwareSnapshot {
 /// 协议本身没有 DTB 通道，但板载 fork U-Boot 的 `bootm` 显式传入 fdt 参数时
 /// 会把 DTB 放在 `$a1` 或 `$a2`；这里用 magic 做确定性识别，不做任何硬编码。
 ///
-/// 早期处于 DMW 直映窗口，任何地址读取都不会触发缺页，地址无效时按读到
-/// 非 magic 字节安全失败。
+/// 早期处于 DMW 直映窗口，不会发生页表缺页；调用方仍须先按启动 ABI 限定候选
+/// 寄存器，因为 DMW 映射本身不保证任意物理地址都由可读 RAM 支撑。
 fn fdt_prefix_valid(vaddr: usize) -> bool {
     if vaddr == 0 {
         return false;
@@ -123,6 +155,117 @@ fn fdt_prefix_valid(vaddr: usize) -> bool {
     let prefix = unsafe { core::slice::from_raw_parts(vaddr as *const u8, 8) };
     let magic = u32::from_be_bytes(prefix[..4].try_into().unwrap_or([0u8; 4]));
     magic == fdt::DTB_MAGIC
+}
+
+/// 判断地址是否指向 Loongson BPI boot_params 头。
+///
+/// 厂商 legacy ABI 的 `$a2` 不是 EFI system table，而是以 `BPI01000` 或
+/// `BPI01001` 开头的 boot_params；识别它后才能正确解释 `$a1/$a3`。
+fn loongson_bpi_header_valid(vaddr: usize) -> bool {
+    if vaddr == 0 {
+        return false;
+    }
+    // Safety: 地址来自固件交接的 `$a2`，DMW1 已建立；这里只读取固定 8 字节
+    // 签名，不跟随其中的任何指针。
+    let signature = unsafe { core::slice::from_raw_parts(vaddr as *const u8, 8) };
+    signature.starts_with(LOONGSON_BPI_SIGNATURE_PREFIX) && matches!(signature[7], b'0' | b'1')
+}
+
+/// 从 Loongson BPI boot_params 取得嵌入的 EFI system table 指针。
+fn loongson_bpi_efi_system_table(vaddr: usize) -> Option<usize> {
+    if !loongson_bpi_header_valid(vaddr) {
+        return None;
+    }
+    // Safety: BPI 结构的偏移 8 是一个可能未对齐的 64 位 efitab 指针；头部已
+    // 校验，使用 read_unaligned 避免对固件结构施加 Rust 对齐要求。
+    let table = unsafe { (vaddr.wrapping_add(8) as *const usize).read_unaligned() };
+    (table != 0).then_some(table)
+}
+
+/// 对固件启动寄存器做一次统一分类，避免早期控制台与正式快照采用不同规则。
+#[derive(Clone, Copy)]
+struct FirmwareHandoffProbe {
+    raw_arg0: usize,
+    raw_arg1: usize,
+    raw_arg2: usize,
+    raw_arg3: usize,
+    canonical_arg1: usize,
+    canonical_arg2: usize,
+    canonical_arg3: usize,
+    bpi_handoff: bool,
+    legacy_argv: bool,
+    a1_is_fdt: bool,
+    a2_is_fdt: bool,
+    a3_is_fdt: bool,
+    raw_system_table: Option<usize>,
+    handoff_fdt: Option<usize>,
+}
+
+/// 统一命令行快照的诊断状态。
+#[derive(Clone, Copy)]
+struct CommandLineSnapshotStatus {
+    source: &'static str,
+    truncated: bool,
+    malformed: bool,
+}
+
+/// 识别 QEMU/Linux、UHI 与 Loongson legacy 三种启动寄存器布局。
+///
+/// 外部 DTB 的优先级固定为 EFI 配置表、legacy `$a3`、UHI `$a1`、兼容
+/// `$a2`。EFI 配置表在后续解析，此处只选择寄存器直传候选。
+fn probe_firmware_handoff() -> FirmwareHandoffProbe {
+    let raw_arg0 = EFI_BOOT.load(Ordering::Acquire);
+    let raw_arg1 = CMDLINE_PTR.load(Ordering::Acquire);
+    let raw_arg2 = EFI_SYSTEM_TABLE_PTR.load(Ordering::Acquire);
+    let raw_arg3 = FIRMWARE_ARG3.load(Ordering::Acquire);
+
+    let canonical_arg1 = reset_to_virt(raw_arg1);
+    let canonical_arg2 = if raw_arg2 == 0 {
+        0
+    } else {
+        reset_to_virt(raw_arg2)
+    };
+    let canonical_arg3 = if raw_arg3 == 0 {
+        0
+    } else {
+        reset_to_virt(raw_arg3)
+    };
+
+    let bpi_handoff = loongson_bpi_header_valid(canonical_arg2);
+    let legacy_argv =
+        bpi_handoff && raw_arg1 != 0 && (1..=LEGACY_ARGV_MAX_COUNT).contains(&raw_arg0);
+    let a1_is_fdt = !bpi_handoff && fdt_prefix_valid(canonical_arg1);
+    let a2_is_fdt = !bpi_handoff && fdt_prefix_valid(canonical_arg2);
+    let a3_is_fdt = bpi_handoff && fdt_prefix_valid(canonical_arg3);
+
+    let raw_system_table = if bpi_handoff {
+        loongson_bpi_efi_system_table(canonical_arg2)
+    } else if raw_arg2 != 0 && !a2_is_fdt {
+        Some(raw_arg2)
+    } else {
+        None
+    };
+    let handoff_fdt = a3_is_fdt
+        .then_some(raw_arg3)
+        .or_else(|| a1_is_fdt.then_some(raw_arg1))
+        .or_else(|| a2_is_fdt.then_some(raw_arg2));
+
+    FirmwareHandoffProbe {
+        raw_arg0,
+        raw_arg1,
+        raw_arg2,
+        raw_arg3,
+        canonical_arg1,
+        canonical_arg2,
+        canonical_arg3,
+        bpi_handoff,
+        legacy_argv,
+        a1_is_fdt,
+        a2_is_fdt,
+        a3_is_fdt,
+        raw_system_table,
+        handoff_fdt,
+    }
 }
 
 // ─────────────────────── 固件状态与缓冲区 ─────────────────────────────
@@ -303,44 +446,64 @@ fn firmware_dtb_bytes(vaddr: usize) -> Result<&'static [u8], &'static str> {
     Ok(unsafe { core::slice::from_raw_parts(vaddr as *const u8, total_size) })
 }
 
-/// 在堆初始化之前从 EFI 配置表借用 FDT，仅用于选择最早期控制台。
+/// 在堆初始化之前从固件交接借用 FDT，仅用于选择最早期控制台。
 ///
 /// 该视图不会被保存；正式固件选择仍在退出 Boot Services 前完成私有快照。
-fn early_firmware_dtb() -> Option<Fdt<'static>> {
-    let (fdt, _) = early_firmware_dtb_with_addr()?;
+fn early_firmware_dtb(probe: &FirmwareHandoffProbe) -> Option<Fdt<'static>> {
+    let (fdt, _) = early_firmware_dtb_with_addr(probe)?;
     Some(fdt)
 }
 
-/// 从 EFI 配置表取 FDT 视图及其物理地址。
+/// 从固件交接取 FDT 视图及其原始地址。
 ///
-/// 返回 `(解析视图, 物理地址)`。物理地址用于 Linux 直启路径把配置表暴露的 FDT
-/// 快照进内核 DTB 缓冲区（`store_kernel_dtb_from_address` 需要物理地址）。
-fn early_firmware_dtb_with_addr() -> Option<(Fdt<'static>, usize)> {
-    let raw_system_table = EFI_SYSTEM_TABLE_PTR.load(Ordering::Acquire);
-    if raw_system_table == 0 {
-        return None;
+/// 优先使用 EFI 配置表；随后检查 Loongson legacy `$a3`、UHI `$a1` 和兼容
+/// `$a2` 通道。返回的地址用于正式路径把 FDT 快照进内核缓冲区。
+fn early_firmware_dtb_with_addr(probe: &FirmwareHandoffProbe) -> Option<(Fdt<'static>, usize)> {
+    fn parse_at(raw_fdt: usize) -> Option<(Fdt<'static>, usize)> {
+        let bytes = firmware_dtb_bytes(reset_to_virt(raw_fdt)).ok()?;
+        Fdt::parse(bytes).ok().map(|fdt| (fdt, raw_fdt))
     }
-    let canonical_system_table = reset_to_virt(raw_system_table);
-    // Safety: DMW 已由入口汇编建立；`from_ptr` 会校验 EFI system table 头部、
-    // 对齐和签名，失败时不解引用其配置表。
-    let view = unsafe { EfiSystemTableView::from_ptr(canonical_system_table) }?;
-    // Safety: system table 已通过上面的完整视图校验；EFI 配置表在退出 Boot
-    // Services 前保持可读，这里只提取标准 FDT GUID 对应的指针。
-    let raw_fdt = unsafe { view.table().find_fdt() }? as usize;
-    let bytes = firmware_dtb_bytes(reset_to_virt(raw_fdt)).ok()?;
-    Fdt::parse(bytes).ok().map(|fdt| (fdt, raw_fdt))
+
+    if let Some(raw_system_table) = probe.raw_system_table {
+        let canonical_system_table = reset_to_virt(raw_system_table);
+        // Safety: DMW 已由入口汇编建立；`from_ptr` 会校验 EFI system table
+        // 头部、对齐和签名，失败时不解引用其配置表。
+        if let Some(view) = unsafe { EfiSystemTableView::from_ptr(canonical_system_table) } {
+            // Safety: system table 已通过完整视图校验；这里只提取标准 FDT GUID
+            // 对应的指针。
+            if let Some(raw_fdt) = unsafe { view.table().find_fdt() }.map(|ptr| ptr as usize)
+                && let Some(fdt) = parse_at(raw_fdt)
+            {
+                return Some(fdt);
+            }
+        }
+    }
+
+    probe.handoff_fdt.and_then(parse_at)
 }
 
-/// 将原始命令行地址复制到内核命令行缓冲区，并返回其切片。
+/// 清空内核命令行快照。
+fn clear_kernel_command_line() {
+    // Safety: 命令行缓冲区只在单线程启动阶段写入；先清首字节，再以 Release
+    // 发布零长度，后续读者不会看到旧内容。
+    unsafe {
+        addr_of_mut!(KERNEL_FIRMWARE_BUFFERS.command_line)
+            .cast::<u8>()
+            .write(0);
+    }
+    KERNEL_FIRMWARE_STATE
+        .cmdline_valid_len
+        .store(0, Ordering::Release);
+}
+
+/// 将原始命令行地址复制到内核命令行缓冲区，并返回是否发生截断。
 ///
 /// 复制时会扫描到 NUL 终止符或达到最大长度为止，并保证以 NUL 结尾。
 ///
 /// 在当前平台上，`raw_ptr == 0` 仍可能是有效的命令行地址，因此这里
 /// 不能把 0 直接解释为“没有命令行”。
-fn store_kernel_command_line(raw_ptr: usize) -> Option<&'static [u8]> {
-    KERNEL_FIRMWARE_STATE
-        .cmdline_valid_len
-        .store(0, Ordering::Release);
+fn store_kernel_command_line(raw_ptr: usize) -> bool {
+    clear_kernel_command_line();
 
     let src = reset_to_virt(raw_ptr) as *const u8;
     let mut len = 0usize;
@@ -362,14 +525,135 @@ fn store_kernel_command_line(raw_ptr: usize) -> Option<&'static [u8]> {
         .cmdline_valid_len
         .store(len, Ordering::Release);
 
-    if len + 1 == CMDLINE_BUF_SIZE {
-        printk!(
-            "[loader] boot command line truncated to {} bytes",
-            CMDLINE_BUF_SIZE - 1
-        );
+    len + 1 == CMDLINE_BUF_SIZE
+}
+
+/// 按 Loongson legacy ABI 把 `$a1=argv` 的 `argv[1..argc]` 拼成标准命令行。
+///
+/// 返回 `(truncated, malformed)`。指针必须落在该板 U-Boot 为 boot parameters
+/// 分配的 64 KiB 区域内，避免把损坏的 argv 项继续解释成任意物理地址。
+fn store_legacy_kernel_command_line(argc: usize, raw_argv: usize) -> (bool, bool) {
+    clear_kernel_command_line();
+    if raw_argv == 0 {
+        return (false, true);
+    }
+    let argv = reset_to_virt(raw_argv) as *const usize;
+    // Safety: 命令行缓冲区只在单线程启动阶段写入，地址在内核生命周期内稳定。
+    let dst = unsafe { addr_of_mut!(KERNEL_FIRMWARE_BUFFERS.command_line).cast::<u8>() };
+    let mut len = 0usize;
+    let mut truncated = false;
+    let mut malformed = false;
+
+    let argv_phys = virt_to_phys(raw_argv);
+    let Some(pointer_table_size) = LEGACY_ARGV_MAX_COUNT.checked_mul(core::mem::size_of::<usize>())
+    else {
+        return (false, true);
+    };
+    let Some(strings_start) = argv_phys.checked_add(pointer_table_size) else {
+        return (false, true);
+    };
+    let Some(argv_area_end) = argv_phys.checked_add(LEGACY_ARGV_AREA_SIZE) else {
+        return (false, true);
+    };
+    // Safety: legacy ABI 保证 `$a1` 指向 256 项 argv 表，且 argv[0] 固定为 NULL。
+    if unsafe { argv.read_unaligned() } != 0 {
+        return (false, true);
     }
 
-    kernel_command_line()
+    'arguments: for index in 1..argc.min(LEGACY_ARGV_MAX_COUNT) {
+        // Safety: `$a1` 来自经 BPI + argc 范围确认的 Loongson U-Boot legacy
+        // 交接，指向至少 argc 个 argv 指针；使用未对齐读取兼容固件布局。
+        let raw_argument = unsafe { argv.add(index).read_unaligned() };
+        if raw_argument == 0 {
+            malformed = true;
+            break;
+        }
+        let argument_phys = virt_to_phys(raw_argument);
+        if !(strings_start..argv_area_end).contains(&argument_phys) {
+            malformed = true;
+            break;
+        }
+        let argument = reset_to_virt(raw_argument) as *const u8;
+        let source_capacity = argv_area_end - argument_phys;
+        let mut offset = 0usize;
+        let mut wrote_argument = false;
+        let mut terminated = false;
+        while offset < source_capacity {
+            // Safety: argv 项由 U-Boot 构造为 NUL 结尾字符串，且只在启动交接
+            // 内存仍有效时读取；输出始终保留一个字节写终止 NUL。
+            let byte = unsafe { argument.add(offset).read() };
+            if byte == 0 {
+                terminated = true;
+                break;
+            }
+            if !wrote_argument && len != 0 {
+                if len + 2 >= CMDLINE_BUF_SIZE {
+                    truncated = true;
+                    break 'arguments;
+                }
+                unsafe { dst.add(len).write(b' ') };
+                len += 1;
+            }
+            if len + 1 >= CMDLINE_BUF_SIZE {
+                truncated = true;
+                break 'arguments;
+            }
+            unsafe { dst.add(len).write(byte) };
+            len += 1;
+            offset += 1;
+            wrote_argument = true;
+        }
+        if !terminated {
+            malformed = true;
+            break;
+        }
+    }
+
+    if malformed {
+        len = 0;
+    }
+    // Safety: len 始终小于 CMDLINE_BUF_SIZE，目标是启动期独占的静态缓冲区；
+    // malformed 时写回首字节 NUL，确保不会采用仅部分验证的启动参数。
+    unsafe { dst.add(len).write(0) };
+    KERNEL_FIRMWARE_STATE
+        .cmdline_valid_len
+        .store(len, Ordering::Release);
+    (truncated, malformed)
+}
+
+/// 按探测到的启动 ABI 建立统一命令行快照。
+fn snapshot_handoff_command_line(probe: &FirmwareHandoffProbe) -> CommandLineSnapshotStatus {
+    if probe.bpi_handoff {
+        if probe.legacy_argv {
+            let (truncated, malformed) =
+                store_legacy_kernel_command_line(probe.raw_arg0, probe.raw_arg1);
+            CommandLineSnapshotStatus {
+                source: "loongson-legacy-argv",
+                truncated,
+                malformed,
+            }
+        } else {
+            clear_kernel_command_line();
+            CommandLineSnapshotStatus {
+                source: "loongson-legacy-invalid",
+                truncated: false,
+                malformed: true,
+            }
+        }
+    } else if probe.a1_is_fdt {
+        clear_kernel_command_line();
+        CommandLineSnapshotStatus {
+            source: "none (a1 is FDT)",
+            truncated: false,
+            malformed: false,
+        }
+    } else {
+        CommandLineSnapshotStatus {
+            source: "flat-a1",
+            truncated: store_kernel_command_line(probe.raw_arg1),
+            malformed: false,
+        }
+    }
 }
 
 fn ranges_overlap(a_start: usize, a_len: usize, b_start: usize, b_len: usize) -> bool {
@@ -433,6 +717,44 @@ fn store_kernel_dtb_from_address(fdt_addr: usize) -> Result<Fdt<'static>, &'stat
         dtb_size,
     );
     kernel_dtb().ok_or("[loader][dtb] DTB copy verification failed")
+}
+
+/// 把板级内置 DTB 快照进内核缓冲区（ls2k1000 板专用回退）。
+///
+/// 板载 fork U-Boot 的 `bootm` 不通过寄存器或 EFI 配置表传递 DTB；厂内核
+/// 以 CONFIG_BUILTIN_DTB 解决同一问题。这里在无任何交接 DTB 时把内置
+/// 设备树复制进内核 DTB 缓冲区，供后续协议与启动上下文使用。
+#[cfg(mygo_la_board_ls2k1000)]
+fn snapshot_builtin_board_dtb() -> Option<Fdt<'static>> {
+    let fdt = Fdt::parse(BUILTIN_BOARD_DTB).ok()?;
+    let dtb_bytes = fdt.as_bytes();
+    let dtb_size = dtb_bytes.len();
+    if dtb_size > DTB_BUF_SIZE {
+        return None;
+    }
+    // Safety: 内置 DTB 是编译期常量，长度不超过目标静态缓冲区；该复制发生在
+    // 单线程启动阶段，发布有效长度前没有读者，源地址与内核缓冲区不重叠。
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            dtb_bytes.as_ptr(),
+            addr_of_mut!(KERNEL_FIRMWARE_BUFFERS.dtb).cast::<u8>(),
+            dtb_size,
+        );
+        KERNEL_FIRMWARE_STATE
+            .dtb_valid_len
+            .store(dtb_size, Ordering::Release);
+    }
+    printk!(
+        "[loader][dtb] builtin board DTB copied to kernel buffer: size={} bytes",
+        dtb_size,
+    );
+    kernel_dtb()
+}
+
+/// 非板级构建：无内置 DTB 回退。
+#[cfg(not(mygo_la_board_ls2k1000))]
+fn snapshot_builtin_board_dtb() -> Option<Fdt<'static>> {
+    None
 }
 
 /// 简单的行日志缓冲区，实现 `fmt::Write`，用于格式化一条日志消息。
@@ -592,9 +914,28 @@ pub(crate) fn rearm_local_timer(deadline_ns: Option<u64>) {
 ///
 /// # Safety
 /// 此函数只能由 `_start_virtualized` 调用一次，不得从其他任何位置调用。
+/// 板级调试标记（MYGO_BOARD_DEBUG_UART=1 构建时启用）：向 2K1000LA UART0
+/// （物理 0x1fe20000，经 DMW0 非缓存窗口 0x8000_0000_0000_0000）裸写一个
+/// 字符，用于定位启动链卡点。非调试构建为空操作。仅调试用途。
+pub(crate) fn debug_mark(byte: u8) {
+    #[cfg(mygo_board_debug_uart)]
+    {
+        const DEBUG_UART: usize = 0x8000_0000_1fe2_0000usize;
+        // Safety: UART0 是板级固定 MMIO 外设，DMW0 直映窗口保证可访问；
+        // 轮询 LSR[5]（THRE）避免覆盖未发送完的字符。
+        while unsafe { core::ptr::read_volatile((DEBUG_UART + 5) as *const u8) } & 0x20 == 0 {}
+        unsafe { core::ptr::write_volatile((DEBUG_UART + 0) as *mut u8, byte) };
+    }
+    #[cfg(not(mygo_board_debug_uart))]
+    {
+        let _ = byte;
+    }
+}
+
 pub unsafe extern "C" fn __kernel_arch_loader() {
     // 内存原语默认使用启动安全的字节路径；读取能力后再开放非对齐快路径。
     super::mem::init_ual();
+    debug_mark(b'1'); // loader 入口
 
     // ═══════════════════════════════════════════════════════════════════════════
     // 步骤 1：安装异常/中断入口地址
@@ -612,27 +953,18 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
     // 这些入口函数均位于链接脚本设定的 `.text` 段中，且使用绝对地址，
     // 因此必须在 MMU 和 DMW 窗口稳定后安装。
     unsafe { install_exception_entry() };
+    debug_mark(b'2'); // 异常入口安装
 
-    // BSS、DMW 和临时栈此时已经可用，但堆尚未建立。先从 `_start` 传入的命令行
-    // 解析显式 `earlycon=`（u-boot 直启路径的唯一可靠定位来源），再从 EFI 配置表
-    // 借用 FDT 作为 DT 候选；两个来源都用零分配解析器配置 chosen 16550，任何异常
-    // 都完整回退到传统 QEMU 参数。
-    //
-    // 注意：QEMU 直启路径下 CMDLINE_PTR 可能是 0，但 0 此时仍是有效地址（映射到
-    // DMW1 基址，即物理地址 0），因此这里不把 0 当作“无命令行”——与
-    // `store_kernel_command_line` 的约定一致。地址无效时读到空字节，find 自然
-    // 返回 None，安全回退。
-    let cmdline_earlycon = {
-        let raw = CMDLINE_PTR.load(Ordering::Acquire);
-        let cmd = unsafe {
-            general::cmdline::Cmdline::from_raw_until_nul(
-                reset_to_virt(raw) as *const u8,
-                CMDLINE_BUF_SIZE,
-            )
-        };
-        cmd.find("earlycon")
-    };
-    let early_console = configure_early_console(early_firmware_dtb(), cmdline_earlycon);
+    // BSS、DMW 和临时栈此时已经可用，但堆尚未建立。先统一识别启动寄存器布局，
+    // 并把 flat cmdline 或 legacy argv 快照到内核缓冲区。earlycon、timer_hz 与最终
+    // StartContext 都只消费这份快照，避免把 legacy `$a1=argv` 误当字符串。
+    let handoff_probe = probe_firmware_handoff();
+    let command_line_snapshot = snapshot_handoff_command_line(&handoff_probe);
+    let cmdline_earlycon = kernel_command_line()
+        .and_then(|bytes| general::cmdline::Cmdline::new(bytes).find("earlycon"));
+    let early_console =
+        configure_early_console(early_firmware_dtb(&handoff_probe), cmdline_earlycon);
+    debug_mark(b'3'); // early console 配置
 
     e_print(format_args!(
         "[{:6}.{:06}] [boot] Entering kernel loader...\n",
@@ -720,20 +1052,19 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
         // 步骤 1.1b：配置定时器中断，使其按配置频率产生中断。
         // 默认 100 Hz；命令行 `timer_hz=N` 可覆盖。
         //
-        // 与 earlycon 解析相同：CMDLINE_PTR 为 0 时仍是有效地址（QEMU 直启把
-        // cmdline 放在物理地址 0），因此不把 0 当作“无命令行”，一律尝试解析。
+        // 与 earlycon 解析相同，只读取按启动 ABI 归一化后的内核命令行快照。
         let timer_hz = {
             let mut hz = DEFAULT_TIMER_HZ;
-            let raw = CMDLINE_PTR.load(Ordering::Acquire);
-            let cmd = unsafe {
-                general::cmdline::Cmdline::from_raw_until_nul(reset_to_virt(raw) as *const u8, 4096)
-            };
-            if let Some(val) = cmd.find("timer_hz").and_then(|v| v.parse().ok()) {
+            let configured = kernel_command_line()
+                .and_then(|bytes| general::cmdline::Cmdline::new(bytes).find("timer_hz"))
+                .and_then(|value| value.parse().ok());
+            if let Some(val) = configured {
                 hz = val;
             }
             hz.max(1).min(10000)
         };
         configure_local_timer(timer_hz);
+        debug_mark(b'4'); // 定时器配置
         let period = stable_counter_hz() / timer_hz as u64;
         e_print(format_args!(
             "[{:6}.{:06}] [loader] timer configured: hz={} period={}\n",
@@ -798,6 +1129,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
             write_record: early_sink_write,
         };
         log::bind_log_sink(&EARLY_LOG_SINK);
+        debug_mark(b'5'); // 日志绑定
     }
 
     // 此时日志系统已可用，输出版本或状态信息（不占用串口直接输出的 e_print）
@@ -837,6 +1169,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
         allocator::KERNEL_ALLOCATOR.bind_address_translation(phys_to_virt, virt_to_phys);
         allocator::KERNEL_ALLOCATOR.bind_cpu_id(LoongArch64MessageInterruptOps::current_cpu_id);
         allocator::KERNEL_ALLOCATOR.init_boot(heap_start, heap_size);
+        debug_mark(b'6'); // boot allocator
 
         printk!(
             "[loader] boot allocator: {:#x}..{:#x} ({} MiB)",
@@ -850,73 +1183,67 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
     // 步骤 3：采集启动来源参数并探测交接 DTB
     // ═══════════════════════════════════════════════════════════════════════════
     //
-    // 从 `_start` 传入并由 `pre_boot_init` 保存在全局原子变量中的原始参数：
-    //   - EFI_SYSTEM_TABLE_PTR  (QEMU `-kernel` 伪 EFI 交接的系统表；板子为 0)
-    //   - CMDLINE_PTR           ($a1：命令行，或 fork U-Boot 直传的 DTB 地址)
-    // 这些值可能是固件传递的物理地址，也可能是 QEMU 直线路径下的物理地址，
-    // 因此必须通过 `reset_to_virt` 转换为当前地址空间可访问的虚拟地址
-    // （在 DMW 窗口内）。
-    //
-    // LoongArch Linux 直启协议（booting.rst）定义 $a0=efi_boot、$a1=cmdline、
-    // $a2=system table，没有 DTB 通道；板载 fork U-Boot 的 `bootm` 显式给出
-    // fdt 参数时会把 DTB 放到 $a1 或 $a2。这里对两个交接寄存器做 FDT magic
-    // 探测：命中者即板载 DTB，未命中的 $a1 才按 cmdline 处理。探测在 DMW
-    // 直映窗口内进行，地址无效时按读到非 magic 字节安全失败，不做任何
-    // 板级数据硬编码。
-    let raw_st_addr = EFI_SYSTEM_TABLE_PTR.load(Ordering::Acquire);
-    let raw_cmdline_ptr = CMDLINE_PTR.load(Ordering::Acquire);
-    let canonical_st_addr = if raw_st_addr == 0 {
-        0
-    } else {
-        reset_to_virt(raw_st_addr)
-    };
-    let canonical_cmdline_ptr = reset_to_virt(raw_cmdline_ptr);
-    let a1_is_fdt = fdt_prefix_valid(canonical_cmdline_ptr);
-    let a2_is_fdt = fdt_prefix_valid(canonical_st_addr);
+    // 探测已在堆初始化前完成，此处只记录结果并验证选出的 EFI system table。
+    // Loongson legacy 模式下 `$a2` 是 BPI 结构而不是系统表，真正的系统表地址
+    // 来自 BPI 偏移 8；DTB 则优先从该表的配置表取得，再回退到 `$a3`。
+    debug_mark(b'7'); // handoff 探测
     printk!(
-        "[loader] handoff probe: cmdline={:#x}->{:#x} st={:#x}->{:#x} a1_is_fdt={} a2_is_fdt={}",
-        raw_cmdline_ptr,
-        canonical_cmdline_ptr,
-        raw_st_addr,
-        canonical_st_addr,
-        a1_is_fdt,
-        a2_is_fdt,
+        "[loader] handoff probe: a0={} a1={:#x}->{:#x} a2={:#x}->{:#x} a3={:#x}->{:#x} bpi_handoff={} legacy_argv={} a1_is_fdt={} a2_is_fdt={} a3_is_fdt={}",
+        handoff_probe.raw_arg0,
+        handoff_probe.raw_arg1,
+        handoff_probe.canonical_arg1,
+        handoff_probe.raw_arg2,
+        handoff_probe.canonical_arg2,
+        handoff_probe.raw_arg3,
+        handoff_probe.canonical_arg3,
+        handoff_probe.bpi_handoff,
+        handoff_probe.legacy_argv,
+        handoff_probe.a1_is_fdt,
+        handoff_probe.a2_is_fdt,
+        handoff_probe.a3_is_fdt,
     );
-
-    // $a1 命中 FDT 时不存在命令行，直接置空；否则按直启协议把命令行复制到
-    // 内核静态缓冲区（.data 或 .bss 中），避免后续被覆盖。
-    if a1_is_fdt {
-        KERNEL_FIRMWARE_STATE
-            .cmdline_valid_len
-            .store(0, Ordering::Release);
-    } else {
-        let _ = store_kernel_command_line(raw_cmdline_ptr);
+    if command_line_snapshot.truncated {
+        printk!(
+            "[loader] boot command line truncated to {} bytes",
+            CMDLINE_BUF_SIZE - 1,
+        );
+    }
+    if command_line_snapshot.malformed {
+        printk!("[loader] malformed legacy argv; command line discarded");
     }
     printk!(
-        "[loader] boot args: efi_boot={} cmdline={:?}",
-        EFI_BOOT.load(Ordering::Acquire),
+        "[loader] boot args: source={} cmdline={:?}",
+        command_line_snapshot.source,
         kernel_command_line().map(|bytes| core::str::from_utf8(bytes).unwrap_or("<invalid UTF-8>")),
     );
 
-    // 如果原始系统表地址有效，尝试创建 EfiSystemTableView（非空校验+对齐校验）
-    let fw_view = if raw_st_addr == 0 {
-        None
-    } else {
-        unsafe { EfiSystemTableView::from_ptr(canonical_st_addr) }
-    };
-    if raw_st_addr != 0 && fw_view.is_none() {
+    let raw_system_table = handoff_probe.raw_system_table;
+    let canonical_system_table = raw_system_table.map(reset_to_virt);
+    let fw_view = canonical_system_table.and_then(|address| {
+        // Safety: 候选地址来自已识别的 `$a2` 或 BPI efitab；DMW 已建立，
+        // `from_ptr` 会在产生视图前校验 EFI system table 头部与签名。
+        unsafe { EfiSystemTableView::from_ptr(address) }
+    });
+    if let Some(raw_system_table) = raw_system_table
+        && fw_view.is_none()
+    {
         printk!(
             "[loader] EFI system table pointer invalid: raw={:#x} canonical={:#x}",
-            raw_st_addr,
-            canonical_st_addr,
+            raw_system_table,
+            canonical_system_table.unwrap_or(0),
         );
     }
 
     let fw_table = if let Some(fw_view) = fw_view {
         printk!(
-            "[loader] EFI system table address accepted: raw={:#x} canonical={:#x}",
-            raw_st_addr,
-            canonical_st_addr,
+            "[loader] EFI system table address accepted: raw={:#x} canonical={:#x} via={}",
+            raw_system_table.unwrap_or(0),
+            canonical_system_table.unwrap_or(0),
+            if handoff_probe.bpi_handoff {
+                "bpi"
+            } else {
+                "a2"
+            },
         );
         Some(fw_view.as_ptr() as *mut EfiSystemTable)
     } else {
@@ -931,7 +1258,8 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
     // 已随 U-Boot 直启改造删除）。`BootProtocolDispatcher` 依据 `_start` 原始
     // 参数做协议分类，快照引擎把固件暴露的 DTB 复制进内核私有缓冲区：
     //   - QEMU `-kernel` 直启：FDT 经伪 EFI 配置表暴露（fw_table 非空）；
-    //   - 板载 fork U-Boot：DTB 经 $a1/$a2 直传（handoff_fdt 命中）。
+    //   - 板载 fork U-Boot：先查 BPI EFI 配置表，再查 legacy `$a3`；
+    //   - UHI/兼容直启：DTB 经 `$a1`/`$a2` 直传（handoff_fdt 命中）。
     // 两类来源都只读交接，快照由 dispatcher 驱动，不依赖任何 DTB 硬编码。
     KERNEL_FIRMWARE_STATE.reset_selection();
     let dispatcher =
@@ -939,18 +1267,26 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
     let mut snapshot_engine = LoaderFirmwareSnapshot {
         system_table: fw_table.unwrap_or(core::ptr::null_mut()),
         fdt_paddr: None,
-        handoff_fdt: if a1_is_fdt {
-            Some(raw_cmdline_ptr)
-        } else if a2_is_fdt {
-            Some(raw_st_addr)
-        } else {
-            None
-        },
+        handoff_fdt: handoff_probe.handoff_fdt,
     };
     snapshot_engine.collect_config_tables();
-    let firmware_handoff = dispatcher
-        .dispatch(&mut snapshot_engine)
-        .unwrap_or_else(|err| panic!("[loader] firmware handoff failed: {}", err));
+    debug_mark(b'8'); // 固件快照
+    let firmware_handoff = match dispatcher.dispatch(&mut snapshot_engine) {
+        Ok(handoff) => handoff,
+        Err(err) => {
+            // 外部候选可能只有正确 magic、但完整 FDT 结构已损坏。清除任何未完成
+            // 的快照并保留 DTB 固件模式，让板级内置 DTB 成为最终回退。
+            KERNEL_FIRMWARE_STATE
+                .dtb_valid_len
+                .store(0, Ordering::Release);
+            snapshot_engine.select_firmware_source(StartFirmwareSource::Dtb);
+            printk!(
+                "[loader][dtb] all external DTB candidates rejected: {}; using board fallback",
+                err,
+            );
+            crate::boot_protocol::FirmwareHandoff::dtb_source()
+        }
+    };
     printk!(
         "[loader] firmware selection: DTB via {} adapter",
         firmware_handoff.adapter,
@@ -983,14 +1319,20 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
         let kernel_phys_end = virt_to_phys(ekernel as *const () as usize);
         // DTB 私有快照：dispatcher 已把固件暴露的 DTB 复制进内核缓冲区。若
         // 两个交接通道都未命中（例如板载 U-Boot 的 bootm 未显式传 fdt），
-        // 这里直接失败并给出可操作的修复提示。
-        let dtb = kernel_dtb().unwrap_or_else(|| {
-            panic!(
-                "[loader] no device tree in handoff (a1_is_fdt={} a2_is_fdt={}); \
-                 board U-Boot must pass the DTB explicitly: bootm <kernel> - <fdt_addr>",
-                a1_is_fdt, a2_is_fdt,
-            )
-        });
+        // ls2k1000 板回退到内置设备树（厂内核 CONFIG_BUILTIN_DTB 的同一机制）；
+        // 其他平台直接失败并给出可操作的修复提示。
+        let dtb = kernel_dtb()
+            .or_else(snapshot_builtin_board_dtb)
+            .unwrap_or_else(|| {
+                panic!(
+                    "[loader] no device tree in handoff (bpi={} a1_fdt={} a2_fdt={} a3_fdt={}); \
+                 load a valid DTB at U-Boot fdt_addr before bootm",
+                    handoff_probe.bpi_handoff,
+                    handoff_probe.a1_is_fdt,
+                    handoff_probe.a2_is_fdt,
+                    handoff_probe.a3_is_fdt,
+                )
+            });
         // 板级内存回退：2K1000 工厂 DTB 没有 /memory 节点（内存信息只存在于
         // bootloader），此时以 fork U-Boot bdinfo 实测的板级 DDR 布局
         // （BOARD_MEMORY_RANGES）作为启动内存映射；DTB 自带 /memory（QEMU
@@ -1052,6 +1394,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
         context
     };
     let context_ptr = addr_of!(start_context) as *const StartContext as usize;
+    debug_mark(b'9'); // StartContext 就绪
     printk!("[loader] Welcome to MyGO!!!!! OS");
     unsafe {
         // 将上下文指针放入 $a0 寄存器，然后绝对跳转到内核启动函数

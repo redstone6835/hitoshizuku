@@ -9,9 +9,9 @@ use errno::Errno;
 use general::firmware::power;
 use general::mm::{VmFutexKey, VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
+use general::vfs::nsfs::ProcNsKind;
 use general::vfs::pidfd;
 use general::vfs::{self, fdtable::Fd};
-use general::vfs::nsfs::ProcNsKind;
 use ns::UtsNamespace;
 use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::ids::{CapSet, Capability, Credentials, Gid, Uid};
@@ -1199,7 +1199,9 @@ pub(super) fn sys_setitimer(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         read_itimerval(new_value)?
     };
     let old_spec = match which {
-        ITIMER_REAL => sched::set_realtime_itimer(ctx.task(), new_spec.value_ns, new_spec.interval_ns),
+        ITIMER_REAL => {
+            sched::set_realtime_itimer(ctx.task(), new_spec.value_ns, new_spec.interval_ns)
+        }
         ITIMER_VIRTUAL => {
             let old = sched::cpu_itimer::set_cpu_itimer(
                 &ctx.task(),
@@ -1464,34 +1466,27 @@ fn encode_sysinfo(uptime: i64, totalram: u64, freeram: u64) -> [u8; 112] {
 pub(super) fn sys_sysinfo(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let info = ctx.args[0];
     if info != 0 {
-        // Linux struct sysinfo（64 位布局，sizeof == 112）。
+        // Linux struct sysinfo（64 位布局，sizeof == 112）：
+        // uptime(0) loads[3](8,16,24) totalram(32) freeram(40) sharedram(48)
+        // bufferram(56) totalswap(64) freeswap(72) procs(u16,80) pad(82)
+        // totalhigh(88) freehigh(96) mem_unit(u32,104) _f(108..112)。
         let overview = allocator::KERNEL_ALLOCATOR.detailed_stats();
         let page_size = hal::memory::page_size() as u64;
         let totalram = overview.total_physical as u64;
-        // freeram 与 /proc/meminfo MemAvailable 同口径：空闲物理页 + 可回收缓存。
-        let allocator_reclaimable = {
-            let layers = allocator::KERNEL_ALLOCATOR.layer_stats();
-            let slab_reclaimable = allocator::KERNEL_ALLOCATOR
-                .slab_class_stats()
-                .iter()
-                .fold(0usize, |sum, class| {
-                    sum.saturating_add(class.reclaimable_empty_pages)
-                })
-                .saturating_mul(hal::memory::page_size());
-            layers.kheap.cached_bytes.saturating_add(slab_reclaimable)
-        };
-        let freeram = overview.free_physical.saturating_add(allocator_reclaimable) as u64;
+        let freeram = overview.free_physical as u64;
         let sharedram = general::mm::memstat::SHARED_ANON_PAGES
             .load(core::sync::atomic::Ordering::Relaxed)
-            * page_size;
-        let bufferram = (general::mm::memstat::PRIVATE_FILE_PAGES
-            .load(core::sync::atomic::Ordering::Relaxed)
-            .saturating_add(
-                general::mm::memstat::SHARED_FILE_PAGES.load(core::sync::atomic::Ordering::Relaxed),
-            ))
-            * page_size;
+            .saturating_mul(page_size)
+            .saturating_add(super::ipc::sysv_shm_total_bytes());
         let (total_swap_pages, free_swap_pages) = general::mm::swap::swap_totals();
-        let procs = sched::root_pid_ns().registry().snapshot().len().min(65535) as u16;
+        let mut procs = 0u16;
+        if sched::is_ready() {
+            for (_, weak) in sched::root_pid_ns().registry().snapshot() {
+                if weak.upgrade().is_some() {
+                    procs = procs.saturating_add(1);
+                }
+            }
+        }
         let mut out = encode_sysinfo(
             (sched::now_ns_direct() / 1_000_000_000) as i64,
             totalram,
@@ -1502,9 +1497,9 @@ pub(super) fn sys_sysinfo(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
         put_u64(&mut out, 16, loads[1]);
         put_u64(&mut out, 24, loads[2]);
         put_u64(&mut out, 48, sharedram);
-        put_u64(&mut out, 56, bufferram);
-        put_u64(&mut out, 64, total_swap_pages * page_size);
-        put_u64(&mut out, 72, free_swap_pages * page_size);
+        put_u64(&mut out, 56, 0); // 无块设备 buffer 记账。
+        put_u64(&mut out, 64, total_swap_pages.saturating_mul(page_size));
+        put_u64(&mut out, 72, free_swap_pages.saturating_mul(page_size));
         put_u16(&mut out, 80, procs);
         copy_to_user(info, &out).map_err(|e| e.as_errno())?;
     }
@@ -2340,7 +2335,9 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             if flag != 1 && flag != 2 {
                 return Err(Errno::EINVAL);
             }
-            prctl_misc(ctx.task()).tsc_mode.store(flag as u8, Ordering::Release);
+            prctl_misc(ctx.task())
+                .tsc_mode
+                .store(flag as u8, Ordering::Release);
             Ok(0)
         }
         PR_GET_SECUREBITS => Ok(task.credentials().securebits as usize),
@@ -2398,11 +2395,15 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             if value > 1 {
                 return Err(Errno::EINVAL);
             }
-            prctl_misc(ctx.task()).thp_disable.store(value as u8, Ordering::Release);
+            prctl_misc(ctx.task())
+                .thp_disable
+                .store(value as u8, Ordering::Release);
             Ok(0)
         }
-        PR_GET_THP_DISABLE => Ok(prctl_misc(ctx.task()).thp_disable.load(Ordering::Acquire) as usize),
-        PR_GET_SECCOMP => Ok(0),
+        PR_GET_THP_DISABLE => {
+            Ok(prctl_misc(ctx.task()).thp_disable.load(Ordering::Acquire) as usize)
+        }
+        PR_GET_SECCOMP => Ok(seccomp_state(task).mode() as usize),
         PR_SET_SECCOMP => {
             // 老式 PR_SET_SECCOMP：arg2 是 SECCOMP_MODE_*（STRICT=1 / FILTER=2），
             // 与 seccomp(2) 的 SECCOMP_SET_MODE_*（STRICT=0 / FILTER=1）不同，
@@ -4953,12 +4954,22 @@ fn timer_create_common(ctx: &mut SyscallContext<'_>, _time64: bool) -> Result<us
     if sevp != 0 {
         let mut buf = [0u8; SIGEV_HEADER_SIZE];
         copy_from_user(sevp, &mut buf).map_err(|e| e.as_errno())?;
-        sigev_value = u64::from_le_bytes(buf[SIGEV_VALUE_OFF..SIGEV_VALUE_OFF + 8].try_into().unwrap());
+        sigev_value = u64::from_le_bytes(
+            buf[SIGEV_VALUE_OFF..SIGEV_VALUE_OFF + 8]
+                .try_into()
+                .unwrap(),
+        );
         signo = SignalNumber::from_raw(i32::from_le_bytes(
-            buf[SIGEV_SIGNO_OFF..SIGEV_SIGNO_OFF + 4].try_into().unwrap(),
+            buf[SIGEV_SIGNO_OFF..SIGEV_SIGNO_OFF + 4]
+                .try_into()
+                .unwrap(),
         ))
         .ok_or(Errno::EINVAL)?;
-        notify = i32::from_le_bytes(buf[SIGEV_NOTIFY_OFF..SIGEV_NOTIFY_OFF + 4].try_into().unwrap());
+        notify = i32::from_le_bytes(
+            buf[SIGEV_NOTIFY_OFF..SIGEV_NOTIFY_OFF + 4]
+                .try_into()
+                .unwrap(),
+        );
         thread_id = i32::from_le_bytes(buf[SIGEV_TID_OFF..SIGEV_TID_OFF + 4].try_into().unwrap());
     }
 
@@ -4991,7 +5002,10 @@ fn timer_create_common(ctx: &mut SyscallContext<'_>, _time64: bool) -> Result<us
     };
     let sigev = match notify {
         SIGEV_NONE => sched::posix_timer::SigevNotify::None,
-        _ => sched::posix_timer::SigevNotify::Signal { signo, value: sigev_value },
+        _ => sched::posix_timer::SigevNotify::Signal {
+            signo,
+            value: sigev_value,
+        },
     };
     let timer_t = sched::posix_timer::create(clock, &caller, sigev, target_tid)?;
     copy_to_user(timeridp, &timer_t.to_le_bytes()).map_err(|e| e.as_errno())?;
@@ -5033,7 +5047,13 @@ fn timer_settime_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 
     if value_ns == 0 {
         // 解除定时器。
-        if !sched::posix_timer::arm(timer_t, sched::posix_timer::TimerSpec { deadline_ns: 0, interval_ns: 0 }) {
+        if !sched::posix_timer::arm(
+            timer_t,
+            sched::posix_timer::TimerSpec {
+                deadline_ns: 0,
+                interval_ns: 0,
+            },
+        ) {
             return Err(Errno::EINVAL);
         }
         return Ok(0);
@@ -5057,7 +5077,10 @@ fn timer_settime_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     };
     if !sched::posix_timer::arm(
         timer_t,
-        sched::posix_timer::TimerSpec { deadline_ns: deadline, interval_ns: interval_ns },
+        sched::posix_timer::TimerSpec {
+            deadline_ns: deadline,
+            interval_ns: interval_ns,
+        },
     ) {
         return Err(Errno::EINVAL);
     }
@@ -5094,8 +5117,6 @@ fn write_timespec_pair(out: &mut [u8], off: usize, ns: u64) {
     put_i64(out, off, (ns / 1_000_000_000) as i64);
     put_i64(out, off + 8, (ns % 1_000_000_000) as i64);
 }
-
-
 
 pub(super) fn sys_clock_settime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     clock_settime_common(ctx)
@@ -5539,7 +5560,10 @@ fn clone_install_namespaces(
     if ns_flags == 0 {
         return Ok(());
     }
-    if !parent.credentials().has_cap(sched::ids::Capability::SysAdmin) {
+    if !parent
+        .credentials()
+        .has_cap(sched::ids::Capability::SysAdmin)
+    {
         return Err(Errno::EPERM);
     }
     let parent_ns = crate::ns::task_ns(parent);
@@ -5561,7 +5585,8 @@ fn clone_install_namespaces(
             pending_pid: sched::sync::Spinlock::new(None),
         };
         if flags.has(F::CLONE_NEWUTS) {
-            proxy.uts = ns::UtsNamespace::new(&parent_ns.uts.hostname(), &parent_ns.uts.domainname());
+            proxy.uts =
+                ns::UtsNamespace::new(&parent_ns.uts.hostname(), &parent_ns.uts.domainname());
         }
         if flags.has(F::CLONE_NEWIPC) {
             proxy.ipc = crate::ns::IpcNamespace::new();
@@ -5801,8 +5826,24 @@ fn adjtimex_common(ctx: &mut SyscallContext<'_>, timex_arg: usize) -> Result<usi
 
     let read_i64 = |off: usize| i64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
     let read_i32 = |off: usize| i32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+    let modes = u32::from_le_bytes(
+        buf[TIMEX_MODES_OFF..TIMEX_MODES_OFF + 4]
+            .try_into()
+            .unwrap(),
+    );
+    if modes & 0x8000 != 0
+        && modes != crate::adjtimex::ADJ_OFFSET_SINGLESHOT
+        && modes != crate::adjtimex::ADJ_OFFSET_SS_READ
+    {
+        return Err(Errno::EINVAL);
+    }
+    if modes != 0 && modes != crate::adjtimex::ADJ_OFFSET_SS_READ {
+        require_cap(ctx.task(), Capability::SysTime)?;
+    }
+    let setoffset = modes & crate::adjtimex::ADJ_SETOFFSET != 0;
+    let old_realtime_offset = setoffset.then(crate::vdso::realtime_offset_ns);
     let fields = crate::adjtimex::TimexFields {
-        modes: u32::from_le_bytes(buf[TIMEX_MODES_OFF..TIMEX_MODES_OFF + 4].try_into().unwrap()),
+        modes,
         offset: read_i64(TIMEX_OFFSET_OFF),
         freq: read_i64(TIMEX_FREQ_OFF),
         maxerror: read_i64(TIMEX_MAXERROR_OFF),
@@ -5810,6 +5851,8 @@ fn adjtimex_common(ctx: &mut SyscallContext<'_>, timex_arg: usize) -> Result<usi
         status: read_i32(TIMEX_STATUS_OFF),
         constant: read_i64(TIMEX_CONSTANT_OFF),
         tick: read_i64(TIMEX_TICK_OFF),
+        time_sec: read_i64(TIMEX_TIME_OFF),
+        time_subsec: read_i64(TIMEX_TIME_OFF + 8),
         precision: 0,
         tolerance: 0,
     };
@@ -5819,6 +5862,11 @@ fn adjtimex_common(ctx: &mut SyscallContext<'_>, timex_arg: usize) -> Result<usi
     }
 
     let out = crate::adjtimex::do_adjtimex(fields)?;
+    if let Some(old_offset) = old_realtime_offset {
+        if crate::vdso::realtime_offset_ns() != old_offset {
+            vfs::timerfd::cancel_timers_on_clock_set();
+        }
+    }
 
     let write_i64 = |buf: &mut [u8; TIMEX_SIZE], off: usize, v: i64| {
         buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
@@ -5833,17 +5881,24 @@ fn adjtimex_common(ctx: &mut SyscallContext<'_>, timex_arg: usize) -> Result<usi
     write_i64(&mut buf, TIMEX_PRECISION_OFF, out.precision);
     write_i64(&mut buf, TIMEX_TOLERANCE_OFF, out.tolerance);
     write_i64(&mut buf, TIMEX_TICK_OFF, out.tick);
-    // time 字段：当前 CLOCK_REALTIME（sec/usec）。
+    // time 字段：当前 CLOCK_REALTIME；STA_NANO 决定亚秒字段单位。
     let realtime_ns = crate::vdso::realtime_ns();
-    write_i64(&mut buf, TIMEX_TIME_OFF, (realtime_ns / 1_000_000_000) as i64);
-    write_i64(&mut buf, TIMEX_TIME_OFF + 8, ((realtime_ns % 1_000_000_000) / 1_000) as i64);
+    write_i64(
+        &mut buf,
+        TIMEX_TIME_OFF,
+        (realtime_ns / 1_000_000_000) as i64,
+    );
+    let realtime_subsec = if out.status & crate::adjtimex::STA_NANO != 0 {
+        realtime_ns % 1_000_000_000
+    } else {
+        (realtime_ns % 1_000_000_000) / 1_000
+    };
+    write_i64(&mut buf, TIMEX_TIME_OFF + 8, realtime_subsec as i64);
     copy_to_user(ptr, &buf).map_err(|e| e.as_errno())?;
 
     // 返回值 = 时钟状态（TIME_OK/TIME_INS/TIME_DEL/TIME_ERROR）。
     Ok(crate::adjtimex::clock_state(out.status) as usize)
 }
-
-
 
 pub(super) fn sys_perf_event_open(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Err(Errno::ENOSYS)
@@ -7004,18 +7059,6 @@ fn waitid_code(status: WaitStatus) -> i32 {
 
 fn write_i64(out: &mut [u8], off: usize, value: i64) {
     out[off..off + 8].copy_from_slice(&value.to_le_bytes());
-}
-
-fn read_u32(raw: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(raw[off..off + 4].try_into().unwrap())
-}
-
-fn read_u64(raw: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(raw[off..off + 8].try_into().unwrap())
-}
-
-fn read_i64(raw: &[u8], off: usize) -> i64 {
-    i64::from_le_bytes(raw[off..off + 8].try_into().unwrap())
 }
 
 fn write_i32(out: &mut [u8], off: usize, value: i32) {

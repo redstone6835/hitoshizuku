@@ -58,6 +58,6 @@ impl ElmModule for Ls2kUsbElm {
 
 #[cfg(not(feature = "elm-integrated"))]
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+fn panic(_info: &::core::panic::PanicInfo<'_>) -> ! {
     elm::runtime::abort_panic()
 }

@@ -599,12 +599,12 @@ impl Uart16550 {
         if duration_ms == 0 {
             return Ok(());
         }
-        let start = sched::now_ns_public();
+        let start = hal::time::monotonic_ns();
         if start == 0 {
             return Err(ControlError::Busy);
         }
         let deadline = start.saturating_add((duration_ms as u64).saturating_mul(NS_PER_MS));
-        while sched::now_ns_public() < deadline {
+        while hal::time::monotonic_ns() < deadline {
             if sched::is_ready() {
                 sched::schedule_once(0);
             } else {

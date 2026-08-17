@@ -251,6 +251,39 @@ static void test_mmap_flags(void) {
     }
 }
 
+static void test_mmap_hint(void) {
+    const size_t len = 64 * PAGE;
+    /* 选用高位候选，避免被前面用例的自动 mmap 游标占用。 */
+    const uintptr_t hint_addr = 0x0000004000000000ULL;
+    void *hint = (void *)hint_addr;
+
+    /* 该地址若被测试进程之前的映射碰巧占用，先释放后再测试 hint 语义。 */
+    munmap(hint, len);
+
+    errno = 0;
+    void *mapped = mmap(hint, len, PROT_NONE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    CHECK("mmap-hint-exact", mapped == hint);
+    if (mapped != MAP_FAILED)
+        munmap(mapped, len);
+
+    /* 已占用的 hint 只能触发普通地址分配，不能覆盖现有 VMA。 */
+    errno = 0;
+    void *occupied = mmap(hint, len, PROT_NONE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    CHECK("mmap-hint-occupied", occupied == hint);
+    if (occupied == MAP_FAILED)
+        return;
+
+    errno = 0;
+    void *fallback = mmap(occupied, len, PROT_NONE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    CHECK("mmap-hint-fallback", fallback != MAP_FAILED && fallback != occupied);
+    if (fallback != MAP_FAILED)
+        munmap(fallback, len);
+    munmap(occupied, len);
+}
+
 static void test_mprotect_shared_ro(void) {
     /* 可写 fd 的 MAP_SHARED 映射: mprotect 提权成功(Linux 语义) */
     int fd = memfd_create("mprotect-test", 0);
@@ -785,6 +818,8 @@ int main(void) {
     test_mlock_rlimit_and_status();
     printf("MM_PROBE enter mmap-flags\n");
     test_mmap_flags();
+    printf("MM_PROBE enter mmap-hint\n");
+    test_mmap_hint();
     printf("MM_PROBE enter mprotect-ro\n");
     test_mprotect_shared_ro();
     printf("MM_PROBE enter mseal\n");

@@ -69,8 +69,8 @@ const AN_TIMEOUT_NS: u64 = 3_000_000_000;
 const AN_POLL_INTERVAL_NS: u64 = 20_000_000;
 
 fn delay_ns(duration_ns: u64) {
-    let deadline = sched::now_ns_public().saturating_add(duration_ns);
-    while sched::now_ns_public() < deadline {
+    let deadline = hal::time::monotonic_ns().saturating_add(duration_ns);
+    while hal::time::monotonic_ns() < deadline {
         core::hint::spin_loop();
     }
 }
@@ -523,13 +523,13 @@ impl GmacMac {
         self.mdio_write(PHY_ADDR, MII_ADVERTISE, ADVERTISE_ALL)?;
         self.mdio_write(PHY_ADDR, MII_BMCR, BMCR_ANENABLE | BMCR_ANRESTART)?;
 
-        let deadline = sched::now_ns_public().saturating_add(AN_TIMEOUT_NS);
+        let deadline = hal::time::monotonic_ns().saturating_add(AN_TIMEOUT_NS);
         loop {
             let bmsr = self.mdio_read(PHY_ADDR, MII_BMSR)?;
             if bmsr & BMSR_ANEGCOMPLETE != 0 && bmsr & BMSR_LINKSTATUS != 0 {
                 break;
             }
-            if sched::now_ns_public() >= deadline {
+            if hal::time::monotonic_ns() >= deadline {
                 log::printk!(
                     "[ls2k-gmac] phy autoneg/link timeout (BMSR={:#06x}); using last known state",
                     bmsr
@@ -1068,7 +1068,7 @@ impl PnpDriver for Ls2kGmacDriver {
         let mut mac_address = [0u8; 6];
         mac_address[0] = 0x02; // locally administered
         let suffix = hash_mac_suffix(info.fw_path.as_deref().unwrap_or("ls2k-gmac"));
-        mac_address[1..].copy_from_slice(&suffix);
+        mac_address[1..5].copy_from_slice(&suffix);
         mac_address[5] ^= bus_id as u8;
 
         let mac = Arc::new(

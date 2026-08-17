@@ -103,8 +103,8 @@ make defconfig    # 恢复仓库默认配置
 
 ```text
 CONFIG_UART16550=y
-CONFIG_VIRTIO=m
-CONFIG_VIRTIO_BLK=m
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_BLK=y
 ```
 
 - `y`：作为集成 ELM 直接链接进内核，运行时行为与内建代码一致。
@@ -117,7 +117,7 @@ framework 为 `n` 时启用，也不能混用 `y` 与 `m`。构建工具会在�
 IP 协议栈实现位于 `libs/net`，协议状态由 `drivers/net-stack` 中的 `net.stack` ELM
 承载；`kernel/src/net_runtime.rs` 负责宿主调度和设备桥接，INET 套接字数据路径由
 `libs/vfs` 接入。loopback 与 VirtIO-net 分别由 `net.loopback` 和 `net.virtio` ELM
-提供，默认均构建为 `m`，可独立配置和装卸。
+提供，默认均作为 `y` 集成进内核；如需装卸组件，可在 `.config` 中改为 `m`。
 
 构建目标会自动将可提交的 `cargo-config/` 同步到本地 `.cargo/`。`kernel-la` 和
 `kernel-rv` 会把兼容 initramfs 打包进内核镜像；默认裸内核构建不会打包 initramfs。

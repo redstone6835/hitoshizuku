@@ -278,6 +278,7 @@ impl GpioSpecifier {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GpioIrqMap {
+    ngpios: u32,
     sources: Box<[u32]>,
 }
 
@@ -286,19 +287,29 @@ impl GpioIrqMap {
         if !support_irq {
             return Err(GpioError::InterruptsUnsupported);
         }
-        if ngpios == 0 || ngpios > MAX_GPIO_LINES || sources.len() != ngpios as usize {
+        // 固件可以只描述具备中断能力的 GPIO 前缀。没有对应 source 的高号
+        // GPIO 仍然可以作为普通输入输出使用，只有超出 GPIO 总数的映射才无效。
+        if ngpios == 0 || ngpios > MAX_GPIO_LINES || sources.len() > ngpios as usize {
             return Err(GpioError::InvalidIrqDescription);
         }
         let sources: Vec<u32> = sources.to_vec();
         Ok(Self {
+            ngpios,
             sources: sources.into_boxed_slice(),
         })
     }
 
+    pub(crate) fn has_source_for_line(&self, line: u32) -> bool {
+        line < self.ngpios && (line as usize) < self.sources.len()
+    }
+
     pub(crate) fn source_for_line(&self, line: u32) -> Result<u32, GpioError> {
+        if line >= self.ngpios {
+            return Err(GpioError::LineOutOfRange);
+        }
         self.sources
             .get(line as usize)
             .copied()
-            .ok_or(GpioError::LineOutOfRange)
+            .ok_or(GpioError::InterruptsUnsupported)
     }
 }

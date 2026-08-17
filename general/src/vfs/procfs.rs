@@ -48,8 +48,9 @@ static KERNEL_TAINT_FLAGS: AtomicU64 = AtomicU64::new(0);
 
 static ROUTE_SNAPSHOT_PROVIDER: Spinlock<Option<fn() -> Vec<net::control::RouteEntry>>> =
     Spinlock::new(None);
-static NEIGHBOR_SNAPSHOT_PROVIDER:
-    Spinlock<Option<fn() -> Vec<net::control::NeighborSnapshotEntry>>> = Spinlock::new(None);
+static NEIGHBOR_SNAPSHOT_PROVIDER: Spinlock<
+    Option<fn() -> Vec<net::control::NeighborSnapshotEntry>>,
+> = Spinlock::new(None);
 static DNS_SNAPSHOT_PROVIDER: Spinlock<Option<fn() -> Vec<net::IpAddr>>> = Spinlock::new(None);
 
 pub fn install_proc_net_route_provider(provider: fn() -> Vec<net::control::RouteEntry>) {
@@ -102,6 +103,8 @@ const SYS_VM_PARAM_BASE: u64 = 100;
 
 const PROC_DYNAMIC_BASE: u64 = 1_000_000;
 const PROC_FD_BASE: u64 = 10_000_000_000;
+const PROC_NS_BACKING_BASE: u64 = 1 << 61;
+const PROC_NS_LINK_BASE: u64 = 1 << 62;
 
 const TASK_SLOT_DIR_PROCESS: u64 = 1;
 const TASK_SLOT_DIR_THREAD: u64 = 2;
@@ -115,11 +118,11 @@ const TASK_SLOT_ENVIRON: u64 = 9;
 const TASK_SLOT_COMM: u64 = 10;
 const TASK_SLOT_MAPS: u64 = 11;
 const TASK_SLOT_FD_DIR: u64 = 12;
-const TASK_SLOT_NS_DIR: u64 = 11;
 const TASK_SLOT_TASK_DIR: u64 = 13;
 const TASK_SLOT_MOUNTINFO: u64 = 14;
 const TASK_SLOT_MOUNTS: u64 = 15;
 const TASK_SLOT_FDINFO_DIR: u64 = 16;
+const TASK_SLOT_NS_DIR: u64 = 17;
 
 fn procfs_fallible_string(value: &str) -> VfsResult<String> {
     let mut out = String::new();
@@ -763,7 +766,10 @@ fn proc_ipv4_endpoint(address: net::Ipv4Addr, port: u16) -> alloc::string::Strin
     let mut raw = String::new();
     let _ = alloc::fmt::write(
         &mut raw,
-        format_args!("{:02X}{:02X}{:02X}{:02X}:{:04X}", address.0[3], address.0[2], address.0[1], address.0[0], port),
+        format_args!(
+            "{:02X}{:02X}{:02X}{:02X}:{:04X}",
+            address.0[3], address.0[2], address.0[1], address.0[0], port
+        ),
     );
     raw
 }
@@ -789,15 +795,15 @@ fn proc_endpoint(endpoint: net::Endpoint) -> alloc::string::String {
 /// TCP 状态码（Linux /proc/net/tcp st 字段）。
 fn proc_tcp_state_code(state: u8) -> u8 {
     match state {
-        1 => 0x01, // ESTABLISHED
-        2 => 0x02, // SYN_SENT
-        3 => 0x03, // SYN_RECV
-        4 => 0x04, // FIN_WAIT1
-        5 => 0x05, // FIN_WAIT2
-        6 => 0x06, // TIME_WAIT
-        7 => 0x07, // CLOSE
-        8 => 0x08, // CLOSE_WAIT
-        9 => 0x09, // LAST_ACK
+        1 => 0x01,  // ESTABLISHED
+        2 => 0x02,  // SYN_SENT
+        3 => 0x03,  // SYN_RECV
+        4 => 0x04,  // FIN_WAIT1
+        5 => 0x05,  // FIN_WAIT2
+        6 => 0x06,  // TIME_WAIT
+        7 => 0x07,  // CLOSE
+        8 => 0x08,  // CLOSE_WAIT
+        9 => 0x09,  // LAST_ACK
         10 => 0x0a, // LISTEN
         11 => 0x0b, // CLOSING
         _ => 0x07,
@@ -815,8 +821,14 @@ fn render_proc_net_tcp_lines(sockets: &[net::InetSocketSnapshot]) -> alloc::stri
         if socket.kind != net::SocketKind::Stream {
             continue;
         }
-        let local = socket.local.map(proc_endpoint).unwrap_or_else(|| "00000000:0000".into());
-        let peer = socket.peer.map(proc_endpoint).unwrap_or_else(|| "00000000:0000".into());
+        let local = socket
+            .local
+            .map(proc_endpoint)
+            .unwrap_or_else(|| "00000000:0000".into());
+        let peer = socket
+            .peer
+            .map(proc_endpoint)
+            .unwrap_or_else(|| "00000000:0000".into());
         let state = proc_tcp_state_code(socket.tcp_state);
         let inode = socket.id.counter;
         let _ = writeln!(
@@ -846,8 +858,14 @@ fn render_proc_net_udp_lines(sockets: &[net::InetSocketSnapshot]) -> alloc::stri
         if socket.kind != net::SocketKind::Datagram {
             continue;
         }
-        let local = socket.local.map(proc_endpoint).unwrap_or_else(|| "00000000:0000".into());
-        let peer = socket.peer.map(proc_endpoint).unwrap_or_else(|| "00000000:0000".into());
+        let local = socket
+            .local
+            .map(proc_endpoint)
+            .unwrap_or_else(|| "00000000:0000".into());
+        let peer = socket
+            .peer
+            .map(proc_endpoint)
+            .unwrap_or_else(|| "00000000:0000".into());
         let inode = socket.id.counter;
         let _ = writeln!(
             out,
@@ -902,12 +920,7 @@ fn render_proc_net_route() -> String {
         let _ = writeln!(
             out,
             "{}\t{:08X}\t{:08X}\t{:04X}\t0\t0\t{}\t{:08X}\t0\t0\t0",
-            iface,
-            destination_raw,
-            gateway_raw,
-            flags,
-            route.metric,
-            mask,
+            iface, destination_raw, gateway_raw, flags, route.metric, mask,
         );
     }
     out
@@ -1634,6 +1647,18 @@ fn proc_fdinfo_dir_ino(pid: PidT) -> u64 {
     proc_task_base(pid) + TASK_SLOT_FDINFO_DIR
 }
 
+fn proc_ns_dir_ino(pid: PidT) -> u64 {
+    proc_task_base(pid) + TASK_SLOT_NS_DIR
+}
+
+fn push_proc_task_ns_entry(snapshot: &mut Vec<DirEntry>, pid: PidT) {
+    snapshot.push(DirEntry {
+        ino: proc_ns_dir_ino(pid),
+        name: SmallStr::new("ns"),
+        kind: FileType::Directory,
+    });
+}
+
 fn proc_fd_link_ino(pid: PidT, fd: u32) -> u64 {
     PROC_FD_BASE + pid as u64 * 1_000_000 + fd as u64
 }
@@ -1897,6 +1922,7 @@ impl InodeOps for ProcTaskDirOps {
                 kind: FileType::Directory,
             },
         ];
+        push_proc_task_ns_entry(&mut snapshot, self.pid);
         if self.view == TaskDirView::Process {
             snapshot.push(DirEntry {
                 ino: proc_task_list_ino(self.pid),
@@ -2088,7 +2114,12 @@ impl InodeOps for ProcFdInfoDirOps {
         if fdt.get_file(Fd::from_raw(fd)).is_none() {
             return Err(VfsError::NotFound);
         }
-        Ok(proc_fdinfo_file_inode(self.fs_id, &self.weak_sb, self.pid, fd))
+        Ok(proc_fdinfo_file_inode(
+            self.fs_id,
+            &self.weak_sb,
+            self.pid,
+            fd,
+        ))
     }
 
     fn open(
@@ -2154,7 +2185,12 @@ impl InodeOps for ProcFdInfoFileInodeOps {
     }
 }
 
-fn proc_fdinfo_file_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, pid: PidT, fd: u32) -> Arc<Inode> {
+fn proc_fdinfo_file_inode(
+    fs_id: FsId,
+    weak_sb: &Weak<Superblock>,
+    pid: PidT,
+    fd: u32,
+) -> Arc<Inode> {
     mk_inode(
         fs_id,
         weak_sb,
@@ -2178,7 +2214,9 @@ impl ProcFdInfoFileOps {
         let task = lookup_task(self.pid).ok_or(VfsError::NotFound)?;
         ensure_task_access(&task)?;
         let fdt = task_fdtable(&task).ok_or(VfsError::NotFound)?;
-        let file = fdt.get_file(Fd::from_raw(self.fd)).ok_or(VfsError::NotFound)?;
+        let file = fdt
+            .get_file(Fd::from_raw(self.fd))
+            .ok_or(VfsError::NotFound)?;
         let mut out = alloc::string::String::new();
         let _ = writeln!(out, "pos:\t{}", file.pos());
         let _ = writeln!(out, "flags:\t{:o}", file.status_flags());
@@ -4050,15 +4088,11 @@ fn render_pnp() -> String {
 // ── /proc/<pid>/ns ───────────────────────────────────────────────────────────
 
 /// `/proc/<pid>/ns` 目录 inode。
-fn proc_ns_dir_inode(
-    fs_id: FsId,
-    weak_sb: &Weak<Superblock>,
-    pid: PidT,
-) -> Arc<Inode> {
+fn proc_ns_dir_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, pid: PidT) -> Arc<Inode> {
     mk_inode(
         fs_id,
         weak_sb,
-        proc_task_base(pid) + TASK_SLOT_NS_DIR,
+        proc_ns_dir_ino(pid),
         FileType::Directory,
         0o555,
         2,
@@ -4082,26 +4116,67 @@ impl ProcNsDirOps {
             self.fs_id,
             &self.weak_sb,
             proc_ns_file_ino(self.pid, kind),
+            FileType::Symlink,
+            0o777,
+            1,
+            Arc::new(ProcNsFileOps {
+                pid: self.pid,
+                kind,
+            }),
+        )
+    }
+
+    fn ns_backing_inode(&self, namespace: Arc<dyn ns::Namespace>) -> Arc<Inode> {
+        let ino = proc_ns_backing_ino(namespace.inum());
+        mk_inode(
+            self.fs_id,
+            &self.weak_sb,
+            ino,
             FileType::Regular,
             0o444,
             1,
-            Arc::new(ProcNsFileOps { pid: self.pid, kind }),
+            Arc::new(ProcNsBackingInodeOps { namespace }),
         )
     }
 }
 
 fn proc_ns_file_ino(pid: PidT, kind: ProcNsKind) -> u64 {
-    let base = match kind {
-        ProcNsKind::Uts => 0x60,
-        ProcNsKind::Ipc => 0x61,
-        ProcNsKind::Time => 0x62,
-        ProcNsKind::Cgroup => 0x63,
-        ProcNsKind::Pid => 0x64,
-        ProcNsKind::Mount => 0x65,
-        ProcNsKind::User => 0x66,
-        ProcNsKind::Net => 0x67,
-    };
-    PROC_FD_BASE + pid as u64 * 1_000_000 + base
+    PROC_NS_LINK_BASE + pid as u64 * ProcNsKind::ALL.len() as u64 + proc_ns_kind_slot(kind)
+}
+
+fn proc_ns_backing_ino(namespace_inum: u64) -> u64 {
+    PROC_NS_BACKING_BASE + namespace_inum
+}
+
+const fn proc_ns_kind_slot(kind: ProcNsKind) -> u64 {
+    match kind {
+        ProcNsKind::Uts => 0,
+        ProcNsKind::Ipc => 1,
+        ProcNsKind::Time => 2,
+        ProcNsKind::Cgroup => 3,
+        ProcNsKind::Pid => 4,
+        ProcNsKind::Mount => 5,
+        ProcNsKind::User => 6,
+        ProcNsKind::Net => 7,
+    }
+}
+
+fn proc_ns_link_target(kind: ProcNsKind, namespace: &dyn ns::Namespace) -> String {
+    format!("{}:[{}]", kind.name(), namespace.inum())
+}
+
+fn parse_proc_ns_link_target(name: &str) -> Option<(ProcNsKind, u64)> {
+    for kind in ProcNsKind::ALL {
+        let Some(encoded_inum) = name
+            .strip_prefix(kind.name())
+            .and_then(|suffix| suffix.strip_prefix(":["))
+            .and_then(|suffix| suffix.strip_suffix(']'))
+        else {
+            continue;
+        };
+        return Some((kind, encoded_inum.parse().ok()?));
+    }
+    None
 }
 
 impl InodeOps for ProcNsDirOps {
@@ -4112,8 +4187,21 @@ impl InodeOps for ProcNsDirOps {
         let kind = ProcNsKind::ALL
             .iter()
             .find(|kind| kind.name() == name)
-            .ok_or(VfsError::NotFound)?;
-        Ok(self.ns_file_inode(*kind))
+            .copied();
+        if let Some(kind) = kind {
+            return Ok(self.ns_file_inode(kind));
+        }
+
+        // Linux 的 namespace 条目是 magic link。通用 VFS 会把 readlink 文本继续
+        // 当作路径解析，因此这里提供一个不参与 readdir 的 nsfs backing inode，
+        // 既保留 Symlink ABI，也不破坏 open + setns 路径。
+        let (kind, expected_inum) = parse_proc_ns_link_target(name).ok_or(VfsError::NotFound)?;
+        let provider = super::nsfs::ns_provider().ok_or(VfsError::NotFound)?;
+        let namespace = provider(self.pid, kind).ok_or(VfsError::NotFound)?;
+        if namespace.inum() != expected_inum {
+            return Err(VfsError::NotFound);
+        }
+        Ok(self.ns_backing_inode(namespace))
     }
 
     fn open(
@@ -4123,14 +4211,12 @@ impl InodeOps for ProcNsDirOps {
         _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         let mut snapshot = Vec::new();
-        snapshot
-            .try_reserve(8)
-            .map_err(|_| VfsError::NoSpace)?;
+        snapshot.try_reserve(8).map_err(|_| VfsError::NoSpace)?;
         for kind in ProcNsKind::ALL {
             snapshot.push(DirEntry {
                 ino: proc_ns_file_ino(self.pid, kind),
                 name: SmallStr::new(kind.name()),
-                kind: FileType::Regular,
+                kind: FileType::Symlink,
             });
         }
         Ok(Box::new(ProcDirFile { snapshot }))
@@ -4145,7 +4231,8 @@ impl InodeOps for ProcNsDirOps {
     }
 }
 
-/// `/proc/<pid>/ns/<type>` 文件：打开时经 provider 取命名空间。
+/// `/proc/<pid>/ns/<type>` magic link：readlink 显示命名空间标识，打开时经
+/// 隐藏 backing inode 绑定具体命名空间。
 struct ProcNsFileOps {
     pid: PidT,
     kind: ProcNsKind,
@@ -4170,10 +4257,153 @@ impl InodeOps for ProcNsFileOps {
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         let provider = super::nsfs::ns_provider().ok_or(VfsError::NotFound)?;
         let namespace = provider(self.pid, self.kind).ok_or(VfsError::NotFound)?;
-        Ok(super::nsfs::ns_file_content(namespace.as_ref()))
+        Ok(proc_ns_link_target(self.kind, namespace.as_ref()))
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
         self
+    }
+}
+struct ProcNsBackingInodeOps {
+    namespace: Arc<dyn ns::Namespace>,
+}
+
+impl InodeOps for ProcNsBackingInodeOps {
+    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        Ok(Box::new(super::nsfs::NsfsFileOps::new(Arc::clone(
+            &self.namespace,
+        ))))
+    }
+
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ns::Namespace as _;
+
+    struct TestNamespace {
+        inum: u64,
+    }
+
+    impl ns::Namespace for TestNamespace {
+        fn ns_type(&self) -> ns::NsType {
+            ns::NsType::Uts
+        }
+
+        fn inum(&self) -> u64 {
+            self.inum
+        }
+    }
+
+    #[test]
+    fn task_namespace_directory_uses_a_unique_slot_and_is_listed() {
+        let pid = 42;
+        let mut snapshot = Vec::new();
+        push_proc_task_ns_entry(&mut snapshot, pid);
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].name.as_str(), "ns");
+        assert_eq!(snapshot[0].kind, FileType::Directory);
+        assert_eq!(snapshot[0].ino, proc_ns_dir_ino(pid));
+        assert_ne!(
+            proc_ns_dir_ino(pid),
+            proc_task_file_ino(pid, TaskFileKind::Maps)
+        );
+        assert_ne!(proc_ns_dir_ino(pid), proc_fdinfo_dir_ino(pid));
+    }
+
+    #[test]
+    fn namespace_directory_exposes_symlink_entries_with_unique_inodes() {
+        let pid = 73;
+        let weak_sb = Weak::<Superblock>::new();
+        let dir = proc_ns_dir_inode(FsId(9), &weak_sb, pid);
+        let ops = ProcNsDirOps {
+            fs_id: FsId(9),
+            weak_sb,
+            pid,
+        };
+        let file = InodeOps::open(
+            &ops,
+            dir.as_ref(),
+            &OpenOptions::default(),
+            &Credentials::root(),
+        )
+        .unwrap();
+        let mut entries = Vec::new();
+        file.readdir(0, &mut |entry| {
+            entries.push(entry);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+
+        assert_eq!(entries.len(), ProcNsKind::ALL.len());
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.name.as_str(), ProcNsKind::ALL[index].name());
+            assert_eq!(entry.kind, FileType::Symlink);
+            assert_eq!(entry.ino, proc_ns_file_ino(pid, ProcNsKind::ALL[index]));
+            assert_ne!(entry.ino, proc_fd_link_ino(pid, 0x60 + index as u32));
+            for other in entries.iter().skip(index + 1) {
+                assert_ne!(entry.ino, other.ino);
+            }
+        }
+
+        let uts = InodeOps::lookup(&ops, dir.as_ref(), "uts").unwrap();
+        assert_eq!(uts.kind(), FileType::Symlink);
+    }
+
+    #[test]
+    fn namespace_link_target_round_trips_to_hidden_backing_name() {
+        let namespace = TestNamespace { inum: 0x1234_5678 };
+        let target = proc_ns_link_target(ProcNsKind::Uts, &namespace);
+        assert_eq!(target, "uts:[305419896]");
+
+        let (kind, inum) = parse_proc_ns_link_target(&target).unwrap();
+        assert_eq!(kind.name(), "uts");
+        assert_eq!(inum, namespace.inum());
+        assert!(parse_proc_ns_link_target("uts:[]").is_none());
+        assert!(parse_proc_ns_link_target("unknown:[1]").is_none());
+
+        assert_ne!(
+            proc_ns_file_ino(1, ProcNsKind::Uts),
+            proc_ns_backing_ino(namespace.inum()),
+        );
+    }
+
+    #[test]
+    fn shared_namespace_uses_the_same_backing_inode_across_processes() {
+        let namespace: Arc<dyn ns::Namespace> = Arc::new(TestNamespace { inum: 0x4000_0100 });
+        let first = ProcNsDirOps {
+            fs_id: FsId(11),
+            weak_sb: Weak::new(),
+            pid: 101,
+        }
+        .ns_backing_inode(Arc::clone(&namespace));
+        let second = ProcNsDirOps {
+            fs_id: FsId(11),
+            weak_sb: Weak::new(),
+            pid: 202,
+        }
+        .ns_backing_inode(namespace);
+
+        assert_eq!(first.ino(), second.ino());
+        assert_eq!(first.ino(), proc_ns_backing_ino(0x4000_0100));
+        assert_eq!(first.kind(), FileType::Regular);
     }
 }

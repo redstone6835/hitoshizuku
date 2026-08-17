@@ -23,10 +23,10 @@ pub const ADJ_SETOFFSET: u32 = 0x0100;
 pub const ADJ_MICRO: u32 = 0x1000;
 pub const ADJ_NANO: u32 = 0x2000;
 pub const ADJ_TICK: u32 = 0x4000;
-/// `adjtime()` 语义：一次性应用 offset（隐含 `ADJ_OFFSET|ADJ_FREQUENCY`）。
-pub const ADJ_OFFSET_SINGLESHOT: u32 = 0x8002;
+/// `adjtime()` 语义：一次性应用 offset。
+pub const ADJ_OFFSET_SINGLESHOT: u32 = 0x8001;
 /// 只读查询未应用的 singleshot 偏移（本实现立即应用，恒为 0）。
-pub const ADJ_OFFSET_SS_READ: u32 = 0xa000;
+pub const ADJ_OFFSET_SS_READ: u32 = 0xa001;
 
 pub const STA_PLL: i32 = 0x0001;
 pub const STA_PPSFREQ: i32 = 0x0002;
@@ -45,22 +45,21 @@ pub const STA_NANO: i32 = 0x2000;
 pub const STA_MODE: i32 = 0x4000;
 pub const STA_CLK: i32 = 0x8000;
 
-/// 可写 status 位掩码（PLL/FLL/同步状态等由用户态 NTP 维护）。
-const STA_WRITABLE: i32 = STA_PLL
-    | STA_PPSFREQ
-    | STA_PPSTIME
-    | STA_FLL
-    | STA_INS
-    | STA_DEL
-    | STA_UNSYNC
-    | STA_FREQHOLD
-    | STA_PPSSIGNAL
+/// Linux `STA_RONLY`：内核维护、用户态不能经 `ADJ_STATUS` 修改的状态位。
+const STA_RONLY: i32 = STA_PPSSIGNAL
     | STA_PPSJITTER
     | STA_PPSWANDER
     | STA_PPSERROR
     | STA_CLOCKERR
+    | STA_NANO
     | STA_MODE
     | STA_CLK;
+
+/// 按 Linux `process_adjtimex_modes()` 语义合并 `ADJ_STATUS`：可写位来自请求，
+/// `STA_RONLY` 位（特别是 `STA_NANO`）始终保留内核当前值。
+const fn merge_status(current: i32, requested: i32) -> i32 {
+    (current & STA_RONLY) | (requested & !STA_RONLY)
+}
 
 /// 频率上限 ±500 ppm（2^-16 ppm 定点，Linux `MAXFREQ_SCALED`）。
 const MAXFREQ_SCALED: i64 = 500 * 65536;
@@ -89,6 +88,10 @@ pub struct TimexFields {
     pub status: i32,
     pub constant: i64,
     pub tick: i64,
+    /// `ADJ_SETOFFSET` 输入：相对调整量的秒部分。
+    pub time_sec: i64,
+    /// `ADJ_SETOFFSET` 输入：微秒部分；`ADJ_NANO` 模式下为纳秒。
+    pub time_subsec: i64,
     /// 只读：实际精度（ns）。
     pub precision: i64,
     /// 只读：频率容限（2^-16 ppm）。
@@ -149,7 +152,7 @@ pub fn do_adjtimex(mut txc: TimexFields) -> Result<TimexFields, Errno> {
 
     let modes = txc.modes;
     // 未知模式位一律拒绝（Linux 语义）。
-    const KNOWN: u32 = ADJ_OFFSET
+    const KNOWN_REGULAR: u32 = ADJ_OFFSET
         | ADJ_FREQUENCY
         | ADJ_MAXERROR
         | ADJ_ESTERROR
@@ -159,33 +162,90 @@ pub fn do_adjtimex(mut txc: TimexFields) -> Result<TimexFields, Errno> {
         | ADJ_SETOFFSET
         | ADJ_MICRO
         | ADJ_NANO
-        | ADJ_TICK
-        | 0x8000 // ADJ_OFFSET_SINGLESHOT/SS_READ 的标记位
-        | 0x2000;
-    if modes & !KNOWN != 0 {
+        | ADJ_TICK;
+    let singleshot = matches!(modes, ADJ_OFFSET_SINGLESHOT | ADJ_OFFSET_SS_READ);
+    if !singleshot && modes & !KNOWN_REGULAR != 0 {
         return Err(Errno::EINVAL);
     }
 
-    if modes & 0x8000 != 0 {
-        // singleshot 家族：0xa000 = SS_READ（只读），0x8002 = 应用。
-        if modes & ADJ_OFFSET_SS_READ == ADJ_OFFSET_SS_READ {
-            // 立即应用模型下没有挂起的缓变，剩余量恒 0。
-            txc.offset = 0;
-        } else {
-            let delta_ns = if state.nano_mode { txc.offset } else { txc.offset * 1_000 };
-            crate::vdso::adjust_realtime_offset(delta_ns);
-            txc.offset = 0;
-        }
+    if modes == ADJ_OFFSET_SS_READ {
+        // 立即应用模型下没有挂起的缓变，剩余量恒 0。
+        txc.offset = 0;
+    } else if modes == ADJ_OFFSET_SINGLESHOT {
+        let delta_ns = txc.offset.checked_mul(1_000).ok_or(Errno::EINVAL)?;
+        crate::vdso::adjust_realtime_offset(delta_ns);
+        txc.offset = 0;
     } else {
-        if modes & ADJ_OFFSET != 0 {
-            let delta_ns = if state.nano_mode { txc.offset } else { txc.offset * 1_000 };
+        if modes & ADJ_NANO != 0 && modes & ADJ_MICRO != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if modes & ADJ_SETOFFSET != 0 && modes & ADJ_OFFSET != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if modes & ADJ_TAI != 0 {
+            // 本内核未实现 CLOCK_TAI。
+            return Err(Errno::EINVAL);
+        }
+        if modes & ADJ_FREQUENCY != 0 && !(-MAXFREQ_SCALED..=MAXFREQ_SCALED).contains(&txc.freq) {
+            return Err(Errno::EINVAL);
+        }
+        if modes & ADJ_TIMECONST != 0 && !(0..=MAX_TIMECONST).contains(&txc.constant) {
+            return Err(Errno::EINVAL);
+        }
+        if modes & ADJ_TICK != 0 && !(MIN_TICK_USEC..=MAX_TICK_USEC).contains(&txc.tick) {
+            return Err(Errno::EINVAL);
+        }
+
+        let nano_mode = if modes & ADJ_NANO != 0 {
+            true
+        } else if modes & ADJ_MICRO != 0 {
+            false
+        } else {
+            state.nano_mode
+        };
+        let offset_delta_ns = if modes & ADJ_OFFSET != 0 {
+            let scale = if nano_mode { 1 } else { 1_000 };
+            Some(txc.offset.checked_mul(scale).ok_or(Errno::EINVAL)?)
+        } else {
+            None
+        };
+        let setoffset_delta_ns = if modes & ADJ_SETOFFSET != 0 {
+            let setoffset_nano = modes & ADJ_NANO != 0;
+            let subsec_limit = if setoffset_nano {
+                1_000_000_000
+            } else {
+                1_000_000
+            };
+            if !(0..subsec_limit).contains(&txc.time_subsec) {
+                return Err(Errno::EINVAL);
+            }
+            let subsec_scale = if setoffset_nano { 1i128 } else { 1_000i128 };
+            let delta_ns = (txc.time_sec as i128)
+                .checked_mul(1_000_000_000)
+                .and_then(|value| value.checked_add((txc.time_subsec as i128) * subsec_scale))
+                .filter(|value| (i64::MIN as i128..=i64::MAX as i128).contains(value))
+                .ok_or(Errno::EINVAL)? as i64;
+            Some(delta_ns)
+        } else {
+            None
+        };
+
+        if modes & ADJ_STATUS != 0 {
+            state.status = merge_status(state.status, txc.status);
+        }
+        if modes & (ADJ_NANO | ADJ_MICRO) != 0 {
+            state.nano_mode = nano_mode;
+            if nano_mode {
+                state.status |= STA_NANO;
+            } else {
+                state.status &= !STA_NANO;
+            }
+        }
+        if let Some(delta_ns) = offset_delta_ns {
             crate::vdso::adjust_realtime_offset(delta_ns);
             txc.offset = 0;
         }
         if modes & ADJ_FREQUENCY != 0 {
-            if txc.freq.abs() > MAXFREQ_SCALED {
-                return Err(Errno::EINVAL);
-            }
             state.freq_scaled = txc.freq;
         }
         if modes & ADJ_MAXERROR != 0 {
@@ -194,19 +254,10 @@ pub fn do_adjtimex(mut txc: TimexFields) -> Result<TimexFields, Errno> {
         if modes & ADJ_ESTERROR != 0 {
             state.esterror = txc.esterror.clamp(0, DEFAULT_ESTERROR);
         }
-        if modes & ADJ_STATUS != 0 {
-            state.status = txc.status & STA_WRITABLE;
-        }
         if modes & ADJ_TIMECONST != 0 {
-            if !(0..=MAX_TIMECONST).contains(&txc.constant) {
-                return Err(Errno::EINVAL);
-            }
             state.constant = txc.constant;
         }
         if modes & ADJ_TICK != 0 {
-            if !(MIN_TICK_USEC..=MAX_TICK_USEC).contains(&txc.tick) {
-                return Err(Errno::EINVAL);
-            }
             let adj_usec = txc.tick - state.tick_usec;
             state.tick_usec = txc.tick;
             // δ usec / 10000 usec tick → 100·δ ppm（2^-16 定点）。
@@ -216,20 +267,8 @@ pub fn do_adjtimex(mut txc: TimexFields) -> Result<TimexFields, Errno> {
                 .saturating_add(freq_adj)
                 .clamp(-MAXFREQ_SCALED, MAXFREQ_SCALED);
         }
-        if modes & ADJ_TAI != 0 {
-            // 本内核未实现 CLOCK_TAI。
-            return Err(Errno::EINVAL);
-        }
-        if modes & ADJ_SETOFFSET != 0 {
-            return Err(Errno::EOPNOTSUPP);
-        }
-        if modes & ADJ_NANO != 0 {
-            state.nano_mode = true;
-            state.status |= STA_NANO;
-        }
-        if modes & ADJ_MICRO != 0 {
-            state.nano_mode = false;
-            state.status &= !STA_NANO;
+        if let Some(delta_ns) = setoffset_delta_ns {
+            crate::vdso::adjust_realtime_offset(delta_ns);
         }
     }
 
