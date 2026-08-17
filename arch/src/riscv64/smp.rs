@@ -395,6 +395,9 @@ unsafe extern "C" fn secondary_main(hart_id: usize, logical_id: usize) -> ! {
     unsafe {
         Riscv64MessageInterruptOps::set_message_interrupt_enable_bits(super::specific::SIE_SSIE)
     };
+    // IRQ domain/PLIC cascade 由 boot hart 注册，但每个 hart 都必须独立开放
+    // sie.SEIE，才能接收自身 PLIC supervisor context 的外部中断。
+    super::trap::enable_external_interrupts();
 
     let idle_ptr = AP_IDLE_TASKS[logical_id].swap(core::ptr::null_mut(), Ordering::AcqRel);
     if idle_ptr.is_null() {

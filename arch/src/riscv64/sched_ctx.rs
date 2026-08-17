@@ -199,7 +199,10 @@ fn riscv64_idle_relax() {
         if sched::needs_resched(current_cpu_id()) {
             return;
         }
-        core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
+        // 与 Linux cpu_do_idle() 一样，在等待前发布设备/内存写入；否则弱序
+        // hart 可能先观察到 WFI，再延迟看到唤醒源对应的 doorbell/状态更新。
+        core::arch::asm!("fence rw,rw", options(nostack, preserves_flags));
+        core::arch::asm!("wfi", options(nostack, preserves_flags));
         // WFI 在局部中断源 pending 时返回，即使全局 SIE 关闭；重新打开后，
         // pending IPI/timer 会立即进入 trap。最后保持 IRQ-off，交还给调度器的
         // 下一轮安全边界统一处理。

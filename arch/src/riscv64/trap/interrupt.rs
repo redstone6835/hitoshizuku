@@ -46,6 +46,15 @@ pub fn install_riscv_irq_line_ops() {
     });
 }
 
+/// AP 上线时开放该 hart 的 S-mode 外部中断入口。
+///
+/// PLIC 的每个 supervisor context 都是独立的；IRQ domain 注册通常发生在
+/// boot hart，因此不能只依赖注册时对 boot hart 写入 `sie.SEIE`。
+#[inline]
+pub fn enable_external_interrupts() {
+    let _ = set_irq_line_enabled(IrqLine::Hardware(0), true);
+}
+
 fn enable_irq_line(line: IrqLine) -> bool {
     set_irq_line_enabled(line, true)
 }

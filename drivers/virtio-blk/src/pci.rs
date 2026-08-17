@@ -632,6 +632,10 @@ impl BlockDriver for VirtioBlkPciIo {
         self.driver.poll();
     }
 
+    fn completion_is_interrupt_driven(&self) -> bool {
+        true
+    }
+
     #[cfg(feature = "block-profile")]
     fn control(
         &self,
