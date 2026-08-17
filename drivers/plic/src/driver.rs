@@ -28,26 +28,52 @@ const PLIC_CONTEXT_STRIDE: usize = 0x1000;
 
 const RISCV_SUPERVISOR_EXTERNAL_IRQ: u32 = 9;
 const PLIC_DEFAULT_PRIORITY: u32 = 1;
+const INVALID_CONTEXT: usize = usize::MAX;
+/// 一次外部中断入口最多处理的 pending source 数。
+///
+/// 正常情况下 claim 返回 0 就会结束；上限只用于防止设备未清除 level IRQ 时，
+/// 单个 hart 在一个 trap 中无限循环而饿死调度器。达到上限后保持 source pending，
+/// PLIC 会在返回后重新触发外部中断。
+const PLIC_MAX_CLAIMS_PER_ENTRY: usize = 64;
+
+#[derive(Clone, Copy)]
+struct ContextBinding {
+    /// DTB `interrupts-extended` 中的 PLIC context 编号。
+    context: usize,
+    /// 对应 CPU 的固件 hart ID，仅用于启动期把 DTB 顺序映射到调度逻辑 CPU。
+    hart_id: u64,
+}
 
 struct Plic {
-    /// MMIO 基址、源数量和 context 在 probe 后不会变化；claim/complete 位于
-    /// 硬中断热路径，不能为读取这些只读字段获取配置锁。
+    /// MMIO 基址、源数量和每 CPU context 在 probe 后不会变化；claim/complete
+    /// 位于硬中断热路径，不能为读取这些只读字段获取配置锁。
     mmio_base: usize,
     ndev: u32,
-    context: usize,
+    contexts: [usize; sched::NR_CPUS],
     config_lock: Spinlock<()>,
 }
 
 impl Plic {
-    fn claim(&self) -> u32 {
-        let addr = self.mmio_base + PLIC_CLAIM_BASE + PLIC_CONTEXT_STRIDE * self.context;
-        // Safety: PLIC 实例由 platform probe 在固件声明的 MMIO 窗口上映射创建，
-        // `context` 来自已校验的 supervisor 中断上下文。
-        unsafe { core::ptr::read_volatile(addr as *const u32) }
+    #[inline(always)]
+    fn current_context(&self) -> Option<usize> {
+        let cpu = sched::current_cpu_id();
+        let context = *self.contexts.get(cpu)?;
+        (context != INVALID_CONTEXT).then_some(context)
     }
 
-    fn complete(&self, hwirq: u32) {
-        let addr = self.mmio_base + PLIC_CLAIM_BASE + PLIC_CONTEXT_STRIDE * self.context;
+    #[inline(always)]
+    fn claim(&self) -> Option<(usize, u32)> {
+        let context = self.current_context()?;
+        let addr = self.mmio_base + PLIC_CLAIM_BASE + PLIC_CONTEXT_STRIDE * context;
+        // Safety: PLIC 实例由 platform probe 在固件声明的 MMIO 窗口上映射创建，
+        // `context` 来自已校验的 supervisor 中断上下文。
+        let hwirq = unsafe { core::ptr::read_volatile(addr as *const u32) };
+        Some((context, hwirq))
+    }
+
+    #[inline(always)]
+    fn complete(&self, context: usize, hwirq: u32) {
+        let addr = self.mmio_base + PLIC_CLAIM_BASE + PLIC_CONTEXT_STRIDE * context;
         // Safety: 安全条件与 `claim` 相同，claim/complete 寄存器允许 32 位易失写入。
         unsafe { core::ptr::write_volatile(addr as *mut u32, hwirq) };
     }
@@ -71,25 +97,38 @@ impl Plic {
         }
         let reg_idx = hwirq as usize / 32;
         let bit = hwirq % 32;
-        let addr =
-            self.mmio_base + PLIC_ENABLE_BASE + PLIC_ENABLE_STRIDE * self.context + 4 * reg_idx;
-        // Safety: `hwirq` 和 `context` 已校验，地址指向当前上下文的对齐使能寄存器。
-        let mut val = unsafe { core::ptr::read_volatile(addr as *const u32) };
-        if enabled {
-            val |= 1u32 << bit;
-        } else {
-            val &= !(1u32 << bit);
+        // PLIC 的 enable 位是每 context 一份。配置锁只覆盖冷路径的
+        // read-modify-write；claim/complete 不读取这把锁。
+        for &context in &self.contexts {
+            if context == INVALID_CONTEXT {
+                continue;
+            }
+            let addr =
+                self.mmio_base + PLIC_ENABLE_BASE + PLIC_ENABLE_STRIDE * context + 4 * reg_idx;
+            // Safety: `hwirq` 和 `context` 已由 probe 校验，地址指向当前上下文的
+            // 对齐使能寄存器。
+            let mut val = unsafe { core::ptr::read_volatile(addr as *const u32) };
+            if enabled {
+                val |= 1u32 << bit;
+            } else {
+                val &= !(1u32 << bit);
+            }
+            // Safety: 与上面的读取访问同一有效使能寄存器，并由配置锁串行化修改。
+            unsafe { core::ptr::write_volatile(addr as *mut u32, val) };
         }
-        // Safety: 与上面的读取访问同一有效使能寄存器，并由配置锁串行化修改。
-        unsafe { core::ptr::write_volatile(addr as *mut u32, val) };
         true
     }
 
     fn set_threshold(&self, threshold: u32) {
         let _config = self.config_lock.lock();
-        let addr = self.mmio_base + PLIC_THRESHOLD_BASE + PLIC_CONTEXT_STRIDE * self.context;
-        // Safety: `context` 已校验，地址指向已映射窗口内的对齐阈值寄存器。
-        unsafe { core::ptr::write_volatile(addr as *mut u32, threshold) };
+        for &context in &self.contexts {
+            if context == INVALID_CONTEXT {
+                continue;
+            }
+            let addr = self.mmio_base + PLIC_THRESHOLD_BASE + PLIC_CONTEXT_STRIDE * context;
+            // Safety: `context` 已校验，地址指向已映射窗口内的对齐阈值寄存器。
+            unsafe { core::ptr::write_volatile(addr as *mut u32, threshold) };
+        }
     }
 }
 
@@ -138,16 +177,28 @@ struct PlicCascadeHandler {
 
 impl IrqHandler for PlicCascadeHandler {
     fn handle_irq(&self, _line: IrqLine) -> IrqStatus {
-        let hwirq = self.plic.claim();
-        if hwirq == 0 {
-            return IrqStatus::Unhandled;
+        let mut claimed = false;
+        for _ in 0..PLIC_MAX_CLAIMS_PER_ENTRY {
+            let Some((context, hwirq)) = self.plic.claim() else {
+                break;
+            };
+            if hwirq == 0 {
+                break;
+            }
+            claimed = true;
+            let _ = irq::dispatch_irq_line(IrqLine::Controller {
+                controller: self.controller,
+                hwirq,
+            });
+            // 必须使用 claim 返回的同一个 context 完成；不能重新按 current CPU
+            // 查询，否则极端的 hart 迁移/嵌套窗口会把完成写到另一份寄存器。
+            self.plic.complete(context, hwirq);
         }
-        irq::dispatch_irq_line(IrqLine::Controller {
-            controller: self.controller,
-            hwirq,
-        });
-        self.plic.complete(hwirq);
-        IrqStatus::Handled
+        if claimed {
+            IrqStatus::Handled
+        } else {
+            IrqStatus::Unhandled
+        }
     }
 }
 
@@ -169,32 +220,82 @@ impl PlicDriver {
             && (info.has_id(COMPAT_SIFIVE_PLIC) || info.has_id(COMPAT_RISCV_PLIC0))
     }
 
-    fn supervisor_context(
+    fn supervisor_contexts(
         info: &PlatformDeviceInfo,
         boot_hart_id: usize,
-    ) -> Result<usize, PnpError> {
+    ) -> Result<[usize; sched::NR_CPUS], PnpError> {
+        let topology = general::dev::cpu::snapshot_topology();
+        let mut supervisor = [INVALID_CONTEXT; sched::NR_CPUS];
         let mut saw_irq = false;
-        let mut supervisor_index = 0usize;
+        let mut count = 0usize;
         for (index, irq) in info.irq_resources().enumerate() {
             saw_irq = true;
             if irq.cells().first().copied() == Some(RISCV_SUPERVISOR_EXTERNAL_IRQ) {
-                if supervisor_index == boot_hart_id {
-                    return Ok(index);
+                if count == sched::NR_CPUS {
+                    break;
                 }
-                supervisor_index += 1;
+                supervisor[count] = index;
+                count += 1;
             }
         }
-        if saw_irq {
-            Err(PnpError::malformed(
-                PnpResourceKind::Irq,
-                "plic supervisor external context missing",
-            ))
-        } else {
-            Err(PnpError::missing(
-                PnpResourceKind::Irq,
-                "plic interrupts-extended missing",
-            ))
+        if count == 0 {
+            return if saw_irq {
+                Err(PnpError::malformed(
+                    PnpResourceKind::Irq,
+                    "plic supervisor external context missing",
+                ))
+            } else {
+                Err(PnpError::missing(
+                    PnpResourceKind::Irq,
+                    "plic interrupts-extended missing",
+                ))
+            };
         }
+
+        // RISC-V DTB binding places one M/S pair per hart in `interrupts-extended`.
+        // The normalized platform layer intentionally keeps the parent phandle opaque,
+        // so use the same boot-first, hart-id order as riscv64 SMP startup to translate
+        // the preserved DTB order into scheduler logical CPU IDs. This handles a
+        // non-zero boot hart while retaining a fixed, allocation-free hot-path table.
+        let mut bindings = [ContextBinding {
+            context: INVALID_CONTEXT,
+            hart_id: u64::MAX,
+        }; sched::NR_CPUS];
+        for (binding_index, (resource_index, irq)) in info
+            .irq_resources()
+            .enumerate()
+            .filter(|(_, irq)| irq.cells().first().copied() == Some(RISCV_SUPERVISOR_EXTERNAL_IRQ))
+            .take(count)
+            .enumerate()
+        {
+            // `interrupts-extended` preserves the CPU interrupt-controller phandle.
+            // Prefer that identity over the raw resource position, because valid DTBs
+            // may list CPU nodes in an order different from the scheduler's boot-first
+            // order. The resource position remains the PLIC context number fallback,
+            // matching the standard one-M/S-pair-per-hart binding used by QEMU and
+            // Linux's PLIC context enumeration.
+            let matched_cpu = irq.controller().and_then(|phandle| {
+                topology
+                    .iter()
+                    .find(|entry| entry.phandle == Some(phandle))
+            });
+            let fallback_cpu = topology.get(binding_index);
+            bindings[binding_index] = ContextBinding {
+                context: resource_index,
+                hart_id: matched_cpu
+                    .or(fallback_cpu)
+                    .map(|entry| entry.reg)
+                    .unwrap_or(binding_index as u64),
+            };
+        }
+        bindings[..count].sort_unstable_by_key(|binding| {
+            (binding.hart_id != boot_hart_id as u64, binding.hart_id)
+        });
+        let mut contexts = [INVALID_CONTEXT; sched::NR_CPUS];
+        for (logical, binding) in bindings[..count].iter().enumerate() {
+            contexts[logical] = binding.context;
+        }
+        Ok(contexts)
     }
 }
 
@@ -240,16 +341,40 @@ impl PnpDriver for PlicDriver {
                 }
             })
             .unwrap_or(0x5f); // 默认 95 源（QEMU virt）
-        let Some((phys, _size)) = info.first_mmio() else {
+        let Some((phys, mmio_size)) = info.first_mmio() else {
             return Err(PnpError::missing(PnpResourceKind::Mmio, "plic reg missing"));
         };
         let mmio_base = (self.device_mmio_to_virt)(phys);
-        let context = Self::supervisor_context(info, self.boot_hart_id)?;
+        let contexts = Self::supervisor_contexts(info, self.boot_hart_id)?;
+        if mmio_size != 0 {
+            for &context in contexts
+                .iter()
+                .filter(|context| **context != INVALID_CONTEXT)
+            {
+                let Some(offset) =
+                    PLIC_CLAIM_BASE.checked_add(PLIC_CONTEXT_STRIDE.saturating_mul(context))
+                else {
+                    return Err(PnpError::malformed(
+                        PnpResourceKind::Mmio,
+                        "plic context offset overflow",
+                    ));
+                };
+                if offset
+                    .checked_add(core::mem::size_of::<u32>())
+                    .is_none_or(|end| end > mmio_size)
+                {
+                    return Err(PnpError::malformed(
+                        PnpResourceKind::Mmio,
+                        "plic supervisor context outside reg window",
+                    ));
+                }
+            }
+        }
 
         let plic = Arc::new(Plic {
             mmio_base,
             ndev,
-            context,
+            contexts,
             config_lock: Spinlock::new(()),
         });
 
@@ -285,11 +410,11 @@ impl PnpDriver for PlicDriver {
         ))?;
 
         log::printk!(
-            "[platform-riscv-plic] bound {} phys={:#x} ndev={} context={}",
+            "[platform-riscv-plic] bound {} phys={:#x} ndev={} contexts={:?}",
             dev.id,
             phys,
             ndev,
-            context
+            contexts
         );
         Ok(())
     }

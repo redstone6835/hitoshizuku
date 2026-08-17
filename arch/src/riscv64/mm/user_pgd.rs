@@ -243,6 +243,15 @@ unsafe fn inner_ref<'a>(handle: PgdHandle) -> &'a UserPgdInner {
 
 unsafe fn drop_pgd(pgd: PgdHandle) {
     let raw = pgd.as_raw().as_ptr() as *mut UserPgdInner;
+    // VM switch 在释放最后一个 VmSpace 引用前必须让所有 hart 清空当前槽位。
+    // 若该不变量被破坏，CURRENT_USER_PGD 会在下次切换时解引用悬空指针；
+    // 与其静默形成 UAF，不如在页表页回收前立即拒绝。
+    assert!(
+        CURRENT_USER_PGD
+            .iter()
+            .all(|slot| slot.load(Ordering::Acquire) != raw as usize),
+        "[arch][mm] dropping a user PGD still installed on a CPU"
+    );
     let _ = unsafe { Box::from_raw(raw) };
 }
 
@@ -273,12 +282,12 @@ unsafe fn activate(pgd: PgdHandle) {
     if current == Riscv64Paging::satp_value(root, asid)
         && !needs_page_table_fence
         && !needs_asid_fence
-        && inner.active_cpus.load(Ordering::Relaxed) & cpu_bit != 0
+        && inner.active_cpus.load(Ordering::Acquire) & cpu_bit != 0
     {
         // 同一 hart 已经安装了完全有效的页表时，跳过活跃位图和两个交换操作。
         return;
     }
-    let first_activation = inner.active_cpus.fetch_or(cpu_bit, Ordering::Relaxed) & cpu_bit == 0;
+    let first_activation = inner.active_cpus.fetch_or(cpu_bit, Ordering::AcqRel) & cpu_bit == 0;
     let needs_page_table_fence = inner.needs_page_table_fence.swap(false, Ordering::Acquire);
     let needs_asid_fence = inner.needs_asid_fence.swap(false, Ordering::Acquire);
     unsafe {
@@ -291,11 +300,21 @@ unsafe fn activate(pgd: PgdHandle) {
     }
 }
 
-unsafe fn activate_kernel() {
+/// 清除当前 hart 的用户 PGD 驻留记录。
+///
+/// 内核页表切换既可能通过 `UserPgdOps::activate_kernel` 发生，也可能由
+/// HAL/启动代码直接调用 `heap_vm::activate_kernel_page_table` 发生。两条
+/// 路径都必须先撤销驻留记录，否则最后一个 `VmSpace` 引用释放时会误以为
+/// 其根页表仍在硬件中，或者在下一次用户切换时解引用悬空指针。
+pub(crate) fn deactivate_current_user_pgd() {
     let cpu = crate::riscv64::specific::current_cpu_id();
-    let previous = CURRENT_USER_PGD[cpu].swap(0, Ordering::AcqRel);
+    // 访问 `previous_inner` 期间保持槽位非零。`drop_pgd` 将该槽位作为最后一层
+    // 生命周期保护；若先清槽，远端最后一个 `VmSpace` drop 可能在解引用前回收对象。
+    let previous = CURRENT_USER_PGD[cpu].load(Ordering::Acquire);
     if previous != 0 {
-        // Safety: activate_kernel runs at the scheduler VM switch boundary.
+        // Safety: callers invoke this at a scheduler/boot boundary with local
+        // interrupts disabled; the slot points to a live PGD until the final
+        // store below publishes the cleared state.
         let previous_inner = unsafe { &*(previous as *const UserPgdInner) };
         let cpu_bit = 1usize
             .checked_shl(cpu as u32)
@@ -303,13 +322,19 @@ unsafe fn activate_kernel() {
         previous_inner
             .active_cpus
             .fetch_and(!cpu_bit, Ordering::AcqRel);
+        CURRENT_USER_PGD[cpu].store(0, Ordering::Release);
     }
+}
+
+unsafe fn activate_kernel() {
     let root = crate::riscv64::heap_vm::kernel_page_table_root();
     unsafe {
         // ASID 0 专用于内核页表；activate_with_asid 会在切根后刷新
         // 本地 ASID 0，避免 idle 沿用已经回收的用户 PGD。
         Riscv64Paging::activate_with_asid(PhysPageTableRoot::new(root), 0, false);
     }
+    // 硬件已经离开旧用户根后再清驻留槽，避免并发 drop 在切根窗口回收页表。
+    deactivate_current_user_pgd();
 }
 
 fn allocate_page_table_page() -> Result<usize, general::MapError> {
@@ -572,7 +597,7 @@ unsafe fn clone_for_fork_user_pages(
 
 unsafe fn invalidate_range(pgd: PgdHandle, vaddr: usize, len: usize) {
     let inner = unsafe { inner_ref(pgd) };
-    let active_cpus = inner.active_cpus.load(Ordering::Relaxed);
+    let active_cpus = inner.active_cpus.load(Ordering::Acquire);
     flush_user_tlb_range(inner.asid(), active_cpus, vaddr, len);
     // 本次定向 fence 已覆盖相应页表修改，但不能消费新一代 ASID 的首次激活
     // 标记；后者要求 activate() 在安装该 ASID 时完成一次完整 ASID fence。

@@ -166,6 +166,14 @@ impl TaskExtExitHook for KernelExtExitHook {
         let _ = task.ext_remove(crate::native_runtime::TASKEXT_NATIVE_THREAD);
         let _ = task.ext_remove(sched::TASKEXT_ELM_EXECUTION);
         let _ = task.ext_remove(TASKEXT_EXEC_ACCESS);
+        // 退出扩展通常在任务已经切离 CPU 后清理，但测试/早期退出路径也可能
+        // 在当前任务仍驻留时到达这里。先切回内核根页表，再释放 VmSpace，避免
+        // RISC-V 的 CURRENT_USER_PGD 指向即将回收的页表。
+        if sched::try_current_task_ref()
+            .is_some_and(|current| core::ptr::eq(current, task.as_ref()))
+        {
+            hal::sched::activate_kernel_address_space();
+        }
         let _ = task.ext_remove(TASKEXT_VM_SPACE);
         let _ = task.ext_remove(TASKEXT_VFS_FDTABLE);
         let _ = task.ext_remove(TASKEXT_VFS_CONTEXT);
@@ -983,7 +991,9 @@ fn enter_loaded_user_image(
     envp: &[String],
 ) -> ! {
     let exec_path = loaded.exec_path.clone();
-    let _ = task.ext_remove(TASKEXT_VM_SPACE);
+    // 保留旧地址空间的最后一个引用，直到新页表已经安装。否则 ext_remove
+    // 会立即 drop 旧 VmSpace，而 RISC-V 仍可能把它记在 CURRENT_USER_PGD 中。
+    let old_vm = task.ext_remove(TASKEXT_VM_SPACE);
     task.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
     install_exec_access(task, Arc::clone(&loaded.exec_access));
     install_exec_metadata(task, &exec_path, argv, envp);
@@ -995,6 +1005,7 @@ fn enter_loaded_user_image(
 
     let kstack_top = task.ensure_kernel_stack();
     loaded.vm.activate();
+    drop(old_vm);
     hal::user_context::set_kernel_trap_stack(kstack_top);
     let mut frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
     frame.set_kernel_stack_top(kstack_top);

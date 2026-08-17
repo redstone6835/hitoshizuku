@@ -9,6 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use hashbrown::HashTable;
 use vfs::sync::Spinlock;
 
 use super::registry_id;
@@ -87,9 +88,9 @@ impl IrqStatus {
 pub trait IrqHandler: Send + Sync {
     /// 处理中断。
     ///
-    /// 调用发生在 IRQ registry 的短临界区内，handler 必须快速返回，不能睡眠，
-    /// 也不能在回调内注册或注销 IRQ handler。后续如果引入 RCU/epoch registry，
-    /// 可以放宽这个约束。
+    /// registry 只在短临界区内取得 handler 快照，实际回调在释放 registry 锁后
+    /// 执行。handler 仍必须快速返回、不能睡眠，也不能在回调内注册或注销同一
+    /// registry；这样可以避免回调与注册路径互相等待。
     fn handle_irq(&self, line: IrqLine) -> IrqStatus;
 }
 
@@ -199,21 +200,48 @@ impl IrqHandle {
 
 struct IrqRegistration {
     id: u64,
-    proc_irq: u32,
-    line: IrqLine,
     owner: &'static str,
     sharing: IrqSharing,
     _trigger: Option<IrqTrigger>,
     _polarity: Option<IrqPolarity>,
     handler: Arc<dyn IrqHandler>,
     bottom_half: Option<Arc<dyn IrqBottomHalf>>,
+}
+
+struct IrqBucket {
+    line: IrqLine,
+    proc_irq: u32,
+    handlers: Vec<IrqRegistration>,
     counts: [u64; sched::NR_CPUS],
 }
 
 pub struct IrqRegistry {
     next_id: AtomicU64,
     next_proc_irq: AtomicU64,
-    handlers: Spinlock<Vec<IrqRegistration>>,
+    lines: Spinlock<HashTable<IrqBucket>>,
+}
+
+/// 为 IRQ line 生成稳定的 SwissTable 哈希。
+///
+/// controller phandle 和 hwirq 通常都是连续小整数；一次奇数乘法同时打散 bucket
+/// 低位和 7-bit control tag，避免相邻设备线聚集在同一 probe group。
+#[inline]
+fn irq_line_hash(line: IrqLine) -> u64 {
+    let value = match line {
+        IrqLine::Ipi => 0x243f_6a88_85a3_08d3,
+        IrqLine::Hardware(hwirq) => 0x1319_8a2e_0370_7344 ^ hwirq as u64,
+        IrqLine::Controller { controller, hwirq } => {
+            0xa409_3822_299f_31d0 ^ ((controller as u64) << 32) ^ hwirq as u64
+        }
+        IrqLine::Other(value) => 0x082e_fa98_ec4e_6c89 ^ value as u64,
+    };
+    let mixed = value ^ value.rotate_left(25) ^ value.rotate_right(17);
+    mixed.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+#[inline]
+fn irq_bucket_hash(bucket: &IrqBucket) -> u64 {
+    irq_line_hash(bucket.line)
 }
 
 impl IrqRegistry {
@@ -221,7 +249,7 @@ impl IrqRegistry {
         Self {
             next_id: AtomicU64::new(1),
             next_proc_irq: AtomicU64::new(1),
-            handlers: Spinlock::new(Vec::new()),
+            lines: Spinlock::new(HashTable::new()),
         }
     }
 
@@ -229,45 +257,73 @@ impl IrqRegistry {
         if !configure_irq_line(request.line, request.trigger, request.polarity) {
             return Err(IrqError::NotFound);
         }
-        let mut handlers = self.handlers.lock();
-        if handlers.iter().any(|entry| {
-            entry.line == request.line
-                && (entry.sharing == IrqSharing::Exclusive
-                    || request.sharing == IrqSharing::Exclusive)
-        }) {
-            return Err(IrqError::AlreadyRegistered);
+        let line = request.line;
+        let hash = irq_line_hash(line);
+        let mut lines = self.lines.lock();
+        if let Some(bucket) = lines.find_mut(hash, |bucket| bucket.line == line) {
+            if bucket.handlers.iter().any(|entry| {
+                entry.sharing == IrqSharing::Exclusive || request.sharing == IrqSharing::Exclusive
+            }) {
+                return Err(IrqError::AlreadyRegistered);
+            }
+            {
+                // handler 表容量在注销单个 handler 后仍由内核复用，不归动态单元所有。
+                let _accounting = allocator::suspend_implicit_allocation_accounting()
+                    .ok_or(IrqError::OutOfMemory)?;
+                bucket
+                    .handlers
+                    .try_reserve(1)
+                    .map_err(|_| IrqError::OutOfMemory)?;
+            }
+            let id =
+                registry_id::alloc_atomic_id(&self.next_id).map_err(|_| IrqError::OutOfMemory)?;
+            bucket.handlers.push(IrqRegistration {
+                id,
+                owner: request.owner,
+                sharing: request.sharing,
+                _trigger: request.trigger,
+                _polarity: request.polarity,
+                handler: request.handler,
+                bottom_half: request.bottom_half,
+            });
+            drop(lines);
+            enable_irq_line(line);
+            return Ok(IrqHandle { id, line });
         }
+
+        let mut handlers = Vec::new();
         {
-            // handler 表容量在注销单个 handler 后仍由内核复用，不归动态单元所有。
             let _accounting =
                 allocator::suspend_implicit_allocation_accounting().ok_or(IrqError::OutOfMemory)?;
+            lines
+                .try_reserve(1, irq_bucket_hash)
+                .map_err(|_| IrqError::OutOfMemory)?;
             handlers.try_reserve(1).map_err(|_| IrqError::OutOfMemory)?;
         }
         let id = registry_id::alloc_atomic_id(&self.next_id).map_err(|_| IrqError::OutOfMemory)?;
-        let proc_irq = handlers
-            .iter()
-            .find(|entry| entry.line == request.line)
-            .map(|entry| entry.proc_irq)
-            .map(Ok)
-            .unwrap_or_else(|| {
-                registry_id::alloc_atomic_id(&self.next_proc_irq)
-                    .map_err(|_| IrqError::OutOfMemory)
-                    .and_then(|value| u32::try_from(value).map_err(|_| IrqError::OutOfMemory))
-            })?;
-        let line = request.line;
+        let proc_irq = registry_id::alloc_atomic_id(&self.next_proc_irq)
+            .map_err(|_| IrqError::OutOfMemory)
+            .and_then(|value| u32::try_from(value).map_err(|_| IrqError::OutOfMemory))?;
         handlers.push(IrqRegistration {
             id,
-            proc_irq,
-            line,
             owner: request.owner,
             sharing: request.sharing,
             _trigger: request.trigger,
             _polarity: request.polarity,
             handler: request.handler,
             bottom_half: request.bottom_half,
-            counts: [0; sched::NR_CPUS],
         });
-        drop(handlers);
+        lines.insert_unique(
+            hash,
+            IrqBucket {
+                line,
+                proc_irq,
+                handlers,
+                counts: [0; sched::NR_CPUS],
+            },
+            irq_bucket_hash,
+        );
+        drop(lines);
         enable_irq_line(line);
         Ok(IrqHandle { id, line })
     }
@@ -281,25 +337,27 @@ impl IrqRegistry {
     }
 
     pub fn unregister(&self, handle: IrqHandle) -> Result<(), IrqError> {
-        let mut handlers = self.handlers.lock();
-        let Some(index) = handlers
+        let hash = irq_line_hash(handle.line);
+        let mut lines = self.lines.lock();
+        let Some(bucket) = lines.find_mut(hash, |bucket| bucket.line == handle.line) else {
+            return Err(IrqError::NotFound);
+        };
+        let Some(index) = bucket
+            .handlers
             .iter()
-            .position(|entry| entry.id == handle.id && entry.line == handle.line)
+            .position(|entry| entry.id == handle.id)
         else {
             return Err(IrqError::NotFound);
         };
-        let removed = handlers.remove(index);
-        let still_used = if let Some(remaining) =
-            handlers.iter_mut().find(|entry| entry.line == handle.line)
-        {
-            for cpu in 0..sched::NR_CPUS {
-                remaining.counts[cpu] = remaining.counts[cpu].saturating_add(removed.counts[cpu]);
-            }
-            true
-        } else {
-            false
-        };
-        drop(handlers);
+        bucket.handlers.remove(index);
+        let still_used = !bucket.handlers.is_empty();
+        if !still_used {
+            let entry = lines
+                .find_entry(hash, |bucket| bucket.line == handle.line)
+                .map_err(|_| IrqError::NotFound)?;
+            let _ = entry.remove();
+        }
+        drop(lines);
         if !still_used {
             disable_irq_line(handle.line);
         }
@@ -307,16 +365,16 @@ impl IrqRegistry {
     }
 
     pub fn dispatch_line(&self, line: IrqLine) -> bool {
+        let hash = irq_line_hash(line);
         let mut handled = false;
         let mut last_id = 0;
 
         loop {
             let next = {
-                let handlers = self.handlers.lock();
-                handlers
-                    .iter()
-                    .filter(|entry| entry.line == line && entry.id > last_id)
-                    .min_by_key(|entry| entry.id)
+                let lines = self.lines.lock();
+                lines
+                    .find(hash, |bucket| bucket.line == line)
+                    .and_then(|bucket| bucket.handlers.iter().find(|entry| entry.id > last_id))
                     .map(|entry| {
                         (
                             entry.id,
@@ -344,13 +402,12 @@ impl IrqRegistry {
 
         if handled {
             let cpu = sched::current_cpu_id().min(sched::NR_CPUS - 1);
-            if let Some(entry) = self
-                .handlers
+            if let Some(bucket) = self
+                .lines
                 .lock()
-                .iter_mut()
-                .find(|entry| entry.line == line)
+                .find_mut(hash, |bucket| bucket.line == line)
             {
-                entry.counts[cpu] = entry.counts[cpu].saturating_add(1);
+                bucket.counts[cpu] = bucket.counts[cpu].saturating_add(1);
             }
         }
 
@@ -358,34 +415,25 @@ impl IrqRegistry {
     }
 
     fn snapshot(&self) -> Vec<IrqLineSnapshot> {
-        let handlers = self.handlers.lock();
+        let lines = self.lines.lock();
         let mut snapshot: Vec<IrqLineSnapshot> = Vec::new();
-        if snapshot.try_reserve(handlers.len()).is_err() {
+        if snapshot.try_reserve(lines.len()).is_err() {
             return snapshot;
         }
-        for entry in handlers.iter() {
-            if let Some(existing) = snapshot
-                .iter_mut()
-                .find(|item| item.proc_irq == entry.proc_irq)
-            {
-                for cpu in 0..sched::NR_CPUS {
-                    existing.counts[cpu] = existing.counts[cpu].saturating_add(entry.counts[cpu]);
-                }
-                if !existing.owners.contains(&entry.owner) && existing.owners.try_reserve(1).is_ok()
-                {
-                    existing.owners.push(entry.owner);
-                }
-                continue;
-            }
+        for bucket in lines.iter() {
             let mut owners = Vec::new();
-            if owners.try_reserve(1).is_err() {
+            if owners.try_reserve(bucket.handlers.len()).is_err() {
                 continue;
             }
-            owners.push(entry.owner);
+            for entry in &bucket.handlers {
+                if !owners.contains(&entry.owner) {
+                    owners.push(entry.owner);
+                }
+            }
             snapshot.push(IrqLineSnapshot {
-                proc_irq: entry.proc_irq,
-                line: entry.line,
-                counts: entry.counts,
+                proc_irq: bucket.proc_irq,
+                line: bucket.line,
+                counts: bucket.counts,
                 owners,
             });
         }
@@ -986,5 +1034,133 @@ pub fn translate_firmware_irq(controller: Option<u32>, cells: &[u32]) -> Option<
             .lock()
             .as_ref()
             .and_then(|registration| registration.domain.translate(cells)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+
+    use vfs::sync::Spinlock;
+
+    use super::{IrqError, IrqHandler, IrqLine, IrqRegistry, IrqRequest, IrqStatus};
+
+    struct RecordingHandler {
+        marker: usize,
+        status: IrqStatus,
+        calls: Arc<Spinlock<Vec<usize>>>,
+    }
+
+    impl IrqHandler for RecordingHandler {
+        fn handle_irq(&self, _line: IrqLine) -> IrqStatus {
+            self.calls.lock().push(self.marker);
+            self.status
+        }
+    }
+
+    fn handler(
+        marker: usize,
+        status: IrqStatus,
+        calls: &Arc<Spinlock<Vec<usize>>>,
+    ) -> Arc<dyn IrqHandler> {
+        Arc::new(RecordingHandler {
+            marker,
+            status,
+            calls: Arc::clone(calls),
+        })
+    }
+
+    #[test]
+    fn shared_line_keeps_registration_order_counts_and_lifetime() {
+        let registry = IrqRegistry::new();
+        let calls = Arc::new(Spinlock::new(Vec::new()));
+        let line = IrqLine::Controller {
+            controller: 17,
+            hwirq: 32,
+        };
+        let first = registry
+            .register_request(IrqRequest::shared(
+                line,
+                "first",
+                handler(1, IrqStatus::Handled, &calls),
+            ))
+            .expect("first shared handler should register");
+        let second = registry
+            .register_request(IrqRequest::shared(
+                line,
+                "second",
+                handler(2, IrqStatus::Unhandled, &calls),
+            ))
+            .expect("second shared handler should register");
+
+        assert!(registry.dispatch_line(line));
+        assert_eq!(&*calls.lock(), &[1, 2]);
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].line, line);
+        assert_eq!(snapshot[0].counts.iter().sum::<u64>(), 1);
+        assert_eq!(snapshot[0].owners, ["first", "second"]);
+
+        registry
+            .unregister(first)
+            .expect("first shared handler should unregister");
+        calls.lock().clear();
+        assert!(!registry.dispatch_line(line));
+        assert_eq!(&*calls.lock(), &[2]);
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].counts.iter().sum::<u64>(), 1);
+        assert_eq!(snapshot[0].owners, ["second"]);
+
+        registry
+            .unregister(second)
+            .expect("last shared handler should unregister");
+        assert!(!registry.dispatch_line(line));
+        assert!(registry.snapshot().is_empty());
+    }
+
+    #[test]
+    fn exclusive_line_rejects_all_other_handlers() {
+        let registry = IrqRegistry::new();
+        let calls = Arc::new(Spinlock::new(Vec::new()));
+        let line = IrqLine::Hardware(5);
+        let exclusive = registry
+            .register_request(IrqRequest::exclusive(
+                line,
+                "exclusive",
+                handler(1, IrqStatus::Handled, &calls),
+            ))
+            .expect("exclusive handler should register on an empty line");
+        assert_eq!(
+            registry.register_request(IrqRequest::shared(
+                line,
+                "shared",
+                handler(2, IrqStatus::Handled, &calls),
+            )),
+            Err(IrqError::AlreadyRegistered)
+        );
+        registry
+            .unregister(exclusive)
+            .expect("exclusive handler should unregister");
+
+        let shared = registry
+            .register_request(IrqRequest::shared(
+                line,
+                "shared",
+                handler(2, IrqStatus::Handled, &calls),
+            ))
+            .expect("shared handler should register on an empty line");
+        assert_eq!(
+            registry.register_request(IrqRequest::exclusive(
+                line,
+                "exclusive",
+                handler(1, IrqStatus::Handled, &calls),
+            )),
+            Err(IrqError::AlreadyRegistered)
+        );
+        registry
+            .unregister(shared)
+            .expect("shared handler should unregister");
     }
 }

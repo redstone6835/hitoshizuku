@@ -1682,6 +1682,24 @@ fn runqueue_pick_respects_cpu_affinity_mask() {
 }
 
 #[ktest]
+fn runqueue_published_load_hint_tracks_queue_mutations() {
+    let fair = make_task();
+    let realtime = make_task();
+    realtime.sched.set_sched_attr(SchedAttr::rt_fifo(20));
+    let rq = Runqueue::new();
+
+    assert!(rq.enqueue(Arc::clone(&fair), 1));
+    assert!(rq.enqueue(Arc::clone(&realtime), 1));
+    let hint = rq.migratable_class_load_hint();
+    assert_eq!(hint.fair, 1);
+    assert_eq!(hint.realtime, 1);
+
+    assert!(rq.dequeue(&fair, 2));
+    assert!(rq.dequeue(&realtime, 2));
+    assert_eq!(rq.migratable_class_load_hint().total(), 0);
+}
+
+#[ktest]
 fn runqueue_exact_pick_selects_requested_fair_task() {
     let first = make_task();
     let target = make_task();
