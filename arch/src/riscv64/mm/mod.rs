@@ -11,6 +11,14 @@ mod layout;
 pub(crate) mod user_copy;
 mod user_pgd;
 
+/// 清除当前 hart 的用户页表驻留记录。
+///
+/// `heap_vm` 的内核根切换入口也需要更新该记录，因此通过 mm 模块提供
+/// 一个仅限架构 crate 内部使用的转发函数，避免暴露 `user_pgd` 实现细节。
+pub(crate) fn deactivate_current_user_pgd() {
+    user_pgd::deactivate_current_user_pgd();
+}
+
 /// 由 `arch::riscv64::sched_ctx::register` 在启动装契约阶段调用一次。
 pub fn register() {
     #[cfg(debug_assertions)]

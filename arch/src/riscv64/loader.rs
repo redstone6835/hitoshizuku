@@ -26,7 +26,7 @@
 
 use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::riscv64::early_console;
 use crate::riscv64::heap_vm;
@@ -52,6 +52,14 @@ pub(super) const DTB_BUF_SIZE: usize = 4096 * 1024;
 
 /// DTB 快照的有效长度，0 表示尚未发布。
 static DTB_VALID_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// 所有可用 hart 共同支持的 Svvptc 能力。用户页表只在该能力发布后，才会在
+/// fresh invalid->valid 映射路径跳过不必要的 `sfence.vma`。
+static HAS_SVVPTC: AtomicBool = AtomicBool::new(false);
+
+pub fn has_svvptc() -> bool {
+    HAS_SVVPTC.load(Ordering::Acquire)
+}
 
 /// DTB 快照缓冲区的 Sync 包装（UnsafeCell 本身非 Sync）。
 #[repr(align(4096))]
@@ -196,6 +204,7 @@ struct RiscvHartFeatures {
     cbom_block_size: Option<usize>,
     cboz_block_size: Option<usize>,
     cbop_block_size: Option<usize>,
+    svvptc: bool,
     sstc: bool,
     vector: bool,
 }
@@ -208,6 +217,7 @@ struct RiscvPlatformFeatures {
     cbom_block_size: Option<usize>,
     cboz_block_size: Option<usize>,
     cbop_block_size: Option<usize>,
+    svvptc: bool,
     sstc: bool,
     vector: bool,
 }
@@ -317,11 +327,12 @@ fn configure_cpu_features_from_dtb(
     HAS_ZICBOM.store(aggregate.cbom_block_size.is_some(), Ordering::Release);
     HAS_ZICBOP.store(aggregate.cbop_block_size.is_some(), Ordering::Release);
     HAS_ZICBOZ.store(aggregate.cboz_block_size.is_some(), Ordering::Release);
+    HAS_SVVPTC.store(aggregate.svvptc, Ordering::Release);
     time::set_sstc_available(aggregate.sstc);
     crate::riscv64::vector::detect_vector_support(aggregate.vector);
 
     log::info!(
-        "[loader] DT CPU binding: harts={} split-isa={} legacy-isa={} boot-mmu={} common-mmu={:?} cbom={} cboz={} cbop={} sstc={}",
+        "[loader] DT CPU binding: harts={} split-isa={} legacy-isa={} boot-mmu={} common-mmu={:?} cbom={} cboz={} cbop={} svvptc={} sstc={}",
         aggregate.harts,
         aggregate.split_isa_harts,
         aggregate.harts - aggregate.split_isa_harts,
@@ -330,6 +341,7 @@ fn configure_cpu_features_from_dtb(
         aggregate.cbom_block_size.unwrap_or(0),
         aggregate.cboz_block_size.unwrap_or(0),
         aggregate.cbop_block_size.unwrap_or(0),
+        aggregate.svvptc as usize,
         aggregate.sstc as usize,
     );
     Ok(aggregate.paging_mode)
@@ -404,6 +416,7 @@ fn riscv_hart_features(
             CacheBlockKind::Prefetch,
             binding.cbop_block_size(),
         )?,
+        svvptc: binding.has_isa_extension("svvptc"),
         sstc: binding.has_isa_extension("sstc"),
         vector: binding.has_isa_extension("v"),
     })
@@ -461,6 +474,7 @@ fn merge_platform_features(
             cbom_block_size: hart.cbom_block_size,
             cboz_block_size: hart.cboz_block_size,
             cbop_block_size: hart.cbop_block_size,
+            svvptc: hart.svvptc,
             sstc: hart.sstc,
             vector: hart.vector,
         });
@@ -486,6 +500,7 @@ fn merge_platform_features(
         current.cbop_block_size,
         hart.cbop_block_size,
     )?;
+    current.svvptc &= hart.svvptc;
     current.sstc &= hart.sstc;
     current.vector &= hart.vector;
     Ok(())
@@ -690,12 +705,9 @@ pub extern "C" fn __kernel_arch_loader(
     configure_early_console_from_dtb(&dtb);
 
     // 串口带宽有限时用 cmdline 过滤日志级别（mygo.loglevel=warn 等）。
-    if let Some(level) = dtb
-        .chosen_bootargs()
-        .ok()
-        .flatten()
-        .and_then(|bootargs| general::cmdline::Cmdline::new(bootargs.as_bytes()).find("mygo.loglevel"))
-    {
+    if let Some(level) = dtb.chosen_bootargs().ok().flatten().and_then(|bootargs| {
+        general::cmdline::Cmdline::new(bootargs.as_bytes()).find("mygo.loglevel")
+    }) {
         let parsed = match level.trim() {
             "emerg" => log::LogLevel::Emergency,
             "crit" => log::LogLevel::Critical,

@@ -218,6 +218,9 @@ impl Riscv64Paging {
         }
         if current != satp {
             unsafe {
+                // `csrw satp` 只切换根和 ASID，不排序此前对新页表的 PTE 写入。
+                // 先完成写写排序，再安装新根，避免弱序实现观察到半发布的页表。
+                core::arch::asm!("fence w,w", options(nostack, preserves_flags));
                 core::arch::asm!(
                     "csrw satp, {val}",
                     val = in(reg) satp,

@@ -26,6 +26,7 @@ const COMPAT_SIFIVE_PLIC: &str = "sifive,plic-1.0.0";
 const COMPAT_RISCV_PLIC0: &str = "riscv,plic0";
 
 const PLIC_DEFAULT_PRIORITY: u32 = 1;
+const PLIC_MAX_CLAIMS_PER_ENTRY: usize = 64;
 
 struct PlicInner {
     mmio_base: usize,
@@ -40,8 +41,9 @@ struct PlicCpuLayout {
 }
 
 struct Plic {
-    inner: Spinlock<PlicInner>,
-    dispatch_lock: Spinlock<()>,
+    inner: PlicInner,
+    config_lock: Spinlock<()>,
+    dispatch_locks: [Spinlock<()>; sched::NR_CPUS],
     quiesced: AtomicBool,
 }
 
@@ -54,7 +56,8 @@ impl Plic {
     }
 
     fn initialize(&self) {
-        let inner = self.inner.lock();
+        let _config = self.config_lock.lock();
+        let inner = &self.inner;
         let layout = inner
             .contexts
             .first()
@@ -64,7 +67,7 @@ impl Plic {
             let offset = layout
                 .priority_offset(hwirq)
                 .expect("validated PLIC source");
-            let addr = Self::register_address(&inner, offset);
+            let addr = Self::register_address(inner, offset);
             // Safety: layout 已校验 priority 数组完整落在 MMIO 窗口内。
             unsafe { core::ptr::write_volatile(addr as *mut u32, 0) };
         }
@@ -74,11 +77,11 @@ impl Plic {
                     .layout
                     .enable_word_offset(word)
                     .expect("validated PLIC enable word");
-                let addr = Self::register_address(&inner, offset);
+                let addr = Self::register_address(inner, offset);
                 // Safety: 每个 layout 都已校验对应 context 的 enable 数组。
                 unsafe { core::ptr::write_volatile(addr as *mut u32, 0) };
             }
-            let threshold = Self::register_address(&inner, context.layout.threshold_offset());
+            let threshold = Self::register_address(inner, context.layout.threshold_offset());
             // Safety: layout 已校验当前 context 的 threshold 寄存器。
             unsafe { core::ptr::write_volatile(threshold as *mut u32, 0) };
         }
@@ -89,7 +92,11 @@ impl Plic {
         if self.quiesced.load(Ordering::Acquire) {
             return false;
         }
-        let inner = self.inner.lock();
+        let _config = self.config_lock.lock();
+        if self.quiesced.load(Ordering::Acquire) {
+            return false;
+        }
+        let inner = &self.inner;
         let Some(offset) = inner
             .contexts
             .first()
@@ -97,7 +104,7 @@ impl Plic {
         else {
             return false;
         };
-        let addr = Self::register_address(&inner, offset);
+        let addr = Self::register_address(inner, offset);
         // Safety: `hwirq` 已验证处于固件声明的 PLIC 中断源范围，所得优先级寄存器
         // 地址位于已映射窗口内并按 32 位对齐。
         unsafe { core::ptr::write_volatile(addr as *mut u32, priority) };
@@ -108,7 +115,11 @@ impl Plic {
         if self.quiesced.load(Ordering::Acquire) {
             return !enabled;
         }
-        let inner = self.inner.lock();
+        let _config = self.config_lock.lock();
+        if self.quiesced.load(Ordering::Acquire) {
+            return !enabled;
+        }
+        let inner = &self.inner;
         if hwirq == 0 || hwirq > inner.ndev {
             return false;
         }
@@ -117,7 +128,7 @@ impl Plic {
                 .layout
                 .enable_offset(hwirq)
                 .expect("validated PLIC source must exist in every context");
-            let addr = Self::register_address(&inner, offset);
+            let addr = Self::register_address(inner, offset);
             // Safety: `hwirq` 和 context 已校验，地址指向对应的对齐使能寄存器。
             let mut val = unsafe { core::ptr::read_volatile(addr as *const u32) };
             if enabled {
@@ -125,53 +136,64 @@ impl Plic {
             } else {
                 val &= !(1u32 << bit);
             }
-            // Safety: 与上面的读取访问同一有效寄存器，并由 `inner` 锁串行化修改。
+            // Safety: 与上面的读取访问同一有效寄存器，并由配置锁串行化修改。
             unsafe { core::ptr::write_volatile(addr as *mut u32, val) };
         }
         hal::memory::device_io_barrier();
         true
     }
 
-    fn dispatch_one(&self, controller: u32) -> IrqStatus {
-        let _dispatch = self.dispatch_lock.lock();
+    fn dispatch_pending(&self, controller: u32) -> IrqStatus {
+        let logical_cpu = sched::current_cpu_id();
+        let Some(dispatch_lock) = self.dispatch_locks.get(logical_cpu) else {
+            return IrqStatus::Unhandled;
+        };
+        let _dispatch = dispatch_lock.lock();
         if self.quiesced.load(Ordering::Acquire) {
             return IrqStatus::Unhandled;
         }
-        let logical_cpu = sched::current_cpu_id();
-        let inner = self.inner.lock();
+        let inner = &self.inner;
         let Some(layout) = inner
             .contexts
             .iter()
             .find(|context| context.logical_cpu == logical_cpu)
             .map(|context| context.layout)
         else {
-            log::error!(
-                "[platform-riscv-plic] CPU {} has no supervisor context",
-                logical_cpu
-            );
+            // CPU 外部中断线允许由 PLIC 与 IMSIC 共享；没有 PLIC context 时，
+            // 当前中断可能属于另一个级联控制器。
             return IrqStatus::Unhandled;
         };
-        let claim = Self::register_address(&inner, layout.claim_offset());
+        let claim = Self::register_address(inner, layout.claim_offset());
         let ndev = inner.ndev;
-        // Safety: layout 已校验 claim/complete 寄存器完整落在 MMIO 窗口内。
-        let hwirq = unsafe { core::ptr::read_volatile(claim as *const u32) };
-        drop(inner);
-        if hwirq == 0 {
-            return IrqStatus::Unhandled;
+        let mut claimed = 0usize;
+        for _ in 0..PLIC_MAX_CLAIMS_PER_ENTRY {
+            // Safety: layout 已校验 claim/complete 寄存器完整落在 MMIO 窗口内。
+            let hwirq = unsafe { core::ptr::read_volatile(claim as *const u32) };
+            if hwirq == 0 {
+                break;
+            }
+            claimed += 1;
+            hal::memory::device_io_barrier();
+            let valid = hwirq <= ndev;
+            if valid {
+                let _ = irq::dispatch_irq_line(IrqLine::Controller { controller, hwirq });
+                // 设备 ACK 必须在 PLIC complete 前对总线可见。
+                hal::memory::device_io_barrier();
+            }
+            // 即使硬件返回越界 source，也必须完成该 claim，避免卡住 context。
+            // Safety: 与上面的 claim 读取访问同一个已校验寄存器。
+            unsafe { core::ptr::write_volatile(claim as *mut u32, hwirq) };
+            hal::memory::device_io_barrier();
+            if !valid {
+                log::error!(
+                    "[platform-riscv-plic] hardware returned out-of-range claim {} (ndev={})",
+                    hwirq,
+                    ndev
+                );
+                break;
+            }
         }
-        let valid = hwirq <= ndev;
-        if valid {
-            irq::dispatch_irq_line(IrqLine::Controller { controller, hwirq });
-        } else {
-            log::error!(
-                "[platform-riscv-plic] hardware returned out-of-range claim {} (ndev={})",
-                hwirq,
-                ndev
-            );
-        }
-        // Safety: 与上面的 claim 读取访问同一个已校验寄存器。
-        unsafe { core::ptr::write_volatile(claim as *mut u32, hwirq) };
-        if valid {
+        if claimed != 0 {
             IrqStatus::Handled
         } else {
             IrqStatus::Unhandled
@@ -182,11 +204,11 @@ impl Plic {
         if self.quiesced.swap(true, Ordering::AcqRel) {
             return;
         }
-        // 等待已进入的 cascade dispatch 完成，并阻止新 dispatch 越过屏蔽点。
-        let _dispatch = self.dispatch_lock.lock();
-        let inner = self.inner.lock();
+        // 先阻止新配置并屏蔽全部 source，再逐 CPU 等待在途 dispatch 完成。
+        let config = self.config_lock.lock();
+        let inner = &self.inner;
         for context in &inner.contexts {
-            let threshold = Self::register_address(&inner, context.layout.threshold_offset());
+            let threshold = Self::register_address(inner, context.layout.threshold_offset());
             // Safety: layout 已校验 threshold 寄存器。最大阈值先阻断新上报。
             unsafe { core::ptr::write_volatile(threshold as *mut u32, u32::MAX) };
             for word in 0..context.layout.source_words() {
@@ -194,7 +216,7 @@ impl Plic {
                     .layout
                     .enable_word_offset(word)
                     .expect("validated PLIC enable word");
-                let addr = Self::register_address(&inner, offset);
+                let addr = Self::register_address(inner, offset);
                 // Safety: layout 已校验对应 context 的 enable 数组。
                 unsafe { core::ptr::write_volatile(addr as *mut u32, 0) };
             }
@@ -208,11 +230,15 @@ impl Plic {
             let offset = layout
                 .priority_offset(hwirq)
                 .expect("validated PLIC source");
-            let addr = Self::register_address(&inner, offset);
+            let addr = Self::register_address(inner, offset);
             // Safety: layout 已校验 priority 数组。
             unsafe { core::ptr::write_volatile(addr as *mut u32, 0) };
         }
         hal::memory::device_io_barrier();
+        drop(config);
+        for lock in &self.dispatch_locks {
+            drop(lock.lock());
+        }
     }
 }
 
@@ -261,7 +287,7 @@ struct PlicCascadeHandler {
 
 impl IrqHandler for PlicCascadeHandler {
     fn handle_irq(&self, _line: IrqLine) -> IrqStatus {
-        self.plic.dispatch_one(self.controller)
+        self.plic.dispatch_pending(self.controller)
     }
 }
 
@@ -388,12 +414,13 @@ impl PnpDriver for PlicDriver {
             .context;
 
         let plic = Arc::new(Plic {
-            inner: Spinlock::new(PlicInner {
+            inner: PlicInner {
                 mmio_base,
                 ndev,
                 contexts,
-            }),
-            dispatch_lock: Spinlock::new(()),
+            },
+            config_lock: Spinlock::new(()),
+            dispatch_locks: [const { Spinlock::new(()) }; sched::NR_CPUS],
             quiesced: AtomicBool::new(false),
         });
 

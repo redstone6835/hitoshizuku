@@ -106,6 +106,22 @@ impl RunqueueClassLoadSnapshot {
     pub(crate) fn loads(&self) -> &[RunqueueClassLoad; NR_CPUS] {
         &self.loads
     }
+
+    fn suppress_class(&mut self, cpu: CpuId, class: SchedClass) {
+        let load = &mut self.loads[cpu.get()];
+        match class {
+            SchedClass::Deadline => {
+                load.deadline = 0;
+                load.deadline_utilization = 0;
+            }
+            SchedClass::Realtime => load.realtime = 0,
+            SchedClass::Fair => {
+                load.fair = 0;
+                load.fair_weight = 0;
+            }
+            SchedClass::Idle => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2767,10 +2783,9 @@ pub fn balance_once(cpu_id: usize) -> bool {
 
     // 便宜的前置检查：本 CPU 已经有活干就没必要偷。
     //
-    // 下面的亲和性敏感全 CPU 负载快照需要取全局 RUNQUEUE_SNAPSHOT_LOCK，是
-    // 这个函数的主要开销。域统计只供诊断查询使用，不能让每次迁移尝试都
-    // 重复构建一份不会参与本次决策的聚合统计。
-    // 先计算本地 runqueue 深度，能把绝大部分无收益的全局扫描挡在门外。
+    // 先计算本地 runqueue 深度，能把绝大部分无收益的全局摘要读取挡在门外。
+    // 域统计只供诊断查询使用，不能让每次迁移尝试都重复构建一份不会参与本次
+    // 决策的聚合统计。
     if SCHEDULER.cpu_or_boot(cpu_id).runqueue().nr_running() > 1 {
         return false;
     }
@@ -2778,64 +2793,78 @@ pub fn balance_once(cpu_id: usize) -> bool {
     let topology_snapshot = SCHEDULER.topology_snapshot();
     let topology = topology_snapshot.topology();
     let allowed = CpuMask::single(local_cpu).bits();
-    let load_snapshot = {
-        let _snapshot_guard = RUNQUEUE_SNAPSHOT_LOCK.lock();
-        RunqueueClassLoadSnapshot::collect(active, |cpu| {
-            SCHEDULER
-                .cpu_or_boot(cpu.get())
-                .runqueue()
-                .migratable_class_load_for(allowed)
-        })
-    };
+    // 负载摘要由每个 rq 在自身锁内发布，读取时不再串行化所有 CPU，也不需要
+    // 为每个目标 affinity 重新遍历任务树。摘要只用于挑选候选源，摘取入口仍在
+    // 源 rq 锁内严格检查 affinity、状态和上下文所有权。
+    let mut load_snapshot = RunqueueClassLoadSnapshot::collect(active, |cpu| {
+        SCHEDULER
+            .cpu_or_boot(cpu.get())
+            .runqueue()
+            .migratable_class_load_hint()
+    });
     let classes = [SchedClass::Deadline, SchedClass::Realtime, SchedClass::Fair];
-    let Some((src, class)) = classes.into_iter().find_map(|class| {
-        select_balance_source_for_class(topology, local_cpu, active, class, |cpu| {
-            load_snapshot.load_of(cpu)
-        })
-        .map(|source| (source.get(), class))
-    }) else {
-        return false;
-    };
-    let Some(task) = SCHEDULER
-        .cpu_or_boot(src)
-        .runqueue()
-        .take_migratable_from_class(class, allowed, now_ns_internal())
-    else {
-        return false;
-    };
-    if class == SchedClass::Deadline {
-        if !SCHEDULER.deadline_admission().can_migrate(
-            &task,
-            local_cpu,
-            topology.cpu_capacity(local_cpu),
-        ) {
-            let target = requeue_balance_task_on(&SCHEDULER, task, src, now_ns_internal());
-            notify_resched(target);
-            return false;
+    for class in classes {
+        // 摘要可能因 affinity 或并发状态而高估某个源。失败后只屏蔽该源的
+        // 当前 class，继续尝试同一调度域的其它源，避免一次过时摘要让本轮
+        // balance 永远放弃可迁移任务。
+        for _ in 0..active.count() {
+            let Some(src) =
+                select_balance_source_for_class(topology, local_cpu, active, class, |cpu| {
+                    load_snapshot.load_of(cpu)
+                })
+            else {
+                break;
+            };
+            let src_id = src.get();
+            let Some(task) = SCHEDULER
+                .cpu_or_boot(src_id)
+                .runqueue()
+                .take_migratable_from_class(class, allowed, now_ns_internal())
+            else {
+                load_snapshot.suppress_class(src, class);
+                continue;
+            };
+            if class == SchedClass::Deadline
+                && !SCHEDULER.deadline_admission().can_migrate(
+                    &task,
+                    local_cpu,
+                    topology.cpu_capacity(local_cpu),
+                )
+            {
+                let target = requeue_balance_task_on(&SCHEDULER, task, src_id, now_ns_internal());
+                notify_resched(target);
+                load_snapshot.suppress_class(src, class);
+                continue;
+            }
+            let source = task.placement();
+            let topology_snapshot = SCHEDULER.topology_snapshot();
+            let target_domain = topology_snapshot
+                .topology()
+                .domain_for_cpu(local_cpu)
+                .unwrap_or_else(|| topology_snapshot.topology().root_domain())
+                .id();
+            if source.state != crate::PlacementState::Bound
+                || source.topology_generation != topology_snapshot.generation
+                || !task.begin_migration(source)
+            {
+                let target = requeue_balance_task_on(&SCHEDULER, task, src_id, now_ns_internal());
+                notify_resched(target);
+                load_snapshot.suppress_class(src, class);
+                continue;
+            }
+            let context = MigrationContext {
+                source,
+                target_cpu: local_cpu,
+                target_domain,
+                topology_generation: topology_snapshot.generation,
+            };
+            if attach_migrated_task(&task, context, true).is_ok() {
+                return true;
+            }
+            load_snapshot.suppress_class(src, class);
         }
     }
-    let source = task.placement();
-    let topology_snapshot = SCHEDULER.topology_snapshot();
-    let target_domain = topology_snapshot
-        .topology()
-        .domain_for_cpu(local_cpu)
-        .unwrap_or_else(|| topology_snapshot.topology().root_domain())
-        .id();
-    if source.state != crate::PlacementState::Bound
-        || source.topology_generation != topology_snapshot.generation
-        || !task.begin_migration(source)
-    {
-        let target = requeue_balance_task_on(&SCHEDULER, task, src, now_ns_internal());
-        notify_resched(target);
-        return false;
-    }
-    let context = MigrationContext {
-        source,
-        target_cpu: local_cpu,
-        target_domain,
-        topology_generation: topology_snapshot.generation,
-    };
-    attach_migrated_task(&task, context, true).is_ok()
+    false
 }
 
 pub(crate) fn requeue_balance_task_on(
@@ -3546,12 +3575,11 @@ pub(crate) fn cached_state_deadline_call_count_for_test() -> usize {
 /// 周期性负载均衡的最小间隔。
 ///
 /// 对应 Linux `scheduler_tick()` 里的 `trigger_load_balance()`，但节流更保守：
-/// `balance_once` 需要取全局 `RUNQUEUE_SNAPSHOT_LOCK` 并扫描所有 rq，若每个
-/// tick 都在每个 CPU 上执行，多核空闲系统会把这条全局串行路径变成新的瓶颈。
-/// 4 ms 实测过于激进：8 核每核每 4 ms 触发一次全 rq 扫描，光是 balance_once
-/// 自身就吃掉约 9% 的内核指令，而其中绝大多数调用并没有偷到任务。16 ms 与
-/// Linux 各级 sched domain 的 balance interval 量级相当，同时保留了把任务铺开
-/// 到所有核所需的频度（work-stealing 主要靠 idle 路径即时触发，tick 只是兜底）。
+/// balance 使用每个 rq 发布的无锁摘要；若每个 tick 都在每个 CPU 上执行，多核
+/// 空闲系统仍会反复进行跨 CPU 候选决策，因此保持较长的兜底间隔。
+/// 16 ms 与 Linux 各级 sched domain 的 balance interval 量级相当，同时保留了
+/// 把任务铺开到所有核所需的频度（work-stealing 主要靠 idle 路径即时触发，tick
+/// 只是兜底）。
 const PERIODIC_BALANCE_INTERVAL_NS: u64 = 16_000_000;
 
 /// 每 CPU 的下一次允许均衡时间点。
@@ -3560,7 +3588,7 @@ static NEXT_BALANCE_NS: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_
 /// 在 timer tick 上按间隔请求一次负载均衡。
 ///
 /// 只在本 CPU 明显吃不满（runnable 不足以占满自己）时才请求：balance_once 的
-/// 拉取条件本身也要求源 CPU 更忙，所以繁忙 CPU 上的请求只会白跑一次全 rq 扫描。
+/// 拉取条件本身也要求源 CPU 更忙，所以繁忙 CPU 上不会发布周期请求。
 /// 真正的迁移动作留给安全调度边界（`preempt_if_needed` / idle 循环）消费
 /// `take_balance()`，本函数不在中断上下文里直接迁移任务。
 fn request_periodic_balance(cpu_id: usize, now_ns: u64) {
@@ -3584,10 +3612,10 @@ fn request_periodic_balance(cpu_id: usize, now_ns: u64) {
     {
         return;
     }
-    // 只置本地标志位，不发 IPI：请求的目标就是本 CPU，它马上就会走到自己的
-    // 调度边界。发自 IPI 只会在 idle 唤醒路径上制造额外往返。
+    // 只置本地标志位，不发 IPI，也不因为一个独占 current 的 CPU 强制重调度。
+    // idle 循环会消费该标志并执行一次受限 balance；忙 CPU 则等已有的安全调度
+    // 边界处理，避免每个周期都把同一个任务重新入队再取回。
     cpu_state.request_balance();
-    cpu_state.request_resched();
 }
 
 /// 读取当前任务真实 CPU 时间的无分配回调。
@@ -3609,10 +3637,13 @@ pub fn preempt_if_needed(now_ns: u64) {
     }
     let cpu_id = cpu();
     let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
+    // balance 是独立的安全边界工作：它不应因为没有 need_resched 就积压，
+    // 也不应为独占 current 的 CPU 制造一次无意义的 schedule。成功迁移时
+    // attach_migrated_task 会重新发布 need_resched，下面再消费真实切换请求。
+    if cpu_state.take_balance() {
+        let _ = balance_once(cpu_id);
+    }
     if cpu_state.take_resched() {
-        if cpu_state.take_balance() {
-            let _ = balance_once(cpu_id);
-        }
         schedule_once(now_ns);
     }
 }

@@ -38,7 +38,9 @@ static NEXT_BLOCK_DISKSEQ: AtomicU64 = AtomicU64::new(1);
 /// QEMU/virtio 的小请求通常在几十微秒内完成；立即切到 idle 会把一次上下文切换、
 /// 中断返回和再次切回的固定成本叠到每个 512B/4KiB I/O 上。这里先做一个很小的
 /// bounded poll 窗口，完成不了再睡眠，避免长 I/O 忙等。
-const SYNC_WAIT_ACTIVE_DRAIN_LIMIT: usize = 256;
+// VirtIO 完成由中断驱动；请求错过最初几次轮询后，继续 drain 只会反复获取队列锁
+// 并屏蔽中断。主动窗口必须有界，随后交给调度器和中断路径推进。
+const SYNC_WAIT_ACTIVE_DRAIN_LIMIT: usize = 32;
 
 #[cfg(feature = "performance-profile")]
 fn profile_block_args(op: BioOp, range: BlockRange) -> (u64, u64) {
@@ -556,6 +558,14 @@ pub trait BlockDriver: Send + Sync {
     /// 不持有任何外部锁时被调用。
     fn drain(&self) {}
 
+    /// 完成通知是否保证由中断路径投递。
+    ///
+    /// 中断驱动的设备可以让同步等待者直接进入 [`Completion`] 等待队列；
+    /// 返回 `false` 的驱动必须依赖调用方继续主动 `drain`。
+    fn completion_is_interrupt_driven(&self) -> bool {
+        false
+    }
+
     /// 一个 VFS 块设备文件被打开时调用。
     ///
     /// 这是设备对象层的生命周期通知，不携带 fd、路径或权限位等 POSIX 信息。
@@ -856,29 +866,45 @@ impl BlockDevice {
         let mut drain_cycles = 0u64;
         #[cfg(feature = "performance-profile")]
         let mut drain_calls = 0u64;
-        while !completion.is_done() {
-            for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
-                #[cfg(feature = "performance-profile")]
-                let drain_start = profiling::read_counter();
+        // 先给同步完成和刚到达的 IRQ 一个极短的主动窗口。若仍未完成，
+        // 中断驱动设备直接睡眠等待，避免原先“drain + schedule_once”无界循环
+        // 持续争用队列锁；纯轮询驱动保留旧路径直到完成。
+        for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
+            #[cfg(feature = "performance-profile")]
+            let drain_start = profiling::read_counter();
+            self.driver.drain();
+            #[cfg(feature = "performance-profile")]
+            {
+                drain_cycles = drain_cycles
+                    .saturating_add(profiling::read_counter().wrapping_sub(drain_start));
+                drain_calls = drain_calls.saturating_add(1);
+            }
+            if completion.is_done() {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !completion.is_done()
+            && sched::is_ready()
+            && self.driver.completion_is_interrupt_driven()
+        {
+            // Completion::wait 会在注册等待者后再次检查 done，完成与入睡之间
+            // 不存在丢唤醒窗口；IRQ handler 负责调用 Completion::complete。
+        } else {
+            while !completion.is_done() {
                 self.driver.drain();
                 #[cfg(feature = "performance-profile")]
                 {
-                    drain_cycles = drain_cycles
-                        .saturating_add(profiling::read_counter().wrapping_sub(drain_start));
                     drain_calls = drain_calls.saturating_add(1);
                 }
                 if completion.is_done() {
                     break;
                 }
-                core::hint::spin_loop();
-            }
-            if sched::is_ready() {
-                if completion.is_done() {
-                    break;
+                if sched::is_ready() {
+                    sched::schedule_once(sched::now_ns_public());
+                } else {
+                    core::hint::spin_loop();
                 }
-                sched::schedule_once(sched::now_ns_public());
-            } else {
-                core::hint::spin_loop();
             }
         }
         #[cfg(feature = "performance-profile")]
@@ -958,7 +984,12 @@ impl BlockDevice {
 
         #[cfg(feature = "performance-profile")]
         let mut profile_drain_cycles = 0u64;
-        while !completion.is_done() {
+        let interrupt_driven = self.driver.completion_is_interrupt_driven();
+
+        // 给刚提交的请求一个短暂的主动完成窗口。中断驱动设备在调度器可用后
+        // 不再重复 drain/schedule，而是交给 Completion::wait；只有轮询设备或
+        // 早期启动阶段才继续主动推进完成队列。
+        if interrupt_driven && sched::is_ready() {
             for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
                 let t0 = sched::now_ns_public();
                 #[cfg(feature = "performance-profile")]
@@ -979,10 +1010,33 @@ impl BlockDevice {
                 core::hint::spin_loop();
                 profile.spin_calls = profile.spin_calls.saturating_add(1);
             }
-            if sched::is_ready() {
+        }
+
+        while !completion.is_done() && !(interrupt_driven && sched::is_ready()) {
+            for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
+                let t0 = sched::now_ns_public();
+                #[cfg(feature = "performance-profile")]
+                let drain_start = profiling::read_counter();
+                self.driver.drain();
+                #[cfg(feature = "performance-profile")]
+                {
+                    profile_drain_cycles = profile_drain_cycles
+                        .saturating_add(profiling::read_counter().wrapping_sub(drain_start));
+                }
+                profile.drain_ns = profile
+                    .drain_ns
+                    .saturating_add(sched::now_ns_public().saturating_sub(t0));
+                profile.drain_calls = profile.drain_calls.saturating_add(1);
                 if completion.is_done() {
                     break;
                 }
+                core::hint::spin_loop();
+                profile.spin_calls = profile.spin_calls.saturating_add(1);
+            }
+            if completion.is_done() {
+                break;
+            }
+            if sched::is_ready() {
                 let t0 = sched::now_ns_public();
                 sched::schedule_once(sched::now_ns_public());
                 profile.schedule_ns = profile

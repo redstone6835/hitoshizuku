@@ -196,6 +196,7 @@ impl CpuSchedState {
     #[inline]
     pub(crate) fn user_return_work_authoritative(&self) -> bool {
         self.need_resched.load(Ordering::Acquire)
+            || self.need_balance.load(Ordering::Acquire)
             || self.post_syscall_handoff.load(Ordering::Acquire) != 0
     }
 
@@ -229,6 +230,9 @@ impl CpuSchedState {
 
     pub fn request_balance(&self) {
         self.need_balance.store(true, Ordering::Release);
+        // balance 请求也必须唤醒返回用户态前的慢路径；否则忙 CPU 在 timer
+        // tick 上只置 need_balance、却没有 need_resched 时永远不会消费请求。
+        self.mark_user_return_work();
     }
 
     pub fn take_balance(&self) -> bool {
@@ -629,3 +633,18 @@ impl Scheduler {
 }
 
 pub static SCHEDULER: Scheduler = Scheduler::new();
+
+#[cfg(test)]
+mod tests {
+    use super::CpuSchedState;
+
+    #[test]
+    fn balance_request_arms_user_return_work_without_reschedule() {
+        let cpu = CpuSchedState::new();
+        cpu.request_balance();
+        assert!(cpu.user_return_work_authoritative());
+        assert!(!cpu.needs_resched());
+        assert!(cpu.take_balance());
+        assert!(!cpu.take_balance());
+    }
+}

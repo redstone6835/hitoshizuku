@@ -707,6 +707,21 @@ fn replace_required_extension<T: core::any::Any + Send + Sync>(
         .map_err(|_| Errno::EIO)
 }
 
+/// 替换当前任务的地址空间时，先保留旧 `VmSpace`，安装并激活新页表后再释放。
+///
+/// RISC-V 维护每 CPU 的当前 PGD 槽位；若在激活新页表前释放旧对象，槽位会
+/// 短暂指向已回收的页表并在下一次切换时形成 use-after-free。其它扩展可以直接
+/// 使用 [`replace_required_extension`]，地址空间必须经过这个有序路径。
+fn replace_vm_space_extension(task: &Arc<Task>, vm: &Arc<VmSpace>) -> Result<(), Errno> {
+    let erased: Arc<dyn core::any::Any + Send + Sync> = vm.clone();
+    let old = task
+        .ext_replace(TASKEXT_VM_SPACE, erased)
+        .map_err(|_| Errno::EIO)?;
+    vm.activate();
+    drop(old);
+    Ok(())
+}
+
 fn reset_signal_state_for_exec(task: &Arc<Task>, target_abi: UserAbiKind) {
     if target_abi == UserAbiKind::MygoNative {
         task.signal.reset_for_native_exec();
@@ -905,10 +920,9 @@ pub(crate) fn commit_exec(
                 drop(fdtable_lease.take());
             }
             InstallStep::AddressSpace => {
-                replace_required_extension(task, TASKEXT_VM_SPACE, &prepared.image.vm)?;
-                prepared.image.vm.activate();
-                // frame 在 pure prepare 中构造，此时旧地址空间仍保持激活；提交新 VM
-                // 后必须刷新架构地址空间令牌，避免返回路径重新装回旧页表。
+                replace_vm_space_extension(task, &prepared.image.vm)?;
+                // frame 在 pure prepare 中构造；提交新 VM 后必须刷新架构地址空间
+                // 令牌，避免返回路径重新装回旧页表。
                 prepared.initial_thread.frame.set_current_address_space();
                 if prepared.image.sync_icache {
                     arch::CurrentTaskOps::sync_icache();

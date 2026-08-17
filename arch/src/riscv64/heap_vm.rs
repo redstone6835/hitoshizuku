@@ -1247,6 +1247,10 @@ pub fn activate_kernel_page_table() {
     unsafe {
         Riscv64Paging::activate_with_asid(PhysPageTableRoot::new(root_paddr), 0, false);
     }
+    // 保持架构侧用户 PGD 驻留记录与硬件根同步。HAL 调度路径也直接进入
+    // 此入口，不会经过 `UserPgdOps::activate_kernel`。必须先切换硬件根，
+    // 再清驻留槽，避免并发释放仍在使用的用户页表。
+    crate::riscv64::mm::deactivate_current_user_pgd();
 }
 
 /// 为 SBI HSM 的物理入口临时恢复内核镜像所在 1 GiB 的 identity mapping。

@@ -42,6 +42,8 @@ static ASID_ALLOCATOR: Mutex<AsidAllocator> = Mutex::new(AsidAllocator {
     generation: 1,
 });
 static CURRENT_ASID_GENERATION: AtomicUsize = AtomicUsize::new(1);
+static CURRENT_USER_PGD: [AtomicUsize; sched::NR_CPUS] =
+    [const { AtomicUsize::new(0) }; sched::NR_CPUS];
 
 #[inline]
 const fn make_asid_tag(generation: usize, asid: usize) -> usize {
@@ -106,8 +108,8 @@ struct UserPgdInner {
     pgd_phys: usize,
     pgd_virt: usize,
     asid_tag: AtomicUsize,
-    /// 曾经激活过本地址空间的逻辑 CPU。位图在 PGD 生命周期内单调增长，
-    /// 保证已经缓存过该 ASID translation 的 hart 不会被后续 shootdown 遗漏。
+    /// 当前仍可能缓存本地址空间 ASID translation 的逻辑 CPU。调度器切离用户
+    /// 地址空间时清除对应位，页表修改只向仍 resident 的 hart 发起 shootdown。
     active_cpus: AtomicUsize,
     needs_page_table_fence: AtomicBool,
     needs_asid_fence: AtomicBool,
@@ -245,6 +247,15 @@ unsafe fn inner_ref<'a>(handle: PgdHandle) -> &'a UserPgdInner {
 
 unsafe fn drop_pgd(pgd: PgdHandle) {
     let raw = pgd.as_raw().as_ptr() as *mut UserPgdInner;
+    // VM switch 在释放最后一个 VmSpace 引用前必须让所有 hart 清空当前槽位。
+    // 若该不变量被破坏，CURRENT_USER_PGD 会在下次切换时解引用悬空指针；
+    // 与其静默形成 UAF，不如在页表页回收前立即拒绝。
+    assert!(
+        CURRENT_USER_PGD
+            .iter()
+            .all(|slot| slot.load(Ordering::Acquire) != raw as usize),
+        "[arch][mm] dropping a user PGD still installed on a CPU"
+    );
     let _ = unsafe { Box::from_raw(raw) };
 }
 
@@ -257,17 +268,30 @@ unsafe fn activate(pgd: PgdHandle) {
         .checked_shl(cpu as u32)
         .expect("[arch][mm] logical CPU exceeds active mask width");
     let current = Riscv64Paging::current_satp();
+    let current_slot = &CURRENT_USER_PGD[cpu];
+    let previous = current_slot.load(Ordering::Acquire);
+    if previous != pgd.as_usize() {
+        if previous != 0 {
+            // Safety: the scheduler's VM switch callback clears this CPU's slot
+            // before the previous PGD can be reclaimed.
+            let previous_inner = unsafe { &*(previous as *const UserPgdInner) };
+            previous_inner
+                .active_cpus
+                .fetch_and(!cpu_bit, Ordering::AcqRel);
+        }
+        current_slot.store(pgd.as_usize(), Ordering::Release);
+    }
     let needs_page_table_fence = inner.needs_page_table_fence.load(Ordering::Acquire);
     let needs_asid_fence = inner.needs_asid_fence.load(Ordering::Acquire);
     if current == Riscv64Paging::satp_value(root, asid)
         && !needs_page_table_fence
         && !needs_asid_fence
-        && inner.active_cpus.load(Ordering::Relaxed) & cpu_bit != 0
+        && inner.active_cpus.load(Ordering::Acquire) & cpu_bit != 0
     {
         // 同一 hart 已经安装了完全有效的页表时，跳过活跃位图和两个交换操作。
         return;
     }
-    let first_activation = inner.active_cpus.fetch_or(cpu_bit, Ordering::Relaxed) & cpu_bit == 0;
+    let first_activation = inner.active_cpus.fetch_or(cpu_bit, Ordering::AcqRel) & cpu_bit == 0;
     let needs_page_table_fence = inner.needs_page_table_fence.swap(false, Ordering::Acquire);
     let needs_asid_fence = inner.needs_asid_fence.swap(false, Ordering::Acquire);
     unsafe {
@@ -280,6 +304,32 @@ unsafe fn activate(pgd: PgdHandle) {
     }
 }
 
+/// 清除当前 hart 的用户 PGD 驻留记录。
+///
+/// 内核页表切换既可能通过 `UserPgdOps::activate_kernel` 发生，也可能由
+/// HAL/启动代码直接调用 `heap_vm::activate_kernel_page_table` 发生。两条
+/// 路径都必须先撤销驻留记录，否则最后一个 `VmSpace` 引用释放时会误以为
+/// 其根页表仍在硬件中，或者在下一次用户切换时解引用悬空指针。
+pub(crate) fn deactivate_current_user_pgd() {
+    let cpu = crate::riscv64::specific::current_cpu_id();
+    // 访问 `previous_inner` 期间保持槽位非零。`drop_pgd` 将该槽位作为最后一层
+    // 生命周期保护；若先清槽，远端最后一个 `VmSpace` drop 可能在解引用前回收对象。
+    let previous = CURRENT_USER_PGD[cpu].load(Ordering::Acquire);
+    if previous != 0 {
+        // Safety: callers invoke this at a scheduler/boot boundary with local
+        // interrupts disabled; the slot points to a live PGD until the final
+        // store below publishes the cleared state.
+        let previous_inner = unsafe { &*(previous as *const UserPgdInner) };
+        let cpu_bit = 1usize
+            .checked_shl(cpu as u32)
+            .expect("[arch][mm] logical CPU exceeds active mask width");
+        previous_inner
+            .active_cpus
+            .fetch_and(!cpu_bit, Ordering::AcqRel);
+        CURRENT_USER_PGD[cpu].store(0, Ordering::Release);
+    }
+}
+
 unsafe fn activate_kernel() {
     let root = crate::riscv64::heap_vm::kernel_page_table_root();
     unsafe {
@@ -287,6 +337,8 @@ unsafe fn activate_kernel() {
         // 本地 ASID 0，避免 idle 沿用已经回收的用户 PGD。
         Riscv64Paging::activate_with_asid(PhysPageTableRoot::new(root), 0, false);
     }
+    // 硬件已经离开旧用户根后再清驻留槽，避免并发 drop 在切根窗口回收页表。
+    deactivate_current_user_pgd();
 }
 
 fn allocate_page_table_page() -> Result<usize, general::MapError> {
@@ -415,9 +467,15 @@ unsafe fn publish_new_mapping(pgd: PgdHandle, vaddr: usize, len: usize) {
         .checked_add(len)
         .is_some_and(|end| end.saturating_sub(aligned_start) <= page_size);
     let address = targeted.then(|| VirtAddr::new(aligned_start));
-    // Safety: sfence.vma 同时排序先前 PTE store 并清除本 hart 的旧无效状态；
-    // needs_page_table_fence 保留为 true，使以后首次激活该 PGD 的其它 hart 仍会 fence。
-    unsafe { Riscv64Paging::flush_tlb_local_with_asid(inner.asid(), address) };
+    // 严格的 invalid->valid fresh map 在 Svvptc 上不需要失效旧 TLB 项；
+    // 破坏性更新仍由 invalidate/protect 路径显式 flush。能力只在所有启用 hart
+    // 共同支持时发布，未知或不完整 DTB 默认走保守路径。
+    if !crate::riscv64::loader::has_svvptc() {
+        // Safety: 无 Svvptc 时 sfence.vma 同时排序先前 PTE store 并清除本 hart
+        // 的旧无效状态；needs_page_table_fence 保留为 true，使以后首次激活其它
+        // hart 的 PGD 仍会执行必要的 fence。
+        unsafe { Riscv64Paging::flush_tlb_local_with_asid(inner.asid(), address) };
+    }
 }
 
 unsafe fn unmap_user_pages(pgd: PgdHandle, vaddr: usize, len: usize) {
@@ -543,7 +601,7 @@ unsafe fn clone_for_fork_user_pages(
 
 unsafe fn invalidate_range(pgd: PgdHandle, vaddr: usize, len: usize) {
     let inner = unsafe { inner_ref(pgd) };
-    let active_cpus = inner.active_cpus.load(Ordering::Relaxed);
+    let active_cpus = inner.active_cpus.load(Ordering::Acquire);
     flush_user_tlb_range(inner.asid(), active_cpus, vaddr, len);
     // 本次定向 fence 已覆盖相应页表修改，但不能消费新一代 ASID 的首次激活
     // 标记；后者要求 activate() 在安装该 ASID 时完成一次完整 ASID fence。

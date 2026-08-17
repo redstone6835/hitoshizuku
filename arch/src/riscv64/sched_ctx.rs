@@ -192,14 +192,21 @@ static ARCH_IDLE_OPS: ArchIdleOps = ArchIdleOps {
 
 fn riscv64_idle_relax() {
     unsafe {
-        // idle 线程进入等待窗口前必须临时开本地中断，否则 timer/event 只能
-        // 置 pending，无法真正打断 idle 并唤醒睡眠任务。
-        Riscv64InterruptOps::enable_interrupts();
+        // 检查与 WFI 必须处于同一个 IRQ-off 窗口。若先开中断再检查，IPI
+        // 可能恰好在检查后被处理，返回到下一条 WFI 时已经没有 pending source，
+        // 从而把本应立即运行的任务拖到下一次 timer。
+        Riscv64InterruptOps::disable_interrupts();
         if sched::needs_resched(current_cpu_id()) {
-            Riscv64InterruptOps::disable_interrupts();
             return;
         }
-        core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
+        // 与 Linux cpu_do_idle() 一样，在等待前发布设备/内存写入；否则弱序
+        // hart 可能先观察到 WFI，再延迟看到唤醒源对应的 doorbell/状态更新。
+        core::arch::asm!("fence rw,rw", options(nostack, preserves_flags));
+        core::arch::asm!("wfi", options(nostack, preserves_flags));
+        // WFI 在局部中断源 pending 时返回，即使全局 SIE 关闭；重新打开后，
+        // pending IPI/timer 会立即进入 trap。最后保持 IRQ-off，交还给调度器的
+        // 下一轮安全边界统一处理。
+        Riscv64InterruptOps::enable_interrupts();
         Riscv64InterruptOps::disable_interrupts();
     }
 }
