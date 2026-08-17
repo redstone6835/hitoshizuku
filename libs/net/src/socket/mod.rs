@@ -283,6 +283,14 @@ pub enum SocketCommand {
         options: BindOptions,
         nonblocking: bool,
     },
+    /// TCP Fast Open 主动打开（sendmsg(MSG_FASTOPEN)）：数据已入 stream_tx。
+    ConnectFastopen {
+        facade: Arc<SocketFacade>,
+        sequence: u64,
+        generation: u32,
+        peer: Endpoint,
+        interface: Option<InterfaceId>,
+    },
     Listen {
         facade: Arc<SocketFacade>,
         sequence: u64,
@@ -412,6 +420,43 @@ fn enter_resident_allocation_scope()
     elm_model::enter_current_context(&context)
         .map(Some)
         .ok_or(SocketError::Buffer)
+}
+
+/// INET socket 快照（/proc/net/{tcp,udp} 与观测接口用）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InetSocketSnapshot {
+    pub id: SocketId,
+    pub kind: SocketKind,
+    pub family: AddressFamily,
+    pub local: Option<Endpoint>,
+    pub peer: Option<Endpoint>,
+    /// TCP 状态（仅 Stream；Datagram/Raw 为 0）。
+    pub tcp_state: u8,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+}
+
+/// 遍历全部存活 INET socket，生成观测快照。
+pub fn snapshot_inet_sockets() -> Vec<InetSocketSnapshot> {
+    let registry = SOCKET_REGISTRY.read();
+    let mut out = Vec::with_capacity(registry.len());
+    for entry in registry.iter() {
+        let Some(facade) = entry.upgrade() else {
+            continue;
+        };
+        let info = facade.tcp_info();
+        out.push(InetSocketSnapshot {
+            id: facade.id(),
+            kind: facade.kind(),
+            family: facade.family(),
+            local: facade.local_endpoint(),
+            peer: facade.peer_endpoint(),
+            tcp_state: info.state,
+            bytes_sent: info.bytes_sent,
+            bytes_received: info.bytes_received,
+        });
+    }
+    out
 }
 
 /// 将一个已经交给常驻 host/VFS 的 socket 纳入代际卸载跟踪。
@@ -2667,7 +2712,28 @@ pub struct SocketFacade {
     rx: Mutex<Option<DatagramRx>>,
     stream_tx: Mutex<StreamTxRing>,
     stream_rx: Mutex<StreamRxRing>,
+    /// SO_OOBINLINE：紧急字节保留在普通字节流中（Linux tcp_urg 语义）。
+    oob_inline: AtomicBool,
+    /// 紧急字节的副本：非内联模式为从流中剔除的字节；内联模式为流内字节的镜像。
+    oob_byte: Mutex<Option<u8>>,
+    /// 当前紧急字节在接收流中的偏移（相对首个流字节）。
+    oob_seq: Mutex<Option<u64>>,
+    /// 存在可供 recv(MSG_OOB) 读取的紧急数据。
+    oob_pending: AtomicBool,
+    /// 非内联模式下紧急字节已先于 URG 标记进入流：普通读需要跳过该字节。
+    oob_skip: AtomicBool,
+    /// 接收流首个字节的绝对 TCP 序列号（由引擎在流建立时设置）。
+    stream_base_seq: Mutex<Option<u32>>,
+    /// 已推入接收流的字节总数。
+    stream_pushed: AtomicU64,
+    /// 已被用户消费的流字节数。
+    stream_consumed: AtomicU64,
+    /// F_SETOWN 注册的紧急数据信号接收者（owner_type, owner_pid）。
+    urgent_owner: Mutex<Option<(i32, i32)>>,
+    /// 发送侧待发出的紧急字节（drain_send 据此加 URG 标志）。
+    urgent_tx_pending: AtomicBool,
     listen_group: Mutex<Option<Arc<ListenGroup>>>,
+
     readiness: AtomicU16,
     readiness_generation: AtomicU64,
     observer: Mutex<Option<Arc<dyn ReadinessObserver>>>,
@@ -2732,6 +2798,15 @@ pub struct SocketFacade {
     v6_only: AtomicBool,
     ip_hop_limit: AtomicU16,
     ip_traffic_class: AtomicU16,
+    /// IP_OPTIONS：随发出的 IPv4 头携带的选项。
+    ip_options: Mutex<crate::ip_options::IpOptions>,
+    /// TCP Fast Open：客户端缓存的 cookie（从 SYN-ACK 学习，后续连接复用）。
+    tfo_cookie: Mutex<Option<[u8; 8]>>,
+    /// TCP_FASTOPEN_CONNECT：connect() 时携带缓存的 TFO cookie。
+    tfo_connect_enabled: AtomicBool,
+    /// ICMP6_FILTER：原始 ICMPv6 socket 的类型位图（RFC 3542 §3）。
+    icmp6_filter: Mutex<Option<[u32; 8]>>,
+    ipv6_checksum_offset: Mutex<Option<u16>>,
     multicast_memberships: Mutex<Vec<MulticastMembership>>,
     multicast_interface: AtomicU32,
     multicast_hops: AtomicU16,
@@ -2823,7 +2898,18 @@ impl SocketFacade {
             rx: Mutex::new((kind != SocketKind::Stream).then(DatagramRx::new)),
             stream_tx: Mutex::new(StreamTxRing::new()),
             stream_rx: Mutex::new(StreamRxRing::new()),
+            oob_inline: AtomicBool::new(false),
+            oob_byte: Mutex::new(None),
+            oob_seq: Mutex::new(None),
+            oob_pending: AtomicBool::new(false),
+            oob_skip: AtomicBool::new(false),
+            stream_base_seq: Mutex::new(None),
+            stream_pushed: AtomicU64::new(0),
+            stream_consumed: AtomicU64::new(0),
+            urgent_owner: Mutex::new(None),
+            urgent_tx_pending: AtomicBool::new(false),
             listen_group: Mutex::new(None),
+
             readiness: AtomicU16::new(if kind != SocketKind::Stream {
                 Readiness::WRITABLE.0
             } else {
@@ -2892,6 +2978,11 @@ impl SocketFacade {
             v6_only: AtomicBool::new(false),
             ip_hop_limit: AtomicU16::new(64),
             ip_traffic_class: AtomicU16::new(0),
+            ip_options: Mutex::new(crate::ip_options::IpOptions::empty()),
+            tfo_cookie: Mutex::new(None),
+            tfo_connect_enabled: AtomicBool::new(false),
+            icmp6_filter: Mutex::new(None),
+            ipv6_checksum_offset: Mutex::new(None),
             multicast_memberships: Mutex::new(Vec::new()),
             multicast_interface: AtomicU32::new(0),
             multicast_hops: AtomicU16::new(1),
@@ -2986,6 +3077,94 @@ impl SocketFacade {
     pub fn set_ip_traffic_class(&self, value: u8) {
         self.ip_traffic_class
             .store(u16::from(value), Ordering::Release);
+    }
+
+    /// setsockopt(IP_OPTIONS)：设置随 IPv4 头携带的选项（已校验的规范化形式）。
+    pub fn set_ip_options(&self, options: crate::ip_options::IpOptions) {
+        *self.ip_options.lock() = options;
+    }
+
+    pub fn ip_options(&self) -> crate::ip_options::IpOptions {
+        *self.ip_options.lock()
+    }
+
+    /// IP 选项的 4 字节对齐长度（MSS 计算用）。
+    pub fn ip_options_wire_len(&self) -> u8 {
+        self.ip_options.lock().wire_len() as u8
+    }
+
+    /// TCP Fast Open：客户端缓存 cookie（引擎从 SYN-ACK 学习后写入）。
+    pub fn set_tfo_cookie(&self, cookie: [u8; 8]) {
+        *self.tfo_cookie.lock() = Some(cookie);
+    }
+
+    pub fn tfo_cookie(&self) -> Option<[u8; 8]> {
+        *self.tfo_cookie.lock()
+    }
+
+    pub fn stream_connected(&self) -> bool {
+        self.stream_connected.load(Ordering::Acquire)
+    }
+
+    /// ICMP6_FILTER：设置原始 ICMPv6 socket 的类型位图（RFC 3542 §3）。
+    pub fn set_icmp6_filter(&self, filter: [u32; 8]) {
+        *self.icmp6_filter.lock() = Some(filter);
+    }
+
+    /// SOL_RAW IPV6_CHECKSUM：IPv6 raw 发送时由内核计算校验和的偏移（None = 关闭）。
+    pub fn set_ipv6_checksum_offset(&self, offset: Option<u16>) {
+        *self.ipv6_checksum_offset.lock() = offset;
+    }
+
+    pub fn ipv6_checksum_offset(&self) -> Option<u16> {
+        *self.ipv6_checksum_offset.lock()
+    }
+
+    pub fn icmp6_filter(&self) -> Option<[u32; 8]> {
+        *self.icmp6_filter.lock()
+    }
+
+    /// 原始 ICMPv6 递送前按类型位图过滤（未设置过滤器或非 ICMPv6 包不拦截）。
+    ///
+    /// RFC 3542 §3.1 / glibc netinet/icmp6.h 语义：位 = 1 表示**阻止**该消息类型，
+    /// 位 = 0 表示放行（ICMP6_FILTER_SETPASS 清位、SETBLOCK 置位）。
+    pub fn icmp6_filter_rejects(&self, packet: &crate::pipeline::FrontendPacket) -> bool {
+        let guard = self.icmp6_filter.lock();
+        let Some(filter) = guard.as_ref() else {
+            return false;
+        };
+        let Some(ip) = packet.parsed.ip else {
+            return false;
+        };
+        if ip.next_header != 58 {
+            return false;
+        }
+        let mut type_byte = [0u8; 1];
+        if packet
+            .chain
+            .copy_out(usize::from(ip.payload_offset), &mut type_byte)
+            .is_err()
+        {
+            return false;
+        }
+        let kind = usize::from(type_byte[0]);
+        filter[kind / 32] & (1 << (kind % 32)) != 0
+    }
+
+    /// TCP_FASTOPEN_CONNECT：后续 connect() 携带缓存的 cookie。
+    pub fn set_tfo_connect_enabled(&self, enabled: bool) {
+        self.tfo_connect_enabled.store(enabled, Ordering::Release);
+    }
+
+    pub fn tfo_connect_enabled(&self) -> bool {
+        self.tfo_connect_enabled.load(Ordering::Acquire)
+    }
+
+    /// TCP_FASTOPEN（监听端）：启用/关闭监听组的 TFO 接受。
+    pub fn set_listener_tfo_enabled(&self, enabled: bool) {
+        if let Some(group) = self.listen_group.lock().as_ref() {
+            group.set_tfo_enabled(enabled);
+        }
     }
 
     pub fn add_multicast_membership(
@@ -3315,14 +3494,27 @@ impl SocketFacade {
             return Err(error);
         }
         let sequence = self.next_control_sequence();
-        let command = SocketCommand::Connect {
-            facade: Arc::clone(self),
-            sequence,
-            generation: self.generation(),
-            peer,
-            interface,
-            options,
-            nonblocking,
+        // TCP_FASTOPEN_CONNECT：connect() 携带缓存的 TFO cookie（SYN 带 cookie）。
+        let fastopen_connect =
+            self.kind == SocketKind::Stream && self.tfo_connect_enabled.load(Ordering::Acquire);
+        let command = if fastopen_connect {
+            SocketCommand::ConnectFastopen {
+                facade: Arc::clone(self),
+                sequence,
+                generation: self.generation(),
+                peer,
+                interface,
+            }
+        } else {
+            SocketCommand::Connect {
+                facade: Arc::clone(self),
+                sequence,
+                generation: self.generation(),
+                peer,
+                interface,
+                options,
+                nonblocking,
+            }
         };
         if socket_runtime()?.submit_control(command).is_err() {
             self.connect_pending.store(false, Ordering::Release);
@@ -4336,6 +4528,150 @@ impl SocketFacade {
         }
     }
 
+    /// sendmsg(MSG_FASTOPEN)：TCP Fast Open 客户端发送。
+    ///
+    /// - 已连接：退化为普通发送。
+    /// - 未连接且缓存了 cookie：数据推入 stream_tx，SYN 携带 cookie + 数据
+    ///   一次发出，返回已接受字节数。
+    /// - 未连接且无 cookie：数据排队，返回 EINPROGRESS（Linux 语义，SYN 不
+    ///   带数据，握手完成后按普通数据发送）。
+    pub fn send_fastopen(
+        self: &Arc<Self>,
+        data: &[u8],
+        peer: Endpoint,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<usize, SocketError> {
+        self.ensure_stack_attached()?;
+        if self.kind != SocketKind::Stream {
+            return Err(SocketError::InvalidState);
+        }
+        if data.is_empty() {
+            return Err(SocketError::InvalidState);
+        }
+        if self.stream_connected.load(Ordering::Acquire) {
+            // 已连接：MSG_FASTOPEN 退化为普通发送。
+            return self.send_stream(data, nonblocking, deadline_ns, false);
+        }
+        if self.closing.load(Ordering::Acquire) {
+            return Err(SocketError::Closed);
+        }
+        // 数据必须先进入 stream_tx：引擎在 SYN 排队时按 cookie 决定是否随 SYN 发出。
+        let mut accepted = 0usize;
+        loop {
+            if let Some(error) = self.backend_error() {
+                return Err(error);
+            }
+            let copied =
+                self.stream_tx
+                    .lock()
+                    .push_with(data.len() - accepted, &mut |offset, output| {
+                        output.copy_from_slice(
+                            &data[accepted + offset..accepted + offset + output.len()],
+                        );
+                    });
+            if copied != 0 {
+                accepted += copied;
+                if accepted == data.len() {
+                    break;
+                }
+            }
+            if nonblocking {
+                return if accepted == 0 {
+                    Err(SocketError::WouldBlock)
+                } else {
+                    Err(SocketError::InProgress)
+                };
+            }
+            if let Err(error) = self.wait_write(deadline_ns) {
+                return if accepted == 0 {
+                    Err(error)
+                } else {
+                    Ok(accepted)
+                };
+            }
+        }
+        let _control = self.control_lock.lock();
+        if self.connect_pending.swap(true, Ordering::AcqRel) {
+            return Err(SocketError::AlreadyInProgress);
+        }
+        let sequence = self.next_control_sequence();
+        let command = SocketCommand::ConnectFastopen {
+            facade: Arc::clone(self),
+            sequence,
+            generation: self.generation(),
+            peer,
+            interface: None,
+        };
+        if socket_runtime()?.submit_control(command).is_err() {
+            self.connect_pending.store(false, Ordering::Release);
+            return Err(SocketError::RuntimeBusy);
+        }
+        let result = self.wait_control(sequence);
+        self.connect_pending.store(false, Ordering::Release);
+        result?;
+        // 无缓存 cookie：数据已排队，Linux 返回 EINPROGRESS。
+        if self.tfo_cookie().is_none() {
+            return Err(SocketError::InProgress);
+        }
+        Ok(accepted)
+    }
+
+    /// send(MSG_OOB)：把单字节作为紧急数据发送（Linux 语义：只发送缓冲
+    /// 的最后一个字节，返回值 1）。
+    ///
+    /// 紧急字节必须由引擎以带 URG 标志与紧急指针的段发出，因此先拆除本地
+    /// 直连路由，避免字节绕过引擎被直接投递。
+    pub fn send_urgent(
+        self: &Arc<Self>,
+        byte: u8,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<usize, SocketError> {
+        self.ensure_stack_attached()?;
+        if self.kind != SocketKind::Stream {
+            return Err(SocketError::InvalidState);
+        }
+        if self.closing.load(Ordering::Acquire) {
+            return Err(SocketError::Closed);
+        }
+        if self.write_shutdown.load(Ordering::Acquire) {
+            return Err(SocketError::WriteShutdown);
+        }
+        let owner = self.owner();
+        if !matches!(owner, OwnerRef::Flow { .. }) || !self.stream_connected.load(Ordering::Acquire)
+        {
+            return if matches!(owner, OwnerRef::Closed { .. }) && self.peer_endpoint().is_some() {
+                Err(SocketError::WriteShutdown)
+            } else {
+                Err(SocketError::NotConnected)
+            };
+        }
+        self.clear_local_tcp_direct_route();
+        let accepted = loop {
+            if let Some(error) = self.backend_error() {
+                break Err(error);
+            }
+            let copied = self
+                .stream_tx
+                .lock()
+                .push_with(1, &mut |_, output| output[0] = byte);
+            if copied != 0 {
+                break Ok(1usize);
+            }
+            if nonblocking {
+                break Err(SocketError::WouldBlock);
+            }
+            if let Err(error) = self.wait_write(deadline_ns) {
+                break Err(error);
+            }
+        }?;
+        self.urgent_tx_pending.store(true, Ordering::Release);
+        self.tx_generation.fetch_add(1, Ordering::Release);
+        let _ = self.publish_stream_pending();
+        Ok(accepted)
+    }
+
     fn send_stream_buffered_from(
         self: &Arc<Self>,
         payload_len: usize,
@@ -4845,6 +5181,7 @@ impl SocketFacade {
     ) {
         self.tcp_bytes_received
             .fetch_add(len as u64, Ordering::Relaxed);
+        self.stream_pushed.fetch_add(len as u64, Ordering::Relaxed);
         #[cfg(feature = "performance-profile")]
         profiling::observe(profiling::Metric::TcpBytesReceived, len as u64);
         if was_empty && len != 0 {
@@ -4878,6 +5215,206 @@ impl SocketFacade {
         self.state_wait.wake_all();
     }
 
+    // ── 紧急数据（MSG_OOB / SO_OOBINLINE / SIGURG）──────────────────────────
+
+    pub fn set_oob_inline(&self, inline: bool) {
+        self.oob_inline.store(inline, Ordering::Release);
+    }
+
+    pub fn oob_inline(&self) -> bool {
+        self.oob_inline.load(Ordering::Acquire)
+    }
+
+    /// F_SETOWN 注册的紧急数据信号接收者（owner_type, owner_pid）。
+    pub fn set_urgent_owner(&self, owner_type: i32, owner_pid: i32) {
+        *self.urgent_owner.lock() = Some((owner_type, owner_pid));
+    }
+
+    /// 是否存在尚未读取的紧急数据（recv(MSG_OOB) 可立即返回）。
+    pub fn oob_pending(&self) -> bool {
+        self.oob_pending.load(Ordering::Acquire)
+    }
+
+    /// SIOCATMARK：读指针是否正位于 OOB 标记处。
+    pub fn at_oob_mark(&self) -> bool {
+        let Some(offset) = *self.oob_seq.lock() else {
+            return false;
+        };
+        self.oob_pending.load(Ordering::Acquire)
+            && self.stream_consumed.load(Ordering::Acquire) == offset
+    }
+
+    /// 引擎在流建立时记录首个流字节的绝对序列号（仅记录一次）。
+    pub(crate) fn set_stream_base_seq(&self, seq: u32) {
+        let mut base = self.stream_base_seq.lock();
+        if base.is_none() {
+            *base = Some(seq);
+        }
+    }
+
+    /// URG 标记到达：记录紧急字节位置、唤醒读取者并触发 SIGURG。
+    ///
+    /// `byte_abs_seq` 是紧急字节的绝对序列号（非内联 = seq + ptr - 1，
+    /// 内联 = seq + ptr，对应 Linux tcp_check_urg 的 ptr 折算）。字节本身由
+    /// 递送路径经 [`SocketFacade::stash_oob_byte`] 填充；若字节已先进入流
+    /// （迟到的标记），这里直接从流中取回副本并让普通读跳过它。
+    pub(crate) fn mark_urgent(&self, byte_abs_seq: u32) {
+        let Some(base) = *self.stream_base_seq.lock() else {
+            return;
+        };
+        let offset = u64::from(byte_abs_seq.wrapping_sub(base));
+        let pushed = self.stream_pushed.load(Ordering::Acquire);
+        let consumed = self.stream_consumed.load(Ordering::Acquire);
+        if offset < consumed {
+            // 紧急字节已被用户读取：忽略迟到的标记（对应 Linux after(copied_seq, ptr)）。
+            self.oob_pending.store(false, Ordering::Release);
+            *self.oob_byte.lock() = None;
+            return;
+        }
+        *self.oob_seq.lock() = Some(offset);
+        if self.oob_inline() {
+            // 内联模式：字节留在流中，oob_byte 只作 MSG_OOB 读取的镜像。
+            self.oob_pending.store(true, Ordering::Release);
+        } else if offset < pushed {
+            // 非内联且字节已进入流（标记迟到）：取回副本，普通读跳过该字节。
+            let byte = self.peek_stream_byte(offset);
+            *self.oob_byte.lock() = byte;
+            self.oob_skip.store(true, Ordering::Release);
+            self.oob_pending.store(byte.is_some(), Ordering::Release);
+        } else {
+            // 字节尚未递送：递送路径负责剔除并填充副本。
+            *self.oob_byte.lock() = None;
+            self.oob_pending.store(false, Ordering::Release);
+        }
+        self.read_wait.wake_one_default();
+        self.notify_urgent_signal();
+    }
+
+    /// 递送路径填充紧急字节：非内联时该字节已从流中剔除；内联时字节留在流中，
+    /// 此处只保存镜像。
+    pub(crate) fn stash_oob_byte(&self, byte: u8, byte_abs_seq: u32) {
+        let Some(base) = *self.stream_base_seq.lock() else {
+            return;
+        };
+        let offset = u64::from(byte_abs_seq.wrapping_sub(base));
+        *self.oob_seq.lock() = Some(offset);
+        *self.oob_byte.lock() = Some(byte);
+        self.oob_skip.store(false, Ordering::Release);
+        self.oob_pending.store(true, Ordering::Release);
+        self.read_wait.wake_one_default();
+        self.notify_urgent_signal();
+    }
+
+    /// 从流中按流偏移读取一个字节（迟到标记恢复紧急字节用）。
+    fn peek_stream_byte(&self, offset: u64) -> Option<u8> {
+        let consumed = self.stream_consumed.load(Ordering::Acquire);
+        if offset < consumed {
+            return None;
+        }
+        let rx = self.stream_rx.lock();
+        let mut byte = [0u8; 1];
+        rx.bytes
+            .copy_range_with((offset - consumed) as usize, 1, &mut |_, input| {
+                byte[..input.len()].copy_from_slice(input);
+            })
+            .then_some(byte[0])
+    }
+
+    /// 向 F_SETOWN 注册的接收者投递 SIGURG（尽力而为，对应 kill_fasync）。
+    fn notify_urgent_signal(&self) {
+        let Some((owner_type, owner_pid)) = *self.urgent_owner.lock() else {
+            return;
+        };
+        // 宿主测试等尚无调度运行时的环境不投递信号。
+        if sched::try_current_task_ref().is_none() {
+            return;
+        }
+        // kernel fs.rs 的 F_OWNER_PGRP = 2：进程组接收者按 kill(-pgid) 投递。
+        let pid = if owner_type == 2 {
+            -owner_pid
+        } else {
+            owner_pid
+        };
+        let _ = sched::operation::kill(pid, Some(sched::SignalNumber::SIGURG));
+    }
+
+    /// 取走/窥视紧急字节（recv(MSG_OOB) 内部）。
+    ///
+    /// 非内联：返回并移除缓存（peek 不移除）；内联：返回镜像副本，字节始终
+    /// 留在流中，仅当流消费越过其位置后失效。
+    fn take_oob_byte(&self, peek: bool) -> Option<u8> {
+        if !self.oob_pending.load(Ordering::Acquire) {
+            return None;
+        }
+        if self.oob_inline() {
+            let Some(offset) = *self.oob_seq.lock() else {
+                return None;
+            };
+            if self.stream_consumed.load(Ordering::Acquire) >= offset {
+                return None;
+            }
+            return *self.oob_byte.lock();
+        }
+        if peek {
+            return *self.oob_byte.lock();
+        }
+        let byte = self.oob_byte.lock().take();
+        self.oob_pending.store(false, Ordering::Release);
+        self.oob_skip.store(false, Ordering::Release);
+        byte
+    }
+
+    /// recv(MSG_OOB)：读取紧急字节（单字节）。
+    ///
+    /// Linux 语义：非内联且紧急数据未到达时阻塞等待；内联模式或非阻塞且
+    /// 无可用紧急数据时返回 EINVAL（映射为 InvalidState）。
+    pub fn recv_oob(
+        self: &Arc<Self>,
+        peek: bool,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<u8, SocketError> {
+        self.ensure_stack_attached()?;
+        if self.kind != SocketKind::Stream {
+            return Err(SocketError::InvalidState);
+        }
+        loop {
+            if let Some(error) = self.backend_error() {
+                return Err(error);
+            }
+            if let Some(byte) = self.take_oob_byte(peek) {
+                return Ok(byte);
+            }
+            let pending = self.oob_pending.load(Ordering::Acquire);
+            let stashed = self.oob_byte.lock().is_some();
+            if self.oob_inline() {
+                // Linux：内联模式没有可用紧急数据时立即 EINVAL，不阻塞等待；
+                // 仅当标记已到而字节尚未落位（同一 worker turn 内马上补齐）时等待。
+                if !pending || stashed || nonblocking {
+                    return Err(SocketError::InvalidState);
+                }
+            } else if nonblocking {
+                return Err(SocketError::InvalidState);
+            }
+            if self.read_shutdown.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
+                return Err(SocketError::Closed);
+            }
+            // 阻塞等待紧急数据到达（mark_urgent / stash_oob_byte 唤醒 read_wait）。
+            self.wait_io_until(&self.read_wait, deadline_ns, |facade| {
+                let (current, _) = facade.readiness();
+                socket_wait_terminal(current) || facade.oob_pending()
+            })?;
+        }
+    }
+
+    /// 发送侧待发紧急字节的标记（drain_send 据此设置 URG + 紧急指针）。
+    pub(crate) fn urgent_tx_pending(&self) -> bool {
+        self.urgent_tx_pending.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn clear_urgent_tx_pending(&self) {
+        self.urgent_tx_pending.store(false, Ordering::Release);
+    }
     pub fn recv_stream(
         self: &Arc<Self>,
         output: &mut [u8],
@@ -4922,16 +5459,54 @@ impl SocketFacade {
             }
             let (copied, eof) = {
                 let mut rx = self.stream_rx.lock();
-                let copied = (output_len - total).min(rx.bytes.len);
-                if copied != 0
-                    && !rx.bytes.copy_range_with(0, copied, &mut |offset, input| {
-                        copy(total + offset, input);
-                    })
-                {
-                    return Err(SocketError::Buffer);
-                }
+                let want = (output_len - total).min(rx.bytes.len);
+                // 非内联模式下紧急字节已先于 URG 标记进入流（迟到标记）：普通读
+                // 必须跳过该字节，语义等同 Linux tcp_recvmsg 对 urg_seq 的剔除。
+                let consumed_before = self.stream_consumed.load(Ordering::Acquire);
+                let skip = self.oob_skip.load(Ordering::Acquire)
+                    && !self.oob_inline()
+                    && self.oob_seq.lock().is_some_and(|offset| {
+                        offset >= consumed_before && ((offset - consumed_before) as usize) < want
+                    });
+                let (copied, consumed) = if skip {
+                    let offset = self.oob_seq.lock().expect("skip 前置检查已确认位置") as usize;
+                    // 环内偏移相对未消费区起点。
+                    let relative = offset - consumed_before as usize;
+                    if relative != 0
+                        && !rx.bytes.copy_range_with(0, relative, &mut |at, input| {
+                            copy(total + at, input);
+                        })
+                    {
+                        return Err(SocketError::Buffer);
+                    }
+                    let tail = want - relative - 1;
+                    if tail != 0
+                        && !rx
+                            .bytes
+                            .copy_range_with(relative + 1, tail, &mut |at, input| {
+                                copy(total + at - relative - 1, input);
+                            })
+                    {
+                        return Err(SocketError::Buffer);
+                    }
+                    // 读指针越过紧急位置：紧急数据失效（Linux after(copied_seq, urg_seq)）。
+                    self.oob_pending.store(false, Ordering::Release);
+                    self.oob_skip.store(false, Ordering::Release);
+                    (relative + tail, want)
+                } else {
+                    if want != 0
+                        && !rx.bytes.copy_range_with(0, want, &mut |at, input| {
+                            copy(total + at, input);
+                        })
+                    {
+                        return Err(SocketError::Buffer);
+                    }
+                    (want, want)
+                };
                 if copied != 0 && !peek {
-                    rx.bytes.consume(copied);
+                    rx.bytes.consume(consumed);
+                    self.stream_consumed
+                        .fetch_add(consumed as u64, Ordering::Relaxed);
                 }
                 (copied, rx.eof)
             };
@@ -5479,9 +6054,15 @@ impl SocketFacade {
                     let rx = rx.as_mut().expect("UDP facade 必须拥有 RX ring");
                     while rx.pop().is_some() {}
                 }
-                SocketKind::Stream => self.stream_rx.lock().bytes.clear(),
+                SocketKind::Stream => {
+                    self.stream_rx.lock().bytes.clear();
+                    // 读侧关闭后紧急数据一并失效。
+                    self.oob_pending.store(false, Ordering::Release);
+                    self.oob_skip.store(false, Ordering::Release);
+                    *self.oob_byte.lock() = None;
+                    *self.oob_seq.lock() = None;
+                }
             }
-            self.clear_ready(Readiness::READABLE);
             self.set_ready(Readiness::READ_HANGUP);
         }
         if write {

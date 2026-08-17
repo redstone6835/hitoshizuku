@@ -465,6 +465,107 @@ impl NetSocketProxy {
         )
     }
 
+    pub fn send_urgent(
+        &self,
+        byte: u8,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<usize, SocketError> {
+        self.ensure_backend()?;
+        self.facade.send_urgent(byte, nonblocking, deadline_ns)
+    }
+
+    pub fn recv_oob(
+        &self,
+        peek: bool,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<u8, SocketError> {
+        self.ensure_backend()?;
+        self.facade.recv_oob(peek, nonblocking, deadline_ns)
+    }
+
+    pub fn set_oob_inline(&self, inline: bool) {
+        self.facade.set_oob_inline(inline);
+    }
+
+    pub fn oob_inline(&self) -> bool {
+        self.facade.oob_inline()
+    }
+
+    /// F_SETOWN：注册紧急数据（SIGURG）接收者。
+    pub fn set_urgent_owner(&self, owner_type: i32, owner_pid: i32) {
+        self.facade.set_urgent_owner(owner_type, owner_pid);
+    }
+
+    /// SIOCATMARK：读指针是否位于 OOB 标记处。
+    pub fn at_oob_mark(&self) -> bool {
+        self.facade.at_oob_mark()
+    }
+
+    /// 是否存在未读取的紧急数据。
+    pub fn oob_pending(&self) -> bool {
+        self.facade.oob_pending()
+    }
+
+    /// setsockopt(IP_OPTIONS)。
+    pub fn set_ip_options(&self, options: crate::ip_options::IpOptions) {
+        self.facade.set_ip_options(options);
+    }
+
+    pub fn ip_options(&self) -> crate::ip_options::IpOptions {
+        self.facade.ip_options()
+    }
+
+    /// sendmsg(MSG_FASTOPEN)：TCP Fast Open 客户端发送。
+    pub fn send_fastopen(
+        &self,
+        data: &[u8],
+        peer: Endpoint,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<usize, SocketError> {
+        self.ensure_backend()?;
+        self.facade
+            .send_fastopen(data, peer, nonblocking, deadline_ns)
+    }
+
+    /// TCP_FASTOPEN（监听端）：启用/关闭 TFO 接受。
+    pub fn set_listener_tfo_enabled(&self, enabled: bool) {
+        self.facade.set_listener_tfo_enabled(enabled);
+    }
+
+    /// TCP_FASTOPEN_CONNECT：后续 connect() 携带缓存的 cookie。
+    pub fn set_tfo_connect_enabled(&self, enabled: bool) {
+        self.facade.set_tfo_connect_enabled(enabled);
+    }
+
+    pub fn tfo_connect_enabled(&self) -> bool {
+        self.facade.tfo_connect_enabled()
+    }
+
+    /// 客户端缓存的 TFO cookie。
+    pub fn tfo_cookie(&self) -> Option<[u8; 8]> {
+        self.facade.tfo_cookie()
+    }
+
+    /// ICMP6_FILTER（RFC 3542 §3）。
+    pub fn set_icmp6_filter(&self, filter: [u32; 8]) {
+        self.facade.set_icmp6_filter(filter);
+    }
+
+    pub fn icmp6_filter(&self) -> Option<[u32; 8]> {
+        self.facade.icmp6_filter()
+    }
+
+    pub fn set_ipv6_checksum_offset(&self, offset: Option<u16>) {
+        self.facade.set_ipv6_checksum_offset(offset);
+    }
+
+    pub fn ipv6_checksum_offset(&self) -> Option<u16> {
+        self.facade.ipv6_checksum_offset()
+    }
+
     pub fn recv_stream_to(
         &self,
         output_len: usize,
@@ -500,6 +601,11 @@ impl NetSocketProxy {
             self.facade.close();
         }
         self.state.detach();
+    }
+
+    /// TCP 流是否已建立（MSG_FASTOPEN 已连接退化的判断）。
+    pub fn stream_connected(&self) -> bool {
+        self.facade.stream_connected()
     }
 
     pub fn owner(&self) -> OwnerRef {

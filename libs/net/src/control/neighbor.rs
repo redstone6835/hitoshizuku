@@ -1,8 +1,59 @@
+use alloc::vec;
+use alloc::vec::Vec;
 use hashbrown::HashTable;
+use spin::Mutex;
 
 use crate::{InterfaceId, IpAddr};
 
 const MAX_NEIGHBORS: usize = 512;
+
+/// 邻居镜像表条目（跨 shard 聚合快照，供 netlink/procfs 观测）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NeighborSnapshotEntry {
+    pub interface: InterfaceId,
+    pub address: IpAddr,
+    pub mac: [u8; 6],
+    /// NUD 状态位：REACHABLE=0x02 / STALE=0x04。
+    pub nud_state: u16,
+}
+
+/// 全局邻居镜像：observe/confirm/invalidate 时与 per-shard 表双写。
+/// 只服务于观测接口（RTM_GETNEIGH、/proc/net/arp），不做转发决策。
+static NEIGHBOR_MIRROR: Mutex<Vec<NeighborSnapshotEntry>> = Mutex::new(Vec::new());
+
+/// 返回全部 shard 的邻居镜像快照。
+pub fn neighbor_snapshot() -> Vec<NeighborSnapshotEntry> {
+    NEIGHBOR_MIRROR.lock().clone()
+}
+
+fn mirror_observe(
+    key: NeighborKey,
+    mac_address: [u8; 6],
+    now_ns: u64,
+    reachable: bool,
+) {
+    let mut mirror = NEIGHBOR_MIRROR.lock();
+    let entry = NeighborSnapshotEntry {
+        interface: key.interface,
+        address: key.address,
+        mac: mac_address,
+        nud_state: if reachable { 0x02 } else { 0x04 },
+    };
+    if let Some(existing) = mirror
+        .iter_mut()
+        .find(|candidate| candidate.interface == key.interface && candidate.address == key.address)
+    {
+        *existing = entry;
+        return;
+    }
+    mirror.push(entry);
+}
+
+fn mirror_remove(interface: InterfaceId) {
+    NEIGHBOR_MIRROR
+        .lock()
+        .retain(|entry| entry.interface != interface);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NeighborKey {
@@ -54,6 +105,7 @@ impl NeighborTable {
             entry.mac_address = mac_address;
             entry.reachable_until_ns = now_ns.saturating_add(30_000_000_000);
             entry.stale_until_ns = now_ns.saturating_add(90_000_000_000);
+            mirror_observe(key, mac_address, now_ns, true);
             return Ok(entry.generation);
         }
         if self.entries.len() == MAX_NEIGHBORS {
@@ -73,6 +125,7 @@ impl NeighborTable {
             },
             |entry| entry.hash,
         );
+        mirror_observe(key, mac_address, now_ns, true);
         Ok(generation)
     }
 
@@ -100,6 +153,7 @@ impl NeighborTable {
         }
         entry.reachable_until_ns = now_ns.saturating_add(30_000_000_000);
         entry.stale_until_ns = now_ns.saturating_add(90_000_000_000);
+        mirror_observe(key, entry.mac_address, now_ns, true);
         true
     }
 
@@ -107,6 +161,7 @@ impl NeighborTable {
         let before = self.entries.len();
         self.entries
             .retain(|entry| entry.key.interface != interface);
+        mirror_remove(interface);
         before - self.entries.len()
     }
 }
