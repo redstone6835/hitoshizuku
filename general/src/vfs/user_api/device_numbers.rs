@@ -251,11 +251,7 @@ pub const PTY_MAJOR: u32 = 136;
 const PTY_MAJOR_NAME: &str = "pts";
 
 fn next_pty_minor(registry: &DeviceNumberRegistry) -> Option<u32> {
-    if let Some(&(_, minor)) = registry
-        .freed
-        .iter()
-        .find(|(major, _)| *major == PTY_MAJOR)
-    {
+    if let Some(&(_, minor)) = registry.freed.iter().find(|(major, _)| *major == PTY_MAJOR) {
         return Some(minor);
     }
     let mut minor = 0u32;
@@ -283,8 +279,7 @@ pub fn register_pty(index: u32) -> Option<DevId> {
         .iter()
         .find(|record| record.node_name == node_name)
     {
-        return (record.kind == DeviceNumberKind::Char
-            && record.rdev.major == PTY_MAJOR)
+        return (record.kind == DeviceNumberKind::Char && record.rdev.major == PTY_MAJOR)
             .then_some(record.rdev);
     }
     let minor = next_pty_minor(&registry)?;
@@ -401,9 +396,11 @@ fn next_private_rdev(registry: &DeviceNumberRegistry, kind: DeviceNumberKind) ->
         DeviceNumberKind::Char => registry.next_char_private,
         DeviceNumberKind::Block => registry.next_block_private,
     }?;
-    if let Some(&(major, minor)) = registry.freed.iter().find(|(major, _)| {
-        *major >= PRIVATE_DYNAMIC_MAJOR_START
-    }) {
+    if let Some(&(major, minor)) = registry
+        .freed
+        .iter()
+        .find(|(major, _)| *major >= PRIVATE_DYNAMIC_MAJOR_START)
+    {
         return Some(DevId::new(major, minor));
     }
     Some(DevId::new(cursor.major, cursor.minor))
@@ -480,7 +477,9 @@ pub fn unregister_node(node_name: &str) {
             && policy.rdev() == record.rdev
     });
     if !is_well_known {
-        registry.freed.insert((record.rdev.major, record.rdev.minor));
+        registry
+            .freed
+            .insert((record.rdev.major, record.rdev.minor));
     }
 }
 

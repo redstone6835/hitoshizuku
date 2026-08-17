@@ -19,8 +19,13 @@ use sched::{WaitQueue, WaitReason};
 use smallvec::SmallVec;
 
 use crate::mm::fault::{FaultKind, FaultOutcome, KernelFaultReason};
+use crate::mm::memstat;
 use crate::mm::ops::{PgdHandle, UserPteUpdate, UserVmLayoutOps, user_pgd_ops, user_vm_layout};
 use crate::mm::resident_map::RadixPageMap;
+use crate::mm::uffd::{
+    UFFD_PAGEFAULT_FLAG_WP, UFFD_PAGEFAULT_FLAG_WRITE, UFFDIO_REGISTER_MODE_MISSING,
+    UFFDIO_REGISTER_MODE_WP, UffdRegion, UffdState,
+};
 
 /// 顺序只读文件缺页一次最多预装的页数（包含硬件实际命中的页）。
 ///
@@ -72,6 +77,27 @@ struct FileFaultAroundWindow {
     start: usize,
     end: usize,
     file_offset: u64,
+}
+
+/// NUMA 内存策略（单节点语义）。
+///
+/// 目标架构当前只有 node 0，因此策略只记录"模式 + 节点掩码"，不参与页分配。
+/// 模式取值与 Linux `MPOL_*` 一致：DEFAULT=0、PREFERRED=1、BIND=2、
+/// INTERLEAVE=3、LOCAL=4。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mempolicy {
+    pub mode: u32,
+    /// 节点位图（本内核只有 node 0，合法掩码只能是 0 或 1）。
+    pub node_mask: u64,
+}
+
+/// 地址空间级内存策略状态：进程默认策略 + `mbind` 区域覆盖。
+///
+/// 区域表以 `(start, end)` 为键（`Range` 未实现 `Ord`，用元组代替）。
+#[derive(Default, Clone)]
+struct MempolicyState {
+    default_policy: Option<Mempolicy>,
+    ranges: BTreeMap<(usize, usize), Mempolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2271,6 +2297,14 @@ impl ResidentPage {
         matches!(self.kind, ResidentPageKind::PrivateFile)
     }
 
+    fn is_shared_file(&self) -> bool {
+        matches!(self.kind, ResidentPageKind::SharedFile { .. })
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
     fn is_sysv_shm(&self) -> bool {
         matches!(&self.kind, ResidentPageKind::SharedFile { file, .. } if file.is_sysv_shm())
     }
@@ -2744,6 +2778,19 @@ pub struct VmSpace {
     brk_current: AtomicUsize,
     mmap_next: AtomicUsize,
     mlock_future: AtomicBool,
+    /// 本地址空间承诺页数（overcommit 记账，`MAP_NORESERVE` 区域不计）。
+    ///
+    /// 与 Linux `mm->total_vm` 的记账口径一致：VMA 几何大小，而非驻留页数。
+    /// `fork` 时子进程复制父进程的承诺并在全局聚合中加一份。
+    committed_pages: AtomicUsize,
+    /// 已锁页数（`RLIMIT_MEMLOCK` 记账与 `/proc/self/status` 的 `VmLck`）。
+    ///
+    /// 口径与 Linux `mm->locked_vm` 一致：带 `LOCKED` 标记的 VMA 几何页数。
+    locked_pages: AtomicUsize,
+    /// NUMA 内存策略（单节点语义；`set_mempolicy`/`mbind` 状态）。
+    mempolicy: Spinlock<MempolicyState>,
+    /// userfaultfd 登记区域。fork 不继承（Linux 语义：子进程不带 uffd 状态）。
+    uffd_regions: Spinlock<Vec<UffdRegion>>,
     /// `membarrier(2)` expedited 命令的地址空间级注册位。
     membarrier_registration: AtomicUsize,
     /// 诊断辅助：记录当前已建立页表映射的用户页数。
@@ -2775,6 +2822,10 @@ impl VmSpace {
             brk_current: AtomicUsize::new(layout.user_heap_base),
             mmap_next: AtomicUsize::new(layout.user_mmap_base),
             mlock_future: AtomicBool::new(false),
+            committed_pages: AtomicUsize::new(0),
+            locked_pages: AtomicUsize::new(0),
+            mempolicy: Spinlock::new(MempolicyState::default()),
+            uffd_regions: Spinlock::new(Vec::new()),
             membarrier_registration: AtomicUsize::new(0),
             mapped_pages: AtomicUsize::new(0),
             #[cfg(feature = "performance-profile")]
@@ -2808,6 +2859,104 @@ impl VmSpace {
         } else {
             flags
         }
+    }
+
+    /// 区域页数（VMA 几何口径，与 Linux `vma_pages` 一致）。
+    fn area_page_count(area: &VmArea) -> usize {
+        (area.range.end - area.range.start) / page_size()
+    }
+
+    /// 区域插入前的映射策略检查：`max_map_count` 与 overcommit 记账。
+    ///
+    /// `count_after` 为插入后集合的预期 VMA 数量；`pages` 为新增区域页数；
+    /// `noreserve` 对应 `MAP_NORESERVE`（严格模式下仍受启发式上限约束）。
+    fn check_map_policy(
+        &self,
+        count_after: usize,
+        pages: usize,
+        noreserve: bool,
+    ) -> Result<(), Errno> {
+        if !memstat::map_count_allowed(count_after) {
+            return Err(Errno::ENOMEM);
+        }
+        let overview = allocator::KERNEL_ALLOCATOR.detailed_stats();
+        let total_pages = (overview.total_physical / allocator::PAGE_SIZE) as u64;
+        let swap_pages = crate::mm::swap::swap_totals().0;
+        memstat::check_overcommit(pages as u64, noreserve, total_pages, swap_pages)
+            .map_err(|()| Errno::ENOMEM)
+    }
+
+    /// 集合中是否有 `SEALED`(mseal)区域与 `range` 相交。
+    ///
+    /// mseal 语义：密封区域禁止后续 mprotect/munmap/mremap/MAP_FIXED 覆盖，
+    /// 任何相交即拒绝（EPERM），与 Linux `can_modify_mm` 一致。
+    fn contains_sealed(set: &VmaSet, range: &Range<usize>) -> bool {
+        set.iter_overlap(range)
+            .any(|area| area.flags.has(VmFlags::SEALED))
+    }
+
+    /// 记账一次成功的区域插入：承诺页与锁页都按 VMA 几何口径累加。
+    ///
+    /// 调用方必须保证区域已经进入 VMA 集合。合并不破坏口径：可合并的邻居
+    /// flags 必须完全相同，因此分片记账与合并后几何一致。
+    fn account_area_insert(&self, area: &VmArea) {
+        let pages = Self::area_page_count(area);
+        if !area.flags.has(VmFlags::NORESERVE) {
+            self.committed_pages.fetch_add(pages, Ordering::Relaxed);
+            memstat::commit_pages(pages as i64);
+        }
+        if area.flags.has(VmFlags::LOCKED) {
+            self.locked_pages.fetch_add(pages, Ordering::Relaxed);
+        }
+    }
+
+    /// 记账一次区域移除（unmap 摘除的片段）。
+    fn account_area_remove(&self, area: &VmArea) {
+        let pages = Self::area_page_count(area);
+        if !area.flags.has(VmFlags::NORESERVE) {
+            self.committed_pages.fetch_sub(pages, Ordering::Relaxed);
+            memstat::commit_pages(-(pages as i64));
+        }
+        if area.flags.has(VmFlags::LOCKED) {
+            self.locked_pages.fetch_sub(pages, Ordering::Relaxed);
+        }
+    }
+
+    /// 当前已锁页数（`RLIMIT_MEMLOCK` 检查与 `/proc/self/status` VmLck 用）。
+    pub fn locked_pages(&self) -> usize {
+        self.locked_pages.load(Ordering::Acquire)
+    }
+
+    /// 若锁定 `range` 会新增的锁页数（仅统计当前未带 `LOCKED` 标记的区域）。
+    pub fn would_lock_pages(&self, range: &Range<usize>) -> usize {
+        let set = self.vmas.lock();
+        let mut pages = 0usize;
+        for area in set.iter_overlap(range) {
+            if area.flags.has(VmFlags::LOCKED) {
+                continue;
+            }
+            let start = area.range.start.max(range.start);
+            let end = area.range.end.min(range.end);
+            pages = pages.saturating_add((end - start) / page_size());
+        }
+        pages
+    }
+
+    /// 若 `mlockall(MCL_CURRENT)` 会新增的锁页数。
+    pub fn would_lock_all_pages(&self) -> usize {
+        let set = self.vmas.lock();
+        let mut pages = 0usize;
+        for area in set.iter() {
+            if !area.flags.has(VmFlags::LOCKED) {
+                pages = pages.saturating_add(Self::area_page_count(area));
+            }
+        }
+        pages
+    }
+
+    /// 当前承诺页数（overcommit 记账）。
+    pub fn committed_pages(&self) -> usize {
+        self.committed_pages.load(Ordering::Acquire)
     }
 
     #[kernel_symbols::export(name = "general.mm.VmSpace.current_brk", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
@@ -2950,11 +3099,18 @@ impl VmSpace {
             let Some(range) = set.find_aligned_gap(start..end, len, alignment) else {
                 continue;
             };
-            set.insert(VmArea {
+            let area = VmArea {
                 range: range.clone(),
                 flags,
                 backing,
-            })?;
+            };
+            self.check_map_policy(
+                set.len() + 1,
+                Self::area_page_count(&area),
+                flags.has(VmFlags::NORESERVE),
+            )?;
+            set.insert(area.clone())?;
+            self.account_area_insert(&area);
             self.mmap_next.store(range.end, Ordering::Release);
             return Ok(range);
         }
@@ -3004,14 +3160,21 @@ impl VmSpace {
             let Some(range) = set.find_aligned_gap(start..end, len, alignment) else {
                 continue;
             };
-            set.insert(VmArea {
+            let area = VmArea {
                 range: range.clone(),
                 flags,
                 backing: VmBacking::SharedAnon {
                     object: Arc::clone(&object),
                     offset: object_offset,
                 },
-            })?;
+            };
+            self.check_map_policy(
+                set.len() + 1,
+                Self::area_page_count(&area),
+                flags.has(VmFlags::NORESERVE),
+            )?;
+            set.insert(area.clone())?;
+            self.account_area_insert(&area);
             self.mmap_next.store(range.end, Ordering::Release);
             return Ok(range);
         }
@@ -3056,14 +3219,21 @@ impl VmSpace {
             let Some(range) = set.find_aligned_gap(start..end, len, alignment) else {
                 continue;
             };
-            set.insert(VmArea {
+            let area = VmArea {
                 range: range.clone(),
                 flags,
                 backing: VmBacking::File {
                     file: Arc::clone(&file),
                     offset,
                 },
-            })?;
+            };
+            self.check_map_policy(
+                set.len() + 1,
+                Self::area_page_count(&area),
+                flags.has(VmFlags::NORESERVE),
+            )?;
+            set.insert(area.clone())?;
+            self.account_area_insert(&area);
             self.mmap_next.store(range.end, Ordering::Release);
             drop(set);
             mapped_file.on_mapped();
@@ -3109,14 +3279,22 @@ impl VmSpace {
             let Some(range) = set.find_aligned_gap(start..end, len, alignment) else {
                 continue;
             };
-            set.insert(VmArea {
+            let area = VmArea {
                 range: range.clone(),
                 flags: area_flags,
                 backing: VmBacking::Direct(paddr),
-            })?;
+            };
+            self.check_map_policy(
+                set.len() + 1,
+                Self::area_page_count(&area),
+                area_flags.has(VmFlags::NORESERVE),
+            )?;
+            set.insert(area.clone())?;
+            self.account_area_insert(&area);
             self.mmap_next.store(range.end, Ordering::Release);
             drop(set);
             if let Err(error) = self.populate_direct_mapping(range.clone(), paddr, area_flags) {
+                // 回滚路径复用 unmap：其中的记账移除与上面的插入记账对冲。
                 let _ = self.unmap_existing(range);
                 return Err(error);
             }
@@ -3151,7 +3329,17 @@ impl VmSpace {
                 offset: object_offset,
             },
         };
-        self.vmas.lock().insert(area)
+        {
+            let mut set = self.vmas.lock();
+            self.check_map_policy(
+                set.len() + 1,
+                Self::area_page_count(&area),
+                area.flags.has(VmFlags::NORESERVE),
+            )?;
+            set.insert(area.clone())?;
+        }
+        self.account_area_insert(&area);
+        Ok(())
     }
 
     #[kernel_symbols::export(name = "general.mm.VmSpace.is_range_free", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
@@ -3310,6 +3498,7 @@ impl VmSpace {
             profiling::scope(profiling::Event::MmMap).bytes(range.end.saturating_sub(range.start));
         self.validate_range(&range)?;
         let flags = self.with_future_mlock(flags);
+        let pages = (range.end - range.start) / page_size();
         let backing = if flags.has(VmFlags::SHARED) {
             VmBacking::SharedAnon {
                 object: Arc::new(SharedAnonObject::new()),
@@ -3323,7 +3512,13 @@ impl VmSpace {
             flags: flags.with(VmFlags::ANON),
             backing,
         };
-        self.vmas.lock().insert(area)
+        {
+            let mut set = self.vmas.lock();
+            self.check_map_policy(set.len() + 1, pages, flags.has(VmFlags::NORESERVE))?;
+            set.insert(area.clone())?;
+        }
+        self.account_area_insert(&area);
+        Ok(())
     }
 
     /// 注册一段 file-backed VMA。缺页时按 offset + (addr - range.start) 读文件。
@@ -3349,11 +3544,17 @@ impl VmSpace {
         };
         {
             let mut vmas = self.vmas.lock();
-            vmas.insert(area)?;
+            self.check_map_policy(
+                vmas.len() + 1,
+                Self::area_page_count(&area),
+                flags.has(VmFlags::NORESERVE),
+            )?;
+            vmas.insert(area.clone())?;
             if shared_writable {
                 mapped_file.disable_private_page_cache();
             }
         }
+        self.account_area_insert(&area);
         mapped_file.on_mapped();
         Ok(())
     }
@@ -3377,8 +3578,16 @@ impl VmSpace {
         };
         let (removed_areas, removed) = {
             let mut vmas = self.vmas.lock();
+            if Self::contains_sealed(&vmas, &range) {
+                return Err(Errno::EPERM);
+            }
+            self.check_map_policy(
+                vmas.len() + 1,
+                Self::area_page_count(&area),
+                flags.has(VmFlags::NORESERVE),
+            )?;
             let removed_areas = vmas.unmap_range(&range);
-            if let Err(err) = vmas.insert(area) {
+            if let Err(err) = vmas.insert(area.clone()) {
                 drop(vmas);
                 Self::notify_file_unmapped(&removed_areas);
                 return Err(err);
@@ -3389,6 +3598,10 @@ impl VmSpace {
             let removed = self.unmap_page_mappings(range.clone())?;
             (removed_areas, removed)
         };
+        for removed_area in &removed_areas {
+            self.account_area_remove(removed_area);
+        }
+        self.account_area_insert(&area);
         Self::notify_file_unmapped(&removed_areas);
         if !removed.is_empty() {
             self.invalidate_user_range(range.start, range.end - range.start);
@@ -3417,8 +3630,16 @@ impl VmSpace {
         };
         let (removed_areas, removed) = {
             let mut vmas = self.vmas.lock();
+            if Self::contains_sealed(&vmas, &range) {
+                return Err(Errno::EPERM);
+            }
+            self.check_map_policy(
+                vmas.len() + 1,
+                Self::area_page_count(&area),
+                flags.has(VmFlags::NORESERVE),
+            )?;
             let removed_areas = vmas.unmap_range(&range);
-            if let Err(err) = vmas.insert(area) {
+            if let Err(err) = vmas.insert(area.clone()) {
                 drop(vmas);
                 Self::notify_file_unmapped(&removed_areas);
                 return Err(err);
@@ -3429,6 +3650,10 @@ impl VmSpace {
             let removed = self.unmap_page_mappings(range.clone())?;
             (removed_areas, removed)
         };
+        for removed_area in &removed_areas {
+            self.account_area_remove(removed_area);
+        }
+        self.account_area_insert(&area);
         Self::notify_file_unmapped(&removed_areas);
         mapped_file.on_mapped();
         if !removed.is_empty() {
@@ -3459,8 +3684,21 @@ impl VmSpace {
             flags: area_flags,
             backing: VmBacking::Direct(paddr),
         };
-        self.vmas.lock().insert(area)?;
+        {
+            let mut set = self.vmas.lock();
+            if Self::contains_sealed(&set, &range) {
+                return Err(Errno::EPERM);
+            }
+            self.check_map_policy(
+                set.len() + 1,
+                Self::area_page_count(&area),
+                area_flags.has(VmFlags::NORESERVE),
+            )?;
+            set.insert(area.clone())?;
+        }
+        self.account_area_insert(&area);
         if let Err(error) = self.populate_direct_mapping(range.clone(), paddr, area_flags) {
+            // 回滚路径复用 unmap：其中的记账移除会与上面的插入记账对冲。
             let _ = self.unmap_existing(range);
             return Err(error);
         }
@@ -3514,10 +3752,17 @@ impl VmSpace {
             if require_existing && !vmas.contains_range(&range) {
                 return Err(Errno::ENOMEM);
             }
+            if Self::contains_sealed(&vmas, &range) {
+                // mseal 语义：munmap 命中密封区域返回 EPERM，且不做部分拆除。
+                return Err(Errno::EPERM);
+            }
             let removed_areas = vmas.unmap_range(&range);
             let removed = self.unmap_page_mappings(range.clone())?;
             (removed_areas, removed)
         };
+        for removed_area in &removed_areas {
+            self.account_area_remove(removed_area);
+        }
         Self::notify_file_unmapped(&removed_areas);
         if !removed.is_empty() {
             self.invalidate_user_range(range.start, range.end - range.start);
@@ -3555,6 +3800,12 @@ impl VmSpace {
 
         let in_place_end = old_range.start.checked_add(new_len).ok_or(Errno::EINVAL)?;
         let in_place_tail = old_range.end..in_place_end;
+        {
+            let set = self.vmas.lock();
+            if Self::contains_sealed(&set, &old_range) {
+                return Err(Errno::EPERM);
+            }
+        }
         if fixed_addr == Some(old_range.start) {
             return if self.extend_mapping_in_place(&old_range, &in_place_tail)? {
                 Ok(old_range.start)
@@ -3585,6 +3836,9 @@ impl VmSpace {
             let mut vmas = self.vmas.lock();
             if !vmas.contains_range(&old_range) {
                 return Err(Errno::ENOMEM);
+            }
+            if Self::contains_sealed(&vmas, &new_range) {
+                return Err(Errno::EPERM);
             }
             let removed_target = if fixed_addr.is_some() {
                 vmas.unmap_range(&new_range)
@@ -3620,18 +3874,26 @@ impl VmSpace {
                     backing,
                 };
                 let files = Self::collect_file_backings(core::iter::once(&tail));
-                vmas.insert(tail)?;
-                files
+                vmas.insert(tail.clone())?;
+                Some(tail)
             } else {
-                Vec::new()
+                None
             };
             let removed_pages = self.unmap_page_mappings(new_range.clone())?;
             let moved_pages =
                 self.move_page_mappings_locked(&vmas, old_range.start, new_range.start, old_len)?;
             (removed_target, mapped_tail, removed_pages, moved_pages)
         };
+        for removed_area in &removed_target {
+            self.account_area_remove(removed_area);
+        }
+        if let Some(tail) = &mapped_tail {
+            self.account_area_insert(tail);
+        }
         Self::notify_file_unmapped(&removed_target);
-        Self::notify_files_mapped(mapped_tail);
+        if let Some(tail) = &mapped_tail {
+            Self::notify_files_mapped(Self::collect_file_backings(core::iter::once(tail)));
+        }
         if !removed_pages.is_empty() {
             self.invalidate_user_range(new_range.start, new_range.end - new_range.start);
         }
@@ -3661,6 +3923,25 @@ impl VmSpace {
                 .is_some_and(|area| range.end <= area.range.end);
             if !single_area && !set.contains_range(&range) {
                 return Err(Errno::ENOMEM);
+            }
+            // mseal 语义：密封区域禁止 mprotect。
+            if Self::contains_sealed(&set, &range) {
+                return Err(Errno::EPERM);
+            }
+            // Linux mprotect 语义：`MAP_SHARED` 映射请求 `PROT_WRITE` 时，底层
+            // 文件句柄必须可写（`file->f_mode & FMODE_WRITE`），否则返回 EACCES。
+            // 只读 fd 的 MAP_SHARED 映射不能通过 mprotect 提权。
+            if new_flags.has(VmFlags::WRITE) {
+                for area in set.iter_overlap(&range) {
+                    if !area.flags.has(VmFlags::SHARED) {
+                        continue;
+                    }
+                    if let VmBacking::File { file, .. } = &area.backing
+                        && file.writable_hint() == Some(false)
+                    {
+                        return Err(Errno::EACCES);
+                    }
+                }
             }
             if new_flags.has(VmFlags::WRITE) && single_area {
                 let area = set
@@ -3824,7 +4105,34 @@ impl VmSpace {
     }
 
     /// 丢弃指定范围内已经常驻的页，保留 VMA 语义供后续缺页按 backing 重建。
+    ///
+    /// 带 `LOCKED` 标记的区域返回 `EINVAL`——这是 Linux `MADV_DONTNEED` 对
+    /// mlock 区域的行为；`MADV_DONTNEED_LOCKED` 走 [`Self::discard_resident_range_locked`]。
     pub fn discard_resident_range(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        let removed = {
+            let set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(Errno::ENOMEM);
+            }
+            if set
+                .iter_overlap(&range)
+                .any(|area| area.flags.has(VmFlags::LOCKED))
+            {
+                return Err(Errno::EINVAL);
+            }
+            self.unmap_page_mappings(range.clone())?
+        };
+        if !removed.is_empty() {
+            self.invalidate_user_range(range.start, range.end - range.start);
+        }
+        drop(removed);
+        Ok(())
+    }
+
+    /// `MADV_DONTNEED_LOCKED`：同 [`Self::discard_resident_range`]，但允许命中
+    /// 已锁区域（Linux 5.18+ 语义）。
+    pub fn discard_resident_range_locked(&self, range: Range<usize>) -> Result<(), Errno> {
         self.validate_range(&range)?;
         let removed = {
             let set = self.vmas.lock();
@@ -3838,6 +4146,708 @@ impl VmSpace {
         }
         drop(removed);
         Ok(())
+    }
+
+    /// flag 类 `madvise` advice（DONTFORK/DOFORK/MERGEABLE/UNMERGEABLE/
+    /// HUGEPAGE/NOHUGEPAGE/DONTDUMP/DODUMP/WIPEONFORK/KEEPONFORK）：
+    /// 对范围内全部 VMA 应用 `update`。范围必须被 VMA 连续覆盖。
+    ///
+    /// 不触发任何页级动作；`update_flags_range` 的拆分/合并保持 VMA 几何不变，
+    /// 因此不影响承诺/锁页记账。
+    pub fn update_area_flags(
+        &self,
+        range: Range<usize>,
+        update: impl Fn(VmFlags) -> VmFlags,
+    ) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        let mut set = self.vmas.lock();
+        if !set.contains_range(&range) {
+            return Err(Errno::ENOMEM);
+        }
+        set.update_flags_range(&range, update);
+        Ok(())
+    }
+
+    /// `MADV_PAGEOUT`：尝试回收范围内的页。
+    ///
+    /// - 共享文件页：先写回脏数据再丢弃（内容保留在文件中，重读恢复）；
+    /// - 私有文件页：直接丢弃（干净页重读恢复；脏私有页内容丢失，与 Linux 一致）；
+    /// - 匿名页：无 swap 可换出，保持不动（等价无 swap 的 Linux 行为）；
+    /// - 已锁页：跳过（unevictable）。
+    pub fn madvise_pagout(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        {
+            let set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(Errno::ENOMEM);
+            }
+        }
+        let shared_dirty: Vec<Arc<ResidentPage>> = {
+            let pages = self.pages.lock();
+            let mut out = Vec::new();
+            pages.for_each_range(range.clone(), |_va, mapping| {
+                if mapping.page.is_shared_file() && mapping.page.is_dirty() {
+                    out.push(Arc::clone(&mapping.page));
+                }
+            });
+            out
+        };
+        for page in shared_dirty {
+            page.flush_to_backing()?;
+        }
+        let file_subranges: Vec<Range<usize>> = {
+            let set = self.vmas.lock();
+            let mut out = Vec::new();
+            for area in set.iter_overlap(&range) {
+                if area.flags.has(VmFlags::LOCKED) {
+                    continue;
+                }
+                if !matches!(area.backing, VmBacking::File { .. }) {
+                    continue;
+                }
+                out.push(area.range.start.max(range.start)..area.range.end.min(range.end));
+            }
+            out
+        };
+        for sub in file_subranges {
+            let removed = self.unmap_page_mappings(sub.clone())?;
+            if !removed.is_empty() {
+                self.invalidate_user_range(sub.start, sub.end - sub.start);
+            }
+            drop(removed);
+        }
+        Ok(())
+    }
+
+    /// `MADV_REMOVE`：仅对 tmpfs/shmem 文件映射有效（Linux 语义）。
+    ///
+    /// 等价于对文件执行 `fallocate(PUNCH_HOLE | KEEP_SIZE)`（数据释放、读回零），
+    /// 并丢弃范围内驻留页。范围内出现任何非 shmem VMA 即返回 `EINVAL`。
+    pub fn madvise_remove(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        let subranges: Vec<(Range<usize>, Arc<dyn FileLike>, u64)> = {
+            let set = self.vmas.lock();
+            let mut out = Vec::new();
+            for area in set.iter_overlap(&range) {
+                let VmBacking::File { file, offset } = &area.backing else {
+                    return Err(Errno::EINVAL);
+                };
+                if !file.is_shmem() {
+                    return Err(Errno::EINVAL);
+                }
+                let sub = area.range.start.max(range.start)..area.range.end.min(range.end);
+                let file_off = offset.saturating_add((sub.start - area.range.start) as u64);
+                out.push((sub, Arc::clone(file), file_off));
+            }
+            out
+        };
+        for (sub, file, file_off) in subranges {
+            file.punch_hole(file_off, (sub.end - sub.start) as u64)?;
+            let removed = self.unmap_page_mappings(sub.clone())?;
+            if !removed.is_empty() {
+                self.invalidate_user_range(sub.start, sub.end - sub.start);
+            }
+            drop(removed);
+        }
+        Ok(())
+    }
+
+    /// `MADV_WILLNEED` / `MADV_POPULATE_READ` / `MADV_POPULATE_WRITE`：
+    /// 预解析范围内的全部页（匿名分配、文件读入或 COW）。
+    ///
+    /// `strict` 为 true（POPULATE_*）时，未映射或无法填充返回 `EINVAL`；
+    /// WILLNEED 忽略填充错误（Linux 语义：尽力而为）。
+    pub fn madvise_populate(
+        &self,
+        range: Range<usize>,
+        write: bool,
+        strict: bool,
+    ) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        {
+            let set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(if strict { Errno::EINVAL } else { Errno::ENOMEM });
+            }
+        }
+        if strict {
+            self.prefault_user_range(range, write)
+                .map_err(|_| Errno::EINVAL)
+        } else {
+            let _ = self.prefault_user_range(range, write);
+            Ok(())
+        }
+    }
+
+    /// `remap_file_pages(2)` 实现：把 `[addr, addr+size)` 内**已驻留**的页
+    /// 重新映射为文件内自 `pgoff*page_size` 起的内容。
+    ///
+    /// 与 Linux 语义一致：只有调用时已驻留的页被重映射；未驻留页不受影响，
+    /// 后续缺页仍按 VMA 线性偏移读取（Linux 文档化的历史行为）。
+    ///
+    /// 限制与取舍：`prot`/`flags` 必须为 0（调用方校验）；范围必须整体落在单个
+    /// file-backed VMA 内。重映射后的页不发布到共享页缓存——同一文件的其它
+    /// 映射仍看到旧内容（与 Linux 共享页语义有细微差异，见注释）。
+    pub fn remap_file_pages(&self, addr: usize, size: usize, pgoff: usize) -> Result<(), Errno> {
+        if size == 0 {
+            return Ok(());
+        }
+        let page_size = page_size();
+        if addr % page_size != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let len = align_up(size, page_size).ok_or(Errno::EINVAL)?;
+        let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+        let (file, flags) = {
+            let set = self.vmas.lock();
+            let area = set.find(addr).ok_or(Errno::EINVAL)?;
+            if end > area.range.end {
+                return Err(Errno::EINVAL);
+            }
+            let VmBacking::File { file, .. } = &area.backing else {
+                return Err(Errno::EINVAL);
+            };
+            (Arc::clone(file), area.flags)
+        };
+        let new_start_off = (pgoff as u64)
+            .checked_mul(page_size as u64)
+            .ok_or(Errno::EINVAL)?;
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EINVAL)?;
+        let file_size = file.size();
+        let mut va = addr;
+        while va < end {
+            let present = { self.pages.lock().get(va).is_some() };
+            if !present {
+                va += page_size;
+                continue;
+            }
+            let file_off = new_start_off
+                .checked_add((va - addr) as u64)
+                .ok_or(Errno::EINVAL)?;
+            // 锁外分配并读入新内容（I/O 不持 VM 锁）。
+            let new_paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(virt_fn(new_paddr) as *mut u8, page_size)
+            };
+            if file_off < file_size {
+                let read_len = usize::try_from(file_size - file_off)
+                    .unwrap_or(page_size)
+                    .min(page_size);
+                let mut done = 0usize;
+                while done < read_len {
+                    let n = file.read_at(file_off + done as u64, &mut buf[done..read_len])?;
+                    if n == 0 {
+                        break;
+                    }
+                    done += n;
+                }
+            }
+            // 锁内换页：页仍驻留才替换，否则丢弃新页。
+            let new_page = if flags.has(VmFlags::SHARED) {
+                ResidentPage::new_shared_file(new_paddr, Arc::clone(&file), file_off)
+            } else {
+                ResidentPage::new_private_file(new_paddr)
+            };
+            let mut pages = self.pages.lock();
+            let Some(mapping) = pages.get_mut(va) else {
+                drop(pages);
+                free_user_page(new_paddr);
+                va += page_size;
+                continue;
+            };
+            let access = mapping.access;
+            let paddr = new_page.paddr();
+            self.replace_page_no_flush(va, paddr, pte_flags_for(flags, access))?;
+            mapping.page = new_page;
+            drop(pages);
+            self.invalidate_user_range(va, page_size);
+            va += page_size;
+        }
+        Ok(())
+    }
+
+    /// 设置进程默认 NUMA 内存策略（`set_mempolicy(2)` 单节点语义）。
+    pub fn set_task_mempolicy(&self, policy: Option<Mempolicy>) {
+        self.mempolicy.lock().default_policy = policy;
+    }
+
+    /// 读取进程默认 NUMA 内存策略。
+    pub fn task_mempolicy(&self) -> Option<Mempolicy> {
+        self.mempolicy.lock().default_policy
+    }
+
+    /// `mbind(2)` 单节点语义：把区域策略写入策略表，替换被覆盖的旧区域。
+    /// 范围必须已被 VMA 连续覆盖（否则 `ENOMEM`）。
+    pub fn mbind_range(&self, range: Range<usize>, policy: Mempolicy) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        {
+            let set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(Errno::ENOMEM);
+            }
+        }
+        let mut state = self.mempolicy.lock();
+        state
+            .ranges
+            .retain(|(start, end), _| !(*start < range.end && range.start < *end));
+        state.ranges.insert((range.start, range.end), policy);
+        Ok(())
+    }
+
+    /// 查询 `addr` 生效的 NUMA 内存策略（`get_mempolicy(MPOL_F_ADDR)`）。
+    /// 返回 `(策略, 是否命中区域覆盖)`；未命中区域覆盖时返回默认策略。
+    pub fn mempolicy_at(&self, addr: usize) -> (Option<Mempolicy>, bool) {
+        let state = self.mempolicy.lock();
+        for ((start, end), policy) in &state.ranges {
+            if *start <= addr && addr < *end {
+                return (Some(*policy), true);
+            }
+        }
+        (state.default_policy, false)
+    }
+
+    /// 确保远程地址空间（其它进程的 `VmSpace`）的 `addr` 页可访问。
+    ///
+    /// `process_vm_readv/writev` 使用：缺页、COW 通过目标地址空间自己的
+    /// `handle_fault` 完成（所有页表操作都以 `self.pgd` 为句柄，不依赖当前
+    /// 任务的地址空间）。无法修复返回 `EFAULT`。
+    pub fn ensure_remote_page(&self, addr: usize, kind: FaultKind) -> Result<(), Errno> {
+        match self.handle_fault(addr, kind) {
+            FaultOutcome::Fixed => Ok(()),
+            FaultOutcome::Segv | FaultOutcome::OutOfMemory | FaultOutcome::Kernel(_) => {
+                Err(Errno::EFAULT)
+            }
+        }
+    }
+
+    /// 把远程地址空间 `[range.start, range.start+out.len())` 的驻留页内容拷入
+    /// `out`。要求范围内每页都已驻留（调用方先用 [`Self::ensure_remote_page`]
+    /// 逐页解析）；缺失页返回 `EFAULT`。起点允许落在页内。
+    pub fn copy_resident_bytes_out(
+        &self,
+        range: Range<usize>,
+        out: &mut [u8],
+    ) -> Result<(), Errno> {
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EFAULT)?;
+        let pages = self.pages.lock();
+        let mut written = 0usize;
+        let mut va = page_base(range.start);
+        let mut skip = range.start - va;
+        while written < out.len() {
+            let mapping = pages.get(va).ok_or(Errno::EFAULT)?;
+            let copy_len = out.len().saturating_sub(written).min(page_size() - skip);
+            let src = virt_fn(mapping.page.paddr()) + skip;
+            // Safety: 页由 pages 锁内的 Arc 保活；copy_len 不越过页边界。
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src as *const u8,
+                    out[written..].as_mut_ptr(),
+                    copy_len,
+                );
+            }
+            written += copy_len;
+            va += page_size();
+            skip = 0;
+        }
+        Ok(())
+    }
+
+    /// 把 `input` 拷入远程地址空间的 `[range.start, range.start+input.len())`。
+    /// 要求范围内每页已驻留且 PTE 可写（调用方先用
+    /// [`Self::ensure_remote_page`](addr, Store) 完成 COW）；成功后标脏。
+    /// 起点允许落在页内。
+    pub fn copy_resident_bytes_in(&self, range: Range<usize>, input: &[u8]) -> Result<(), Errno> {
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EFAULT)?;
+        let pages = self.pages.lock();
+        let mut written = 0usize;
+        let mut va = page_base(range.start);
+        let mut skip = range.start - va;
+        while written < input.len() {
+            let mapping = pages.get(va).ok_or(Errno::EFAULT)?;
+            if !mapping.access.pte_writable() {
+                return Err(Errno::EFAULT);
+            }
+            let copy_len = input.len().saturating_sub(written).min(page_size() - skip);
+            let dst = virt_fn(mapping.page.paddr()) + skip;
+            // Safety: 页由 pages 锁内的 Arc 保活；copy_len 不越过页边界。
+            unsafe {
+                core::ptr::copy_nonoverlapping(input[written..].as_ptr(), dst as *mut u8, copy_len);
+            }
+            mapping.page.mark_dirty();
+            written += copy_len;
+            va += page_size();
+            skip = 0;
+        }
+        Ok(())
+    }
+
+    // ── userfaultfd ──────────────────────────────────────────────────────────
+
+    /// `UFFDIO_REGISTER`：登记一段私有匿名区域交给用户态处理缺页。
+    ///
+    /// 校验：页对齐、长度非零、范围被私有匿名 VMA 连续覆盖（否则 `EINVAL`）、
+    /// 与既有登记不重叠（否则 `EEXIST`）。shmem/hugetlb/file 区域不支持。
+    pub(crate) fn uffd_register(
+        &self,
+        start: usize,
+        len: usize,
+        mode: u64,
+        state: &Arc<UffdState>,
+    ) -> Result<Range<usize>, Errno> {
+        let page_size = page_size();
+        if start % page_size != 0 || len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+        let end = start.checked_add(len).ok_or(Errno::EINVAL)?;
+        let range = start..end;
+        {
+            let set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(Errno::EINVAL);
+            }
+            for area in set.iter_overlap(&range) {
+                if !matches!(area.backing, VmBacking::Anon { .. })
+                    || area.flags.has(VmFlags::SHARED)
+                {
+                    return Err(Errno::EINVAL);
+                }
+            }
+        }
+        let mut regions = self.uffd_regions.lock();
+        if regions
+            .iter()
+            .any(|region| region.range.start < end && start < region.range.end)
+        {
+            return Err(Errno::EEXIST);
+        }
+        regions.push(UffdRegion {
+            range: range.clone(),
+            mode,
+            state: Arc::clone(state),
+        });
+        Ok(range)
+    }
+
+    /// `UFFDIO_UNREGISTER`：摘除与范围相交、且属于指定状态对象的登记。
+    pub(crate) fn uffd_unregister(
+        &self,
+        start: usize,
+        len: usize,
+        state: &Arc<UffdState>,
+    ) -> Result<(), Errno> {
+        let page_size = page_size();
+        if start % page_size != 0 || len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+        let end = start.checked_add(len).ok_or(Errno::EINVAL)?;
+        let mut regions = self.uffd_regions.lock();
+        regions.retain(|region| {
+            !(Arc::ptr_eq(&region.state, state)
+                && region.range.start < end
+                && start < region.range.end)
+        });
+        Ok(())
+    }
+
+    /// fd 关闭时由 `UffdState::release` 调用：摘除指定状态对象的登记。
+    pub(crate) fn uffd_remove_state(&self, state: &Arc<UffdState>, range: &Range<usize>) {
+        let mut regions = self.uffd_regions.lock();
+        regions.retain(|region| {
+            !(Arc::ptr_eq(&region.state, state) && ranges_overlap(&region.range, range))
+        });
+    }
+
+    /// `UFFDIO_COPY`：把调用者用户内存拷入目标地址空间并安装为匿名页。
+    ///
+    /// 要求目标范围逐页都未驻留（存在任何已驻留页返回 `EEXIST`，Linux 语义）；
+    /// `wp` 对应 `UFFDIO_COPY_MODE_WP`（安装为只读页）。返回安装字节数。
+    pub(crate) fn uffd_copy(
+        &self,
+        dst: usize,
+        src: usize,
+        len: usize,
+        wp: bool,
+    ) -> Result<u64, Errno> {
+        let page_size = page_size();
+        if dst % page_size != 0 || src % page_size != 0 || len == 0 || len % page_size != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = dst.checked_add(len).ok_or(Errno::EINVAL)?;
+        {
+            let pages = self.pages.lock();
+            let mut va = dst;
+            while va < end {
+                if pages.contains_key(va) {
+                    return Err(Errno::EEXIST);
+                }
+                va += page_size;
+            }
+        }
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EINVAL)?;
+        let mut va = dst;
+        while va < end {
+            let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+            let buf =
+                unsafe { core::slice::from_raw_parts_mut(virt_fn(paddr) as *mut u8, page_size) };
+            if crate::mm::copy_from_user(src + (va - dst), buf).is_err() {
+                free_user_page(paddr);
+                return Err(Errno::EFAULT);
+            }
+            let page = ResidentPage::new_anon(paddr);
+            self.uffd_install_page(va, page, wp)?;
+            va += page_size;
+        }
+        Ok(len as u64)
+    }
+
+    /// `UFFDIO_ZEROPAGE`：在目标地址空间安装零页。返回安装字节数。
+    pub(crate) fn uffd_zeropage(&self, start: usize, len: usize) -> Result<u64, Errno> {
+        let page_size = page_size();
+        if start % page_size != 0 || len == 0 || len % page_size != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = start.checked_add(len).ok_or(Errno::EINVAL)?;
+        {
+            let pages = self.pages.lock();
+            let mut va = start;
+            while va < end {
+                if pages.contains_key(va) {
+                    return Err(Errno::EEXIST);
+                }
+                va += page_size;
+            }
+        }
+        let mut va = start;
+        while va < end {
+            let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+            let page = ResidentPage::new_anon(paddr);
+            self.uffd_install_page(va, page, false)?;
+            va += page_size;
+        }
+        Ok(len as u64)
+    }
+
+    /// `UFFDIO_WRITEPROTECT`：设置/清除范围内驻留页的写保护。
+    ///
+    /// 要求范围命中登记了 WP 模式且属于 `state` 的区域（否则 `EINVAL`）。
+    /// 清除写保护时直接把页置为可写并唤醒等待者——这是 userfaultfd WP 协议
+    /// 的语义（页面是否做 COW 由用户态自行管理）。
+    pub(crate) fn uffd_writeprotect(
+        &self,
+        start: usize,
+        len: usize,
+        wp: bool,
+        state: &Arc<UffdState>,
+    ) -> Result<(), Errno> {
+        let page_size = page_size();
+        if start % page_size != 0 || len == 0 || len % page_size != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = start.checked_add(len).ok_or(Errno::EINVAL)?;
+        {
+            // Linux 语义：范围必须**整体**落在本状态对象的 WP 登记区域内。
+            let regions = self.uffd_regions.lock();
+            let mut cursor = start;
+            for region in regions.iter() {
+                if !Arc::ptr_eq(&region.state, state)
+                    || region.mode & UFFDIO_REGISTER_MODE_WP == 0
+                    || region.range.start > cursor
+                {
+                    continue;
+                }
+                cursor = cursor.max(region.range.end);
+                if cursor >= end {
+                    break;
+                }
+            }
+            if cursor < end {
+                return Err(Errno::EINVAL);
+            }
+        }
+        let mut set = self.vmas.lock();
+        let mut pages = self.pages.lock();
+        let mut batch: Option<(usize, usize, VmFlags)> = None;
+        let mut protect_error = None;
+        pages.for_each_range_mut(start..end, |va, mapping| {
+            if protect_error.is_some() {
+                return;
+            }
+            let Some(area) = set.find(va) else {
+                return;
+            };
+            let new_access = if wp {
+                PageAccess::ReadOnly
+            } else {
+                PageAccess::Writable
+            };
+            if new_access == mapping.access {
+                return;
+            }
+            mapping.access = new_access;
+            let pte_flags = pte_flags_for(area.flags, new_access);
+            if let Some((batch_start, batch_end, batch_flags)) = batch {
+                if va == batch_end && batch_flags == pte_flags {
+                    batch = Some((batch_start, batch_end + page_size, batch_flags));
+                    return;
+                }
+                if let Err(error) =
+                    self.protect_pages_no_flush(batch_start, batch_end - batch_start, batch_flags)
+                {
+                    protect_error = Some(error);
+                    return;
+                }
+            }
+            batch = Some((va, va + page_size, pte_flags));
+        });
+        if let Some(error) = protect_error {
+            return Err(error);
+        }
+        if let Some((batch_start, batch_end, batch_flags)) = batch {
+            self.protect_pages_no_flush(batch_start, batch_end - batch_start, batch_flags)?;
+        }
+        drop(pages);
+        drop(set);
+        self.invalidate_user_range(start, end - start);
+        Ok(())
+    }
+
+    /// 把用户态准备好的匿名页安装到 `va`（UFFDIO_COPY/ZEROPAGE 的公共步骤）。
+    ///
+    /// 要求 `va` 属于私有匿名 VMA 且页未驻留；成功后发布新映射（当前 CPU
+    /// 收敛即可，其它 CPU 会在缺页重试路径自行收敛）。
+    fn uffd_install_page(&self, va: usize, page: Arc<ResidentPage>, wp: bool) -> Result<(), Errno> {
+        let (access, flags) = {
+            let set = self.vmas.lock();
+            let area = set.find(va).ok_or(Errno::EINVAL)?;
+            if !matches!(area.backing, VmBacking::Anon { .. }) || area.flags.has(VmFlags::SHARED) {
+                return Err(Errno::EINVAL);
+            }
+            let access = if wp {
+                PageAccess::ReadOnly
+            } else {
+                access_for_new_page(area.flags, &page)
+            };
+            (access, area.flags)
+        };
+        let mut pages = self.pages.lock();
+        if pages.contains_key(va) {
+            return Err(Errno::EEXIST);
+        }
+        self.map_page_no_flush(va, page.paddr(), pte_flags_for(flags, access))?;
+        pages.insert(va, PageMapping { page, access });
+        let mapped = pages.len();
+        self.mapped_pages.store(mapped, Ordering::Release);
+        drop(pages);
+        self.publish_new_user_range(va, page_size());
+        Ok(())
+    }
+
+    /// MISSING 拦截：`page` 命中 MISSING 登记区域且未驻留时，入队事件并挂起
+    /// 当前任务，直到页面被用户态安装或登记失效。返回 true 表示缺页已解决。
+    fn uffd_missing_intercept(&self, page: usize, kind: FaultKind) -> bool {
+        let region = {
+            let regions = self.uffd_regions.lock();
+            if regions.is_empty() {
+                return false;
+            }
+            let Some(region) = regions.iter().find(|region| {
+                region.range.contains(&page) && region.mode & UFFDIO_REGISTER_MODE_MISSING != 0
+            }) else {
+                return false;
+            };
+            region.clone()
+        };
+        if self.pages.lock().contains_key(page) {
+            return false;
+        }
+        // 注册后 VMA 可能被替换；只拦截仍属于私有匿名的区域。
+        {
+            let set = self.vmas.lock();
+            let Some(area) = set.find(page) else {
+                return false;
+            };
+            if !matches!(area.backing, VmBacking::Anon { .. }) || area.flags.has(VmFlags::SHARED) {
+                return false;
+            }
+        }
+        let state = Arc::clone(&region.state);
+        let flags = if matches!(kind, FaultKind::Store | FaultKind::PermWrite) {
+            UFFD_PAGEFAULT_FLAG_WRITE
+        } else {
+            0
+        };
+        state.enqueue_fault(flags, page);
+        let page_present = || self.pages.lock().contains_key(page);
+        let region_alive = || {
+            if !state.alive() {
+                return false;
+            }
+            self.uffd_regions
+                .lock()
+                .iter()
+                .any(|region| region.range.contains(&page) && Arc::ptr_eq(&region.state, &state))
+        };
+        state.wait_fault(|| page_present() || !region_alive());
+        page_present()
+    }
+
+    /// WP 拦截：`page` 命中 WP 登记区域、已驻留但不可写，且本次是写访问时，
+    /// 入队 WP 事件并挂起，直到页面被 `UFFDIO_WRITEPROTECT` 解除保护。
+    fn uffd_wp_intercept(&self, page: usize, kind: FaultKind) -> bool {
+        if !matches!(kind, FaultKind::Store | FaultKind::PermWrite) {
+            return false;
+        }
+        let region = {
+            let regions = self.uffd_regions.lock();
+            if regions.is_empty() {
+                return false;
+            }
+            let Some(region) = regions.iter().find(|region| {
+                region.range.contains(&page) && region.mode & UFFDIO_REGISTER_MODE_WP != 0
+            }) else {
+                return false;
+            };
+            region.clone()
+        };
+        let writable_now = {
+            let pages = self.pages.lock();
+            let Some(mapping) = pages.get(page) else {
+                return false;
+            };
+            mapping.access.pte_writable()
+        };
+        if writable_now {
+            return false;
+        }
+        let state = Arc::clone(&region.state);
+        state.enqueue_fault(UFFD_PAGEFAULT_FLAG_WRITE | UFFD_PAGEFAULT_FLAG_WP, page);
+        let page_writable = || {
+            self.pages
+                .lock()
+                .get(page)
+                .is_some_and(|mapping| mapping.access.pte_writable())
+        };
+        let region_alive = || {
+            if !state.alive() {
+                return false;
+            }
+            self.uffd_regions
+                .lock()
+                .iter()
+                .any(|region| region.range.contains(&page) && Arc::ptr_eq(&region.state, &state))
+        };
+        state.wait_fault(|| page_writable() || !region_alive());
+        page_writable()
     }
 
     pub fn sync_range(&self, range: Range<usize>) -> Result<(), Errno> {
@@ -3862,7 +4872,18 @@ impl VmSpace {
         Ok(())
     }
 
-    pub fn mlock_range(&self, range: Range<usize>) -> Result<(), Errno> {
+    /// `mlock(2)` 语义：把 `range` 内全部 VMA 标记 `LOCKED` 并记账。
+    ///
+    /// `populate` 为 true 时先 fault-in 页面（Linux 默认行为；`mlock2` 的
+    /// `MLOCK_ONFAULT` 不 populate）。populate 失败返回 `EAGAIN`（Linux 语义），
+    /// 且不改变任何锁状态。`RLIMIT_MEMLOCK` 检查由 syscall 层在调用前用
+    /// [`Self::would_lock_pages`] 完成，这里只负责状态与记账。
+    pub fn mlock_range(&self, range: Range<usize>, populate: bool) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        if populate {
+            self.prefault_user_range(range.clone(), true)
+                .map_err(|_| Errno::EAGAIN)?;
+        }
         self.update_locked_range(range, true)
     }
 
@@ -3870,12 +4891,26 @@ impl VmSpace {
         self.update_locked_range(range, false)
     }
 
-    pub fn mlock_all_current(&self) {
-        let mut set = self.vmas.lock();
-        let ranges: Vec<Range<usize>> = set.iter().map(|area| area.range.clone()).collect();
-        for range in ranges {
-            set.update_flags_range(&range, |flags| flags.with(VmFlags::LOCKED));
+    /// `mlockall(MCL_CURRENT)`：锁定当前全部 VMA 并记账。
+    pub fn mlock_all_current(&self, populate: bool) -> Result<(), Errno> {
+        let ranges: Vec<Range<usize>> = {
+            let set = self.vmas.lock();
+            set.iter().map(|area| area.range.clone()).collect()
+        };
+        if populate {
+            for range in &ranges {
+                self.prefault_user_range(range.clone(), true)
+                    .map_err(|_| Errno::EAGAIN)?;
+            }
         }
+        let mut set = self.vmas.lock();
+        for range in &ranges {
+            set.update_flags_range(range, |flags| flags.with(VmFlags::LOCKED));
+        }
+        // 全部区域已带 LOCKED：锁页数 = 全部 VMA 几何页数。
+        let total: usize = set.iter().map(Self::area_page_count).sum();
+        self.locked_pages.store(total, Ordering::Release);
+        Ok(())
     }
 
     pub fn set_mlock_future(&self, enabled: bool) {
@@ -3889,23 +4924,60 @@ impl VmSpace {
         for range in ranges {
             set.update_flags_range(&range, |flags| flags.without(VmFlags::LOCKED));
         }
+        self.locked_pages.store(0, Ordering::Release);
     }
 
+    /// 翻转 `range` 内全部 VMA 的 `LOCKED` 位并同步锁页记账。
+    ///
+    /// 记账口径与 Linux `mm->locked_vm` 一致：带 `LOCKED` 的 VMA 几何页数。
+    /// 由于 `update_flags_range` 的拆分可能让部分片段原本就带 `LOCKED`，
+    /// 需要先统计旧状态，避免重复计数。
     fn update_locked_range(&self, range: Range<usize>, locked: bool) -> Result<(), Errno> {
         self.validate_range(&range)?;
-        let mut set = self.vmas.lock();
-        if !set.contains_range(&range) {
-            return Err(Errno::ENOMEM);
-        }
+        let (already_locked, pieces) = {
+            let mut set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(Errno::ENOMEM);
+            }
+            let already_locked: usize = set
+                .iter_overlap(&range)
+                .filter(|area| area.flags.has(VmFlags::LOCKED))
+                .map(|area| {
+                    let start = area.range.start.max(range.start);
+                    let end = area.range.end.min(range.end);
+                    (end - start) / page_size()
+                })
+                .sum();
+            let pieces = set.update_flags_range(&range, |flags| {
+                if locked {
+                    flags.with(VmFlags::LOCKED)
+                } else {
+                    flags.without(VmFlags::LOCKED)
+                }
+            });
+            (already_locked, pieces)
+        };
+        let after_locked: usize = pieces
+            .iter()
+            .filter(|(_, flags)| flags.has(VmFlags::LOCKED))
+            .map(|(piece_range, _)| (piece_range.end - piece_range.start) / page_size())
+            .sum();
         if locked {
-            set.update_flags_range(&range, |flags| flags.with(VmFlags::LOCKED));
+            let delta = after_locked.saturating_sub(already_locked);
+            self.locked_pages.fetch_add(delta, Ordering::Relaxed);
+            memstat::locked_pages_delta(delta as i64);
         } else {
-            set.update_flags_range(&range, |flags| flags.without(VmFlags::LOCKED));
+            self.locked_pages
+                .fetch_sub(already_locked, Ordering::Relaxed);
+            memstat::locked_pages_delta(-(already_locked as i64));
         }
         Ok(())
     }
 
     /// fork：克隆 VMA 元数据，已驻留的页按 private-COW / shared 语义重建页表。
+    ///
+    /// `DONTFORK` VMA 不进子进程（`fork_clone_metadata` 已过滤）；`WIPEONFORK`
+    /// VMA 保留元数据但子进程不复制页，首次缺页得到零页。
     #[kernel_symbols::export(name = "general.mm.VmSpace.fork", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn fork(&self) -> Self {
         let ops = user_pgd_ops().expect("[mm] user_pgd_ops not registered");
@@ -3922,6 +4994,10 @@ impl VmSpace {
                 let Some(area) = cloned_set.find(va) else {
                     return;
                 };
+                if area.flags.has(VmFlags::WIPEONFORK) {
+                    // WIPEONFORK：子进程不继承页，缺页时分配零页。
+                    return;
+                }
                 let old_access = mapping.access;
                 mapping.access = access_after_fork(area.flags, &mapping.page);
                 if old_access != mapping.access {
@@ -3950,6 +5026,10 @@ impl VmSpace {
         Self::notify_files_mapped(cloned_file_backings);
 
         let mapped_pages = child_pages.len();
+        // overcommit 记账：子进程复制父进程承诺，全局聚合再计一份。
+        let inherited_committed = self.committed_pages.load(Ordering::Acquire);
+        memstat::commit_pages(inherited_committed as i64);
+        let inherited_locked = self.locked_pages.load(Ordering::Acquire);
         VM_SPACE_CREATED.fetch_add(1, Ordering::Relaxed);
         VM_SPACE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
@@ -3960,6 +5040,12 @@ impl VmSpace {
             brk_current: AtomicUsize::new(self.current_brk()),
             mmap_next: AtomicUsize::new(self.mmap_next.load(Ordering::Acquire)),
             mlock_future: AtomicBool::new(self.mlock_future.load(Ordering::Acquire)),
+            committed_pages: AtomicUsize::new(inherited_committed),
+            locked_pages: AtomicUsize::new(inherited_locked),
+            // fork 继承内存策略（Linux 语义：mempolicy 随 mm 复制）。
+            mempolicy: Spinlock::new(self.mempolicy.lock().clone()),
+            // fork 不继承 userfaultfd 登记（Linux 语义）。
+            uffd_regions: Spinlock::new(Vec::new()),
             // fork 创建独立 mm，按 Linux 语义不继承 expedited 注册状态。
             membarrier_registration: AtomicUsize::new(0),
             mapped_pages: AtomicUsize::new(mapped_pages),
@@ -4021,6 +5107,14 @@ impl VmSpace {
             return FaultOutcome::Kernel(KernelFaultReason::NotInitialized);
         }
         let page = page_base(addr);
+        // userfaultfd 拦截：MISSING 区域的缺页与 WP 区域的写保护缺页先入队
+        // 事件并挂起本任务，由用户态解决后返回 Fixed 让硬件重试。
+        if self.uffd_missing_intercept(page, kind) {
+            return FaultOutcome::Fixed;
+        }
+        if self.uffd_wp_intercept(page, kind) {
+            return FaultOutcome::Fixed;
+        }
         #[cfg(feature = "performance-profile")]
         let vma_profile =
             profile_phases.then(|| profiling::scope(profiling::Event::PageFaultVmaLookup));
@@ -5560,10 +6654,12 @@ impl VmSpace {
                 backing,
             };
             let files = Self::collect_file_backings(core::iter::once(&tail));
-            vmas.insert(tail)?;
-            files
+            vmas.insert(tail.clone())?;
+            (tail, files)
         };
-        Self::notify_files_mapped(mapped_tail);
+        let (tail, files) = mapped_tail;
+        self.account_area_insert(&tail);
+        Self::notify_files_mapped(files);
         Ok(true)
     }
 
@@ -5601,6 +6697,11 @@ impl Drop for VmSpace {
     fn drop(&mut self) {
         VM_SPACE_DROPPED.fetch_add(1, Ordering::Relaxed);
         VM_SPACE_LIVE.fetch_sub(1, Ordering::Relaxed);
+        // 归还 overcommit 承诺记账。
+        let committed = self.committed_pages.load(Ordering::Acquire);
+        if committed != 0 {
+            memstat::commit_pages(-(committed as i64));
+        }
         let (files, areas) = {
             let mut vmas = self.vmas.lock();
             let files = Self::collect_file_backings(vmas.iter());
@@ -6026,6 +7127,16 @@ fn reclaim_private_file_cache_pages(limit: usize) -> usize {
     PRIVATE_FILE_PAGES.reclaim(limit)
 }
 
+/// `drop_caches=1`：清空私有干净文件页缓存（逐批回收直到空）。
+pub fn drop_private_file_cache() {
+    loop {
+        let reclaimed = reclaim_private_file_cache_pages(1024);
+        if reclaimed == 0 {
+            break;
+        }
+    }
+}
+
 fn find_cached_file_page(cache: &WeakFilePageCache, key: FilePageKey) -> Option<Arc<ResidentPage>> {
     cache.lock().get(&key).and_then(Weak::upgrade)
 }
@@ -6055,6 +7166,57 @@ fn remove_cached_file_page(cache: &WeakFilePageCache, key: FilePageKey, page: &R
     {
         pages.remove(&key);
     }
+}
+
+/// `cachestat(2)` 计数：统计文件 `[off, off+len)` 内处于"页缓存"状态的页。
+///
+/// 本内核的页缓存由两部分构成：私有干净文件页强缓存（`PRIVATE_FILE_PAGES`，
+/// 含未映射的缓存页）与共享文件页缓存（`SHARED_FILE_PAGES`，驻留页的弱引用表）。
+/// 返回 `(cached_pages, dirty_pages)`；写回中/最近回收的计数没有对应状态，
+/// 恒为 0。
+///
+/// 两类缓存的键不同：共享缓存用 [`FileLike::cache_key`]（inode 身份），私有
+/// 缓存用 [`FileLike::private_page_cache_key`]（独立分配的缓存 id）。
+pub fn file_cache_stat(
+    shared_key: usize,
+    private_key: Option<usize>,
+    off: u64,
+    len: u64,
+) -> (u64, u64) {
+    let end = off.saturating_add(len);
+    let mut cached = 0u64;
+    let mut dirty = 0u64;
+    {
+        let pages = SHARED_FILE_PAGES.lock();
+        for (key, weak) in pages.iter() {
+            if key.file_key != shared_key || key.offset < off || key.offset >= end {
+                continue;
+            }
+            if let Some(page) = weak.upgrade() {
+                cached += 1;
+                if page.is_dirty() {
+                    dirty += 1;
+                }
+            }
+        }
+    }
+    if let Some(private_key) = private_key {
+        for shard in &PRIVATE_FILE_PAGES.shards {
+            let shard = shard.lock();
+            for (key, entry) in shard.pages.entries.iter() {
+                if key.file_key != private_key || key.offset < off || key.offset >= end {
+                    continue;
+                }
+                if let PrivateFilePageCacheEntry::Ready(ready) = entry {
+                    cached += 1;
+                    if ready.page.is_dirty() {
+                        dirty += 1;
+                    }
+                }
+            }
+        }
+    }
+    (cached, dirty)
 }
 
 fn shared_anon_page(

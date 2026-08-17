@@ -361,6 +361,17 @@ impl Inode {
         self.cached_size.load(Ordering::Acquire)
     }
 
+    /// 该文件是否属于内存文件系统（tmpfs / anonfs，Linux 统称 shmem）。
+    ///
+    /// `MADV_REMOVE` 只对这类文件生效；普通文件映射返回 `EINVAL`。anonfs 上的
+    /// memfd 与 tmpfs 同为 Linux shmem 语义，因此一并计入。
+    pub fn is_shmem_fs(&self) -> bool {
+        matches!(
+            self.superblock.upgrade().map(|sb| sb.fs_type),
+            Some("tmpfs" | "anonfs")
+        )
+    }
+
     /// 返回当前硬链接计数的无锁快照。
     pub fn nlink(&self) -> u32 {
         self.cached_nlink.load(Ordering::Acquire)

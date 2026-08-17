@@ -1464,37 +1464,48 @@ fn encode_sysinfo(uptime: i64, totalram: u64, freeram: u64) -> [u8; 112] {
 pub(super) fn sys_sysinfo(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let info = ctx.args[0];
     if info != 0 {
-        let memory = allocator::KERNEL_ALLOCATOR.detailed_stats();
+        // Linux struct sysinfo（64 位布局，sizeof == 112）。
+        let overview = allocator::KERNEL_ALLOCATOR.detailed_stats();
+        let page_size = hal::memory::page_size() as u64;
+        let totalram = overview.total_physical as u64;
+        // freeram 与 /proc/meminfo MemAvailable 同口径：空闲物理页 + 可回收缓存。
+        let allocator_reclaimable = {
+            let layers = allocator::KERNEL_ALLOCATOR.layer_stats();
+            let slab_reclaimable = allocator::KERNEL_ALLOCATOR
+                .slab_class_stats()
+                .iter()
+                .fold(0usize, |sum, class| {
+                    sum.saturating_add(class.reclaimable_empty_pages)
+                })
+                .saturating_mul(hal::memory::page_size());
+            layers.kheap.cached_bytes.saturating_add(slab_reclaimable)
+        };
+        let freeram = overview.free_physical.saturating_add(allocator_reclaimable) as u64;
+        let sharedram = general::mm::memstat::SHARED_ANON_PAGES
+            .load(core::sync::atomic::Ordering::Relaxed)
+            * page_size;
+        let bufferram = (general::mm::memstat::PRIVATE_FILE_PAGES
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .saturating_add(
+                general::mm::memstat::SHARED_FILE_PAGES.load(core::sync::atomic::Ordering::Relaxed),
+            ))
+            * page_size;
+        let (total_swap_pages, free_swap_pages) = general::mm::swap::swap_totals();
+        let procs = sched::root_pid_ns().registry().snapshot().len().min(65535) as u16;
         let mut out = encode_sysinfo(
-            sched::now_ns_direct() as i64 / 1_000_000_000,
-            memory.total_physical as u64,
-            memory.free_physical as u64,
+            (sched::now_ns_direct() / 1_000_000_000) as i64,
+            totalram,
+            freeram,
         );
         let loads = sched::avenrun::loads_scaled();
         put_u64(&mut out, 8, loads[0]);
         put_u64(&mut out, 16, loads[1]);
         put_u64(&mut out, 24, loads[2]);
-        let layers = allocator::KERNEL_ALLOCATOR.layer_stats();
-        put_u64(&mut out, 48, super::ipc::sysv_shm_total_bytes());
-        let page_size = general::mm::page_size() as u64;
-        let slab_reclaimable_bytes = allocator::KERNEL_ALLOCATOR
-            .slab_class_stats()
-            .iter()
-            .fold(0u64, |sum, class| {
-                sum.saturating_add(class.reclaimable_empty_pages as u64 * page_size)
-            });
-        let bufferram = layers.kheap.cached_bytes as u64 + slab_reclaimable_bytes;
+        put_u64(&mut out, 48, sharedram);
         put_u64(&mut out, 56, bufferram);
-        let mut processes = 0u16;
-        if sched::is_ready() {
-            for (_, weak) in sched::root_pid_ns().registry().snapshot() {
-                let Some(_task) = weak.upgrade() else {
-                    continue;
-                };
-                processes = processes.saturating_add(1);
-            }
-        }
-        put_u16(&mut out, 80, processes);
+        put_u64(&mut out, 64, total_swap_pages * page_size);
+        put_u64(&mut out, 72, free_swap_pages * page_size);
+        put_u16(&mut out, 80, procs);
         copy_to_user(info, &out).map_err(|e| e.as_errno())?;
     }
     Ok(0)

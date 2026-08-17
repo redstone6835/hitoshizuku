@@ -515,6 +515,33 @@ const KERNEL_PROFILE_SNAPSHOT_INO: u64 = 74;
 const KERNEL_PROFILE_HEALTH_INO: u64 = 75;
 const KERNEL_ELM_DIR_INO: u64 = 80;
 const KERNEL_ELM_FILE_BASE_INO: u64 = 81;
+const KERNEL_MM_DIR_INO: u64 = 90;
+const KERNEL_MM_THP_DIR_INO: u64 = 91;
+const KERNEL_MM_THP_KHUGEPAGED_DIR_INO: u64 = 92;
+const KERNEL_MM_KSM_DIR_INO: u64 = 93;
+const KERNEL_MM_HUGEPAGES_DIR_INO: u64 = 94;
+const KERNEL_MM_THP_ENABLED_INO: u64 = 95;
+const KERNEL_MM_THP_DEFRAG_INO: u64 = 96;
+const KERNEL_MM_THP_SHMEM_ENABLED_INO: u64 = 97;
+const KERNEL_MM_THP_USE_ZERO_PAGE_INO: u64 = 98;
+const KERNEL_MM_KHP_SCAN_SLEEP_INO: u64 = 99;
+const KERNEL_MM_KHP_ALLOC_SLEEP_INO: u64 = 100;
+const KERNEL_MM_KHP_MAX_PTES_NONE_INO: u64 = 101;
+const KERNEL_MM_KHP_PAGES_COLLAPSED_INO: u64 = 102;
+const KERNEL_MM_KSM_RUN_INO: u64 = 110;
+const KERNEL_MM_KSM_MERGE_ACROSS_NODES_INO: u64 = 111;
+const KERNEL_MM_KSM_PAGES_SHARED_INO: u64 = 112;
+const KERNEL_MM_KSM_PAGES_SHARING_INO: u64 = 113;
+const KERNEL_MM_KSM_PAGES_UNSHARED_INO: u64 = 114;
+const KERNEL_MM_KSM_PAGES_VOLATILE_INO: u64 = 115;
+const KERNEL_MM_KSM_FULL_SCANS_INO: u64 = 116;
+const KERNEL_MM_KSM_MAX_PAGE_SHARING_INO: u64 = 117;
+const KERNEL_MM_HUGEPAGES_SUBDIR_INO: u64 = 120;
+const KERNEL_MM_HP_NR_INO: u64 = 121;
+const KERNEL_MM_HP_NR_OVERCOMMIT_INO: u64 = 122;
+const KERNEL_MM_HP_FREE_INO: u64 = 123;
+const KERNEL_MM_HP_RESV_INO: u64 = 124;
+const KERNEL_MM_HP_SURPLUS_INO: u64 = 125;
 const DEV_BLOCK_DIR_INO: u64 = 30;
 const DEV_CHAR_DIR_INO: u64 = 31;
 const FS_CGROUP_INO: u64 = 40;
@@ -2159,6 +2186,27 @@ enum SysRegFile {
     Elm {
         slot: ElmSysfsSlot,
     },
+    ThpEnabled,
+    ThpDefrag,
+    ThpShmemEnabled,
+    ThpUseZeroPage,
+    KhpScanSleepMs,
+    KhpAllocSleepMs,
+    KhpMaxPtesNone,
+    KhpPagesCollapsed,
+    KsmRun,
+    KsmMergeAcrossNodes,
+    KsmPagesShared,
+    KsmPagesSharing,
+    KsmPagesUnshared,
+    KsmPagesVolatile,
+    KsmFullScans,
+    KsmMaxPageSharing,
+    HugepagesNr,
+    HugepagesNrOvercommit,
+    HugepagesFree,
+    HugepagesResv,
+    HugepagesSurplus,
     NetDev {
         iface_id: u32,
         slot: NetDevSlot,
@@ -3338,6 +3386,30 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
         #[cfg(feature = "performance-profile")]
         SysRegFile::ProfileHealth => render_profile_health(),
         SysRegFile::Elm { slot } => render_elm_sysfs_file(slot.file_name()),
+        // THP/khugepaged 视图：本内核无 THP，enabled 恒为 never，其余为默认值。
+        SysRegFile::ThpEnabled => "always madvise [never]\n".into(),
+        SysRegFile::ThpDefrag => "always defer defer+madvise madvise [never]\n".into(),
+        SysRegFile::ThpShmemEnabled => "always within_size advise [never]\n".into(),
+        SysRegFile::ThpUseZeroPage => "0\n".into(),
+        SysRegFile::KhpScanSleepMs => "10000\n".into(),
+        SysRegFile::KhpAllocSleepMs => "60000\n".into(),
+        SysRegFile::KhpMaxPtesNone => "511\n".into(),
+        SysRegFile::KhpPagesCollapsed => "0\n".into(),
+        // KSM 视图：本内核无 KSM，run=0（禁用），其余为 Linux 默认值。
+        SysRegFile::KsmRun => "0\n".into(),
+        SysRegFile::KsmMergeAcrossNodes => "1\n".into(),
+        SysRegFile::KsmPagesShared => "0\n".into(),
+        SysRegFile::KsmPagesSharing => "0\n".into(),
+        SysRegFile::KsmPagesUnshared => "0\n".into(),
+        SysRegFile::KsmPagesVolatile => "0\n".into(),
+        SysRegFile::KsmFullScans => "0\n".into(),
+        SysRegFile::KsmMaxPageSharing => "256\n".into(),
+        // hugetlb 视图：本内核无大页池，全部为 0。
+        SysRegFile::HugepagesNr => "0\n".into(),
+        SysRegFile::HugepagesNrOvercommit => "0\n".into(),
+        SysRegFile::HugepagesFree => "0\n".into(),
+        SysRegFile::HugepagesResv => "0\n".into(),
+        SysRegFile::HugepagesSurplus => "0\n".into(),
         SysRegFile::NetDev { iface_id, slot } => {
             if let Some(iface) = net::device::snapshot_devices()
                 .into_iter()
@@ -3826,6 +3898,12 @@ enum SysDirKind {
     },
     Kernel,
     KernelElm,
+    KernelMm,
+    KernelMmThp,
+    KernelMmThpKhugepaged,
+    KernelMmKsm,
+    KernelMmHugepages,
+    KernelMmHugepagesLeaf,
     Fs,
     FsCgroup,
     Bus,
@@ -4308,6 +4386,96 @@ impl SysDirInodeOps {
                 #[cfg(feature = "performance-profile")]
                 "profile_health" => mk_reg(KERNEL_PROFILE_HEALTH_INO, SysRegFile::ProfileHealth),
                 "elm" => Ok(mk_dir(KERNEL_ELM_DIR_INO, SysDirKind::KernelElm)),
+                "mm" => Ok(mk_dir(KERNEL_MM_DIR_INO, SysDirKind::KernelMm)),
+                _ => Err(VfsError::NotFound),
+            },
+            SysDirKind::KernelMm => match name {
+                "transparent_hugepage" => {
+                    Ok(mk_dir(KERNEL_MM_THP_DIR_INO, SysDirKind::KernelMmThp))
+                }
+                "ksm" => Ok(mk_dir(KERNEL_MM_KSM_DIR_INO, SysDirKind::KernelMmKsm)),
+                "hugepages" => Ok(mk_dir(
+                    KERNEL_MM_HUGEPAGES_DIR_INO,
+                    SysDirKind::KernelMmHugepages,
+                )),
+                _ => Err(VfsError::NotFound),
+            },
+            SysDirKind::KernelMmThp => match name {
+                "enabled" => mk_reg(KERNEL_MM_THP_ENABLED_INO, SysRegFile::ThpEnabled),
+                "defrag" => mk_reg(KERNEL_MM_THP_DEFRAG_INO, SysRegFile::ThpDefrag),
+                "shmem_enabled" => {
+                    mk_reg(KERNEL_MM_THP_SHMEM_ENABLED_INO, SysRegFile::ThpShmemEnabled)
+                }
+                "use_zero_page" => {
+                    mk_reg(KERNEL_MM_THP_USE_ZERO_PAGE_INO, SysRegFile::ThpUseZeroPage)
+                }
+                "khugepaged" => Ok(mk_dir(
+                    KERNEL_MM_THP_KHUGEPAGED_DIR_INO,
+                    SysDirKind::KernelMmThpKhugepaged,
+                )),
+                _ => Err(VfsError::NotFound),
+            },
+            SysDirKind::KernelMmThpKhugepaged => match name {
+                "scan_sleep_millisecs" => {
+                    mk_reg(KERNEL_MM_KHP_SCAN_SLEEP_INO, SysRegFile::KhpScanSleepMs)
+                }
+                "alloc_sleep_millisecs" => {
+                    mk_reg(KERNEL_MM_KHP_ALLOC_SLEEP_INO, SysRegFile::KhpAllocSleepMs)
+                }
+                "max_ptes_none" => {
+                    mk_reg(KERNEL_MM_KHP_MAX_PTES_NONE_INO, SysRegFile::KhpMaxPtesNone)
+                }
+                "pages_collapsed" => mk_reg(
+                    KERNEL_MM_KHP_PAGES_COLLAPSED_INO,
+                    SysRegFile::KhpPagesCollapsed,
+                ),
+                _ => Err(VfsError::NotFound),
+            },
+            SysDirKind::KernelMmKsm => match name {
+                "run" => mk_reg(KERNEL_MM_KSM_RUN_INO, SysRegFile::KsmRun),
+                "merge_across_nodes" => mk_reg(
+                    KERNEL_MM_KSM_MERGE_ACROSS_NODES_INO,
+                    SysRegFile::KsmMergeAcrossNodes,
+                ),
+                "pages_shared" => {
+                    mk_reg(KERNEL_MM_KSM_PAGES_SHARED_INO, SysRegFile::KsmPagesShared)
+                }
+                "pages_sharing" => {
+                    mk_reg(KERNEL_MM_KSM_PAGES_SHARING_INO, SysRegFile::KsmPagesSharing)
+                }
+                "pages_unshared" => mk_reg(
+                    KERNEL_MM_KSM_PAGES_UNSHARED_INO,
+                    SysRegFile::KsmPagesUnshared,
+                ),
+                "pages_volatile" => mk_reg(
+                    KERNEL_MM_KSM_PAGES_VOLATILE_INO,
+                    SysRegFile::KsmPagesVolatile,
+                ),
+                "full_scans" => mk_reg(KERNEL_MM_KSM_FULL_SCANS_INO, SysRegFile::KsmFullScans),
+                "max_page_sharing" => mk_reg(
+                    KERNEL_MM_KSM_MAX_PAGE_SHARING_INO,
+                    SysRegFile::KsmMaxPageSharing,
+                ),
+                _ => Err(VfsError::NotFound),
+            },
+            SysDirKind::KernelMmHugepages => match name {
+                "hugepages-2048kB" => Ok(mk_dir(
+                    KERNEL_MM_HUGEPAGES_SUBDIR_INO,
+                    SysDirKind::KernelMmHugepagesLeaf,
+                )),
+                _ => Err(VfsError::NotFound),
+            },
+            SysDirKind::KernelMmHugepagesLeaf => match name {
+                "nr_hugepages" => mk_reg(KERNEL_MM_HP_NR_INO, SysRegFile::HugepagesNr),
+                "nr_overcommit_hugepages" => mk_reg(
+                    KERNEL_MM_HP_NR_OVERCOMMIT_INO,
+                    SysRegFile::HugepagesNrOvercommit,
+                ),
+                "free_hugepages" => mk_reg(KERNEL_MM_HP_FREE_INO, SysRegFile::HugepagesFree),
+                "resv_hugepages" => mk_reg(KERNEL_MM_HP_RESV_INO, SysRegFile::HugepagesResv),
+                "surplus_hugepages" => {
+                    mk_reg(KERNEL_MM_HP_SURPLUS_INO, SysRegFile::HugepagesSurplus)
+                }
                 _ => Err(VfsError::NotFound),
             },
             SysDirKind::KernelElm => {
@@ -5019,6 +5187,119 @@ impl SysDirInodeOps {
                     FileType::Regular,
                 ),
                 mk_dir_entry(KERNEL_ELM_DIR_INO, "elm", FileType::Directory),
+                mk_dir_entry(KERNEL_MM_DIR_INO, "mm", FileType::Directory),
+            ],
+            SysDirKind::KernelMm => vec![
+                mk_dir_entry(
+                    KERNEL_MM_THP_DIR_INO,
+                    "transparent_hugepage",
+                    FileType::Directory,
+                ),
+                mk_dir_entry(KERNEL_MM_KSM_DIR_INO, "ksm", FileType::Directory),
+                mk_dir_entry(
+                    KERNEL_MM_HUGEPAGES_DIR_INO,
+                    "hugepages",
+                    FileType::Directory,
+                ),
+            ],
+            SysDirKind::KernelMmThp => vec![
+                mk_dir_entry(KERNEL_MM_THP_ENABLED_INO, "enabled", FileType::Regular),
+                mk_dir_entry(KERNEL_MM_THP_DEFRAG_INO, "defrag", FileType::Regular),
+                mk_dir_entry(
+                    KERNEL_MM_THP_SHMEM_ENABLED_INO,
+                    "shmem_enabled",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    KERNEL_MM_THP_USE_ZERO_PAGE_INO,
+                    "use_zero_page",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    KERNEL_MM_THP_KHUGEPAGED_DIR_INO,
+                    "khugepaged",
+                    FileType::Directory,
+                ),
+            ],
+            SysDirKind::KernelMmThpKhugepaged => vec![
+                mk_dir_entry(
+                    KERNEL_MM_KHP_SCAN_SLEEP_INO,
+                    "scan_sleep_millisecs",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    KERNEL_MM_KHP_ALLOC_SLEEP_INO,
+                    "alloc_sleep_millisecs",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    KERNEL_MM_KHP_MAX_PTES_NONE_INO,
+                    "max_ptes_none",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    KERNEL_MM_KHP_PAGES_COLLAPSED_INO,
+                    "pages_collapsed",
+                    FileType::Regular,
+                ),
+            ],
+            SysDirKind::KernelMmKsm => vec![
+                mk_dir_entry(KERNEL_MM_KSM_RUN_INO, "run", FileType::Regular),
+                mk_dir_entry(
+                    KERNEL_MM_KSM_MERGE_ACROSS_NODES_INO,
+                    "merge_across_nodes",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    KERNEL_MM_KSM_PAGES_SHARED_INO,
+                    "pages_shared",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    KERNEL_MM_KSM_PAGES_SHARING_INO,
+                    "pages_sharing",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    KERNEL_MM_KSM_PAGES_UNSHARED_INO,
+                    "pages_unshared",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    KERNEL_MM_KSM_PAGES_VOLATILE_INO,
+                    "pages_volatile",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    KERNEL_MM_KSM_FULL_SCANS_INO,
+                    "full_scans",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    KERNEL_MM_KSM_MAX_PAGE_SHARING_INO,
+                    "max_page_sharing",
+                    FileType::Regular,
+                ),
+            ],
+            SysDirKind::KernelMmHugepages => vec![mk_dir_entry(
+                KERNEL_MM_HUGEPAGES_SUBDIR_INO,
+                "hugepages-2048kB",
+                FileType::Directory,
+            )],
+            SysDirKind::KernelMmHugepagesLeaf => vec![
+                mk_dir_entry(KERNEL_MM_HP_NR_INO, "nr_hugepages", FileType::Regular),
+                mk_dir_entry(
+                    KERNEL_MM_HP_NR_OVERCOMMIT_INO,
+                    "nr_overcommit_hugepages",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(KERNEL_MM_HP_FREE_INO, "free_hugepages", FileType::Regular),
+                mk_dir_entry(KERNEL_MM_HP_RESV_INO, "resv_hugepages", FileType::Regular),
+                mk_dir_entry(
+                    KERNEL_MM_HP_SURPLUS_INO,
+                    "surplus_hugepages",
+                    FileType::Regular,
+                ),
             ],
             SysDirKind::KernelElm => {
                 let mut entries = Vec::new();

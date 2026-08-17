@@ -152,9 +152,9 @@ fn parse_mount_options(data: &str) -> VfsResult<TmpfsMountOptions> {
             // busybox mount 会把 `-o nosuid,nodev` 等约束也放进 data 串而不是
             // 全部转成 mount(2) 标志位；时间戳与执行约束由 VFS 层处理，这里
             // 只负责不拒绝常见组合（OpenRC 挂 /run 使用 strictatime 等）。
-            "strictatime" | "relatime" | "noatime" | "nodiratime" | "lazytime"
-            | "nosuid" | "nodev" | "noexec" | "suid" | "dev" | "exec" | "sync"
-            | "async" | "dirsync" | "rw" | "ro" | "defaults" | "mand" | "nomand" => {}
+            "strictatime" | "relatime" | "noatime" | "nodiratime" | "lazytime" | "nosuid"
+            | "nodev" | "noexec" | "suid" | "dev" | "exec" | "sync" | "async" | "dirsync"
+            | "rw" | "ro" | "defaults" | "mand" | "nomand" => {}
             _ => return Err(VfsError::InvalidArgument),
         }
     }
