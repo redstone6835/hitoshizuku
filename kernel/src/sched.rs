@@ -21,7 +21,9 @@ use general::vfs::{
     Credentials, Dentry, FdTable, FileMode, Mount, MountNamespace, VfsContext, VfsLimits, VfsRoot,
     build_boot_vfs_parts,
 };
+use hal::memory::page_size;
 use hal::user_context::UserTrapFrame;
+use mm::VmFlags;
 use sched::arch_hooks::VmSwitchOps;
 use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::process_ops::{ExecRequest, ProcessImageOps, UserContextRef};
@@ -31,7 +33,8 @@ use sched::task::{
     TaskExitAccountingHook, TaskExtCloneHook, TaskExtExitHook, TaskExtKey, TaskPreExitHook,
 };
 use sched::{
-    TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task,
+    SchedParams, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE,
+    TASKEXT_VM_SPACE, Task,
 };
 use vfs::Arc as VfsArc;
 
@@ -147,6 +150,46 @@ impl TaskExtCloneHook for KernelExtCloneHook {
             }
             sched::TASKEXT_ELM_EXECUTION => {
                 Arc::new(general::elm_guard::ElmTaskExecutionState::new())
+            }
+            crate::syscalls::ipc::TASKEXT_SEM_UNDO => {
+                let table = Arc::clone(src)
+                    .downcast::<general::ipc::sem_undo::SemUndoTable>()
+                    .expect("[sched][ext] sem undo table type mismatch");
+                // CLONE_SYSVSEM 共享撤销表；否则子进程得到空表（Linux 语义：
+                // 撤销项不随 fork 继承）。
+                if flags.has(CloneFlags::CLONE_SYSVSEM) {
+                    table
+                } else {
+                    Arc::new(general::ipc::sem_undo::SemUndoTable::new())
+                }
+            }
+            crate::syscalls::process::TASKEXT_PRCTL_MISC => {
+                let state = Arc::clone(src)
+                    .downcast::<crate::syscalls::process::PrctlMiscState>()
+                    .expect("[sched][ext] prctl misc state type mismatch");
+                // Linux：TSC 模式与 THP 开关随 fork 继承（exec 保留）。
+                let child = crate::syscalls::process::PrctlMiscState::new();
+                child.tsc_mode.store(state.tsc_mode.load(Ordering::Acquire), Ordering::Release);
+                child.thp_disable.store(
+                    state.thp_disable.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+                Arc::new(child)
+            }
+            crate::syscalls::ipc::TASKEXT_KEYRINGS => {
+                let process = Arc::clone(src)
+                    .downcast::<general::ipc::keys::ProcessKeyrings>()
+                    .expect("[sched][ext] process keyrings type mismatch");
+                // CLONE_THREAD 共享 thread keyring；fork 时新建引用集并继承
+                // process/session keyring 引用（Linux copy_keys 语义）。
+                if flags.has(CloneFlags::CLONE_THREAD) {
+                    process
+                } else {
+                    let child = general::ipc::keys::ProcessKeyrings::new();
+                    *child.process.lock() = *process.process.lock();
+                    *child.session.lock() = *process.session.lock();
+                    Arc::new(child)
+                }
             }
             _ => Arc::clone(src),
         }
@@ -567,6 +610,97 @@ pub(crate) fn prepare_native_thread(
     child.into_kernel_thread(user_clone_entry, 0);
     child.ext_install(TASKEXT_USER_TRAP_FRAME, Arc::new(frame));
     Ok(())
+}
+
+/// `mq_notify(SIGEV_THREAD)`：在注册者进程上下文创建线程执行通知函数。
+///
+/// 语义对齐 POSIX/Linux：helper 是注册者的同进程新线程（共享 mm/fs/files/
+/// sighand），从 `function(value)` 开始执行；函数返回后经用户态退出桩调用
+/// `exit(0)` 结束该线程，不影响进程其它线程。
+pub(crate) fn spawn_mq_notify_thread(registrant: &Arc<Task>, function: usize, value: usize) {
+    use sched::clone_flags::{CloneArgs, CloneFlags};
+
+    if registrant.is_kernel_task() {
+        return;
+    }
+    let args = CloneArgs {
+        flags: CloneFlags(
+            CloneFlags::CLONE_VM
+                | CloneFlags::CLONE_FS
+                | CloneFlags::CLONE_FILES
+                | CloneFlags::CLONE_SIGHAND
+                | CloneFlags::CLONE_THREAD,
+        ),
+        pidfd: 0,
+        stack: 0,
+        stack_size: 0,
+        parent_tid: 0,
+        child_tid: 0,
+        tls: 0,
+        exit_signal: 0,
+        set_tid: 0,
+        set_tid_size: 0,
+        requested_pid: 0,
+        cgroup: 0,
+    };
+    let child = sched::spawn::clone_task(registrant, args, sched::SchedParams::default_fair());
+    if child.state() == sched::TaskState::Dead {
+        log::warning!(
+            "[mq][SIGEV_THREAD] clone failed for registrant pid={:?}",
+            registrant.pid_root(),
+        );
+        return;
+    }
+    let Some(vm) = registrant
+        .ext_lookup(TASKEXT_VM_SPACE)
+        .and_then(|payload| payload.downcast::<VmSpace>().ok())
+    else {
+        log::debug!("[mq][SIGEV_THREAD] registrant has no vm, drop notification");
+        return;
+    };
+    // 通知线程的用户栈 + 退出桩（一页，可执行）。
+    let Ok(stack_range) = vm.alloc_mmap_range(page_size()) else {
+        return;
+    };
+    let stack_flags = VmFlags::EMPTY
+        .with(VmFlags::READ)
+        .with(VmFlags::WRITE)
+        .with(VmFlags::EXEC)
+        .with(VmFlags::USER);
+    if vm.map_anon(stack_range.clone(), stack_flags).is_err() {
+        let _ = vm.unmap(stack_range.clone());
+        return;
+    }
+    let stub_addr = stack_range.start;
+    if vm.copy_user_bytes_out(stub_addr, exit_stub_code()).is_err() {
+        let _ = vm.unmap(stack_range);
+        return;
+    }
+
+    let kernel_stack_top = child.ensure_kernel_stack();
+    let mut frame = UserTrapFrame::init_user(function, stack_range.end, value);
+    frame.set_ra(stub_addr);
+    frame.set_kernel_stack_top(kernel_stack_top);
+    frame.set_current_address_space();
+    child.set_comm(b"mq-notify");
+    child.into_kernel_thread(user_clone_entry, 0);
+    child.ext_install(TASKEXT_USER_TRAP_FRAME, Arc::new(frame));
+    let _ = sched::spawn::activate_task(&child);
+}
+
+/// 用户态退出桩：`exit(0)` 的两条指令（架构相关机器码）。
+///
+/// loongarch64：`ori $a7, $zero, 93` + `syscall 0`（SYS_exit）。
+/// riscv64：`addi a7, zero, 93` + `ecall`（SYS_exit）。
+fn exit_stub_code() -> &'static [u8] {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        &[0x0b, 0x74, 0x81, 0x03, 0x00, 0x00, 0x2b, 0x00]
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        &[0x93, 0x08, 0xd0, 0x05, 0x73, 0x00, 0x00, 0x00]
+    }
 }
 
 fn process_clone_user_context(
@@ -1288,7 +1422,10 @@ pub fn boot_init() -> Arc<Task> {
 
         init.ext_install(TASKEXT_VFS_CONTEXT, vfs_ctx);
         init.ext_install(TASKEXT_VFS_FDTABLE, fdtable);
-        log::info!("[sched][boot] init ext: vfs ctx + fdtable + stdio installed");
+        // 根命名空间（uts/ipc/time/cgroup/pid）。
+        let root_ns: Arc<dyn core::any::Any + Send + Sync> = crate::ns::NsProxy::root();
+        init.ext_install(crate::ns::TASKEXT_NS, root_ns);
+        log::info!("[sched][boot] init ext: vfs ctx + fdtable + stdio + ns installed");
     } else {
         log::info!("[sched][boot] BOOT_VFS_PARTS empty — init has no vfs ext");
     }
@@ -1300,6 +1437,10 @@ pub fn boot_init() -> Arc<Task> {
     // 9. 注册全套 syscall 实现（kernel::syscalls::register_all 把 fs/process/
     //    mm/signal 四类实现写进 general::syscall 的全局表）。
     crate::syscalls::register_all();
+    // pid 命名空间：子进程的命名空间由 kernel 的 NsProxy.pending_pid 决定。
+    sched::spawn::register_child_pid_ns_hook(|parent| {
+        crate::ns::task_ns(parent).pending_pid.lock().take()
+    });
     crate::native_runtime::register();
 
     init

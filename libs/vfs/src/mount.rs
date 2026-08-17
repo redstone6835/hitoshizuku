@@ -31,6 +31,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use ns::Namespace as _;
 use crate::vfs::DCACHE;
 use crate::vfs::dentry::Dentry;
 use crate::vfs::error::{VfsError, VfsResult};
@@ -437,6 +438,16 @@ pub struct MountNamespace {
 
     /// 挂载数据（扁平列表 + 索引），单锁保护。
     data: Spinlock<MountData>,
+}
+
+impl ns::Namespace for MountNamespace {
+    fn ns_type(&self) -> ns::NsType {
+        ns::NsType::Mount
+    }
+
+    fn inum(&self) -> u64 {
+        self.id
+    }
 }
 
 impl MountNamespace {

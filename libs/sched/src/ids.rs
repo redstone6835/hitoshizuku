@@ -62,8 +62,7 @@ impl CapSet {
     }
 }
 
-/// Linux capability 子集。本 crate 只枚举调度/信号相关条目，其它由 vfs 侧定义。
-/// 数值与 Linux UAPI 对齐。
+/// Linux capability 位集。数值与 Linux UAPI 对齐（`linux/capability.h`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Capability {
@@ -76,9 +75,17 @@ pub enum Capability {
     Setgid = 6,
     Setuid = 7,
     Setpcap = 8,
-    /// 绕过 `RLIMIT_MEMLOCK` 上限（`mlock`/`mlockall`/`MAP_LOCKED` 检查）。
-    IpcLock = 9,
+    LinuxImmutable = 9,
     NetBindService = 10,
+    NetBroadcast = 11,
+    NetAdmin = 12,
+    NetRaw = 13,
+    /// 绕过 `RLIMIT_MEMLOCK` 上限（`mlock`/`mlockall`/`MAP_LOCKED` 检查）。
+    IpcLock = 14,
+    IpcOwner = 15,
+    SysModule = 16,
+    SysRawio = 17,
+    SysChroot = 18,
     /// 对其它进程执行 ptrace 级访问（`process_vm_readv`/`writev`、
     /// `process_madvise`、`move_pages` 权限检查）。
     SysPtrace = 19,
@@ -88,7 +95,20 @@ pub enum Capability {
     SysNice = 23,
     SysResource = 24,
     SysTime = 25,
+    SysTtyConfig = 26,
+    Mknod = 27,
+    Lease = 28,
+    AuditWrite = 29,
+    AuditControl = 30,
+    Setfcap = 31,
+    MacOverride = 32,
+    MacAdmin = 33,
     Syslog = 34,
+    WakeAlarm = 35,
+    BlockSuspend = 36,
+    AuditRead = 37,
+    Perfmon = 38,
+    Bpf = 39,
     CheckpointRestore = 40,
 }
 
@@ -114,6 +134,8 @@ pub struct Credentials {
     pub cap_inheritable: CapSet,
     /// Linux capability bounding set, modified by PR_CAPBSET_DROP.
     pub cap_bset: CapSet,
+    /// `PR_SET_SECUREBITS` 的安全位（`SECBIT_*`）。
+    pub securebits: u32,
 }
 
 impl Credentials {
@@ -133,6 +155,7 @@ impl Credentials {
             cap_permitted: CapSet::FULL,
             cap_inheritable: CapSet::EMPTY,
             cap_bset: CapSet::FULL,
+            securebits: 0,
         }
     }
 
@@ -152,6 +175,7 @@ impl Credentials {
             cap_permitted: CapSet::EMPTY,
             cap_inheritable: CapSet::EMPTY,
             cap_bset: CapSet::EMPTY,
+            securebits: 0,
         }
     }
 

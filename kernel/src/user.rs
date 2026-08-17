@@ -63,6 +63,8 @@ pub(crate) enum LoadedExecutionImage {
         image: LoadedUserImage,
         argv: Vec<String>,
         envp: Vec<String>,
+        /// 被执行文件的 (uid, gid, mode)，供 exec 凭据计算（setuid/setgid 位）。
+        file_owner: Option<(u32, u32, u16)>,
     },
     MygoNative {
         image: crate::soyo::LoadedSoyoImage,
@@ -175,6 +177,12 @@ pub(crate) fn load_execution_image_from_file(
     envp: Vec<Vec<u8>>,
 ) -> Result<LoadedExecutionImage, errno::Errno> {
     let prepared = prepare_executable_file(task, file)?;
+    let file_owner = prepared
+        .file
+        .inode()
+        .stat()
+        .ok()
+        .map(|stat| (stat.uid, stat.gid, stat.mode as u16));
     match detect_executable_format(&prepared.prefix) {
         ExecutableFormat::Soyo => {
             let image = crate::soyo::load_soyo_image_from_file(Arc::clone(&prepared.file))?;
@@ -195,7 +203,12 @@ pub(crate) fn load_execution_image_from_file(
     let argv = byte_strings_to_text(argv)?;
     let envp = byte_strings_to_text(envp)?;
     let image = load_tomori_image_from_prepared(task, prepared, exec_path, &argv, &envp, 0)?;
-    Ok(LoadedExecutionImage::Tomori { image, argv, envp })
+    Ok(LoadedExecutionImage::Tomori {
+        image,
+        argv,
+        envp,
+        file_owner,
+    })
 }
 
 fn load_user_image_from_path_inner(
@@ -224,6 +237,12 @@ fn load_user_image_from_file_inner(
     shebang_depth: usize,
 ) -> Result<LoadedUserImage, errno::Errno> {
     let prepared = prepare_executable_file(task, file)?;
+    let file_owner = prepared
+        .file
+        .inode()
+        .stat()
+        .ok()
+        .map(|stat| (stat.uid, stat.gid, stat.mode as u16));
     load_tomori_image_from_prepared(task, prepared, path, argv, envp, shebang_depth)
 }
 

@@ -2,14 +2,17 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
+use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use errno::Errno;
 use general::firmware::power;
 use general::mm::{VmFutexKey, VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
+use general::vfs::nsfs::ProcNsKind;
 use general::vfs::pidfd;
 use general::vfs::{self, fdtable::Fd};
+use ns::UtsNamespace;
 use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::ids::{CapSet, Capability, Credentials, Gid, Uid};
 use sched::pid::PidT;
@@ -86,6 +89,14 @@ static UTS_DOMAINNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_F
 
 pub(super) fn sys_getpid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let task = ctx.task();
+    // Linux：getpid 返回调用者 pid 命名空间中的 pid。任务的权威 ns 是
+    // sched 侧 `task.pid_ns()`（spawn 时由 register_pid_chain 按
+    // pending/父 ns 设置）；NsProxy.pid 只反映 fork 时的快照，unshare
+    // (CLONE_NEWPID) 后子进程会得到新 ns，必须用任务自身 ns 查询。
+    let ns = task.pid_ns();
+    if let Some(pid) = task.pid_in(&ns) {
+        return Ok(pid as usize);
+    }
     Ok(task
         .tgid_cached()
         .or_else(|| task.pid_root_cached())
@@ -284,6 +295,8 @@ pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if let Some(installed) = installed_pidfd {
         installed.commit();
     }
+    ptrace_notify_fork(ctx.task(), flags, outcome.pid);
+    clone_install_namespaces(ctx.task(), &outcome.child, flags)?;
     Ok(outcome.pid as usize)
 }
 
@@ -346,6 +359,8 @@ pub(super) fn sys_clone3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if let Some(installed) = installed_pidfd {
         installed.commit();
     }
+    ptrace_notify_fork(ctx.task(), args.flags, outcome.pid);
+    clone_install_namespaces(ctx.task(), &outcome.child, args.flags)?;
     Ok(outcome.pid as usize)
 }
 
@@ -1047,15 +1062,27 @@ fn clock_time_ns_for_task(task: &Arc<Task>, clock_id: usize) -> Option<u64> {
 }
 
 pub(super) fn sys_uname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let uts = Arc::clone(&crate::ns::task_ns(ctx.task()).uts);
     let mut out = [0u8; 65 * 6];
     write_uts_field(&mut out, 0, b"MyGo");
-    write_uts_dynamic_field(&mut out, 1, &UTS_HOSTNAME, b"mygo");
+    let hostname = uts.hostname();
+    write_uts_ns_field(&mut out, 1, &hostname, b"mygo");
     write_uts_field(&mut out, 2, b"10.1.0");
     write_uts_field(&mut out, 3, b"MyGo kernel");
     write_uts_field(&mut out, 4, hal::platform::arch_name().as_bytes());
-    write_uts_dynamic_field(&mut out, 5, &UTS_DOMAINNAME, b"localdomain");
+    let domainname = uts.domainname();
+    write_uts_ns_field(&mut out, 5, &domainname, b"localdomain");
     copy_to_user(ctx.args[0], &out).map_err(|e| e.as_errno())?;
     Ok(0)
+}
+
+/// 写 `utsname` 字段：命名空间值非空时优先。
+fn write_uts_ns_field(out: &mut [u8], index: usize, value: &[u8], default: &[u8]) {
+    if value.iter().all(|byte| *byte == 0) {
+        write_uts_field(out, index, default);
+    } else {
+        write_uts_field(out, index, value);
+    }
 }
 
 pub(super) fn sys_getcpu(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1146,7 +1173,9 @@ pub(super) fn sys_setitimer(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         read_itimerval(new_value)?
     };
     let old_spec = match which {
-        ITIMER_REAL => sched::set_realtime_itimer(ctx.task(), new_spec.value_ns, new_spec.interval_ns),
+        ITIMER_REAL => {
+            sched::set_realtime_itimer(ctx.task(), new_spec.value_ns, new_spec.interval_ns)
+        }
         ITIMER_VIRTUAL => {
             let old = sched::cpu_itimer::set_cpu_itimer(
                 &ctx.task(),
@@ -2137,13 +2166,91 @@ pub(super) fn sys_personality(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
 }
 
 pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    const PR_SET_PDEATHSIG: usize = 1;
+    const PR_GET_PDEATHSIG: usize = 2;
+    const PR_GET_DUMPABLE: usize = 3;
+    const PR_SET_DUMPABLE: usize = 4;
+    const PR_GET_KEEPCAPS: usize = 7;
+    const PR_SET_KEEPCAPS: usize = 8;
     const PR_SET_NAME: usize = 15;
     const PR_GET_NAME: usize = 16;
+    const PR_GET_SECCOMP: usize = 21;
+    const PR_SET_SECCOMP: usize = 22;
     const PR_CAPBSET_READ: usize = 23;
     const PR_CAPBSET_DROP: usize = 24;
+    const PR_GET_TSC: usize = 25;
+    const PR_SET_TSC: usize = 26;
+    const PR_GET_SECUREBITS: usize = 27;
+    const PR_SET_SECUREBITS: usize = 28;
     const PR_SET_TIMERSLACK: usize = 29;
     const PR_GET_TIMERSLACK: usize = 30;
+    const PR_SET_MM: usize = 35;
+    const PR_SET_CHILD_SUBREAPER: usize = 36;
+    const PR_GET_CHILD_SUBREAPER: usize = 37;
+    const PR_SET_NO_NEW_PRIVS: usize = 38;
+    const PR_GET_NO_NEW_PRIVS: usize = 39;
+    const PR_SET_THP_DISABLE: usize = 41;
+    const PR_GET_THP_DISABLE: usize = 42;
+
+    const SECBIT_KEEP_CAPS: u32 = 1 << 0;
+    const SECBIT_KEEP_CAPS_LOCKED: u32 = 1 << 1;
+    const SECBIT_NO_SETUID_FIXUP: u32 = 1 << 2;
+    const SECBIT_NO_SETUID_FIXUP_LOCKED: u32 = 1 << 3;
+    const SECBIT_NOROOT: u32 = 1 << 4;
+    const SECBIT_NOROOT_LOCKED: u32 = 1 << 5;
+    const SECBIT_NO_CAP_AMBIENT_RAISE: u32 = 1 << 6;
+    const SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED: u32 = 1 << 7;
+    const SECBIT_LOCKED: u32 = SECBIT_KEEP_CAPS_LOCKED
+        | SECBIT_NO_SETUID_FIXUP_LOCKED
+        | SECBIT_NOROOT_LOCKED
+        | SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+    const SECBIT_ALL: u32 = SECBIT_KEEP_CAPS
+        | SECBIT_KEEP_CAPS_LOCKED
+        | SECBIT_NO_SETUID_FIXUP
+        | SECBIT_NO_SETUID_FIXUP_LOCKED
+        | SECBIT_NOROOT
+        | SECBIT_NOROOT_LOCKED
+        | SECBIT_NO_CAP_AMBIENT_RAISE
+        | SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+
+    let task = ctx.task();
     match ctx.args[0] {
+        PR_SET_PDEATHSIG => {
+            let raw = ctx.args[1] as i32;
+            if raw >= 0 && raw > 64 {
+                return Err(Errno::EINVAL);
+            }
+            task.set_pdeathsig(raw);
+            Ok(0)
+        }
+        PR_GET_PDEATHSIG => {
+            let addr = ctx.args[1];
+            if addr == 0 {
+                return Err(Errno::EFAULT);
+            }
+            copy_to_user(addr, &(task.pdeathsig() as u32).to_le_bytes())
+                .map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        PR_GET_DUMPABLE => Ok(task.dumpable() as usize),
+        PR_SET_DUMPABLE => {
+            let value = ctx.args[1];
+            if value > 2 {
+                return Err(Errno::EINVAL);
+            }
+            task.set_dumpable(value as u8);
+            Ok(0)
+        }
+        PR_GET_KEEPCAPS => Ok(task.keepcaps() as usize),
+        PR_SET_KEEPCAPS => {
+            let enabled = ctx.args[1] != 0;
+            let creds = task.credentials();
+            if enabled && creds.euid != Uid::ROOT {
+                return Err(Errno::EPERM);
+            }
+            task.set_keepcaps(enabled);
+            Ok(0)
+        }
         PR_SET_NAME => {
             let name_user = ctx.args[1];
             if name_user == 0 {
@@ -2151,13 +2258,13 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             }
             let mut raw = [0u8; sched::TASK_COMM_LEN];
             copy_from_user(name_user, &mut raw).map_err(|e| e.as_errno())?;
-            ctx.task().set_comm(&raw);
+            task.set_comm(&raw);
             Ok(0)
         }
         PR_GET_NAME => {
             let buf = ctx.args[1];
             if buf != 0 {
-                copy_to_user(buf, &ctx.task().comm()).map_err(|e| e.as_errno())?;
+                copy_to_user(buf, &task.comm()).map_err(|e| e.as_errno())?;
             }
             Ok(0)
         }
@@ -2166,7 +2273,7 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             if !linux_cap_valid(cap) {
                 return Err(Errno::EINVAL);
             }
-            let creds = ctx.task().credentials();
+            let creds = task.credentials();
             Ok(((creds.cap_bset.raw() >> cap) & 1) as usize)
         }
         PR_CAPBSET_DROP => {
@@ -2174,21 +2281,173 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             if !linux_cap_valid(cap) {
                 return Err(Errno::EINVAL);
             }
-            let current = ctx.task().credentials();
+            let current = task.credentials();
             if !current.has_cap(Capability::Setpcap) {
                 return Err(Errno::EPERM);
             }
             let mut new = (*current).clone();
             new.cap_bset = CapSet::from_raw(new.cap_bset.raw() & !(1u64 << cap));
-            install_credentials(ctx.task(), new);
+            install_credentials(task, new);
+            Ok(0)
+        }
+        PR_GET_TSC => Ok(prctl_misc(ctx.task()).tsc_mode.load(Ordering::Acquire) as usize),
+        PR_SET_TSC => {
+            let flag = ctx.args[1];
+            // PR_TSC_ENABLE=1 / PR_TSC_SIGSEGV=2。
+            if flag != 1 && flag != 2 {
+                return Err(Errno::EINVAL);
+            }
+            prctl_misc(ctx.task())
+                .tsc_mode
+                .store(flag as u8, Ordering::Release);
+            Ok(0)
+        }
+        PR_GET_SECUREBITS => Ok(task.credentials().securebits as usize),
+        PR_SET_SECUREBITS => {
+            let bits = ctx.args[1] as u32;
+            if bits & !SECBIT_ALL != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let current = task.credentials();
+            if current.securebits & SECBIT_LOCKED != 0 {
+                // 已锁定位不可再改。
+                if current.securebits & SECBIT_LOCKED != bits & SECBIT_LOCKED {
+                    return Err(Errno::EPERM);
+                }
+            }
+            if bits & SECBIT_LOCKED != 0 && !current.has_cap(Capability::Setpcap) {
+                return Err(Errno::EPERM);
+            }
+            let mut new = (*current).clone();
+            new.securebits = bits;
+            install_credentials(task, new);
             Ok(0)
         }
         PR_SET_TIMERSLACK => {
-            ctx.task().set_timer_slack_ns(ctx.args[1] as u64);
+            task.set_timer_slack_ns(ctx.args[1] as u64);
             Ok(0)
         }
-        PR_GET_TIMERSLACK => Ok(ctx.task().timer_slack_ns().min(usize::MAX as u64) as usize),
-        _ => Ok(0),
+        PR_GET_TIMERSLACK => Ok(task.timer_slack_ns().min(usize::MAX as u64) as usize),
+        PR_SET_MM => Err(Errno::EINVAL),
+        PR_SET_CHILD_SUBREAPER => {
+            task.set_subreaper(ctx.args[1] != 0);
+            Ok(0)
+        }
+        PR_GET_CHILD_SUBREAPER => {
+            let addr = ctx.args[1];
+            if addr == 0 {
+                return Err(Errno::EFAULT);
+            }
+            copy_to_user(addr, &(task.is_subreaper() as u32).to_le_bytes())
+                .map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        PR_SET_NO_NEW_PRIVS => {
+            if ctx.args[1] != 0 && ctx.args[1] != 1 {
+                return Err(Errno::EINVAL);
+            }
+            if ctx.args[1] == 1 {
+                task.set_no_new_privs(true);
+            }
+            Ok(0)
+        }
+        PR_GET_NO_NEW_PRIVS => Ok(task.no_new_privs() as usize),
+        PR_SET_THP_DISABLE => {
+            let value = ctx.args[1];
+            if value > 1 {
+                return Err(Errno::EINVAL);
+            }
+            prctl_misc(ctx.task())
+                .thp_disable
+                .store(value as u8, Ordering::Release);
+            Ok(0)
+        }
+        PR_GET_THP_DISABLE => {
+            Ok(prctl_misc(ctx.task()).thp_disable.load(Ordering::Acquire) as usize)
+        }
+        PR_GET_SECCOMP => Ok(seccomp_state(task).mode() as usize),
+        PR_SET_SECCOMP => {
+            // 老式 PR_SET_SECCOMP：arg2 是 SECCOMP_MODE_*（STRICT=1 / FILTER=2），
+            // 与 seccomp(2) 的 SECCOMP_SET_MODE_*（STRICT=0 / FILTER=1）不同，
+            // 先换算成 SET 语义再走公共安装路径。
+            use general::seccomp::{SECCOMP_MODE_FILTER, SECCOMP_MODE_STRICT};
+            let mode = match ctx.args[1] as i32 {
+                SECCOMP_MODE_STRICT => general::seccomp::SECCOMP_SET_MODE_STRICT as usize,
+                SECCOMP_MODE_FILTER => general::seccomp::SECCOMP_SET_MODE_FILTER as usize,
+                _ => return Err(Errno::EINVAL),
+            };
+            crate::syscalls::process::seccomp_filter_setup(ctx.task(), mode, ctx.args[2])?;
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// 每个任务/进程的 `prctl` 杂项状态（TSC 模式、THP 开关）。
+pub(crate) const TASKEXT_PRCTL_MISC: sched::TaskExtKey = 0x0004_0005;
+
+/// `prctl` 持久化的进程级杂项状态（Linux `PR_SET_TSC`/`PR_SET_THP_DISABLE`）。
+pub(crate) struct PrctlMiscState {
+    /// `PR_TSC_ENABLE=1` / `PR_TSC_SIGSEGV=2`。
+    pub(crate) tsc_mode: AtomicU8,
+    /// `PR_SET_THP_DISABLE` 的 0/1。
+    pub(crate) thp_disable: AtomicU8,
+}
+
+impl PrctlMiscState {
+    pub(crate) fn new() -> Self {
+        Self {
+            tsc_mode: AtomicU8::new(1), // 默认 PR_TSC_ENABLE
+            thp_disable: AtomicU8::new(0),
+        }
+    }
+}
+
+/// 取任务的 prctl 杂项状态（惰性创建并挂载）。
+fn prctl_misc(task: &Arc<Task>) -> Arc<PrctlMiscState> {
+    if let Some(state) = task
+        .ext_lookup(TASKEXT_PRCTL_MISC)
+        .and_then(|payload| payload.downcast::<PrctlMiscState>().ok())
+    {
+        return state;
+    }
+    let state = Arc::new(PrctlMiscState::new());
+    let erased: Arc<dyn core::any::Any + Send + Sync> = state.clone();
+    task.ext_install(TASKEXT_PRCTL_MISC, erased);
+    state
+}
+
+/// `PR_SET_SECCOMP`：老式 seccomp 入口，等价 `seccomp(2)`。
+pub(super) fn seccomp_filter_setup(
+    task: &Arc<Task>,
+    mode: usize,
+    filter_user: usize,
+) -> Result<(), Errno> {
+    use general::seccomp::*;
+    match mode as u32 {
+        SECCOMP_SET_MODE_STRICT => {
+            seccomp_state(task).set_strict();
+            Ok(())
+        }
+        SECCOMP_SET_MODE_FILTER => {
+            let cred = vfs_cred_from_sched(&task.credentials());
+            if !filter_install_allowed(task.no_new_privs(), &cred) {
+                return Err(Errno::EACCES);
+            }
+            let mut fprog = [0u8; 16];
+            copy_from_user(filter_user, &mut fprog).map_err(|e| e.as_errno())?;
+            let len = u16::from_le_bytes(fprog[0..2].try_into().unwrap()) as usize;
+            let ptr = u64::from_le_bytes(fprog[8..16].try_into().unwrap()) as usize;
+            let mut bytes = vec![0u8; len * 8];
+            if len > 0 {
+                copy_from_user(ptr, &mut bytes).map_err(|e| e.as_errno())?;
+            }
+            let insns = parse_program(&bytes)?;
+            let filter = SeccompFilter::new(insns, 0)?;
+            seccomp_state(task).push_filter(filter);
+            Ok(())
+        }
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -4586,8 +4845,9 @@ pub(super) fn sys_futex_requeue(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     )
 }
 
-pub(super) fn sys_unshare(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_unshare(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    crate::ns::unshare(ctx.task(), ctx.args[0] as u64)?;
+    Ok(0)
 }
 
 pub(super) fn sys_kexec_load(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -4656,12 +4916,22 @@ fn timer_create_common(ctx: &mut SyscallContext<'_>, _time64: bool) -> Result<us
     if sevp != 0 {
         let mut buf = [0u8; SIGEV_HEADER_SIZE];
         copy_from_user(sevp, &mut buf).map_err(|e| e.as_errno())?;
-        sigev_value = u64::from_le_bytes(buf[SIGEV_VALUE_OFF..SIGEV_VALUE_OFF + 8].try_into().unwrap());
+        sigev_value = u64::from_le_bytes(
+            buf[SIGEV_VALUE_OFF..SIGEV_VALUE_OFF + 8]
+                .try_into()
+                .unwrap(),
+        );
         signo = SignalNumber::from_raw(i32::from_le_bytes(
-            buf[SIGEV_SIGNO_OFF..SIGEV_SIGNO_OFF + 4].try_into().unwrap(),
+            buf[SIGEV_SIGNO_OFF..SIGEV_SIGNO_OFF + 4]
+                .try_into()
+                .unwrap(),
         ))
         .ok_or(Errno::EINVAL)?;
-        notify = i32::from_le_bytes(buf[SIGEV_NOTIFY_OFF..SIGEV_NOTIFY_OFF + 4].try_into().unwrap());
+        notify = i32::from_le_bytes(
+            buf[SIGEV_NOTIFY_OFF..SIGEV_NOTIFY_OFF + 4]
+                .try_into()
+                .unwrap(),
+        );
         thread_id = i32::from_le_bytes(buf[SIGEV_TID_OFF..SIGEV_TID_OFF + 4].try_into().unwrap());
     }
 
@@ -4694,7 +4964,10 @@ fn timer_create_common(ctx: &mut SyscallContext<'_>, _time64: bool) -> Result<us
     };
     let sigev = match notify {
         SIGEV_NONE => sched::posix_timer::SigevNotify::None,
-        _ => sched::posix_timer::SigevNotify::Signal { signo, value: sigev_value },
+        _ => sched::posix_timer::SigevNotify::Signal {
+            signo,
+            value: sigev_value,
+        },
     };
     let timer_t = sched::posix_timer::create(clock, &caller, sigev, target_tid)?;
     copy_to_user(timeridp, &timer_t.to_le_bytes()).map_err(|e| e.as_errno())?;
@@ -4736,7 +5009,13 @@ fn timer_settime_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 
     if value_ns == 0 {
         // 解除定时器。
-        if !sched::posix_timer::arm(timer_t, sched::posix_timer::TimerSpec { deadline_ns: 0, interval_ns: 0 }) {
+        if !sched::posix_timer::arm(
+            timer_t,
+            sched::posix_timer::TimerSpec {
+                deadline_ns: 0,
+                interval_ns: 0,
+            },
+        ) {
             return Err(Errno::EINVAL);
         }
         return Ok(0);
@@ -4760,7 +5039,10 @@ fn timer_settime_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     };
     if !sched::posix_timer::arm(
         timer_t,
-        sched::posix_timer::TimerSpec { deadline_ns: deadline, interval_ns: interval_ns },
+        sched::posix_timer::TimerSpec {
+            deadline_ns: deadline,
+            interval_ns: interval_ns,
+        },
     ) {
         return Err(Errno::EINVAL);
     }
@@ -4798,8 +5080,6 @@ fn write_timespec_pair(out: &mut [u8], off: usize, ns: u64) {
     put_i64(out, off + 8, (ns % 1_000_000_000) as i64);
 }
 
-
-
 pub(super) fn sys_clock_settime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     clock_settime_common(ctx)
 }
@@ -4807,6 +5087,7 @@ pub(super) fn sys_clock_settime(ctx: &mut SyscallContext<'_>) -> Result<usize, E
 pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let request = ctx.args[0];
     let pid = ctx.args[1] as i32;
+    let addr = ctx.args[2];
     let data = ctx.args[3];
 
     match request {
@@ -4818,8 +5099,23 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             sched::operation::ptrace_attach(pid)?;
             Ok(0)
         }
-        PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP => {
+        PTRACE_SEIZE => {
+            sched::operation::ptrace_seize(pid)?;
+            Ok(0)
+        }
+        PTRACE_CONT => {
             sched::operation::ptrace_cont(pid, ptrace_signal_arg(data)?)?;
+            Ok(0)
+        }
+        PTRACE_SYSCALL => {
+            sched::operation::ptrace_syscall(pid, ptrace_signal_arg(data)?)?;
+            Ok(0)
+        }
+        PTRACE_SINGLESTEP => {
+            let target = ptrace_target_task(pid)?;
+            // 指令补丁法单步：把目标 PC 处的指令替换为断点指令。
+            arm_singlestep(&target)?;
+            sched::operation::ptrace_singlestep(pid, ptrace_signal_arg(data)?)?;
             Ok(0)
         }
         PTRACE_KILL => {
@@ -4830,9 +5126,8 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             sched::operation::ptrace_detach(pid, ptrace_signal_arg(data)?)?;
             Ok(0)
         }
-        PTRACE_SETOPTIONS | PTRACE_OLDSETOPTIONS => Ok(0),
-        PTRACE_SEIZE => {
-            sched::operation::ptrace_seize(pid)?;
+        PTRACE_SETOPTIONS | PTRACE_OLDSETOPTIONS => {
+            ptrace_set_options(pid, data as u64)?;
             Ok(0)
         }
         PTRACE_INTERRUPT => {
@@ -4843,30 +5138,551 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             sched::operation::ptrace_cont(pid, None)?;
             Ok(0)
         }
-        PTRACE_PEEKTEXT
-        | PTRACE_PEEKDATA
-        | PTRACE_PEEKUSR
-        | PTRACE_POKETEXT
-        | PTRACE_POKEDATA
-        | PTRACE_POKEUSR
-        | PTRACE_GETFDPIC
-        | PTRACE_GETEVENTMSG
-        | PTRACE_GETSIGINFO
-        | PTRACE_SETSIGINFO
-        | PTRACE_GETREGSET
-        | PTRACE_SETREGSET
-        | PTRACE_PEEKSIGINFO
-        | PTRACE_GETSIGMASK
-        | PTRACE_SETSIGMASK
-        | PTRACE_SECCOMP_GET_FILTER
-        | PTRACE_SECCOMP_GET_METADATA
-        | PTRACE_GET_SYSCALL_INFO
-        | PTRACE_GET_RSEQ_CONFIGURATION
-        | PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG
+        PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
+            // Linux：PEEKDATA/POKEDATA 的第四个参数直接携带数据（word），
+            // 不做指针解引用——PEEK 以系统调用返回值回传。
+            let target = ptrace_target_task(pid)?;
+            let vm = ptrace_target_vm(&target)?;
+            let mut raw = [0u8; 8];
+            vm.copy_user_bytes_in(addr, &mut raw)?;
+            Ok(usize::from_ne_bytes(raw))
+        }
+        PTRACE_POKETEXT | PTRACE_POKEDATA => {
+            let target = ptrace_target_task(pid)?;
+            let vm = ptrace_target_vm(&target)?;
+            let raw = (data as u64).to_ne_bytes();
+            vm.copy_user_bytes_out(addr, &raw)?;
+            if request == PTRACE_POKETEXT {
+                <arch::CurrentTaskOps as general::TaskOps>::sync_icache();
+            }
+            Ok(0)
+        }
+        PTRACE_PEEKUSR => {
+            let target = ptrace_target_task(pid)?;
+            let value = ptrace_peek_usr(&target, addr)?;
+            Ok(value)
+        }
+        PTRACE_POKEUSR => {
+            let target = ptrace_target_task(pid)?;
+            ptrace_poke_usr(&target, addr, data)?;
+            Ok(0)
+        }
+        PTRACE_GETREGSET | PTRACE_SETREGSET => {
+            let target = ptrace_target_task(pid)?;
+            let note_type = addr;
+            let iov_user = data;
+            ptrace_regset(&target, note_type, request == PTRACE_SETREGSET, iov_user)?;
+            Ok(0)
+        }
+        PTRACE_GETSIGINFO => {
+            let info = sched::operation::ptrace_getsiginfo(pid)?;
+            super::signal::write_siginfo(data, &info)?;
+            Ok(0)
+        }
+        PTRACE_SETSIGINFO => {
+            let info = super::signal::read_queued_siginfo_raw(data)?;
+            sched::operation::ptrace_setsiginfo(pid, info)?;
+            Ok(0)
+        }
+        PTRACE_GETEVENTMSG => {
+            let message = sched::operation::ptrace_geteventmsg(pid)?;
+            copy_to_user(data, &(message as u64).to_ne_bytes()).map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        PTRACE_GETSIGMASK => {
+            let mask = sched::operation::ptrace_get_sigmask(pid)?;
+            copy_to_user(data, &mask.raw().to_ne_bytes()).map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        PTRACE_SETSIGMASK => {
+            let mut raw = [0u8; 8];
+            copy_from_user(data, &mut raw).map_err(|e| e.as_errno())?;
+            let mask = sched::SigSet::from_raw(u64::from_ne_bytes(raw));
+            sched::operation::ptrace_set_sigmask(pid, mask)?;
+            Ok(0)
+        }
+        PTRACE_PEEKSIGINFO => {
+            // 位图式 pending 信号不保留排队 siginfo；按 Linux 语义返回
+            // 已拷贝数量（本实现无排队信号 → 0）。
+            let mut args = [0u8; 16];
+            copy_from_user(addr, &mut args).map_err(|e| e.as_errno())?;
+            let flags = u32::from_le_bytes(args[8..12].try_into().unwrap());
+            if flags != 0 {
+                return Err(Errno::EINVAL);
+            }
+            Ok(0)
+        }
+        PTRACE_GET_SYSCALL_INFO => {
+            let target = ptrace_target_task(pid)?;
+            write_ptrace_syscall_info(&target, data)?;
+            Ok(0)
+        }
+        PTRACE_GET_RSEQ_CONFIGURATION => {
+            let target = ptrace_target_task(pid)?;
+            write_ptrace_rseq_configuration(&target, data)?;
+            Ok(0)
+        }
+        PTRACE_GETFDPIC => Err(Errno::EINVAL),
+        PTRACE_SECCOMP_GET_FILTER | PTRACE_SECCOMP_GET_METADATA => Err(Errno::EINVAL),
+        PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG
         | PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG
-        | PTRACE_SET_SYSCALL_INFO => Err(Errno::EIO),
+        | PTRACE_SET_SYSCALL_INFO => Err(Errno::EINVAL),
         _ => Err(Errno::EIO),
     }
+}
+
+/// 校验 `PTRACE_SETOPTIONS` 的选项位并安装到目标。
+fn ptrace_set_options(pid: i32, options: u64) -> Result<(), Errno> {
+    const PTRACE_O_TRACESYSGOOD: u64 = 0x0000_0001;
+    const PTRACE_O_TRACEFORK: u64 = 0x0000_0002;
+    const PTRACE_O_TRACEVFORK: u64 = 0x0000_0004;
+    const PTRACE_O_TRACECLONE: u64 = 0x0000_0008;
+    const PTRACE_O_TRACEEXEC: u64 = 0x0000_0010;
+    const PTRACE_O_TRACEEXIT: u64 = 0x0000_0040;
+    const PTRACE_O_TRACESECCOMP: u64 = 0x0000_0080;
+    const PTRACE_O_EXITKILL: u64 = 0x0010_0000;
+    const PTRACE_O_SUSPEND_SECCOMP: u64 = 0x0020_0000;
+    const KNOWN: u64 = PTRACE_O_TRACESYSGOOD
+        | PTRACE_O_TRACEFORK
+        | PTRACE_O_TRACEVFORK
+        | PTRACE_O_TRACECLONE
+        | PTRACE_O_TRACEEXEC
+        | PTRACE_O_TRACEEXIT
+        | PTRACE_O_TRACESECCOMP
+        | PTRACE_O_EXITKILL
+        | PTRACE_O_SUSPEND_SECCOMP;
+    if options & !KNOWN != 0 {
+        return Err(Errno::EINVAL);
+    }
+    sched::operation::ptrace_set_options(pid, options)?;
+    Ok(())
+}
+
+/// 取 ptrace 目标（已跟踪 + 权限）。
+fn ptrace_target_task(pid: i32) -> Result<Arc<Task>, Errno> {
+    let target = sched::operation::lookup_pid(pid)?;
+    if target.is_kernel_task() || !target.is_ptrace_traced() {
+        return Err(Errno::ESRCH);
+    }
+    let me = sched::current_task_direct();
+    if !sched::operation::ptrace_may_access(&me, &target) {
+        return Err(Errno::EPERM);
+    }
+    Ok(target)
+}
+
+fn ptrace_target_vm(target: &Arc<Task>) -> Result<Arc<VmSpace>, Errno> {
+    task_vm_space(target).ok_or(Errno::EIO)
+}
+
+/// 取目标停止时保存的用户 trap frame。
+fn ptrace_target_frame(target: &Arc<Task>) -> Result<hal::user_context::UserTrapFrame, Errno> {
+    // 优先取 syscall 入口的 arch 快照（arch 在 syscall 分发前保存）；
+    // 回退到恢复/写回路径保存的 UserTrapFrame（POKEUSR 写回后、以及
+    // 信号/单步场景）。
+    #[cfg(target_arch = "loongarch64")]
+    let arch_frame = target
+        .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
+        .and_then(|payload| payload.downcast::<arch::loongarch64::TrapFrame>().ok());
+    #[cfg(target_arch = "riscv64")]
+    let arch_frame = target
+        .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
+        .and_then(|payload| payload.downcast::<arch::riscv64::TrapFrame>().ok());
+    if let Some(frame) = arch_frame {
+        let raw = Arc::as_ptr(&frame) as usize;
+        return Ok(hal::user_context::UserTrapFrame::from_context(raw));
+    }
+    let frame = target
+        .ext_lookup(sched::TASKEXT_USER_TRAP_FRAME)
+        .and_then(|payload| payload.downcast::<hal::user_context::UserTrapFrame>().ok())
+        .ok_or(Errno::EIO)?;
+    Ok(*frame)
+}
+
+/// 写回目标 trap frame（POKEUSR 使用）。
+fn ptrace_store_frame(target: &Arc<Task>, frame: hal::user_context::UserTrapFrame) {
+    let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(frame);
+    target.ext_install(sched::TASKEXT_USER_TRAP_FRAME, erased);
+}
+
+/// `PTRACE_PEEKUSR`：按 mcontext 布局读寄存器字（pc@0、regs@8、每项 8 字节）。
+fn ptrace_peek_usr(target: &Arc<Task>, offset: usize) -> Result<usize, Errno> {
+    let frame = ptrace_target_frame(target)?;
+    let mut mcontext = [0u8; 1024];
+    if !frame.write_linux_mcontext(&mut mcontext) {
+        return Err(Errno::EIO);
+    }
+    // mcontext 布局：pc@0；regs@8（32 项）；可能还有 flags 等尾部。
+    let regs_len = 8 + 32 * 8;
+    if offset < 8 {
+        return Ok(u64::from_ne_bytes(mcontext[0..8].try_into().unwrap()) as usize);
+    }
+    if offset < regs_len && (offset - 8) % 8 == 0 {
+        let index = (offset - 8) / 8;
+        let start = 8 + index * 8;
+        return Ok(u64::from_ne_bytes(mcontext[start..start + 8].try_into().unwrap()) as usize);
+    }
+    Err(Errno::EIO)
+}
+
+/// `PTRACE_POKEUSR`：按 mcontext 布局写寄存器字。
+fn ptrace_poke_usr(target: &Arc<Task>, offset: usize, value: usize) -> Result<(), Errno> {
+    let mut frame = ptrace_target_frame(target)?;
+    let mut mcontext = [0u8; 1024];
+    if !frame.write_linux_mcontext(&mut mcontext) {
+        return Err(Errno::EIO);
+    }
+    let regs_len = 8 + 32 * 8;
+    if offset < 8 {
+        mcontext[0..8].copy_from_slice(&(value as u64).to_ne_bytes());
+    } else if offset < regs_len && (offset - 8) % 8 == 0 {
+        let index = (offset - 8) / 8;
+        let start = 8 + index * 8;
+        mcontext[start..start + 8].copy_from_slice(&(value as u64).to_ne_bytes());
+    } else {
+        return Err(Errno::EIO);
+    }
+    if !frame.apply_linux_mcontext(&mcontext) {
+        return Err(Errno::EIO);
+    }
+    ptrace_store_frame(target, frame);
+    Ok(())
+}
+
+/// `PTRACE_GETREGSET`/`SETREGSET`：`struct iovec { base, len }` 指向的数据区。
+fn ptrace_regset(
+    target: &Arc<Task>,
+    note_type: usize,
+    set: bool,
+    iov_user: usize,
+) -> Result<(), Errno> {
+    let mut iov = [0u8; 16];
+    copy_from_user(iov_user, &mut iov).map_err(|e| e.as_errno())?;
+    let base = u64::from_le_bytes(iov[0..8].try_into().unwrap()) as usize;
+    let mut len = u64::from_le_bytes(iov[8..16].try_into().unwrap()) as usize;
+
+    const NT_PRSTATUS: usize = 1;
+    const NT_FPREGSET: usize = 2;
+
+    match note_type {
+        NT_PRSTATUS => {
+            let frame = ptrace_target_frame(target)?;
+            let mut mcontext = [0u8; 1024];
+            if !frame.write_linux_mcontext(&mut mcontext) {
+                return Err(Errno::EIO);
+            }
+            let size = linux_mcontext_size();
+            if set {
+                if len < size {
+                    return Err(Errno::EIO);
+                }
+                let mut input = [0u8; 1024];
+                copy_from_user(base, &mut input[..size]).map_err(|e| e.as_errno())?;
+                let mut frame = ptrace_target_frame(target)?;
+                if !frame.apply_linux_mcontext(&input) {
+                    return Err(Errno::EIO);
+                }
+                ptrace_store_frame(target, frame);
+            } else {
+                if len < size {
+                    len = size;
+                    write_iov_len(iov_user, len)?;
+                    return Ok(());
+                }
+                copy_to_user(base, &mcontext[..size]).map_err(|e| e.as_errno())?;
+            }
+            Ok(())
+        }
+        NT_FPREGSET => {
+            // 本内核的 trap frame 不保存浮点寄存器（FPU 状态由用户态维护）；
+            // 按 Linux ABI 提供全零的寄存器集。
+            let size = linux_fpregset_size();
+            if set {
+                if len < size {
+                    return Err(Errno::EIO);
+                }
+                let mut input = [0u8; 1024];
+                copy_from_user(base, &mut input[..size]).map_err(|e| e.as_errno())?;
+                // 忽略写入值（架构无内核侧 FP 状态）。
+                Ok(())
+            } else {
+                if len < size {
+                    len = size;
+                    write_iov_len(iov_user, len)?;
+                    return Ok(());
+                }
+                let zeros = [0u8; 1024];
+                copy_to_user(base, &zeros[..size]).map_err(|e| e.as_errno())?;
+                Ok(())
+            }
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn write_iov_len(iov_user: usize, len: usize) -> Result<(), Errno> {
+    copy_to_user(iov_user + 8, &(len as u64).to_ne_bytes()).map_err(|e| e.as_errno())
+}
+
+/// Linux `struct user_regs_struct`（mcontext 布局）的大小。
+fn linux_mcontext_size() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        8 + 32 * 8 + 4 // pc + regs + flags
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        8 + 32 * 8 // pc + regs
+    }
+}
+
+/// Linux `struct user_fpregs_struct` 的大小。
+fn linux_fpregset_size() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        33 * 8 // 32 FPR + fcc
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        33 * 8 + 4 // 32 FPR + fcsr + pad
+    }
+}
+
+/// 单步断点：把目标 PC 处的指令替换为断点指令。
+fn arm_singlestep(target: &Arc<Task>) -> Result<(), Errno> {
+    if target.singlestep_armed() {
+        return Ok(());
+    }
+    let frame = ptrace_target_frame(target)?;
+    let pc = frame.pc();
+    let vm = ptrace_target_vm(target)?;
+    let mut insn = [0u8; 4];
+    vm.copy_user_bytes_in(pc, &mut insn)?;
+    let original = u32::from_ne_bytes(insn);
+    let breakpoint = breakpoint_insn();
+    vm.copy_user_bytes_out(pc, &breakpoint.to_ne_bytes())?;
+    <arch::CurrentTaskOps as general::TaskOps>::sync_icache();
+    target.arm_singlestep(pc, original);
+    Ok(())
+}
+
+/// 架构断点指令（loongarch64 `break 0` / riscv64 `ebreak`）。
+fn breakpoint_insn() -> u32 {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        0x2a000000 // break 0
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        0x00100073 // ebreak
+    }
+}
+
+/// 单步断点陷阱钩子（arch 的 break trap 在用户态调用）：命中则恢复原指令
+/// 并把目标置为 `SIGTRAP` stop。
+pub(crate) fn ptrace_singlestep_trap_hook(pc: usize) -> bool {
+    let me = sched::current_task_direct();
+    if !me.singlestep_armed() {
+        return false;
+    }
+    if me.singlestep_addr() != pc {
+        me.clear_singlestep();
+        return false;
+    }
+    let insn = me.take_singlestep_insn();
+    me.clear_singlestep();
+    if let Some(insn) = insn {
+        if let Some(vm) = task_vm_space(&me) {
+            let _ = vm.copy_user_bytes_out(pc, &insn.to_ne_bytes());
+        }
+        <arch::CurrentTaskOps as general::TaskOps>::sync_icache();
+    }
+    me.set_ptrace_stop_event(0);
+    me.clear_ptrace_last_siginfo();
+    sched::operation::ptrace_mark_stopped(&me, sched::SignalNumber::SIGTRAP);
+    true
+}
+
+/// clone 后安装命名空间：`CLONE_NEWUTS/NEWIPC/NEWTIME/NEWCGROUP` 换子进程
+/// 的引用集，`CLONE_NEWNS` 换子进程的 VFS 上下文，`CLONE_NEWPID` 已在
+/// clone 前经 pending 命名空间生效。
+fn clone_install_namespaces(
+    parent: &Arc<Task>,
+    child: &Arc<Task>,
+    flags: CloneFlags,
+) -> Result<(), Errno> {
+    use sched::clone_flags::CloneFlags as F;
+
+    let ns_flags = flags.raw()
+        & (F::CLONE_NEWNS
+            | F::CLONE_NEWCGROUP
+            | F::CLONE_NEWUTS
+            | F::CLONE_NEWIPC
+            | F::CLONE_NEWPID);
+    if ns_flags == 0 {
+        return Ok(());
+    }
+    if !parent
+        .credentials()
+        .has_cap(sched::ids::Capability::SysAdmin)
+    {
+        return Err(Errno::EPERM);
+    }
+    let parent_ns = crate::ns::task_ns(parent);
+    if flags.has(F::CLONE_NEWPID) {
+        // 子进程进新 pid 命名空间（sched 的 child_pid_ns hook 已消费）。
+        // 无需额外动作；验证子进程确实注册进了新 ns。
+    }
+    if flags.has(F::CLONE_NEWNS)
+        || flags.has(F::CLONE_NEWCGROUP)
+        || flags.has(F::CLONE_NEWUTS)
+        || flags.has(F::CLONE_NEWIPC)
+    {
+        let mut proxy = crate::ns::NsProxy {
+            uts: Arc::clone(&parent_ns.uts),
+            ipc: Arc::clone(&parent_ns.ipc),
+            time: Arc::clone(&parent_ns.time),
+            cgroup: Arc::clone(&parent_ns.cgroup),
+            pid: crate::ns::child_pid_namespace(parent),
+            pending_pid: sched::sync::Spinlock::new(None),
+        };
+        if flags.has(F::CLONE_NEWUTS) {
+            proxy.uts =
+                ns::UtsNamespace::new(&parent_ns.uts.hostname(), &parent_ns.uts.domainname());
+        }
+        if flags.has(F::CLONE_NEWIPC) {
+            proxy.ipc = crate::ns::IpcNamespace::new();
+        }
+        if flags.has(F::CLONE_NEWCGROUP) {
+            proxy.cgroup = ns::CgroupNamespace::new();
+        }
+        let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(proxy);
+        child.ext_install(crate::ns::TASKEXT_NS, erased);
+        if flags.has(F::CLONE_NEWNS) {
+            if let Some(vfs_ctx) = child
+                .ext_lookup(sched::TASKEXT_VFS_CONTEXT)
+                .and_then(|payload| payload.downcast::<general::vfs::VfsContext>().ok())
+            {
+                if let Ok(forked) = vfs_ctx.clone_with_new_ns() {
+                    let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(forked);
+                    child.ext_install(sched::TASKEXT_VFS_CONTEXT, erased);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 命名空间 provider（procfs `/proc/<pid>/ns/*` 使用）。
+pub(crate) fn ns_provider(pid: i32, kind: ProcNsKind) -> Option<Arc<dyn ns::Namespace>> {
+    let task = sched::operation::lookup_pid(pid).ok()?;
+    let proxy = crate::ns::task_ns(&task);
+    match kind {
+        ProcNsKind::Uts => Some(proxy.uts.clone() as Arc<dyn ns::Namespace>),
+        ProcNsKind::Ipc => Some(proxy.ipc.clone() as Arc<dyn ns::Namespace>),
+        ProcNsKind::Time => Some(proxy.time.clone() as Arc<dyn ns::Namespace>),
+        ProcNsKind::Cgroup => Some(proxy.cgroup.clone() as Arc<dyn ns::Namespace>),
+        ProcNsKind::Pid => Some(proxy.pid.clone() as Arc<dyn ns::Namespace>),
+        ProcNsKind::Mount => task
+            .ext_lookup(sched::TASKEXT_VFS_CONTEXT)
+            .and_then(|payload| payload.downcast::<general::vfs::VfsContext>().ok())
+            .map(|ctx| Arc::clone(&ctx.mount_ns) as Arc<dyn ns::Namespace>),
+        ProcNsKind::User | ProcNsKind::Net => None,
+    }
+}
+
+/// `PTRACE_O_TRACEFORK/VFORK/CLONE`：克隆事件通知（父进程停止）。
+fn ptrace_notify_fork(parent: &Arc<Task>, flags: CloneFlags, child_pid: i32) {
+    const PTRACE_O_TRACEFORK: u64 = 0x0000_0002;
+    const PTRACE_O_TRACEVFORK: u64 = 0x0000_0004;
+    const PTRACE_O_TRACECLONE: u64 = 0x0000_0008;
+    const PTRACE_EVENT_FORK: u16 = 1;
+    const PTRACE_EVENT_VFORK: u16 = 2;
+    const PTRACE_EVENT_CLONE: u16 = 3;
+
+    if !parent.is_ptrace_traced() {
+        return;
+    }
+    let options = parent.ptrace_options();
+    let (event, mask) = if flags.has(CloneFlags::CLONE_VFORK) {
+        (PTRACE_EVENT_VFORK, PTRACE_O_TRACEVFORK)
+    } else if flags.has(CloneFlags::CLONE_THREAD) {
+        (PTRACE_EVENT_CLONE, PTRACE_O_TRACECLONE)
+    } else {
+        (PTRACE_EVENT_FORK, PTRACE_O_TRACEFORK)
+    };
+    if options & mask == 0 {
+        return;
+    }
+    parent.set_ptrace_event_msg(child_pid as i64);
+    parent.set_ptrace_stop_event(event);
+    parent.clear_ptrace_last_siginfo();
+    sched::operation::ptrace_mark_stopped(parent, sched::SignalNumber::SIGTRAP);
+}
+
+/// `PTRACE_GET_SYSCALL_INFO`：`struct ptrace_syscall_info`（80 字节）。
+fn write_ptrace_syscall_info(target: &Arc<Task>, user: usize) -> Result<(), Errno> {
+    const PTRACE_SYSCALL_INFO_NONE: u8 = 0;
+    const PTRACE_SYSCALL_INFO_ENTRY: u8 = 1;
+    const PTRACE_SYSCALL_INFO_EXIT: u8 = 2;
+    const PTRACE_SYSCALL_INFO_SECCOMP: u8 = 3;
+    #[cfg(target_arch = "loongarch64")]
+    const AUDIT_ARCH: u32 = 0x4000_0102; // AUDIT_ARCH_LOONGARCH64
+    #[cfg(target_arch = "riscv64")]
+    const AUDIT_ARCH: u32 = 0x4000_00f3; // AUDIT_ARCH_RISCV64
+
+    let (state, nr, args, ret) = target.ptrace_syscall_info();
+    let frame = ptrace_target_frame(target)?;
+    let ip = frame.pc() as u64;
+    let sp = frame.sp() as u64;
+    let mut raw = [0u8; 80];
+    match state {
+        PTRACE_SYSCALL_INFO_ENTRY => {
+            raw[0] = PTRACE_SYSCALL_INFO_ENTRY;
+            raw[4..8].copy_from_slice(&AUDIT_ARCH.to_le_bytes());
+            raw[8..16].copy_from_slice(&ip.to_le_bytes());
+            raw[16..24].copy_from_slice(&sp.to_le_bytes());
+            raw[24..32].copy_from_slice(&(nr as u64).to_le_bytes());
+            for (index, arg) in args.iter().enumerate() {
+                raw[32 + index * 8..40 + index * 8].copy_from_slice(&arg.to_le_bytes());
+            }
+        }
+        PTRACE_SYSCALL_INFO_EXIT => {
+            raw[0] = PTRACE_SYSCALL_INFO_EXIT;
+            raw[4..8].copy_from_slice(&AUDIT_ARCH.to_le_bytes());
+            raw[8..16].copy_from_slice(&ip.to_le_bytes());
+            raw[16..24].copy_from_slice(&sp.to_le_bytes());
+            raw[24..32].copy_from_slice(&(ret as u64).to_le_bytes());
+            raw[32] = (ret < 0 && ret > -4096) as u8; // is_error
+        }
+        PTRACE_SYSCALL_INFO_SECCOMP => {
+            raw[0] = PTRACE_SYSCALL_INFO_SECCOMP;
+            raw[4..8].copy_from_slice(&AUDIT_ARCH.to_le_bytes());
+            raw[8..16].copy_from_slice(&ip.to_le_bytes());
+            raw[16..24].copy_from_slice(&sp.to_le_bytes());
+            raw[24..32].copy_from_slice(&(nr as u64).to_le_bytes());
+            for (index, arg) in args.iter().enumerate() {
+                raw[32 + index * 8..40 + index * 8].copy_from_slice(&arg.to_le_bytes());
+            }
+        }
+        _ => raw[0] = PTRACE_SYSCALL_INFO_NONE,
+    }
+    copy_to_user(user, &raw).map_err(|e| e.as_errno())?;
+    Ok(())
+}
+
+/// `PTRACE_GET_RSEQ_CONFIGURATION`：`struct ptrace_rseq_configuration`（24 字节）。
+fn write_ptrace_rseq_configuration(target: &Arc<Task>, user: usize) -> Result<(), Errno> {
+    let mut raw = [0u8; 24];
+    let (abi_pointer, abi_size, signature) = target
+        .rseq_registration_if_registered()
+        .map(|registration| (registration.ptr, registration.len, registration.signature))
+        .unwrap_or((0, 0, 0));
+    raw[0..8].copy_from_slice(&(abi_pointer as u64).to_le_bytes());
+    raw[8..12].copy_from_slice(&abi_size.to_le_bytes());
+    raw[12..16].copy_from_slice(&signature.to_le_bytes());
+    copy_to_user(user, &raw).map_err(|e| e.as_errno())?;
+    Ok(())
 }
 
 pub(super) fn sys_getresuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -4886,11 +5702,37 @@ pub(super) fn sys_getresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 }
 
 pub(super) fn sys_sethostname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    set_uts_field(ctx, &UTS_HOSTNAME)
+    require_cap(ctx.task(), Capability::SysAdmin)?;
+    let user = ctx.args[0];
+    let len = ctx.args[1];
+    if len > UTS_NAME_MAX {
+        return Err(Errno::EINVAL);
+    }
+    let mut value = [0u8; UTS_FIELD_LEN];
+    if len != 0 {
+        copy_from_user(user, &mut value[..len]).map_err(|e| e.as_errno())?;
+    }
+    crate::ns::task_ns(ctx.task())
+        .uts
+        .set_hostname(&value[..len])
+        .map(|_| 0)
 }
 
 pub(super) fn sys_setdomainname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    set_uts_field(ctx, &UTS_DOMAINNAME)
+    require_cap(ctx.task(), Capability::SysAdmin)?;
+    let user = ctx.args[0];
+    let len = ctx.args[1];
+    if len > UTS_NAME_MAX {
+        return Err(Errno::EINVAL);
+    }
+    let mut value = [0u8; UTS_FIELD_LEN];
+    if len != 0 {
+        copy_from_user(user, &mut value[..len]).map_err(|e| e.as_errno())?;
+    }
+    crate::ns::task_ns(ctx.task())
+        .uts
+        .set_domainname(&value[..len])
+        .map(|_| 0)
 }
 
 pub(super) fn sys_umask(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -4946,8 +5788,24 @@ fn adjtimex_common(ctx: &mut SyscallContext<'_>, timex_arg: usize) -> Result<usi
 
     let read_i64 = |off: usize| i64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
     let read_i32 = |off: usize| i32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+    let modes = u32::from_le_bytes(
+        buf[TIMEX_MODES_OFF..TIMEX_MODES_OFF + 4]
+            .try_into()
+            .unwrap(),
+    );
+    if modes & 0x8000 != 0
+        && modes != crate::adjtimex::ADJ_OFFSET_SINGLESHOT
+        && modes != crate::adjtimex::ADJ_OFFSET_SS_READ
+    {
+        return Err(Errno::EINVAL);
+    }
+    if modes != 0 && modes != crate::adjtimex::ADJ_OFFSET_SS_READ {
+        require_cap(ctx.task(), Capability::SysTime)?;
+    }
+    let setoffset = modes & crate::adjtimex::ADJ_SETOFFSET != 0;
+    let old_realtime_offset = setoffset.then(crate::vdso::realtime_offset_ns);
     let fields = crate::adjtimex::TimexFields {
-        modes: u32::from_le_bytes(buf[TIMEX_MODES_OFF..TIMEX_MODES_OFF + 4].try_into().unwrap()),
+        modes,
         offset: read_i64(TIMEX_OFFSET_OFF),
         freq: read_i64(TIMEX_FREQ_OFF),
         maxerror: read_i64(TIMEX_MAXERROR_OFF),
@@ -4955,11 +5813,18 @@ fn adjtimex_common(ctx: &mut SyscallContext<'_>, timex_arg: usize) -> Result<usi
         status: read_i32(TIMEX_STATUS_OFF),
         constant: read_i64(TIMEX_CONSTANT_OFF),
         tick: read_i64(TIMEX_TICK_OFF),
+        time_sec: read_i64(TIMEX_TIME_OFF),
+        time_subsec: read_i64(TIMEX_TIME_OFF + 8),
         precision: 0,
         tolerance: 0,
     };
 
     let out = crate::adjtimex::do_adjtimex(fields)?;
+    if let Some(old_offset) = old_realtime_offset {
+        if crate::vdso::realtime_offset_ns() != old_offset {
+            vfs::timerfd::cancel_timers_on_clock_set();
+        }
+    }
 
     let write_i64 = |buf: &mut [u8; TIMEX_SIZE], off: usize, v: i64| {
         buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
@@ -4974,17 +5839,24 @@ fn adjtimex_common(ctx: &mut SyscallContext<'_>, timex_arg: usize) -> Result<usi
     write_i64(&mut buf, TIMEX_PRECISION_OFF, out.precision);
     write_i64(&mut buf, TIMEX_TOLERANCE_OFF, out.tolerance);
     write_i64(&mut buf, TIMEX_TICK_OFF, out.tick);
-    // time 字段：当前 CLOCK_REALTIME（sec/usec）。
+    // time 字段：当前 CLOCK_REALTIME；STA_NANO 决定亚秒字段单位。
     let realtime_ns = crate::vdso::realtime_ns();
-    write_i64(&mut buf, TIMEX_TIME_OFF, (realtime_ns / 1_000_000_000) as i64);
-    write_i64(&mut buf, TIMEX_TIME_OFF + 8, ((realtime_ns % 1_000_000_000) / 1_000) as i64);
+    write_i64(
+        &mut buf,
+        TIMEX_TIME_OFF,
+        (realtime_ns / 1_000_000_000) as i64,
+    );
+    let realtime_subsec = if out.status & crate::adjtimex::STA_NANO != 0 {
+        realtime_ns % 1_000_000_000
+    } else {
+        (realtime_ns % 1_000_000_000) / 1_000
+    };
+    write_i64(&mut buf, TIMEX_TIME_OFF + 8, realtime_subsec as i64);
     copy_to_user(ptr, &buf).map_err(|e| e.as_errno())?;
 
     // 返回值 = 时钟状态（TIME_OK/TIME_INS/TIME_DEL/TIME_ERROR）。
     Ok(crate::adjtimex::clock_state(out.status) as usize)
 }
-
-
 
 pub(super) fn sys_perf_event_open(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Err(Errno::ENOSYS)
@@ -4999,8 +5871,21 @@ pub(super) fn sys_clock_adjtime(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     adjtimex_common(ctx, 1)
 }
 
-pub(super) fn sys_setns(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_setns(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd_raw = ctx.args[0] as isize;
+    let nstype = ctx.args[1] as u64;
+    if fd_raw < 0 {
+        return Err(Errno::EBADF);
+    }
+    let fdt = general::vfs::current_fdtable().ok_or(Errno::EBADF)?;
+    let file = fdt
+        .get_file(vfs::fdtable::Fd::from_raw(fd_raw as u32))
+        .ok_or(Errno::EBADF)?;
+    let ns_file = file
+        .downcast_ops::<general::vfs::nsfs::NsfsFileOps>()
+        .ok_or(Errno::EBADF)?;
+    crate::ns::setns(ctx.task(), Arc::clone(ns_file.namespace()), nstype)?;
+    Ok(0)
 }
 
 pub(super) fn sys_kcmp(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -5058,8 +5943,103 @@ pub(super) fn sys_finit_module(_ctx: &mut SyscallContext<'_>) -> Result<usize, E
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_seccomp(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_seccomp(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    use general::seccomp::*;
+
+    const KNOWN_FLAGS: u32 = SECCOMP_FILTER_FLAG_TSYNC
+        | SECCOMP_FILTER_FLAG_LOG
+        | SECCOMP_FILTER_FLAG_SPEC_ALLOW
+        | SECCOMP_FILTER_FLAG_NEW_LISTENER
+        | SECCOMP_FILTER_FLAG_TSYNC_ESRCH;
+    const KNOWN_ACTIONS: [u32; 8] = [
+        SECCOMP_RET_KILL_PROCESS,
+        SECCOMP_RET_KILL_THREAD,
+        SECCOMP_RET_TRAP,
+        SECCOMP_RET_ERRNO,
+        SECCOMP_RET_USER_NOTIF,
+        SECCOMP_RET_TRACE,
+        SECCOMP_RET_LOG,
+        SECCOMP_RET_ALLOW,
+    ];
+
+    let op = ctx.args[0] as u32;
+    let flags = ctx.args[1] as u32;
+    let filter_user = ctx.args[2];
+    let task = ctx.task();
+
+    match op {
+        SECCOMP_SET_MODE_STRICT => {
+            if flags != 0 || filter_user != 0 {
+                return Err(Errno::EINVAL);
+            }
+            seccomp_state(task).set_strict();
+            Ok(0)
+        }
+        SECCOMP_SET_MODE_FILTER => {
+            if filter_user == 0 {
+                return Err(Errno::EFAULT);
+            }
+            if flags & !KNOWN_FLAGS != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let cred = vfs_cred_from_sched(&task.credentials());
+            if !filter_install_allowed(task.no_new_privs(), &cred) {
+                return Err(Errno::EACCES);
+            }
+            // struct sock_fprog { u16 len; u16 pad; ... ptr }
+            let mut fprog = [0u8; 16];
+            copy_from_user(filter_user, &mut fprog).map_err(|e| e.as_errno())?;
+            let len = u16::from_le_bytes(fprog[0..2].try_into().unwrap()) as usize;
+            let ptr = u64::from_le_bytes(fprog[8..16].try_into().unwrap()) as usize;
+            if ptr == 0 {
+                return Err(Errno::EFAULT);
+            }
+            let mut bytes = vec![0u8; len * 8];
+            if len > 0 {
+                copy_from_user(ptr, &mut bytes).map_err(|e| e.as_errno())?;
+            }
+            let insns = parse_program(&bytes)?;
+            let filter = SeccompFilter::new(insns, flags)?;
+            seccomp_state(task).push_filter(filter);
+            Ok(0)
+        }
+        SECCOMP_GET_ACTION_AVAIL => {
+            let action = ctx.args[1] as u32;
+            if action & !SECCOMP_RET_ACTION_FULL != 0
+                || !KNOWN_ACTIONS.contains(&(action & SECCOMP_RET_ACTION_FULL))
+            {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            Ok(0)
+        }
+        SECCOMP_GET_NOTIF_SIZES => {
+            // struct seccomp_notif_sizes { u16 seccomp_notif; u16 seccomp_notif_resp; u16 seccomp_data; }
+            if filter_user == 0 {
+                return Err(Errno::EFAULT);
+            }
+            let mut sizes = [0u8; 8];
+            sizes[0..2].copy_from_slice(&16u16.to_le_bytes());
+            sizes[2..4].copy_from_slice(&16u16.to_le_bytes());
+            sizes[4..6].copy_from_slice(&64u16.to_le_bytes());
+            copy_to_user(filter_user, &sizes[..6]).map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// 取任务的 seccomp 状态（惰性创建并挂载）。
+fn seccomp_state(task: &Arc<Task>) -> Arc<general::seccomp::SeccompState> {
+    if let Some(state) = task
+        .ext_lookup(general::syscall::TASKEXT_SECCOMP)
+        .and_then(|payload| payload.downcast::<general::seccomp::SeccompState>().ok())
+    {
+        return state;
+    }
+    let state = general::seccomp::SeccompState::new();
+    let erased: Arc<dyn core::any::Any + Send + Sync> = state.clone();
+    task.ext_install(general::syscall::TASKEXT_SECCOMP, erased);
+    state
 }
 
 pub(super) fn sys_bpf(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -5643,6 +6623,7 @@ fn cleanup_task_before_exit_in_active_vm(task: &Arc<Task>) {
     pi_release_owned_futexes(task);
     exit_robust_list(task);
     clear_child_tid_and_wake(task);
+    super::ipc::apply_sem_undo_on_exit(task);
     #[cfg(feature = "trace-task-lifecycle")]
     log::info!(
         "[syscall][exit-cleanup] futex-done pid={:?}",
@@ -6032,6 +7013,10 @@ fn waitid_code(status: WaitStatus) -> i32 {
     } else {
         0
     }
+}
+
+fn write_i64(out: &mut [u8], off: usize, value: i64) {
+    out[off..off + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 fn write_i32(out: &mut [u8], off: usize, value: i32) {

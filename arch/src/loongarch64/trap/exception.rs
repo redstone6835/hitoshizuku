@@ -213,6 +213,18 @@ fn terminate_user_exception(
         sig.raw()
     );
 
+    // ptrace 单步补丁法：用户态断点陷阱优先交给钩子消费（命中则任务已停止）。
+    if from_user && code == ECODE_BRK {
+        let hook = USER_BREAK_HOOK.load(core::sync::atomic::Ordering::Acquire);
+        if hook != 0 {
+            // Safety: register_user_break_hook 只写入 fn(usize) -> bool 指针。
+            let hook_fn: fn(usize) -> bool = unsafe { core::mem::transmute(hook) };
+            if hook_fn(era) {
+                return tf_ptr;
+            }
+        }
+    }
+
     if sched::is_ready() {
         let me = sched::current_task();
         if me.user_abi_kind() == sched::UserAbiKind::MygoNative {
@@ -231,6 +243,13 @@ fn terminate_user_exception(
     }
 
     tf_ptr
+}
+
+static USER_BREAK_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 注册用户态断点陷阱钩子（ptrace 单步补丁法使用）。
+pub fn register_user_break_hook(hook: fn(usize) -> bool) {
+    USER_BREAK_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
 }
 
 /// LoongArch64 统一异常入口（Rust 端）。
@@ -470,6 +489,15 @@ unsafe fn loongarch64_handle_exception_inner(
             // 汇编入口已保存完整现场，内核态嵌套 trap 会继续使用当前
             // 内核栈。在可能长时间阻塞或处理大数据的 syscall 期间恢复中断，
             // 确保 timer、reschedule 和 TLB shootdown 不会被拖到 syscall 返回。
+            // 被 ptrace 跟踪的任务：保存用户 trap frame 快照，供 tracer 的
+            // PTRACE_GETREGSET/PEEKUSR 在 syscall-stop 期间读取。
+            if sched::is_ready() && sched::current_task().is_ptrace_traced() {
+                let task = sched::current_task();
+                let erased: alloc::sync::Arc<dyn core::any::Any + Send + Sync> =
+                    alloc::sync::Arc::new(*tf);
+                let _ = task.ext_remove(sched::TASKEXT_PTRACE_FRAME);
+                task.ext_install(sched::TASKEXT_PTRACE_FRAME, erased);
+            }
             unsafe { LoongArch64InterruptOps::enable_interrupts() };
         }
         general::syscall::dispatch(general::TrapFramePtr::new(arg4));

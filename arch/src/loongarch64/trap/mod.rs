@@ -9,7 +9,7 @@
 mod interrupt;
 pub use interrupt::*;
 
-mod exception;
+pub mod exception;
 pub use exception::*;
 
 use core::arch::naked_asm;

@@ -30,6 +30,13 @@ pub const IPC_SET: u32 = 1;
 pub const IPC_STAT: u32 = 2;
 /// `shmctl` 系统限制查询命令。
 pub const IPC_INFO: u32 = 3;
+/// `shmctl` 锁定/解锁段内存。
+pub const SHM_LOCK: u32 = 11;
+pub const SHM_UNLOCK: u32 = 12;
+/// `shmctl` 的枚举类命令（索引/信息查询族）。
+pub const SHM_STAT: u32 = 13;
+pub const SHM_INFO: u32 = 14;
+pub const SHM_STAT_ANY: u32 = 15;
 /// Linux 兼容 ABI 标志；general 层只集中定义，不解释用户结构布局。
 pub const IPC_64: u32 = 0x0100;
 /// `shmat` 只读映射。
@@ -40,6 +47,8 @@ pub const SHM_RND: u32 = 0o20000;
 pub const SHM_REMAP: u32 = 0o40000;
 /// `shmat` 请求可执行映射。
 pub const SHM_EXEC: u32 = 0o100000;
+/// 段已 `SHM_LOCK` 的标志；按 Linux 语义暴露在 `shm_perm.mode` 的该位。
+pub const SHM_LOCKED: u32 = 0o2000;
 
 /// sparse backing 的块大小。集中定义，避免读写路径出现裸常量。
 pub const SHM_SPARSE_BLOCK_SIZE: usize = 4096;
@@ -142,6 +151,8 @@ pub struct ShmMetadata {
     pub ctime: i64,
     pub cpid: i32,
     pub lpid: i32,
+    /// 段是否被 `SHM_LOCK`（`SHM_LOCKED` 标志位）。
+    pub locked: bool,
 }
 
 /// `IPC_SET` 可更新的字段。
@@ -158,6 +169,8 @@ pub struct ShmSystemInfo {
     pub limits: ShmLimits,
     pub used_segments: usize,
     pub total_pages: usize,
+    /// 当前最大的段 id（`IPC_INFO`/`SHM_INFO` 的返回值，Linux `ipc_get_maxidx`）。
+    pub max_index: i32,
 }
 
 /// shm 段的共享 backing object。
@@ -350,6 +363,8 @@ struct ShmEntry {
     ctime: i64,
     cpid: i32,
     lpid: i32,
+    /// `SHM_LOCK` 标记（对应 `SHM_LOCKED` 标志位）。
+    locked: bool,
 }
 
 struct ShmState {
@@ -565,6 +580,45 @@ impl ShmManager {
         Ok(())
     }
 
+    /// `SHM_LOCK`/`SHM_UNLOCK`：设置/清除段的锁定标志。
+    ///
+    /// Linux 语义：需要 `CAP_IPC_LOCK`（由 syscall 层校验）；本内核没有页换出，
+    /// 因此"锁定"的完整语义是权限校验 + `SHM_LOCKED` 状态记账（`ipcs` 可见）。
+    /// 返回是否处于锁定状态。
+    #[kernel_symbols::export(name = "general.ipc.ShmManager.lock", contract = "kernel.ipc.sysv-shm@1", version = 1, capabilities = kernel_symbols::capability::IPC, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
+    pub fn lock(&self, id: ShmId, locked: bool, cred: &Credentials) -> Result<bool, Errno> {
+        let mut state = self.state.lock();
+        let entry = state.by_id.get_mut(&id).ok_or(Errno::EINVAL)?;
+        if entry.marked_for_removal {
+            return Err(Errno::EIDRM);
+        }
+        if !cred.has_cap(Capability::IpcLock) {
+            return Err(Errno::EPERM);
+        }
+        entry.locked = locked;
+        Ok(locked)
+    }
+
+    /// `SHM_STAT`/`SHM_STAT_ANY`：按 id 排序后的序号取段，返回 (真实 id, 快照)。
+    pub fn stat_by_index(
+        &self,
+        index: i32,
+        cred: &Credentials,
+        check_perms: bool,
+    ) -> Result<(ShmId, ShmMetadata), Errno> {
+        if index < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let state = self.state.lock();
+        let Some((&id, entry)) = state.by_id.iter().nth(index as usize) else {
+            return Err(Errno::EINVAL);
+        };
+        if check_perms && !cred.can_read(entry.perm.uid, entry.perm.gid, entry.perm.mode) {
+            return Err(Errno::EACCES);
+        }
+        Ok((id, metadata_from_entry(id, entry)))
+    }
+
     #[kernel_symbols::export(name = "general.ipc.ShmManager.info", contract = "kernel.ipc.sysv-shm@1", version = 1, capabilities = kernel_symbols::capability::IPC, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC)]
     pub fn info(&self) -> ShmSystemInfo {
         let state = self.state.lock();
@@ -572,6 +626,7 @@ impl ShmManager {
             limits: self.limits,
             used_segments: state.by_id.len(),
             total_pages: state.total_pages,
+            max_index: state.by_id.keys().next_back().map_or(0, |id| id.0),
         }
     }
 
@@ -610,6 +665,7 @@ impl ShmManager {
                 ctime: 0,
                 cpid: 0,
                 lpid: 0,
+                locked: false,
             },
         );
         if key != ShmKey::PRIVATE {
@@ -673,6 +729,7 @@ fn metadata_from_entry(id: ShmId, entry: &ShmEntry) -> ShmMetadata {
         ctime: entry.ctime,
         cpid: entry.cpid,
         lpid: entry.lpid,
+        locked: entry.locked,
     }
 }
 

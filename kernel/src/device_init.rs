@@ -383,6 +383,16 @@ pub fn register_core_filesystems(tag: &str) {
                 )
             });
     }
+    if FS_REGISTRY.find("mqueue").is_none() {
+        FS_REGISTRY
+            .register(Box::leak(Box::new(general::vfs::MqFsDriver)))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "[kernel-start][{}] failed to register mqueue driver: {:?}",
+                    tag, err
+                )
+            });
+    }
     general::vfs::user_api::standard_devices::register_standard_device_policies().unwrap_or_else(
         |err| {
             panic!(
@@ -521,6 +531,61 @@ pub fn mount_standard_user_api_filesystems(tag: &str, ctx: &VfsContext) {
     });
     mount_devpts_on_pts(tag, ctx);
     mount_sysfs_on_sys(tag, ctx);
+    mount_mqueue_on_dev_mqueue(tag, ctx);
+}
+
+/// 挂载 mqueue 到 `/dev/mqueue`（Linux 布局）。
+fn mount_mqueue_on_dev_mqueue(tag: &str, ctx: &VfsContext) -> Arc<Mount> {
+    ensure_dir(ctx, "/dev/mqueue", vfs::stat::FileMode::new(0o755)).unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to ensure /dev/mqueue directory: {:?}",
+            tag, err
+        )
+    });
+    if let Ok(existing) = path::lookup(ctx, &Dirfd::Cwd, "/dev/mqueue", LookupFlags::DIRECTORY)
+        && existing.mount.superblock.fs_type == "mqueue"
+        && Arc::ptr_eq(&existing.dentry, &existing.mount.mount_root)
+    {
+        return existing.mount;
+    }
+    let mountpoint = path::lookup(
+        ctx,
+        &Dirfd::Cwd,
+        "/dev/mqueue",
+        LookupFlags::DIRECTORY.with(LookupFlags::NO_MOUNT_LAST),
+    )
+    .unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to resolve /dev/mqueue mountpoint: {:?}",
+            tag, err
+        )
+    });
+    let sb = FS_REGISTRY
+        .find("mqueue")
+        .expect("[kernel-start] mqueue driver not found")
+        .mount(None, "")
+        .unwrap_or_else(|err| {
+            panic!(
+                "[kernel-start][{}] failed to mount mqueue: {:?}",
+                tag, err
+            )
+        });
+    let mount = ctx.mount_ns.mount_at(
+        Arc::clone(&mountpoint.dentry),
+        Arc::clone(&mountpoint.mount),
+        sb,
+        MountFlags::default(),
+    );
+    match mount {
+        Ok(mount) => {
+            printk!("[kernel-start][{}] mqueue mounted on /dev/mqueue", tag);
+            mount
+        }
+        Err(err) => panic!(
+            "[kernel-start][{}] failed to mount mqueue at /dev/mqueue: {:?}",
+            tag, err
+        ),
+    }
 }
 
 /// 挂载 devpts 到 `/dev/pts`(Linux 布局)。

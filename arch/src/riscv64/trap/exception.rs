@@ -442,6 +442,15 @@ fn handle_user_syscall(tf_ptr: usize) -> usize {
         let tf = unsafe { trap_frame_ref(tf_ptr) };
         (tf.a7, tf.satp)
     };
+    // 被 ptrace 跟踪的任务：保存用户 trap frame 快照，供 tracer 的
+    // PTRACE_GETREGSET/PEEKUSR 在 syscall-stop 期间读取。
+    if sched::current_task().is_ptrace_traced() {
+        let task = sched::current_task();
+        let erased: alloc::sync::Arc<dyn core::any::Any + Send + Sync> =
+            alloc::sync::Arc::new(*unsafe { trap_frame_ref(tf_ptr) });
+        let _ = task.ext_remove(sched::TASKEXT_PTRACE_FRAME);
+        task.ext_install(sched::TASKEXT_PTRACE_FRAME, erased);
+    }
     #[cfg(feature = "syscall-model-markers")]
     let _syscall_model = {
         let task = sched::current_task();
@@ -602,8 +611,27 @@ fn handle_user_illegal_instruction(tf_ptr: usize, code: usize) -> usize {
     }
 }
 
+static USER_BREAK_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 注册用户态断点陷阱钩子（ptrace 单步补丁法使用）。
+pub fn register_user_break_hook(hook: fn(usize) -> bool) {
+    USER_BREAK_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
+}
+
 fn handle_breakpoint(tf_ptr: usize, code: usize, from_user: bool) -> usize {
     if from_user {
+        let sepc = {
+            let tf = unsafe { trap_frame_ref(tf_ptr) };
+            tf.sepc
+        };
+        let hook = USER_BREAK_HOOK.load(core::sync::atomic::Ordering::Acquire);
+        if hook != 0 {
+            // Safety: register_user_break_hook 只写入 fn(usize) -> bool 指针。
+            let hook_fn: fn(usize) -> bool = unsafe { core::mem::transmute(hook) };
+            if hook_fn(sepc) {
+                return finish_trap_return(tf_ptr, true);
+            }
+        }
         return terminate_user_exception(code, sched::SignalNumber::SIGTRAP, tf_ptr, true);
     }
     if let Some(recovered) = try_recover_elm_kernel_fault(tf_ptr, code, "native breakpoint") {
@@ -719,6 +747,15 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
         let tf = unsafe { trap_frame_ref(tf_ptr) };
         (tf.a7, [tf.a0, tf.a1, tf.a2, tf.a3, tf.a4, tf.a5], tf.satp)
     };
+    // 被 ptrace 跟踪的任务：保存用户 trap frame 快照，供 tracer 的
+    // PTRACE_GETREGSET/PEEKUSR 在 syscall-stop 期间读取。
+    if task.as_arc().is_ptrace_traced() {
+        let erased: alloc::sync::Arc<dyn core::any::Any + Send + Sync> =
+            alloc::sync::Arc::new(*unsafe { trap_frame_ref(tf_ptr) });
+        let _ = task.as_arc().ext_remove(sched::TASKEXT_PTRACE_FRAME);
+        task.as_arc()
+            .ext_install(sched::TASKEXT_PTRACE_FRAME, erased);
+    }
     #[cfg(feature = "syscall-model-markers")]
     let _syscall_model = profiling::syscall_model_scope(
         task.as_arc().profile_session_id(),

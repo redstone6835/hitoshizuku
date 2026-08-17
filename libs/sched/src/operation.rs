@@ -86,15 +86,24 @@ pub fn getegid() -> Gid {
 
 // ── 进程组 / 会话 ────────────────────────────────────────────────────────────
 
-fn lookup_pid(pid: PidT) -> Result<Arc<Task>, Errno> {
+/// 按 pid 查找任务：从调用者自身的 pid 命名空间向根逐层解析
+/// （Linux `find_task_by_vpid` 语义）。
+pub fn lookup_pid(pid: PidT) -> Result<Arc<Task>, Errno> {
     if pid == 0 {
         return Ok(current_task());
     }
-    root_pid_ns()
-        .registry()
-        .lookup(pid)
-        .and_then(|w| w.upgrade())
-        .ok_or(Errno::ESRCH)
+    let me = current_task();
+    let mut ns = me.pid_ns();
+    loop {
+        if let Some(task) = ns.registry().lookup(pid).and_then(|w| w.upgrade()) {
+            return Ok(task);
+        }
+        match ns.parent() {
+            Some(parent) => ns = Arc::clone(parent),
+            None => break,
+        }
+    }
+    Err(Errno::ESRCH)
 }
 
 pub fn getpgid(pid: PidT) -> Result<PidT, Errno> {
@@ -1054,14 +1063,13 @@ pub(crate) fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
         | CloneFlags::CLONE_NEWNET
         | CloneFlags::CLONE_IO
         | CloneFlags::CLONE_CLEAR_SIGHAND;
+    // NEWUSER/NEWNET 未实现（能力语义改造/网络栈 per-ns）；NEWTIME 只能经
+    // unshare(2) 使用（clone 报 EINVAL）。NEWNS/NEWCGROUP/NEWUTS/NEWIPC/
+    // NEWPID 由 kernel 侧在 clone 完成后安装命名空间。
     const UNSUPPORTED: u64 = CloneFlags::CLONE_PTRACE
-        | CloneFlags::CLONE_NEWNS
-        | CloneFlags::CLONE_NEWCGROUP
-        | CloneFlags::CLONE_NEWUTS
-        | CloneFlags::CLONE_NEWIPC
         | CloneFlags::CLONE_NEWUSER
-        | CloneFlags::CLONE_NEWPID
         | CloneFlags::CLONE_NEWNET
+        | CloneFlags::CLONE_NEWTIME
         | CloneFlags::CLONE_IO;
     if flags.has(CloneFlags::CLONE_NEWNS) && flags.has(CloneFlags::CLONE_FS) {
         return Err(Errno::EINVAL);
@@ -1617,7 +1625,47 @@ pub fn queueinfo(pid: PidT, info: SigInfo) -> Result<(), Errno> {
     Ok(())
 }
 
-// ── ptrace 最小兼容层 ───────────────────────────────────────────────────────
+// ── ptrace 完整层 ────────────────────────────────────────────────────────────
+
+/// ptrace 访问权限检查（Linux `ptrace_may_access` 语义）：
+/// 同 uid、或调用者拥有 `CAP_SYS_PTRACE`，或目标 `dumpable == 0` 时仅限
+/// 特权追踪者（dumpable 由 prctl 维护，默认 1）。
+pub fn ptrace_may_access(tracer: &Arc<Task>, target: &Arc<Task>) -> bool {
+    let tracer_cred = tracer.credentials();
+    let target_cred = target.credentials();
+    if tracer_cred.has_cap(crate::ids::Capability::SysPtrace) {
+        return true;
+    }
+    if target.dumpable() == 0 {
+        return false;
+    }
+    tracer_cred.uid == target_cred.uid || tracer_cred.euid == target_cred.uid
+}
+
+/// 标记任务进入 ptrace stop（`PTRACE_EVENT_*` 编码由调用方提前设置；
+/// `raw_sig` 允许 `0x80|SIGTRAP` 这类 TRACESYSGOOD 编码）。
+pub fn ptrace_mark_stopped_raw(task: &Arc<Task>, raw_sig: i32) -> bool {
+    task.mark_stopped_with_raw_sig(raw_sig)
+}
+
+/// 标记任务进入 ptrace stop（普通信号编码）。
+pub fn ptrace_mark_stopped(task: &Arc<Task>, sig: SignalNumber) -> bool {
+    task.mark_stopped_with_raw_sig(sig.raw() as i32)
+}
+
+/// 恢复被 `PTRACE_SINGLESTEP` 停止的任务（单步补丁由调用方布置）。
+pub fn ptrace_continue(task: &Arc<Task>) -> bool {
+    continue_task(task)
+}
+
+fn ptrace_target(pid: PidT) -> Result<Arc<Task>, Errno> {
+    let target = lookup_pid(pid)?;
+    if target.is_kernel_task() || !target.is_ptrace_traced() {
+        return Err(Errno::ESRCH);
+    }
+    check_kill_permission(&target)?;
+    Ok(target)
+}
 
 pub fn ptrace_traceme() -> Result<(), Errno> {
     let me = current_task();
@@ -1630,49 +1678,87 @@ pub fn ptrace_traceme() -> Result<(), Errno> {
     Ok(())
 }
 
+/// `PTRACE_ATTACH`：发 `SIGSTOP` 并等待目标进入 stop 后才返回（Linux 语义）。
 pub fn ptrace_attach(pid: PidT) -> Result<(), Errno> {
     let target = lookup_pid(pid)?;
     let me = current_task();
     if target.is_kernel_task() || Arc::ptr_eq(&target, &me) {
         return Err(Errno::EPERM);
     }
-    check_kill_permission(&target)?;
+    if !ptrace_may_access(&me, &target) {
+        return Err(Errno::EPERM);
+    }
     if !target.enable_ptrace_traced() {
         return Err(Errno::EPERM);
     }
+    target.set_ptrace_seized(false);
     let _ = mark_task_stopped(&target, SignalNumber::SIGSTOP);
+    // 等待 stop 生效（Linux `PTRACE_ATTACH` 在目标停下后才返回）。
+    while target.state() != crate::TaskState::Stopped {
+        schedule_once(now_ns_public());
+    }
     Ok(())
 }
 
+/// `PTRACE_SEIZE`：附着但不停止目标（后续用 `PTRACE_INTERRUPT` 停下）。
 pub fn ptrace_seize(pid: PidT) -> Result<(), Errno> {
     let target = lookup_pid(pid)?;
     let me = current_task();
     if target.is_kernel_task() || Arc::ptr_eq(&target, &me) {
         return Err(Errno::EPERM);
     }
-    check_kill_permission(&target)?;
+    if !ptrace_may_access(&me, &target) {
+        return Err(Errno::EPERM);
+    }
     if !target.enable_ptrace_traced() {
         return Err(Errno::EPERM);
     }
+    target.set_ptrace_seized(true);
     Ok(())
 }
 
 pub fn ptrace_interrupt(pid: PidT) -> Result<(), Errno> {
-    let target = lookup_pid(pid)?;
-    if target.is_kernel_task() || !target.is_ptrace_traced() {
-        return Err(Errno::ESRCH);
-    }
-    check_kill_permission(&target)?;
+    let target = ptrace_target(pid)?;
+    target.set_ptrace_stop_event(0);
     let _ = mark_task_stopped(&target, SignalNumber::SIGTRAP);
     Ok(())
 }
 
+/// `PTRACE_CONT`：恢复执行（清除 syscall-stop 与单步状态）。
 pub fn ptrace_cont(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
-    let target = lookup_pid(pid)?;
-    if target.is_kernel_task() || !target.is_ptrace_traced() {
-        return Err(Errno::ESRCH);
+    let target = ptrace_target(pid)?;
+    target.set_ptrace_syscall_stop(false);
+    target.clear_singlestep();
+    target.set_ptrace_stop_event(0);
+    target.clear_ptrace_last_siginfo();
+    let _ = continue_task(&target);
+    if let Some(sig) = sig {
+        tkill(pid, Some(sig))?;
     }
-    check_kill_permission(&target)?;
+    Ok(())
+}
+
+/// `PTRACE_SYSCALL`：恢复执行并在每个 syscall 边界停止。
+pub fn ptrace_syscall(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
+    let target = ptrace_target(pid)?;
+    target.set_ptrace_syscall_stop(true);
+    target.clear_singlestep();
+    target.set_ptrace_stop_event(0);
+    target.clear_ptrace_last_siginfo();
+    let _ = continue_task(&target);
+    if let Some(sig) = sig {
+        tkill(pid, Some(sig))?;
+    }
+    Ok(())
+}
+
+/// `PTRACE_SINGLESTEP`：布置单步断点（指令补丁由 kernel 层经
+/// `arm_singlestep` 完成）后恢复执行。
+pub fn ptrace_singlestep(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
+    let target = ptrace_target(pid)?;
+    target.set_ptrace_syscall_stop(false);
+    target.set_ptrace_stop_event(0);
+    target.clear_ptrace_last_siginfo();
     let _ = continue_task(&target);
     if let Some(sig) = sig {
         tkill(pid, Some(sig))?;
@@ -1681,12 +1767,12 @@ pub fn ptrace_cont(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
 }
 
 pub fn ptrace_detach(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
-    let target = lookup_pid(pid)?;
-    if target.is_kernel_task() || !target.is_ptrace_traced() {
-        return Err(Errno::ESRCH);
-    }
-    check_kill_permission(&target)?;
+    let target = ptrace_target(pid)?;
     target.clear_ptrace_traced();
+    target.set_ptrace_syscall_stop(false);
+    target.clear_singlestep();
+    target.set_ptrace_stop_event(0);
+    target.clear_ptrace_last_siginfo();
     let _ = continue_task(&target);
     if let Some(sig) = sig {
         tkill(pid, Some(sig))?;
@@ -1695,11 +1781,66 @@ pub fn ptrace_detach(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> 
 }
 
 pub fn ptrace_kill(pid: PidT) -> Result<(), Errno> {
-    let target = lookup_pid(pid)?;
-    if target.is_kernel_task() || !target.is_ptrace_traced() {
-        return Err(Errno::ESRCH);
-    }
+    let target = ptrace_target(pid)?;
     tkill(pid, Some(SignalNumber::SIGKILL))
+}
+
+/// `PTRACE_SETOPTIONS`（kernel 层校验具体位）。
+pub fn ptrace_set_options(pid: PidT, options: u64) -> Result<(), Errno> {
+    let target = ptrace_target(pid)?;
+    target.set_ptrace_options(options);
+    Ok(())
+}
+
+/// `PTRACE_GETEVENTMSG`。
+pub fn ptrace_geteventmsg(pid: PidT) -> Result<i64, Errno> {
+    let target = ptrace_target(pid)?;
+    Ok(target.ptrace_event_msg())
+}
+
+/// `PTRACE_GETSIGINFO`（仅在 stop 期间有效）。
+pub fn ptrace_getsiginfo(pid: PidT) -> Result<crate::signal::SigInfo, Errno> {
+    let target = ptrace_target(pid)?;
+    target
+        .take_ptrace_last_siginfo()
+        .ok_or(Errno::EINVAL)
+}
+
+/// `PTRACE_SETSIGINFO`。
+pub fn ptrace_setsiginfo(pid: PidT, info: crate::signal::SigInfo) -> Result<(), Errno> {
+    let target = ptrace_target(pid)?;
+    target.set_ptrace_last_siginfo(info);
+    Ok(())
+}
+
+/// `PTRACE_GETSIGMASK`/`PTRACE_SETSIGMASK`。
+pub fn ptrace_get_sigmask(pid: PidT) -> Result<crate::signal::SigSet, Errno> {
+    let target = ptrace_target(pid)?;
+    Ok(target.signal.blocked_snapshot())
+}
+
+pub fn ptrace_set_sigmask(pid: PidT, mask: crate::signal::SigSet) -> Result<(), Errno> {
+    let target = ptrace_target(pid)?;
+    target.signal.block(mask, crate::signal::SigProcMaskHow::SetMask);
+    Ok(())
+}
+
+/// 单步断点命中检查（arch 的 break trap 钩子调用）：命中则恢复原指令、
+/// 清除单步状态并把任务置为 `SIGTRAP` stop。返回 `true` 表示已消费该陷阱。
+pub fn ptrace_singlestep_hit_check(task: &Arc<Task>, pc: usize) -> bool {
+    if !task.singlestep_armed() {
+        return false;
+    }
+    if task.singlestep_addr() == pc {
+        task.clear_singlestep();
+        task.set_ptrace_stop_event(0);
+        task.clear_ptrace_last_siginfo();
+        mark_task_stopped(task, SignalNumber::SIGTRAP);
+        return true;
+    }
+    // 断点出现在非预期地址：清除单步状态，按普通断点处理。
+    task.clear_singlestep();
+    false
 }
 
 // ── sigaction / sigprocmask / sigpending ─────────────────────────────────────
