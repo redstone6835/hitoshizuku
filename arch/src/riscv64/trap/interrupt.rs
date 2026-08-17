@@ -55,17 +55,32 @@ fn disable_irq_line(line: IrqLine) -> bool {
 }
 
 fn set_irq_line_enabled(line: IrqLine, enabled: bool) -> bool {
-    let mask = match line {
-        IrqLine::Ipi => SIE_SSIE,
-        IrqLine::Hardware(0) => SIE_SEIE,
+    match line {
+        IrqLine::Ipi => {
+            if enabled {
+                set_csr!(sie, SIE_SSIE);
+            } else {
+                clear_csr!(sie, SIE_SSIE);
+            }
+        }
+        IrqLine::Hardware(0) => {
+            let changed = crate::riscv64::external_irq::set_enabled(enabled);
+            sync_external_irq_current_cpu();
+            if changed {
+                crate::riscv64::smp::request_external_irq_sync();
+            }
+        }
         _ => return false,
-    };
-    if enabled {
-        set_csr!(sie, mask);
-    } else {
-        clear_csr!(sie, mask);
     }
     true
+}
+
+pub(in crate::riscv64) fn sync_external_irq_current_cpu() {
+    if crate::riscv64::external_irq::is_enabled() {
+        set_csr!(sie, SIE_SEIE);
+    } else {
+        clear_csr!(sie, SIE_SEIE);
+    }
 }
 
 impl Riscv64InterruptOps {

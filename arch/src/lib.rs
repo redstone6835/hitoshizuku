@@ -20,6 +20,11 @@ pub(crate) mod boot_protocol;
 #[path = "riscv64/paging_geometry.rs"]
 mod riscv_paging_geometry;
 
+// 非 RISC-V 宿主机只编译外部中断期望状态的纯逻辑单测。
+#[cfg(all(test, not(target_arch = "riscv64")))]
+#[path = "riscv64/external_irq.rs"]
+mod riscv_external_irq;
+
 #[cfg(target_arch = "riscv64")]
 pub mod riscv64;
 #[cfg(target_arch = "riscv64")]

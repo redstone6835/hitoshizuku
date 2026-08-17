@@ -21,16 +21,19 @@ use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, DriverHandle, PnpBusInfo, PnpDevice, PnpDriver,
     PnpError, PnpId, PnpResourceKind, register_driver_factory,
 };
+use crate::dispatch::{DispatchGate, drain_pending, mark_unhandled_once, select_target_context};
 
 const COMPAT_SIFIVE_PLIC: &str = "sifive,plic-1.0.0";
 const COMPAT_RISCV_PLIC0: &str = "riscv,plic0";
 
 const PLIC_DEFAULT_PRIORITY: u32 = 1;
+const PLIC_DRAIN_BUDGET: usize = 64;
 
 struct PlicInner {
     mmio_base: usize,
     ndev: u32,
     contexts: Vec<PlicCpuLayout>,
+    boot_context_index: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -41,8 +44,8 @@ struct PlicCpuLayout {
 
 struct Plic {
     inner: Spinlock<PlicInner>,
-    dispatch_lock: Spinlock<()>,
-    quiesced: AtomicBool,
+    dispatch_gate: DispatchGate,
+    unhandled_reported: Vec<AtomicBool>,
 }
 
 impl Plic {
@@ -86,10 +89,13 @@ impl Plic {
     }
 
     fn set_priority(&self, hwirq: u32, priority: u32) -> bool {
-        if self.quiesced.load(Ordering::Acquire) {
+        if self.dispatch_gate.is_closed() {
             return false;
         }
         let inner = self.inner.lock();
+        if self.dispatch_gate.is_closed() {
+            return false;
+        }
         let Some(offset) = inner
             .contexts
             .first()
@@ -105,14 +111,34 @@ impl Plic {
     }
 
     fn set_enabled(&self, hwirq: u32, enabled: bool) -> bool {
-        if self.quiesced.load(Ordering::Acquire) {
+        if self.dispatch_gate.is_closed() {
             return !enabled;
         }
         let inner = self.inner.lock();
+        if self.dispatch_gate.is_closed() {
+            return !enabled;
+        }
         if hwirq == 0 || hwirq > inner.ndev {
             return false;
         }
-        for context in &inner.contexts {
+        let target = enabled
+            .then(|| {
+                select_target_context(
+                    inner.contexts.len(),
+                    sched::online_cpu_mask(),
+                    inner.boot_context_index,
+                    hwirq,
+                    |index| inner.contexts[index].logical_cpu,
+                )
+            })
+            .flatten();
+        if enabled && target.is_none() {
+            return false;
+        }
+        if enabled {
+            self.unhandled_reported[hwirq as usize].store(false, Ordering::Relaxed);
+        }
+        for (index, context) in inner.contexts.iter().enumerate() {
             let (offset, bit) = context
                 .layout
                 .enable_offset(hwirq)
@@ -120,7 +146,7 @@ impl Plic {
             let addr = Self::register_address(&inner, offset);
             // Safety: `hwirq` 和 context 已校验，地址指向对应的对齐使能寄存器。
             let mut val = unsafe { core::ptr::read_volatile(addr as *const u32) };
-            if enabled {
+            if target == Some(index) {
                 val |= 1u32 << bit;
             } else {
                 val &= !(1u32 << bit);
@@ -132,11 +158,10 @@ impl Plic {
         true
     }
 
-    fn dispatch_one(&self, controller: u32) -> IrqStatus {
-        let _dispatch = self.dispatch_lock.lock();
-        if self.quiesced.load(Ordering::Acquire) {
-            return IrqStatus::Unhandled;
-        }
+    fn dispatch_pending(&self, controller: u32) -> IrqStatus {
+        let Some(_active) = self.dispatch_gate.try_enter() else {
+            return IrqStatus::Handled;
+        };
         let logical_cpu = sched::current_cpu_id();
         let inner = self.inner.lock();
         let Some(layout) = inner
@@ -145,33 +170,54 @@ impl Plic {
             .find(|context| context.logical_cpu == logical_cpu)
             .map(|context| context.layout)
         else {
-            log::error!(
-                "[platform-riscv-plic] CPU {} has no supervisor context",
-                logical_cpu
-            );
+            // CPU 外部中断线允许由 PLIC 与 IMSIC 共享；没有 PLIC context 时
+            // 当前中断可能属于另一个级联控制器。
             return IrqStatus::Unhandled;
         };
         let claim = Self::register_address(&inner, layout.claim_offset());
         let ndev = inner.ndev;
-        // Safety: layout 已校验 claim/complete 寄存器完整落在 MMIO 窗口内。
-        let hwirq = unsafe { core::ptr::read_volatile(claim as *const u32) };
         drop(inner);
-        if hwirq == 0 {
-            return IrqStatus::Unhandled;
-        }
-        let valid = hwirq <= ndev;
-        if valid {
-            irq::dispatch_irq_line(IrqLine::Controller { controller, hwirq });
-        } else {
+
+        let result = drain_pending(
+            ndev,
+            PLIC_DRAIN_BUDGET,
+            || {
+                // Safety: layout 已校验 claim/complete 寄存器完整落在 MMIO 窗口内。
+                let hwirq = unsafe { core::ptr::read_volatile(claim as *const u32) };
+                // claim 必须先于设备状态读取生效。
+                hal::memory::device_io_barrier();
+                hwirq
+            },
+            |hwirq| {
+                let handled = irq::dispatch_irq_line(IrqLine::Controller { controller, hwirq });
+                // 设备 ACK 必须在 PLIC complete 前对总线可见，避免 level source
+                // 在去断言传播完成前被当前批次立即重新 claim。
+                hal::memory::device_io_barrier();
+                let reported = &self.unhandled_reported[hwirq as usize];
+                if !handled && mark_unhandled_once(reported) {
+                    log::error!(
+                        "[platform-riscv-plic] unhandled source {} on CPU {}",
+                        hwirq,
+                        logical_cpu
+                    );
+                }
+                handled
+            },
+            |hwirq| {
+                // Safety: 与 claim 读取访问同一个已校验寄存器。
+                unsafe { core::ptr::write_volatile(claim as *mut u32, hwirq) };
+                // complete 必须在下一次 claim 前完成。
+                hal::memory::device_io_barrier();
+            },
+        );
+        if let Some(hwirq) = result.invalid {
             log::error!(
                 "[platform-riscv-plic] hardware returned out-of-range claim {} (ndev={})",
                 hwirq,
                 ndev
             );
         }
-        // Safety: 与上面的 claim 读取访问同一个已校验寄存器。
-        unsafe { core::ptr::write_volatile(claim as *mut u32, hwirq) };
-        if valid {
+        if result.claimed != 0 {
             IrqStatus::Handled
         } else {
             IrqStatus::Unhandled
@@ -179,11 +225,10 @@ impl Plic {
     }
 
     fn quiesce(&self) {
-        if self.quiesced.swap(true, Ordering::AcqRel) {
+        if !self.dispatch_gate.close() {
             return;
         }
-        // 等待已进入的 cascade dispatch 完成，并阻止新 dispatch 越过屏蔽点。
-        let _dispatch = self.dispatch_lock.lock();
+        // 先阻止新 dispatch，再关闭全部源；在途 handler 仍可完成已经 claim 的中断。
         let inner = self.inner.lock();
         for context in &inner.contexts {
             let threshold = Self::register_address(&inner, context.layout.threshold_offset());
@@ -213,6 +258,8 @@ impl Plic {
             unsafe { core::ptr::write_volatile(addr as *mut u32, 0) };
         }
         hal::memory::device_io_barrier();
+        drop(inner);
+        self.dispatch_gate.wait_for_idle();
     }
 }
 
@@ -261,7 +308,7 @@ struct PlicCascadeHandler {
 
 impl IrqHandler for PlicCascadeHandler {
     fn handle_irq(&self, _line: IrqLine) -> IrqStatus {
-        self.plic.dispatch_one(self.controller)
+        self.plic.dispatch_pending(self.controller)
     }
 }
 
@@ -386,15 +433,25 @@ impl PnpDriver for PlicDriver {
             .find(|context| context.hart_id == self.boot_hart_id as u64)
             .expect("context selection requires the boot hart")
             .context;
+        let boot_context_index = supervisor_contexts
+            .iter()
+            .position(|context| context.hart_id == self.boot_hart_id as u64)
+            .expect("context selection requires the boot hart");
+        let mut unhandled_reported = Vec::new();
+        unhandled_reported
+            .try_reserve_exact(ndev as usize + 1)
+            .map_err(|_| PnpError::OutOfMemory)?;
+        unhandled_reported.resize_with(ndev as usize + 1, || AtomicBool::new(false));
 
         let plic = Arc::new(Plic {
             inner: Spinlock::new(PlicInner {
                 mmio_base,
                 ndev,
                 contexts,
+                boot_context_index,
             }),
-            dispatch_lock: Spinlock::new(()),
-            quiesced: AtomicBool::new(false),
+            dispatch_gate: DispatchGate::new(),
+            unhandled_reported,
         });
 
         // 初始化：清空全部 S-mode context 的 enable，所有源 priority=0、threshold=0。

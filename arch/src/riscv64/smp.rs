@@ -75,6 +75,25 @@ pub(super) fn request_aia_sync(logical_id: usize) -> bool {
     }
 }
 
+/// 请求全部在线远端 hart 同步 supervisor 外部中断线状态。
+pub(super) fn request_external_irq_sync() {
+    let current = crate::riscv64::specific::current_cpu_id();
+    let online = ONLINE_HARTS.load(Ordering::Acquire);
+    for logical_id in 0..MAX_CPUS {
+        if logical_id == current || online & (1 << logical_id) == 0 {
+            continue;
+        }
+        if !send_software_ipi(logical_id) {
+            let hart_id = physical_hart_id(logical_id).unwrap_or(UNKNOWN_HART_ID);
+            log::warning!(
+                "[smp] external IRQ sync IPI failed: logical={} hart={}",
+                logical_id,
+                hart_id,
+            );
+        }
+    }
+}
+
 fn send_reschedule(logical_id: usize) {
     if !send_software_ipi(logical_id) {
         let hart_id = physical_hart_id(logical_id).unwrap_or(UNKNOWN_HART_ID);
@@ -117,6 +136,7 @@ pub(crate) static CPU_CONTROL_OPS: CpuControlOps = CpuControlOps {
 
 pub(crate) fn handle_ipi() {
     super::aia::sync_current_cpu();
+    super::trap::sync_external_irq_current_cpu();
     sched::poll_urgent_work();
     // request_resched() 在发送 IPI 前已发布目标 CPU 的 need_resched；trap 返回路径
     // 会在安全边界消费该标志。RFENCE 由 OpenSBI 同步执行，不进入 S-mode handler。
@@ -426,6 +446,8 @@ unsafe extern "C" fn secondary_main(hart_id: usize, logical_id: usize) -> ! {
     <Riscv64TaskOps as TaskOps>::set_kernel_trap_stack(idle.ensure_kernel_stack());
 
     ONLINE_HARTS.fetch_or(1 << logical_id, Ordering::Release);
+    // online 发布后、全局开中断前重新读取期望状态，闭合与并发 line 更新的竞态。
+    super::trap::sync_external_irq_current_cpu();
     STARTED_HARTS.fetch_or(1 << logical_id, Ordering::Release);
     log::info!("[smp] CPU online: logical={} hart={}", logical_id, hart_id);
     unsafe { Riscv64InterruptOps::enable_interrupts() };
