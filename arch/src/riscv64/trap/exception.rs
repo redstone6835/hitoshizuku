@@ -386,6 +386,8 @@ fn handle_interrupt(tf_ptr: usize, cause: usize, code: usize, from_user: bool) -
             }
         }
         vdso::run_timer_tick_hook(now_ns);
+        // tick 级 user/system 记账：按被中断上下文把本段增量计入用户时间。
+        sched::account_tick_user_system(now_ns, from_user);
         // timer 可打断持有 runqueue、topology 等普通自旋锁的内核路径。
         // top-half 只记录待处理时间；syscall 返回或下一次主动调度会在无锁
         // 边界补做调度工作，避免同一 CPU 重入锁后永久自旋。

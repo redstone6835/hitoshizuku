@@ -9,6 +9,7 @@ extern crate alloc;
 
 pub use alloc::sync::Arc;
 
+pub mod acl;
 pub mod addr;
 pub mod anon;
 pub mod cred;
@@ -17,10 +18,14 @@ pub mod elm;
 pub mod epoll;
 pub mod error;
 pub mod eventfd;
+pub mod fanotify;
 pub mod fdtable;
 pub mod file;
 pub mod flock;
+pub mod fs_context;
+pub mod fsnotify;
 pub mod inode;
+pub mod inotify;
 pub mod lease;
 pub mod limits;
 pub mod memfd;
@@ -40,6 +45,7 @@ pub mod superblock;
 pub mod sync;
 pub mod sysctl;
 pub mod timerfd;
+pub mod xattr;
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use cred::Credentials;

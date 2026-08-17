@@ -29,7 +29,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use ns::Namespace as _;
 use crate::vfs::DCACHE;
@@ -198,6 +198,11 @@ impl MountFlags {
         self.0
     }
 
+    /// 从原始位构造（传播克隆复制标志用）。
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
     /// 判断是否只读挂载。
     pub const fn is_rdonly(self) -> bool {
         self.has(Self::RDONLY)
@@ -242,6 +247,26 @@ pub struct Mount {
 
     /// 活跃引用计数：当前在此挂载上存活的文件描述符与路径引用之和。
     pub open_count: AtomicUsize,
+
+    /// 挂载传播类型（Linux shared-subtree：private/shared/slave/unbindable）。
+    pub propagation: AtomicU32,
+
+    /// 传播 peer 组 ID（`PROP_PRIVATE` 表示不在任何组；shared 与 slave 共享组）。
+    pub peer_group: AtomicU64,
+}
+
+/// 挂载传播类型取值（`Mount::propagation`）。
+pub const PROP_PRIVATE: u32 = 0;
+pub const PROP_SHARED: u32 = 1;
+pub const PROP_SLAVE: u32 = 2;
+pub const PROP_UNBINDABLE: u32 = 3;
+
+/// 传播 peer 组 ID 分配（全局单调递增；0 保留给 private）。
+static NEXT_PEER_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// 分配一个新的传播 peer 组 ID。
+pub fn alloc_peer_group_id() -> u64 {
+    NEXT_PEER_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
 impl Mount {
@@ -261,6 +286,8 @@ impl Mount {
             flags: AtomicU32::new(flags.raw()),
             children: Spinlock::new(Vec::new()),
             open_count: AtomicUsize::new(0),
+            propagation: AtomicU32::new(PROP_PRIVATE),
+            peer_group: AtomicU64::new(0),
         })
     }
 
@@ -522,7 +549,194 @@ impl MountNamespace {
 
         parent_mount.add_child(Arc::clone(&new_mount));
         self.data.lock().add(&new_mount);
+        self.propagate_mount_event(&parent_mount, &new_mount);
         Ok(new_mount)
+    }
+
+    /// 把已构造的 Mount 挂到 `parent` 下（fs_context/open_tree 落位用），
+    /// 并触发挂载事件传播。
+    pub fn attach_mount(&self, mount: Arc<Mount>, parent: &Arc<Mount>) {
+        parent.add_child(Arc::clone(&mount));
+        self.data.lock().add(&mount);
+        self.propagate_mount_event(parent, &mount);
+    }
+
+    /// bind 挂载：把 `superblock` 的 `mount_root` 子树挂到 `mountpoint`
+    /// （`mount --bind`；源与目标共享同一文件系统实例）。
+    ///
+    /// `propagate_from` 为源挂载（bind 复制其传播属性，Linux 语义：bind 使
+    /// 两个挂载成为同一 peer 组）；随后向 peer 组传播挂载事件。
+    pub fn bind_at(
+        &self,
+        mountpoint: Arc<Dentry>,
+        parent_mount: Arc<Mount>,
+        superblock: Arc<Superblock>,
+        mount_root: Arc<Dentry>,
+        flags: MountFlags,
+        propagate_from: Option<&Arc<Mount>>,
+        propagate: bool,
+    ) -> VfsResult<Arc<Mount>> {
+        let new_mount = Mount::new(
+            superblock,
+            Arc::clone(&mountpoint),
+            mount_root,
+            flags,
+            Some(Arc::downgrade(&parent_mount)),
+        );
+        if let Some(src) = propagate_from {
+            new_mount
+                .propagation
+                .store(src.propagation.load(Ordering::Acquire), Ordering::Release);
+            new_mount
+                .peer_group
+                .store(src.peer_group.load(Ordering::Acquire), Ordering::Release);
+        }
+        parent_mount.add_child(Arc::clone(&new_mount));
+        self.data.lock().add(&new_mount);
+        // 传播副本（propagate=false）不再触发传播，避免 peer 间无限循环。
+        if propagate {
+            self.propagate_mount_event(&parent_mount, &new_mount);
+        }
+        Ok(new_mount)
+    }
+
+    /// 迁移挂载：把 `source` 挂载从原挂载点移动到 `new_mountpoint`
+    /// （`mount --move`；挂载树中位置变化，superblock/子树保持不变）。
+    pub fn move_mount_at(
+        &self,
+        source: &Arc<Mount>,
+        new_mountpoint: Arc<Dentry>,
+        new_parent: Arc<Mount>,
+    ) -> VfsResult<()> {
+        let old_mountpoint = source.location.lock().mountpoint.clone();
+        {
+            let mut data = self.data.lock();
+            let old_key = Arc::as_ptr(&old_mountpoint) as usize;
+            if let Some(list) = data.by_mountpoint.get_mut(&old_key) {
+                list.retain(|m| !Arc::ptr_eq(m, source));
+                if list.is_empty() {
+                    data.by_mountpoint.remove(&old_key);
+                }
+            }
+            data.by_mountpoint
+                .entry(Arc::as_ptr(&new_mountpoint) as usize)
+                .or_default()
+                .push(Arc::clone(source));
+        }
+        if let Some(old_parent) = source.location.lock().parent.clone() {
+            if let Some(p) = old_parent.upgrade() {
+                p.remove_child(source);
+            }
+        }
+        source.location.lock().mountpoint = Arc::clone(&new_mountpoint);
+        source.location.lock().parent = Some(Arc::downgrade(&new_parent));
+        new_parent.add_child(Arc::clone(source));
+        self.propagate_mount_event(&new_parent, source);
+        Ok(())
+    }
+
+    /// 设置挂载传播类型（`mount --make-shared/private/slave/unbindable`）。
+    /// `rec` 为 true 时递归应用到所有子挂载。
+    pub fn set_propagation_at(
+        &self,
+        mountpoint: &Arc<Dentry>,
+        kind: u32,
+        rec: bool,
+    ) -> VfsResult<()> {
+        let mount = self
+            .lookup_mount(mountpoint)
+            .ok_or(VfsError::InvalidArgument)?;
+        set_mount_propagation(&mount, kind);
+        if rec {
+            let children: Vec<Arc<Mount>> = mount.children.lock().clone();
+            for child in children {
+                set_mount_propagation_recursive(&child, kind);
+            }
+        }
+        Ok(())
+    }
+
+    /// 挂载事件传播（Linux shared-subtree）：`parent` 是 shared/slave 组时，
+    /// 把新挂载复制到同 peer 组其它成员的挂载点子树相同相对路径处。
+    fn propagate_mount_event(&self, parent: &Arc<Mount>, new_mount: &Arc<Mount>) {
+        let pg = parent.peer_group.load(Ordering::Acquire);
+        let parent_prop = parent.propagation.load(Ordering::Acquire);
+        if pg == 0 || parent_prop != PROP_SHARED {
+            // 只有 shared 挂载发出传播（slave 只接收）。
+            return;
+        }
+        // 事件挂载点相对 parent 根 dentry 的路径。
+        let rel = relative_dentry_path(&parent.mount_root, &new_mount.location.lock().mountpoint);
+        let Some(rel) = rel else { return };
+        let data = self.data.lock();
+        let peers: Vec<Arc<Mount>> = data
+            .mounts
+            .iter()
+            .filter(|m| {
+                !Arc::ptr_eq(m, parent)
+                    // bind 副本与源共享同一 mount_root（同一 dentry 树）：
+                    // 挂载/卸载在共享 dentry 上天然可见，跳过可避免同挂载点
+                    // 叠层（Linux 中 bind 是独立 vfsmount 才需要传播）。
+                    && !Arc::ptr_eq(&m.mount_root, &parent.mount_root)
+                    && m.peer_group.load(Ordering::Acquire) == pg
+                    && matches!(
+                        m.propagation.load(Ordering::Acquire),
+                        PROP_SHARED | PROP_SLAVE
+                    )
+            })
+            .cloned()
+            .collect();
+        drop(data);
+        for peer in peers {
+            // 在 peer 根 dentry 下沿相对路径定位副本挂载点（bind 副本共享
+            // inode 树，相对路径语义一致）。副本与原始挂载可叠在同一挂载点
+            // dentry 上（Linux 多挂载叠放语义）；umount 链式传播会逐层移除。
+            let Ok(mp) = lookup_relative(&peer.mount_root, &rel) else {
+                continue;
+            };
+            let _ = self.bind_at(
+                mp,
+                Arc::clone(&peer),
+                Arc::clone(&new_mount.superblock),
+                Arc::clone(&new_mount.mount_root),
+                MountFlags::from_raw(new_mount.flags.load(Ordering::Acquire)),
+                None,
+                false,
+            );
+        }
+    }
+
+    /// 卸载事件传播：从 peer 组其它成员的对应相对路径处移除副本挂载。
+    pub fn propagate_umount_event(&self, parent: &Arc<Mount>, mountpoint: &Arc<Dentry>) {
+        let pg = parent.peer_group.load(Ordering::Acquire);
+        if pg == 0 || parent.propagation.load(Ordering::Acquire) != PROP_SHARED {
+            return;
+        }
+        let Some(rel) = relative_dentry_path(&parent.mount_root, mountpoint) else {
+            return;
+        };
+        let data = self.data.lock();
+        let peers: Vec<Arc<Mount>> = data
+            .mounts
+            .iter()
+            .filter(|m| {
+                !Arc::ptr_eq(m, parent)
+                    && !Arc::ptr_eq(&m.mount_root, &parent.mount_root)
+                    && m.peer_group.load(Ordering::Acquire) == pg
+                    && matches!(
+                        m.propagation.load(Ordering::Acquire),
+                        PROP_SHARED | PROP_SLAVE
+                    )
+            })
+            .cloned()
+            .collect();
+        drop(data);
+        for peer in peers {
+            let Ok(mp) = lookup_relative(&peer.mount_root, &rel) else {
+                continue;
+            };
+            let _ = self.umount(&mp, false);
+        }
     }
 
     /// 卸载 `mountpoint` 上最上层的挂载。
@@ -538,14 +752,12 @@ impl MountNamespace {
             .rposition(|m| Arc::ptr_eq(&m.location.lock().mountpoint, mountpoint))
             .ok_or(VfsError::InvalidArgument)?;
         let mount = Arc::clone(&data.mounts[pos]);
-
         if !force && mount.is_busy() {
             return Err(VfsError::DeviceBusy);
         }
         if !force && !mount.children.lock().is_empty() {
             return Err(VfsError::DeviceBusy);
         }
-
         if force {
             let mut to_remove: Vec<Arc<Mount>> = Vec::new();
             let mut queue: alloc::collections::VecDeque<Arc<Mount>> =
@@ -568,14 +780,21 @@ impl MountNamespace {
             data.index_remove(&mount);
             data.mounts.swap_remove(pos);
         }
-
         // 从父 mount 的 children 列表移除
-        if let Some(weak_parent) = &mount.location.lock().parent
-            && let Some(parent) = weak_parent.upgrade()
-        {
+        // （显式两步：避免 &temp 临时 guard 在 let-chain 中被扩展生命周期）
+        let parent_weak = mount.location.lock().parent.clone();
+        if let Some(parent) = parent_weak.and_then(|w| w.upgrade()) {
             parent.remove_child(&mount);
         }
         drop(data);
+        // fsnotify：被卸载文件系统上的全部监视收到 IN_UNMOUNT 并被移除。
+        let sb_id = mount.superblock.fs_id.raw();
+        crate::fsnotify::unmount_sb(sb_id);
+        // shared-subtree：向父挂载的 peer 组传播卸载事件。
+        let parent_weak = mount.location.lock().parent.clone();
+        if let Some(parent) = parent_weak.and_then(|w| w.upgrade()) {
+            self.propagate_umount_event(&parent, &mount.location.lock().mountpoint);
+        }
         Ok(())
     }
 
@@ -657,6 +876,13 @@ impl MountNamespace {
                 MountFlags(old.flags.load(Ordering::Relaxed)),
                 None, // 第二遍填充
             );
+            // 复制传播属性（clone(CLONE_NEWNS) 后挂载树状态一致）。
+            new_mount
+                .propagation
+                .store(old.propagation.load(Ordering::Relaxed), Ordering::Relaxed);
+            new_mount
+                .peer_group
+                .store(old.peer_group.load(Ordering::Relaxed), Ordering::Relaxed);
             drop(old_loc);
             old_to_new.insert(Arc::as_ptr(old) as usize, new_mount);
         }
@@ -958,4 +1184,83 @@ impl MountNamespace {
         }
         out
     }
+}
+
+// ── shared-subtree 辅助 ──────────────────────────────────────────────────────
+
+/// 设置单个挂载的传播类型（`make-shared` 分配新 peer 组；`make-slave` 继承
+/// 当前组作为 master 组；private/unbindable 清除组）。
+pub fn set_mount_propagation(mount: &Arc<Mount>, kind: u32) {
+    mount
+        .propagation
+        .store(kind, core::sync::atomic::Ordering::Release);
+    match kind {
+        PROP_SHARED => {
+            // make-shared 创建全新 peer 组（Linux 语义）。
+            mount
+                .peer_group
+                .store(alloc_peer_group_id(), core::sync::atomic::Ordering::Release);
+        }
+        PROP_SLAVE => {
+            // make-slave 保留当前 peer 组（bind 复制来的 master 组），
+            // 仅把类型改为 slave：接收来自 master 的传播但不向外传播。
+        }
+        _ => {
+            mount
+                .peer_group
+                .store(0, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// 递归设置传播类型（`--make-rshared` 等）。
+fn set_mount_propagation_recursive(mount: &Arc<Mount>, kind: u32) {
+    set_mount_propagation(mount, kind);
+    let children: Vec<Arc<Mount>> = mount.children.lock().clone();
+    for child in children {
+        set_mount_propagation_recursive(&child, kind);
+    }
+}
+
+/// 从 `from_root` 到 `to` 的 dentry 名序列（不含 `from_root` 自身）。
+fn relative_dentry_path(
+    from_root: &Arc<Dentry>,
+    to: &Arc<Dentry>,
+) -> Option<Vec<alloc::string::String>> {
+    let mut names = Vec::new();
+    let mut cur = Some(Arc::clone(to));
+    while let Some(d) = cur {
+        if Arc::ptr_eq(&d, from_root) {
+            return Some(names);
+        }
+        let name = d.meta.lock().name_cloned();
+        if d.meta.lock().parent.is_none() && !Arc::ptr_eq(&d, from_root) {
+            return None; // 越过了根还没到 from_root
+        }
+        names.push(alloc::string::String::from(name.as_str()));
+        cur = d.meta.lock().parent_cloned();
+    }
+    None
+}
+
+/// 从 `root` dentry 沿名字序列逐级查找（inode 遍历 + DCACHE 缓存），
+/// 返回副本挂载点 dentry。
+fn lookup_relative(root: &Arc<Dentry>, names: &[alloc::string::String]) -> VfsResult<Arc<Dentry>> {
+    let mut cur = Arc::clone(root);
+    for name in names {
+        let cur_inode = cur.inode().ok_or(VfsError::NotFound)?;
+        let child_inode = cur_inode
+            .ops
+            .lookup(&cur_inode, name)
+            .map_err(|_| VfsError::NotFound)?;
+        cur = match crate::DCACHE.get(&cur, name) {
+            Some(d) => d,
+            None => crate::DCACHE.insert(Dentry::new_positive(
+                name,
+                Some(Arc::clone(&cur)),
+                child_inode,
+            )),
+        };
+    }
+    Ok(cur)
 }

@@ -251,6 +251,25 @@ fn prepare_executable_file(
     file: Arc<File>,
 ) -> Result<PreparedExecutableFile, errno::Errno> {
     check_exec_permission(task, &file)?;
+    // fanotify：FAN_OPEN_EXEC（通知）与 FAN_OPEN_EXEC_PERM（权限，exec 前裁决）。
+    if vfs::fsnotify::perm_enabled() {
+        vfs::fsnotify::emit_perm_at(
+            file.inode(),
+            Some(file.mount()),
+            vfs::fsnotify::FAN_OPEN_EXEC_PERM,
+        )
+        .map_deny()
+        .map_err(|e| e.to_errno())?;
+    }
+    if vfs::fsnotify::is_enabled() {
+        vfs::fsnotify::emit_at_with_parents(
+            file.inode(),
+            Some(file.dentry()),
+            Some(file.mount()),
+            vfs::fsnotify::FAN_OPEN_EXEC,
+            0,
+        );
+    }
     let access = file
         .inode()
         .acquire_exec_access()

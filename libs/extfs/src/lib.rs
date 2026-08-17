@@ -54,6 +54,7 @@ mod fc;
 mod file;
 mod inode;
 mod inode_wr;
+mod xattr;
 mod journal;
 mod layout;
 mod map;

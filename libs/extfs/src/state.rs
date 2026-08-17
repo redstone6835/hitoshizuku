@@ -2113,6 +2113,10 @@ impl SuperblockOps for ExtFsSuperblockOps {
     fn sync_fs(&self, _sb: &Arc<VfsSuperblock>) -> VfsResult<()> {
         self.state.sync_all().map_err(map_err)
     }
+    fn supports_direct_io(&self) -> bool {
+        true
+    }
+
     fn remount(&self, _sb: &Arc<VfsSuperblock>, flags: MountFlags) -> VfsResult<()> {
         use core::sync::atomic::Ordering;
         if flags.has(MountFlags::RDONLY) {

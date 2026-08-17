@@ -9,6 +9,7 @@ use core::alloc::{GlobalAlloc, Layout};
 
 mod acct;
 mod acpi;
+mod adjtimex;
 #[cfg(any(
     feature = "bench",
     feature = "block-bench",

@@ -141,6 +141,13 @@ pub enum VfsError {
 
     /// 连接被对端重置（ECONNRESET）。
     ConnectionReset,
+
+    /// 操作被取消（ECANCELED）。例如实时钟被设置后，
+    /// `TFD_TIMER_CANCEL_ON_SET` 的 timerfd 读取返回此错误。
+    Canceled,
+
+    /// 请求的属性不存在（ENODATA）：getxattr/removexattr 语义。
+    NoData,
 }
 
 impl VfsError {
@@ -179,6 +186,8 @@ impl VfsError {
             VfsError::BrokenPipe => Errno::EPIPE,
             VfsError::MessageTooLong => Errno::EMSGSIZE,
             VfsError::ConnectionReset => Errno::ECONNRESET,
+            VfsError::Canceled => Errno::ECANCELED,
+            VfsError::NoData => Errno::ENODATA,
         }
     }
 }

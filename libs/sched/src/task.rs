@@ -2594,6 +2594,8 @@ impl Task {
             now_ns.saturating_sub(encoded - 1)
         };
         self.cpu_runtime_ns.fetch_add(charged, Ordering::AcqRel);
+        // 同步累计到线程组（CLOCK_PROCESS_CPUTIME_ID 基准）。
+        self.thread_group().cpu_runtime_ns.fetch_add(charged, Ordering::Relaxed);
         if encoded != 0 {
             self.running_since_ns
                 .store(now_ns.saturating_add(1), Ordering::Release);

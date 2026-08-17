@@ -3480,6 +3480,12 @@ fn on_timer_tick_inner(now_ns: u64) -> bool {
         request_resched(cpu_id);
     }
     request_periodic_balance(cpu_id, now_ns);
+    // 周期 tick 上采样并衰减 1/5/15 分钟负载均值（多 CPU 由 CAS 去重）。
+    crate::avenrun::tick(now_ns);
+    // 检查当前 CPU 任务的 CPU 时钟 POSIX 定时器（Linux 同样在 scheduler tick 检查）。
+    crate::posix_timer::fire_expired_cpu_timers(now_ns, cpu_id);
+    // 检查当前任务的线程组 ITIMER_VIRTUAL/ITIMER_PROF（进程 CPU 时间域）。
+    crate::cpu_itimer::fire_expired_cpu_itimers(now_ns, cpu_id);
     fired
 }
 

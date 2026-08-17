@@ -404,6 +404,8 @@ unsafe fn loongarch64_handle_exception_inner(
             if boot_cpu {
                 super::super::vdso::run_timer_tick_hook(now_ns);
             }
+            // tick 级 user/system 记账：按被中断上下文把本段增量计入用户时间。
+            sched::account_tick_user_system(now_ns, from_user);
             // timer 可能打断持有 runqueue、topology 等普通自旋锁的内核路径。
             // 内核态 top-half 只记录待处理时间，随后由 syscall 返回或主动调度的
             // 无锁边界补做调度工作，避免本 CPU 重入锁后永久自旋。

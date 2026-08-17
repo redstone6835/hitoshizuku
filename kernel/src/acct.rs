@@ -42,6 +42,14 @@ pub(crate) fn account_task_exit(task: &Task) {
     let now_ns = crate::vdso::monotonic_ns();
     let group = task.thread_group();
     let last = group.account_member_exit(task.usage_snapshot(now_ns));
+    // POSIX 定时器生命周期：SIGEV_THREAD_ID 定时器随目标线程终止自动删除
+    // （Linux 语义）；线程组最后一个成员退出时删除该组全部定时器。
+    if let Some(tid) = task.pid_root_cached() {
+        sched::posix_timer::release_timers_of_thread(tid);
+    }
+    if last {
+        sched::posix_timer::release_timers_of_group(&group);
+    }
     if !last || !task.is_user_task() || !ACCT_ACTIVE.load(Ordering::Acquire) {
         return;
     }

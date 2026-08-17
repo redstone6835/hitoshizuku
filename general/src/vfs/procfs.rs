@@ -115,6 +115,7 @@ const TASK_SLOT_NS_DIR: u64 = 11;
 const TASK_SLOT_TASK_DIR: u64 = 13;
 const TASK_SLOT_MOUNTINFO: u64 = 14;
 const TASK_SLOT_MOUNTS: u64 = 15;
+const TASK_SLOT_FDINFO_DIR: u64 = 16;
 
 fn procfs_fallible_string(value: &str) -> VfsResult<String> {
     let mut out = String::new();
@@ -1501,6 +1502,10 @@ fn proc_task_list_ino(pid: PidT) -> u64 {
     proc_task_base(pid) + TASK_SLOT_TASK_DIR
 }
 
+fn proc_fdinfo_dir_ino(pid: PidT) -> u64 {
+    proc_task_base(pid) + TASK_SLOT_FDINFO_DIR
+}
+
 fn proc_fd_link_ino(pid: PidT, fd: u32) -> u64 {
     PROC_FD_BASE + pid as u64 * 1_000_000 + fd as u64
 }
@@ -1685,6 +1690,7 @@ impl InodeOps for ProcTaskDirOps {
                 TaskFileKind::Mounts,
             )),
             "fd" => Ok(proc_fd_dir_inode(self.fs_id, &self.weak_sb, self.pid)),
+            "fdinfo" => Ok(proc_fdinfo_dir_inode(self.fs_id, &self.weak_sb, self.pid)),
             "task" if self.view == TaskDirView::Process => Ok(proc_task_list_dir_inode(
                 self.fs_id,
                 &self.weak_sb,
@@ -1913,6 +1919,179 @@ impl InodeOps for ProcTaskLinkOps {
             TaskLinkKind::Root => task_root_path(&task),
         }
     }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn proc_fdinfo_dir_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, pid: PidT) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        proc_fdinfo_dir_ino(pid),
+        FileType::Directory,
+        0o555,
+        2,
+        Arc::new(ProcFdInfoDirOps {
+            fs_id,
+            weak_sb: weak_sb.clone(),
+            pid,
+        }),
+    )
+}
+
+fn proc_fdinfo_file_ino(pid: PidT, fd: u32) -> u64 {
+    // 与 fd 链接 ino 区分：高位翻转一位避免冲突。
+    proc_fd_link_ino(pid, fd) | (1 << 40)
+}
+
+struct ProcFdInfoDirOps {
+    fs_id: FsId,
+    weak_sb: Weak<Superblock>,
+    pid: PidT,
+}
+
+impl InodeOps for ProcFdInfoDirOps {
+    fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
+        let task = lookup_task(self.pid).ok_or(VfsError::NotFound)?;
+        ensure_task_access(&task)?;
+        let fd = parse_fd_component(name).ok_or(VfsError::NotFound)?;
+        let fdt = task_fdtable(&task).ok_or(VfsError::NotFound)?;
+        if fdt.get_file(Fd::from_raw(fd)).is_none() {
+            return Err(VfsError::NotFound);
+        }
+        Ok(proc_fdinfo_file_inode(self.fs_id, &self.weak_sb, self.pid, fd))
+    }
+
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        let task = lookup_task(self.pid).ok_or(VfsError::NotFound)?;
+        ensure_task_access(&task)?;
+        let fdt = task_fdtable(&task).ok_or(VfsError::NotFound)?;
+        let mut fds = fdt.snapshot_fds();
+        fds.sort_unstable_by_key(|(fd, _)| *fd);
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve(fds.len())
+            .map_err(|_| VfsError::NoSpace)?;
+        for (fd, _) in fds {
+            let name = procfs_decimal_name(fd)?;
+            push_proc_dir_entry(
+                &mut snapshot,
+                proc_fdinfo_file_ino(self.pid, fd),
+                &name,
+                FileType::Regular,
+            )?;
+        }
+        Ok(Box::new(ProcDirFile { snapshot }))
+    }
+
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+struct ProcFdInfoFileInodeOps {
+    pid: PidT,
+    fd: u32,
+}
+
+impl InodeOps for ProcFdInfoFileInodeOps {
+    fn lookup(&self, _inode: &Inode, _name: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+    fn open(
+        &self,
+        _inode: &Inode,
+        _opts: &OpenOptions,
+        _cred: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        Ok(Box::new(ProcFdInfoFileOps {
+            pid: self.pid,
+            fd: self.fd,
+        }))
+    }
+    fn readlink(&self, _inode: &Inode) -> VfsResult<alloc::string::String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn proc_fdinfo_file_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, pid: PidT, fd: u32) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        proc_fdinfo_file_ino(pid, fd),
+        FileType::Regular,
+        0o444,
+        1,
+        Arc::new(ProcFdInfoFileInodeOps { pid, fd }),
+    )
+}
+
+/// `/proc/self/fdinfo/<fd>`：pos/flags/mnt_id + 驱动专属行（show_fdinfo）。
+struct ProcFdInfoFileOps {
+    pid: PidT,
+    fd: u32,
+}
+
+impl ProcFdInfoFileOps {
+    fn render(&self, buf: &mut [u8]) -> VfsResult<usize> {
+        use core::fmt::Write;
+        let task = lookup_task(self.pid).ok_or(VfsError::NotFound)?;
+        ensure_task_access(&task)?;
+        let fdt = task_fdtable(&task).ok_or(VfsError::NotFound)?;
+        let file = fdt.get_file(Fd::from_raw(self.fd)).ok_or(VfsError::NotFound)?;
+        let mut out = alloc::string::String::new();
+        let _ = writeln!(out, "pos:\t{}", file.pos());
+        let _ = writeln!(out, "flags:\t{:o}", file.status_flags());
+        let _ = writeln!(out, "mnt_id:\t0");
+        file.show_fdinfo(&mut out);
+        let bytes = out.as_bytes();
+        let take = bytes.len().min(buf.len());
+        buf[..take].copy_from_slice(&bytes[..take]);
+        Ok(take)
+    }
+}
+
+impl FileOps for ProcFdInfoFileOps {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut full = alloc::vec![0u8; 4096];
+        let n = self.render(&mut full)?;
+        let start = (offset as usize).min(n);
+        let take = (n - start).min(buf.len());
+        buf[..take].copy_from_slice(&full[start..start + take]);
+        Ok(take)
+    }
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn poll(&self, _interest: PollEvents) -> PollEvents {
+        PollEvents::default()
+    }
+    fn readdir(
+        &self,
+        _pos: u64,
+        _sink: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
+    ) -> VfsResult<u64> {
+        Err(VfsError::NotADirectory)
+    }
+    fn sync(&self) -> VfsResult<()> {
+        Ok(())
+    }
+    fn release(&self) {}
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
