@@ -526,14 +526,7 @@ fn new_packet_socket_file(
         nonblock,
         ..Default::default()
     };
-    let file = File::new(
-        inode,
-        flags,
-        cred,
-        ops,
-        dentry,
-        Arc::clone(&mount),
-    );
+    let file = File::new(inode, flags, cred, ops, dentry, Arc::clone(&mount));
     mount.inc_open();
     Arc::new(file)
 }
@@ -549,14 +542,7 @@ fn new_netlink_socket_file(
         nonblock,
         ..Default::default()
     };
-    let file = File::new(
-        inode,
-        flags,
-        cred,
-        ops,
-        dentry,
-        Arc::clone(&mount),
-    );
+    let file = File::new(inode, flags, cred, ops, dentry, Arc::clone(&mount));
     mount.inc_open();
     Arc::new(file)
 }
@@ -1097,11 +1083,7 @@ fn recv_inner(
             file.flags().nonblock || (flags & MSG_DONTWAIT) != 0,
             deadline_ns,
         )?;
-        let address = if want_addr {
-            Some(sll.to_vec())
-        } else {
-            None
-        };
+        let address = if want_addr { Some(sll.to_vec()) } else { None };
         return Ok(RecvOutput {
             len,
             address,
@@ -1674,11 +1656,14 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
         },
         SOL_RAW if net_ops.family() == crate::addr::AF_INET6 => match optname {
             // Linux 语义：默认 -1（关闭），启用时为 ICMPv6 校验和字段偏移。
-            IPV6_CHECKSUM => Ok(
-                (i32::from(net_ops.proxy().ipv6_checksum_offset().map_or(-1, |offset| i32::from(offset))))
-                    .to_ne_bytes()
-                    .to_vec(),
-            ),
+            IPV6_CHECKSUM => Ok((i32::from(
+                net_ops
+                    .proxy()
+                    .ipv6_checksum_offset()
+                    .map_or(-1, |offset| i32::from(offset)),
+            ))
+            .to_ne_bytes()
+            .to_vec()),
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_IPV6 => match optname {
@@ -2057,8 +2042,7 @@ fn inet_setsockopt(
                 }
                 let mut filter = [0u32; 8];
                 for (index, word) in filter.iter_mut().enumerate() {
-                    *word =
-                        u32::from_ne_bytes(value[index * 4..index * 4 + 4].try_into().unwrap());
+                    *word = u32::from_ne_bytes(value[index * 4..index * 4 + 4].try_into().unwrap());
                 }
                 net_ops.proxy().set_icmp6_filter(filter);
                 Ok(())
@@ -2072,13 +2056,11 @@ fn inet_setsockopt(
                 if offset < -1 {
                     return Err(Errno::EINVAL);
                 }
-                net_ops
-                    .proxy()
-                    .set_ipv6_checksum_offset(if offset < 0 {
-                        None
-                    } else {
-                        Some(offset as u16)
-                    });
+                net_ops.proxy().set_ipv6_checksum_offset(if offset < 0 {
+                    None
+                } else {
+                    Some(offset as u16)
+                });
                 Ok(())
             }
             _ => Err(Errno::ENOPROTOOPT),
@@ -2384,7 +2366,11 @@ fn resolve_connect_address(ctx: &VfsContext, raw: &[u8]) -> Result<UnixAddress, 
             if inode.kind() != FileType::Socket {
                 return Err(Errno::ENOTSOCK);
             }
-            if !crate::acl::check_access(ctx.cred().as_ref(), inode.as_ref(), crate::acl::AclCheckKind::Write) {
+            if !crate::acl::check_access(
+                ctx.cred().as_ref(),
+                inode.as_ref(),
+                crate::acl::AclCheckKind::Write,
+            ) {
                 return Err(Errno::EACCES);
             }
             Ok(UnixAddress::Path {

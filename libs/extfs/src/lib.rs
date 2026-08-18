@@ -54,7 +54,6 @@ mod fc;
 mod file;
 mod inode;
 mod inode_wr;
-mod xattr;
 mod journal;
 mod layout;
 mod map;
@@ -63,6 +62,7 @@ mod orphan;
 mod sb;
 mod state;
 mod symlink;
+mod xattr;
 
 pub use state::{BlockBackend, BlockBackendError, ExtFsDriver};
 

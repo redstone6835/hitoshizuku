@@ -221,10 +221,8 @@ impl SemSet {
                     if operation.sem_flg & IPC_NOWAIT != 0 {
                         return Err(Errno::EAGAIN);
                     }
-                    first_blocked = first_blocked.or(Some((
-                        operation.sem_num as usize,
-                        SemBlockKind::Increment,
-                    )));
+                    first_blocked = first_blocked
+                        .or(Some((operation.sem_num as usize, SemBlockKind::Increment)));
                     break;
                 }
                 value.val -= needed;
@@ -869,9 +867,7 @@ mod tests {
         let id = create(&manager, 3, SemKey::PRIVATE);
         let set = manager.set_for_operation(id).expect("查找 semaphore set");
 
-        manager
-            .set_value(id, 0, 5, &cred, 11, 100)
-            .expect("SETVAL");
+        manager.set_value(id, 0, 5, &cred, 11, 100).expect("SETVAL");
         set.try_apply(&[operation(1, 3, 0)], &cred, 12, 200)
             .expect("semop");
         assert_eq!(manager.get_all(id, &cred), Ok(vec![5, 3, 0]));

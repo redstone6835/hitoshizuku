@@ -350,8 +350,11 @@ fn walk_path(state: &mut WalkState<'_>, path: &str, flags: LookupFlags) -> VfsRe
             if inode.kind != crate::vfs::stat::FileType::Directory {
                 return Err(VfsError::NotADirectory);
             }
-            if !crate::acl::check_access(&cred, inode.as_ref(), crate::acl::AclCheckKind::Exec { is_dir: true })
-            {
+            if !crate::acl::check_access(
+                &cred,
+                inode.as_ref(),
+                crate::acl::AclCheckKind::Exec { is_dir: true },
+            ) {
                 return Err(VfsError::PermissionDenied);
             }
             continue;

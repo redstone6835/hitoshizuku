@@ -564,8 +564,7 @@ impl InodeOps for ExtInodeOps {
         let (new_block, block) = crate::xattr::set(&self.state, acl_block, name, value, flags)?;
         if new_block == 0 {
             // 首个属性：分配 xattr 块。
-            let block_no = crate::alloc_mod::alloc_block(&self.state)
-                .map_err(|_| VfsError::Io)?;
+            let block_no = crate::alloc_mod::alloc_block(&self.state).map_err(|_| VfsError::Io)?;
             raw.set_file_acl(block_no);
             self.state
                 .write_data_blocks(block_no, 1, &block)
@@ -575,7 +574,9 @@ impl InodeOps for ExtInodeOps {
                 .write_data_blocks(new_block, 1, &block)
                 .map_err(|_| VfsError::Io)?;
         }
-        self.state.publish_inode_write(&raw).map_err(|_| VfsError::Io)?;
+        self.state
+            .publish_inode_write(&raw)
+            .map_err(|_| VfsError::Io)?;
         Ok(())
     }
 
@@ -591,11 +592,12 @@ impl InodeOps for ExtInodeOps {
         if new_block == 0 {
             // 最后一个属性被删除：释放 xattr 块并清 i_file_acl。
             if acl_block != 0 {
-                crate::alloc_mod::free_block(&self.state, acl_block)
-                    .map_err(|_| VfsError::Io)?;
+                crate::alloc_mod::free_block(&self.state, acl_block).map_err(|_| VfsError::Io)?;
             }
             raw.set_file_acl(0);
-            self.state.publish_inode_write(&raw).map_err(|_| VfsError::Io)?;
+            self.state
+                .publish_inode_write(&raw)
+                .map_err(|_| VfsError::Io)?;
         } else {
             self.state
                 .write_data_blocks(new_block, 1, &block)

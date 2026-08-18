@@ -259,7 +259,12 @@ impl Key {
 
     /// 迭代成员（供递归搜索；不可在遍历中修改）。
     fn member_ids(&self) -> Vec<KeyId> {
-        self.inner.lock().members.iter().map(|(_, id)| *id).collect()
+        self.inner
+            .lock()
+            .members
+            .iter()
+            .map(|(_, id)| *id)
+            .collect()
     }
 }
 
@@ -434,7 +439,12 @@ impl KeyManager {
 
     /// 按序列号取 key（校验存在性，不校验权限）。
     pub fn key(&self, id: KeyId) -> Result<Arc<Key>, Errno> {
-        self.state.lock().keys.get(&id).cloned().ok_or(Errno::ENOKEY)
+        self.state
+            .lock()
+            .keys
+            .get(&id)
+            .cloned()
+            .ok_or(Errno::ENOKEY)
     }
 
     /// 销毁 key（引用为 0 时由 `drop` 自然回收；此处移除注册与配额）。
@@ -504,14 +514,9 @@ impl KeyManager {
         for member_id in keyring.member_ids() {
             let member = self.key(member_id).ok()?;
             if member.is_keyring() && member.is_live(now_sec) {
-                if let Some(found) = self.search_inner(
-                    member_id,
-                    key_type,
-                    description,
-                    cred,
-                    now_sec,
-                    depth + 1,
-                ) {
+                if let Some(found) =
+                    self.search_inner(member_id, key_type, description, cred, now_sec, depth + 1)
+                {
                     return Some(found);
                 }
             }
@@ -569,9 +574,7 @@ impl KeyManager {
                 }
             }
             KEY_SPEC_USER_KEYRING => self.user_keyring(cred.euid.0, cred)?,
-            KEY_SPEC_USER_SESSION_KEYRING => {
-                self.user_session(cred.euid.0, cred, now_sec)?
-            }
+            KEY_SPEC_USER_SESSION_KEYRING => self.user_session(cred.euid.0, cred, now_sec)?,
             KEY_SPEC_REQKEY_AUTH_KEY => process.reqkey_auth.lock().ok_or(Errno::ENOKEY)?,
             spec if spec > 0 => KeyId(spec),
             _ => return Err(Errno::ENOKEY),
@@ -672,12 +675,7 @@ impl KeyManager {
     }
 
     /// `keyctl(KEYCTL_LINK)`。
-    pub fn link(
-        &self,
-        keyring_id: KeyId,
-        key_id: KeyId,
-        cred: &Credentials,
-    ) -> Result<(), Errno> {
+    pub fn link(&self, keyring_id: KeyId, key_id: KeyId, cred: &Credentials) -> Result<(), Errno> {
         let keyring = self.key(keyring_id)?;
         if !keyring.is_keyring() {
             return Err(Errno::ENOTDIR);
@@ -698,7 +696,12 @@ impl KeyManager {
     }
 
     /// `keyctl(KEYCTL_UNLINK)`。
-    pub fn unlink(&self, keyring_id: KeyId, key_id: KeyId, cred: &Credentials) -> Result<(), Errno> {
+    pub fn unlink(
+        &self,
+        keyring_id: KeyId,
+        key_id: KeyId,
+        cred: &Credentials,
+    ) -> Result<(), Errno> {
         let keyring = self.key(keyring_id)?;
         if !keyring.is_keyring() {
             return Err(Errno::ENOTDIR);
@@ -715,12 +718,7 @@ impl KeyManager {
     }
 
     /// `keyctl(KEYCTL_UPDATE)`：仅 user/logon 可更新；keyring 报 `EOPNOTSUPP`。
-    pub fn update(
-        &self,
-        key_id: KeyId,
-        payload: Vec<u8>,
-        cred: &Credentials,
-    ) -> Result<(), Errno> {
+    pub fn update(&self, key_id: KeyId, payload: Vec<u8>, cred: &Credentials) -> Result<(), Errno> {
         let key = self.key(key_id)?;
         if !permission_ok(&key, cred, KEY_POS_WRITE) {
             return Err(Errno::EACCES);
@@ -755,7 +753,13 @@ impl KeyManager {
 
     /// `keyctl(KEYCTL_CHOWN)`：改 uid/gid 需 `CAP_SYS_ADMIN`（简化：owner 或
     /// 相同 uid）；`KEY_USR_SETATTR` 权限。
-    pub fn chown(&self, key_id: KeyId, uid: Option<u32>, gid: Option<u32>, cred: &Credentials) -> Result<(), Errno> {
+    pub fn chown(
+        &self,
+        key_id: KeyId,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        cred: &Credentials,
+    ) -> Result<(), Errno> {
         let key = self.key(key_id)?;
         if !permission_ok(&key, cred, KEY_POS_SETATTR) {
             return Err(Errno::EACCES);
@@ -800,7 +804,13 @@ impl KeyManager {
     }
 
     /// `keyctl(KEYCTL_SET_TIMEOUT)`：设置到期时间（相对秒）。
-    pub fn set_timeout(&self, key_id: KeyId, seconds: u64, cred: &Credentials, now_sec: u64) -> Result<(), Errno> {
+    pub fn set_timeout(
+        &self,
+        key_id: KeyId,
+        seconds: u64,
+        cred: &Credentials,
+        now_sec: u64,
+    ) -> Result<(), Errno> {
         let key = self.key(key_id)?;
         if !permission_ok(&key, cred, KEY_POS_SETATTR) {
             return Err(Errno::EACCES);
@@ -887,11 +897,7 @@ impl KeyManager {
     /// 全部 key 快照（`/proc/keys`）。
     pub fn snapshot_all(&self) -> Vec<KeySnapshot> {
         let guard = self.state.lock();
-        guard
-            .keys
-            .values()
-            .map(|key| key.snapshot())
-            .collect()
+        guard.keys.values().map(|key| key.snapshot()).collect()
     }
 
     /// 每 uid 配额快照（`/proc/key-users`）。

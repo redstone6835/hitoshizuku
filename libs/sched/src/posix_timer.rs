@@ -19,8 +19,8 @@ use errno::Errno;
 
 use crate::pid::PidT;
 use crate::scheduler::{
-    cancel_deadline_observer, deliver_shared_signal_to_group, now_ns_public,
-    register_deadline_observer, reserve_deadline_observer_id, signal_wakeup, DeadlineObserver,
+    DeadlineObserver, cancel_deadline_observer, deliver_shared_signal_to_group, now_ns_public,
+    register_deadline_observer, reserve_deadline_observer_id, signal_wakeup,
 };
 use crate::signal::{SigInfo, SignalNumber};
 use crate::sync::Spinlock;
@@ -131,7 +131,10 @@ fn encode_timer_t(clock: TimerClock, id: u32) -> u32 {
 
 /// 按 tid 查找任务（SIGEV_THREAD_ID 目标解析；pid 注册表弱引用升级失败视为不存在）。
 pub fn lookup_task(pid: PidT) -> Option<Arc<Task>> {
-    crate::scheduler::root_pid_ns().registry().lookup(pid)?.upgrade()
+    crate::scheduler::root_pid_ns()
+        .registry()
+        .lookup(pid)?
+        .upgrade()
 }
 
 /// 按 `timer_t` 查找定时器；顺带清理 owner 已销毁的僵尸条目。

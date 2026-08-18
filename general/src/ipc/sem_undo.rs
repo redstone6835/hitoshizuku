@@ -40,7 +40,6 @@ impl SemUndoTable {
         self.inner.lock().is_empty()
     }
 
-
     /// 整批 `semop` 成功提交后调用：把带 `SEM_UNDO` 标志的操作累计为撤销值。
     ///
     /// 调用方必须保证 `operations` 就是刚被原子提交的那一批。

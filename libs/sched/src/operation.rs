@@ -1801,9 +1801,7 @@ pub fn ptrace_geteventmsg(pid: PidT) -> Result<i64, Errno> {
 /// `PTRACE_GETSIGINFO`（仅在 stop 期间有效）。
 pub fn ptrace_getsiginfo(pid: PidT) -> Result<crate::signal::SigInfo, Errno> {
     let target = ptrace_target(pid)?;
-    target
-        .take_ptrace_last_siginfo()
-        .ok_or(Errno::EINVAL)
+    target.take_ptrace_last_siginfo().ok_or(Errno::EINVAL)
 }
 
 /// `PTRACE_SETSIGINFO`。
@@ -1821,7 +1819,9 @@ pub fn ptrace_get_sigmask(pid: PidT) -> Result<crate::signal::SigSet, Errno> {
 
 pub fn ptrace_set_sigmask(pid: PidT, mask: crate::signal::SigSet) -> Result<(), Errno> {
     let target = ptrace_target(pid)?;
-    target.signal.block(mask, crate::signal::SigProcMaskHow::SetMask);
+    target
+        .signal
+        .block(mask, crate::signal::SigProcMaskHow::SetMask);
     Ok(())
 }
 

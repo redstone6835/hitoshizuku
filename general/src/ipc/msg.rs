@@ -243,7 +243,11 @@ impl MsgQueue {
         check_operation_permissions(cred, &inner.perm, Access::Send)?;
 
         let added = data.len();
-        if inner.bytes.checked_add(added).map_or(true, |b| b > inner.qbytes) {
+        if inner
+            .bytes
+            .checked_add(added)
+            .map_or(true, |b| b > inner.qbytes)
+        {
             if flags & IPC_NOWAIT != 0 {
                 return Err(Errno::EAGAIN);
             }
@@ -283,9 +287,7 @@ impl MsgQueue {
             if flags & MSG_EXCEPT != 0 || flags & IPC_NOWAIT == 0 {
                 return Err(Errno::EINVAL);
             }
-            if !cred.has_cap(Capability::CheckpointRestore)
-                && !cred.has_cap(Capability::SysAdmin)
-            {
+            if !cred.has_cap(Capability::CheckpointRestore) && !cred.has_cap(Capability::SysAdmin) {
                 return Err(Errno::EPERM);
             }
         }
@@ -497,12 +499,7 @@ impl MsgManager {
 
     /// `msgget`：`IPC_PRIVATE` 总是创建；普通 key 按 `IPC_CREAT/IPC_EXCL`
     /// 查找或创建。存在 key 时按请求 mode 校验权限。
-    pub fn msgget(
-        &self,
-        key: MsgKey,
-        flags: u32,
-        cred: &Credentials,
-    ) -> Result<MsgId, Errno> {
+    pub fn msgget(&self, key: MsgKey, flags: u32, cred: &Credentials) -> Result<MsgId, Errno> {
         let mut state = self.state.lock();
         if key != MsgKey::PRIVATE {
             if let Some(id) = state.by_key.get(&key).copied() {
@@ -650,11 +647,7 @@ fn check_operation_permissions(
         Access::Receive => cred.can_read(perm.uid, perm.gid, perm.mode),
         Access::Send => cred.can_write(perm.uid, perm.gid, perm.mode),
     };
-    if allowed {
-        Ok(())
-    } else {
-        Err(Errno::EACCES)
-    }
+    if allowed { Ok(()) } else { Err(Errno::EACCES) }
 }
 
 fn check_control_owner(cred: &Credentials, perm: &MsgPerm) -> Result<(), Errno> {
@@ -742,10 +735,7 @@ mod tests {
         send(&manager, id, 1, b"0123456789", 0);
 
         // 无 MSG_NOERROR 且缓冲区太短 → E2BIG，消息保留。
-        assert_eq!(
-            queue.try_receive(0, 4, 0, &cred, 2, 0),
-            Err(Errno::E2BIG)
-        );
+        assert_eq!(queue.try_receive(0, 4, 0, &cred, 2, 0), Err(Errno::E2BIG));
         let got = recv(&queue, 0, 4, MSG_NOERROR, &cred, 2, 0);
         assert_eq!(got.data, b"0123");
         assert_eq!(got.full_size, 10);

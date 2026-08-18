@@ -450,9 +450,11 @@ mod tests {
             Err(VfsError::Canceled)
         );
         // 取消状态一次性：下一次 settime 正常。
-        assert!(revived
-            .set_deadline(now, Some(now.saturating_add(1_000_000_000)), 0)
-            .is_ok());
+        assert!(
+            revived
+                .set_deadline(now, Some(now.saturating_add(1_000_000_000)), 0)
+                .is_ok()
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::ptr::NonNull;
 use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU16, AtomicU8, AtomicU32, AtomicU64,
+    AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64,
     AtomicUsize, Ordering,
 };
 
@@ -1424,7 +1424,8 @@ impl Task {
     }
 
     pub fn set_ptrace_syscall_stop(&self, enabled: bool) {
-        self.ptrace_syscall_stop.store(enabled as u8, Ordering::Release);
+        self.ptrace_syscall_stop
+            .store(enabled as u8, Ordering::Release);
     }
 
     pub fn ptrace_syscall_stop_enabled(&self) -> bool {
@@ -2595,7 +2596,9 @@ impl Task {
         };
         self.cpu_runtime_ns.fetch_add(charged, Ordering::AcqRel);
         // 同步累计到线程组（CLOCK_PROCESS_CPUTIME_ID 基准）。
-        self.thread_group().cpu_runtime_ns.fetch_add(charged, Ordering::Relaxed);
+        self.thread_group()
+            .cpu_runtime_ns
+            .fetch_add(charged, Ordering::Relaxed);
         if encoded != 0 {
             self.running_since_ns
                 .store(now_ns.saturating_add(1), Ordering::Release);

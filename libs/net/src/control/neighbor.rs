@@ -26,12 +26,7 @@ pub fn neighbor_snapshot() -> Vec<NeighborSnapshotEntry> {
     NEIGHBOR_MIRROR.lock().clone()
 }
 
-fn mirror_observe(
-    key: NeighborKey,
-    mac_address: [u8; 6],
-    now_ns: u64,
-    reachable: bool,
-) {
+fn mirror_observe(key: NeighborKey, mac_address: [u8; 6], now_ns: u64, reachable: bool) {
     let mut mirror = NEIGHBOR_MIRROR.lock();
     let entry = NeighborSnapshotEntry {
         interface: key.interface,

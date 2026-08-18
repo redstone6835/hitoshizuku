@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Mutex;
 
-use crate::{NsType, Namespace, allocate_ns_inum};
+use crate::{Namespace, NsType, allocate_ns_inum};
 
 /// `utsname` 字段长度（Linux `__NEW_UTS_LEN + 1`）。
 pub const UTS_FIELD_LEN: usize = 65;

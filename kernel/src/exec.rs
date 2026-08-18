@@ -545,7 +545,12 @@ pub(crate) fn prepare_exec(task: &Arc<Task>, request: ExecRequest) -> Result<Pre
 
     let kernel_stack_top = task.ensure_kernel_stack();
     let loaded = match loaded {
-        LoadedExecutionImage::Tomori { image, argv, envp, file_owner } => {
+        LoadedExecutionImage::Tomori {
+            image,
+            argv,
+            envp,
+            file_owner,
+        } => {
             let prepared_fdtable = observed
                 .fdtable
                 .as_ref()

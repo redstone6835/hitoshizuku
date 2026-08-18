@@ -33,9 +33,7 @@ use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
 use vfs::superblock::{FsDriver, FsDriverFlags, Superblock, SuperblockOps};
 use vfs::sync::Spinlock;
 
-use crate::ipc::mqueue::{
-    MqNotification, MqObject, MqRegistry, MqStateObserver, MqAttr,
-};
+use crate::ipc::mqueue::{MqAttr, MqNotification, MqObject, MqRegistry, MqStateObserver};
 
 static MQ_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static MQ_REGISTRY: Spinlock<Option<Arc<MqRegistry>>> = Spinlock::new(None);
@@ -360,7 +358,9 @@ impl MqRootOps {
             ino,
             FileType::Regular,
             0o600,
-            Arc::new(MqFileInodeOps { name: name.to_string() }),
+            Arc::new(MqFileInodeOps {
+                name: name.to_string(),
+            }),
         ))
     }
 }
@@ -399,9 +399,7 @@ impl InodeOps for MqRootOps {
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         // 目录本身以 ProcDirFile 风格的快照列出队列名。
         let mut snapshot = Vec::new();
-        snapshot
-            .try_reserve(64)
-            .map_err(|_| VfsError::NoSpace)?;
+        snapshot.try_reserve(64).map_err(|_| VfsError::NoSpace)?;
         for name in mq_registry().names() {
             snapshot.push(DirEntry {
                 ino: 2 + stable_name_hash(&name),

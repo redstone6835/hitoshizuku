@@ -81,9 +81,15 @@ pub struct MqMessage {
 pub enum MqNotifyKind {
     None,
     /// `SIGEV_SIGNAL`：向注册者投递 `signo`，`siginfo.si_value = value`。
-    Signal { signo: i32, value: usize },
+    Signal {
+        signo: i32,
+        value: usize,
+    },
     /// `SIGEV_THREAD`：在注册者进程上下文创建线程执行 `function(value)`。
-    Thread { function: usize, value: usize },
+    Thread {
+        function: usize,
+        value: usize,
+    },
 }
 
 /// 一次已注册的队列通知。
@@ -156,7 +162,9 @@ impl MqObject {
     fn notify_state_changed(&self) {
         let observers: Vec<Arc<dyn MqStateObserver>> = {
             let mut inner = self.inner.lock();
-            inner.observers.retain(|observer| observer.strong_count() != 0);
+            inner
+                .observers
+                .retain(|observer| observer.strong_count() != 0);
             inner
                 .observers
                 .iter()
@@ -220,11 +228,7 @@ impl MqObject {
         } else {
             cred.can_read(inner.perm_uid, inner.perm_gid, inner.perm_mode)
         };
-        if allowed {
-            Ok(())
-        } else {
-            Err(Errno::EACCES)
-        }
+        if allowed { Ok(()) } else { Err(Errno::EACCES) }
     }
 
     /// 原子尝试发送一条消息。
@@ -264,11 +268,7 @@ impl MqObject {
                 data: data.to_vec(),
             });
         inner.curmsgs += 1;
-        let notify = if was_empty {
-            inner.notify.take()
-        } else {
-            None
-        };
+        let notify = if was_empty { inner.notify.take() } else { None };
         drop(inner);
         self.receivers.wake_all();
         self.notify_state_changed();
@@ -280,11 +280,7 @@ impl MqObject {
     /// 成功返回 `Some(消息)`；队列为空且 `nonblock` 时返回 `EAGAIN`，否则返回
     /// `None` 供调用方决定阻塞。`maxsize < msgsize` 时返回 `EMSGSIZE`
     /// （Linux 语义：即使消息实际更短也拒绝，见 `ipc/mqueue.c`）。
-    pub fn try_receive(
-        &self,
-        maxsize: usize,
-        nonblock: bool,
-    ) -> Result<Option<MqMessage>, Errno> {
+    pub fn try_receive(&self, maxsize: usize, nonblock: bool) -> Result<Option<MqMessage>, Errno> {
         if (maxsize as i64) < self.inner.lock().msgsize {
             return Err(Errno::EMSGSIZE);
         }
@@ -299,9 +295,7 @@ impl MqObject {
             }
             return Ok(None);
         };
-        let message = queue
-            .pop_front()
-            .expect("最高优先级队列非空必有消息");
+        let message = queue.pop_front().expect("最高优先级队列非空必有消息");
         if queue.is_empty() {
             inner.messages.remove(&priority);
         }

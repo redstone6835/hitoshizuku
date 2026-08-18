@@ -18,15 +18,14 @@ use general::ipc::keys::{
 };
 use general::ipc::mqueue::{
     MQ_ATTR_CURMSGS, MQ_ATTR_FLAGS, MQ_ATTR_MAXMSG, MQ_ATTR_MSGSIZE, MQ_ATTR_SIZE, MQ_NAME_MAX,
-    SI_MESGQ, MqAttr, MqNotifyKind, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD,
+    MqAttr, MqNotifyKind, SI_MESGQ, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD,
 };
 use general::ipc::msg::{
-    MSG_COPY, MSG_EXCEPT, MSG_INFO, MSG_NOERROR, MSG_STAT, MSG_STAT_ANY, MSG_TRUNC, MSGMAX,
-    MSGMNB, MSGMNI, MsgId, MsgKey, MsgManager, MsgMetadata, MsgOpAttempt, MsgRecvOutcome,
-    MsgSystemInfo,
+    MSG_COPY, MSG_EXCEPT, MSG_INFO, MSG_NOERROR, MSG_STAT, MSG_STAT_ANY, MSG_TRUNC, MSGMAX, MSGMNB,
+    MSGMNI, MsgId, MsgKey, MsgManager, MsgMetadata, MsgOpAttempt, MsgRecvOutcome, MsgSystemInfo,
 };
 use general::ipc::sem::{
-    SEM_UNDO, SEM_INFO, SEM_STAT, SEM_STAT_ANY, SEMCTL_GETALL, SEMCTL_GETNCNT, SEMCTL_GETPID,
+    SEM_INFO, SEM_STAT, SEM_STAT_ANY, SEM_UNDO, SEMCTL_GETALL, SEMCTL_GETNCNT, SEMCTL_GETPID,
     SEMCTL_GETVAL, SEMCTL_GETZCNT, SEMCTL_SETALL, SEMCTL_SETVAL, SEMOPM, SemBlockKind, SemId,
     SemKey, SemManager, SemMetadata, SemOpAttempt, SemOperation, SemSystemInfo,
 };
@@ -570,9 +569,7 @@ pub(super) fn sys_mq_notify(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     }
     // Linux `ipc/mqueue.c`：注册通知要求读权限（ipcperms）。
     queue.check_access(false, &cred)?;
-    queue
-        .register_notify(kind, pid, cred.uid.0)
-        .map(|_| 0)
+    queue.register_notify(kind, pid, cred.uid.0).map(|_| 0)
 }
 
 pub(super) fn sys_mq_getsetattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1300,7 +1297,11 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 *process.reqkey_auth.lock() = None;
                 Ok(0)
             } else if key_arg == KEY_SPEC_REQKEY_AUTH_KEY {
-                Ok(process.reqkey_auth.lock().map(|id| id.0 as usize).unwrap_or(0))
+                Ok(process
+                    .reqkey_auth
+                    .lock()
+                    .map(|id| id.0 as usize)
+                    .unwrap_or(0))
             } else {
                 *process.reqkey_auth.lock() = Some(KeyId(key_arg));
                 Ok(0)
@@ -1376,9 +1377,13 @@ fn resolve_keyring(
     now: u64,
 ) -> Result<KeyId, Errno> {
     if spec == 0 {
-        return Ok(general::ipc::keys::default_keyring_chain(process, cred, manager, now));
+        return Ok(general::ipc::keys::default_keyring_chain(
+            process, cred, manager, now,
+        ));
     }
-    manager.resolve_spec(spec, process, cred, now).map(|key| key.id)
+    manager
+        .resolve_spec(spec, process, cred, now)
+        .map(|key| key.id)
 }
 
 /// 复制以 NUL 结尾的字符串到用户缓冲区；返回包含 NUL 的长度（Linux 语义）。
@@ -1657,7 +1662,10 @@ pub(super) fn apply_sem_undo_on_exit(task: &Arc<sched::Task>) {
 }
 
 /// 注销本等待周期的阻塞统计登记。
-fn unregister_sem_blocked(set: &general::ipc::sem::SemSet, registered: Option<(usize, SemBlockKind)>) {
+fn unregister_sem_blocked(
+    set: &general::ipc::sem::SemSet,
+    registered: Option<(usize, SemBlockKind)>,
+) {
     if let Some((sem_num, kind)) = registered {
         set.unregister_blocked(sem_num, kind);
     }

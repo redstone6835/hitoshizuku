@@ -12,7 +12,6 @@ use crate::clone_flags::{CloneArgs, CloneFlags};
 use crate::eevdf::SchedParams;
 use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::pid::{PidNamespace, PidT};
-use crate::sync::Spinlock;
 use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::scheduler::{
     activate_task_on_cpu, current_task, deliver_shared_signal_to_group, enqueue_task,
@@ -20,6 +19,7 @@ use crate::scheduler::{
     root_pid_ns, schedule_once,
 };
 use crate::signal::SignalNumber;
+use crate::sync::Spinlock;
 use crate::task::{Task, ext_clone_hook};
 use crate::{ExitCode, TaskState};
 

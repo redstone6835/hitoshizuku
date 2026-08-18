@@ -14,8 +14,8 @@ use general::ipc::msg::MsgManager;
 use general::ipc::sem::SemManager;
 use general::ipc::shm::ShmManager;
 use ns::Namespace as _;
-use sched::sync::Spinlock;
 use sched::Task;
+use sched::sync::Spinlock;
 
 /// SysV IPC 命名空间：三个管理器各一份。
 pub struct IpcNamespace {
@@ -121,12 +121,8 @@ pub fn unshare(task: &Arc<Task>, flags: u64) -> Result<(), Errno> {
     const CLONE_NEWPID: u64 = 0x2000_0000;
     const CLONE_NEWNET: u64 = 0x4000_0000;
     const CLONE_NEWTIME: u64 = 0x0000_0080;
-    const SUPPORTED: u64 = CLONE_NEWNS
-        | CLONE_NEWCGROUP
-        | CLONE_NEWUTS
-        | CLONE_NEWIPC
-        | CLONE_NEWPID
-        | CLONE_NEWTIME;
+    const SUPPORTED: u64 =
+        CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWTIME;
     const UNSUPPORTED: u64 = CLONE_NEWUSER | CLONE_NEWNET;
 
     if flags & UNSUPPORTED != 0 {
@@ -189,7 +185,11 @@ pub fn unshare(task: &Arc<Task>, flags: u64) -> Result<(), Errno> {
 ///
 /// `nstype == 0` 时按命名空间自身类型；`CLONE_NEWPID` 同样只对后续子进程
 /// 生效。要求 `CAP_SYS_ADMIN`。
-pub fn setns(task: &Arc<Task>, namespace: Arc<dyn ns::Namespace>, nstype: u64) -> Result<(), Errno> {
+pub fn setns(
+    task: &Arc<Task>,
+    namespace: Arc<dyn ns::Namespace>,
+    nstype: u64,
+) -> Result<(), Errno> {
     if nstype != 0 && nstype != namespace.ns_type() as u64 {
         return Err(Errno::EINVAL);
     }
@@ -199,8 +199,8 @@ pub fn setns(task: &Arc<Task>, namespace: Arc<dyn ns::Namespace>, nstype: u64) -
     let ns = task_ns(task);
     match namespace.ns_type() {
         ns::NsType::Mount => {
-            let mount_ns = ns::downcast_arc::<general::vfs::MountNamespace>(namespace)
-                .ok_or(Errno::EINVAL)?;
+            let mount_ns =
+                ns::downcast_arc::<general::vfs::MountNamespace>(namespace).ok_or(Errno::EINVAL)?;
             let vfs_ctx = task
                 .ext_lookup(sched::TASKEXT_VFS_CONTEXT)
                 .and_then(|payload| payload.downcast::<general::vfs::VfsContext>().ok())
@@ -210,8 +210,7 @@ pub fn setns(task: &Arc<Task>, namespace: Arc<dyn ns::Namespace>, nstype: u64) -
             task.ext_install(sched::TASKEXT_VFS_CONTEXT, erased);
         }
         ns::NsType::Uts => {
-            let uts = ns::downcast_arc::<ns::UtsNamespace>(namespace)
-                .ok_or(Errno::EINVAL)?;
+            let uts = ns::downcast_arc::<ns::UtsNamespace>(namespace).ok_or(Errno::EINVAL)?;
             let mut proxy = (*ns).clone_proxy();
             proxy.uts = uts;
             install_proxy(task, proxy);
@@ -223,22 +222,20 @@ pub fn setns(task: &Arc<Task>, namespace: Arc<dyn ns::Namespace>, nstype: u64) -
             install_proxy(task, proxy);
         }
         ns::NsType::Time => {
-            let time = ns::downcast_arc::<ns::TimeNamespace>(namespace)
-                .ok_or(Errno::EINVAL)?;
+            let time = ns::downcast_arc::<ns::TimeNamespace>(namespace).ok_or(Errno::EINVAL)?;
             let mut proxy = (*ns).clone_proxy();
             proxy.time = time;
             install_proxy(task, proxy);
         }
         ns::NsType::Cgroup => {
-            let cgroup = ns::downcast_arc::<ns::CgroupNamespace>(namespace)
-                .ok_or(Errno::EINVAL)?;
+            let cgroup = ns::downcast_arc::<ns::CgroupNamespace>(namespace).ok_or(Errno::EINVAL)?;
             let mut proxy = (*ns).clone_proxy();
             proxy.cgroup = cgroup;
             install_proxy(task, proxy);
         }
         ns::NsType::Pid => {
-            let pid = ns::downcast_arc::<sched::pid::PidNamespace>(namespace)
-                .ok_or(Errno::EINVAL)?;
+            let pid =
+                ns::downcast_arc::<sched::pid::PidNamespace>(namespace).ok_or(Errno::EINVAL)?;
             *ns.pending_pid.lock() = Some(pid);
         }
         ns::NsType::User | ns::NsType::Net => return Err(Errno::EOPNOTSUPP),
