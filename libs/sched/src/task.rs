@@ -384,8 +384,10 @@ fn more_urgent(current: SchedAttr, donated: SchedAttr) -> SchedAttr {
                 _ => SchedAttr::rt_fifo(donated_prio),
             }
         }
-        SchedPolicy::Fair => {
-            if current.policy == SchedPolicy::Fair && donated.nice < current.nice {
+        SchedPolicy::Fair | SchedPolicy::Batch => {
+            if matches!(current.policy, SchedPolicy::Fair | SchedPolicy::Batch)
+                && donated.nice < current.nice
+            {
                 let mut boosted = current;
                 boosted.nice = donated.nice;
                 boosted

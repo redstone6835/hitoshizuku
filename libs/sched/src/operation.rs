@@ -1065,12 +1065,12 @@ pub(crate) fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
         | CloneFlags::CLONE_CLEAR_SIGHAND;
     // NEWUSER/NEWNET 未实现（能力语义改造/网络栈 per-ns）；NEWTIME 只能经
     // unshare(2) 使用（clone 报 EINVAL）。NEWNS/NEWCGROUP/NEWUTS/NEWIPC/
-    // NEWPID 由 kernel 侧在 clone 完成后安装命名空间。
-    const UNSUPPORTED: u64 = CloneFlags::CLONE_PTRACE
-        | CloneFlags::CLONE_NEWUSER
+    // NEWPID 由 kernel 侧在 clone 完成后安装命名空间。CLONE_PTRACE 在
+    // spawn 路径处理（父被追踪时子也被追踪）；CLONE_IO 无 io_context 记账，
+    // 作为 no-op 接受。
+    const UNSUPPORTED: u64 = CloneFlags::CLONE_NEWUSER
         | CloneFlags::CLONE_NEWNET
-        | CloneFlags::CLONE_NEWTIME
-        | CloneFlags::CLONE_IO;
+        | CloneFlags::CLONE_NEWTIME;
     if flags.has(CloneFlags::CLONE_NEWNS) && flags.has(CloneFlags::CLONE_FS) {
         return Err(Errno::EINVAL);
     }

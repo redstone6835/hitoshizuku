@@ -451,7 +451,9 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
         // 或负 nice 权重；子任务自身不继续携带该继承标志。
         let parent_attr = parent.pi_base_attr();
         let child_attr = match parent_attr.policy {
-            SchedPolicy::Fair | SchedPolicy::Idle => SchedAttr::fair(parent_attr.nice.max(0), 0),
+            SchedPolicy::Fair | SchedPolicy::Batch | SchedPolicy::Idle => {
+                SchedAttr::fair(parent_attr.nice.max(0), 0)
+            }
             SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin | SchedPolicy::Deadline => {
                 SchedAttr::fair(0, 0)
             }
@@ -579,6 +581,11 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
         for (key, src) in parent.ext_snapshot() {
             child.ext_install(key, src);
         }
+    }
+
+    // 11. CLONE_PTRACE：父被追踪时，子进程也被追踪（Linux 语义）。
+    if flags.has(CloneFlags::CLONE_PTRACE) && parent.is_ptrace_traced() {
+        let _ = child.enable_ptrace_traced();
     }
 
     #[cfg(feature = "trace-task-lifecycle")]
