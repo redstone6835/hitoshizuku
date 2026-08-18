@@ -3754,12 +3754,123 @@ pub(super) fn sys_fanotify_mark(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     Ok(0)
 }
 
-pub(super) fn sys_name_to_handle_at(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// 文件句柄编码：`fs_id`(u64) + `ino`(u64)，共 16 字节。
+const FILE_HANDLE_SIZE: usize = 16;
+const FILE_HANDLE_TYPE: i32 = 1;
+
+/// `name_to_handle_at(2)`：把路径解析为 inode，导出 (fs_id, ino) 句柄与挂载 id。
+pub(super) fn sys_name_to_handle_at(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
+    let path = copy_path_from_user(ctx.args[1])?;
+    let handle_user = ctx.args[2];
+    let mount_id_user = ctx.args[3];
+    let flags = ctx.args[4];
+    if (flags & !AT_SYMLINK_NOFOLLOW) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let result = vfs::path::lookup(
+        &vfs_ctx,
+        &dirfd,
+        &path,
+        if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
+            LookupFlags::NO_FOLLOW
+        } else {
+            LookupFlags::default()
+        },
+    )
+    .map_err(|e| e.to_errno())?;
+    let inode = result.dentry.inode().ok_or(Errno::ENOENT)?;
+    let sb_id = inode.superblock().map(|s| s.fs_id.raw()).unwrap_or(0);
+
+    // struct file_handle：handle_bytes(u32) + handle_type(i32) + f_handle[]。
+    if handle_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut hdr = [0u8; 8];
+    copy_from_user(handle_user, &mut hdr).map_err(|e| e.as_errno())?;
+    let capacity = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
+    if capacity < FILE_HANDLE_SIZE {
+        put_u32(&mut hdr, 0, FILE_HANDLE_SIZE as u32);
+        copy_to_user(handle_user, &hdr).map_err(|e| e.as_errno())?;
+        return Err(Errno::EOVERFLOW);
+    }
+    let mut handle = [0u8; FILE_HANDLE_SIZE];
+    put_u64(&mut handle, 0, sb_id);
+    put_u64(&mut handle, 8, inode.ino());
+    copy_to_user(handle_user + 8, &handle).map_err(|e| e.as_errno())?;
+    put_u32(&mut hdr, 0, FILE_HANDLE_SIZE as u32);
+    put_i32(&mut hdr, 4, FILE_HANDLE_TYPE);
+    copy_to_user(handle_user, &hdr).map_err(|e| e.as_errno())?;
+    // mount_id 以 superblock 实例 ID 低 32 位近似（本 VFS 无 per-mount id 注册表）。
+    if mount_id_user != 0 {
+        copy_to_user(mount_id_user, &(sb_id as u32).to_le_bytes()).map_err(|e| e.as_errno())?;
+    }
+    Ok(0)
 }
 
-pub(super) fn sys_open_by_handle_at(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// `open_by_handle_at(2)`：按句柄重开文件。mount_fd 是 open_tree/fsmount 产生的
+/// 挂载 fd，用于定位句柄所属文件系统实例。
+pub(super) fn sys_open_by_handle_at(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let mount_fd = fd_arg(ctx.args[0])?;
+    let handle_user = ctx.args[1];
+    let flags = ctx.args[2];
+
+    if handle_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut hdr = [0u8; 8];
+    copy_from_user(handle_user, &mut hdr).map_err(|e| e.as_errno())?;
+    let handle_bytes = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
+    let handle_type = i32::from_le_bytes(hdr[4..8].try_into().unwrap());
+    if handle_bytes < FILE_HANDLE_SIZE || handle_type != FILE_HANDLE_TYPE {
+        return Err(Errno::EINVAL);
+    }
+    let mut handle = [0u8; FILE_HANDLE_SIZE];
+    copy_from_user(handle_user + 8, &mut handle).map_err(|e| e.as_errno())?;
+    let sb_id = u64::from_le_bytes(handle[0..8].try_into().unwrap());
+    let ino = u64::from_le_bytes(handle[8..16].try_into().unwrap());
+
+    // 从挂载 fd 取出 superblock 并校验句柄所属文件系统实例。
+    let mount_file = fdt.get_file(mount_fd).ok_or(Errno::EBADF)?;
+    let fsc = vfs::fs_context::FsContextFileOps::from_file(&mount_file).ok_or(Errno::EINVAL)?;
+    let sb = fsc.take_superblock().ok_or(Errno::EINVAL)?;
+    if sb.fs_id.raw() != sb_id {
+        return Err(Errno::ESTALE);
+    }
+    let inode = sb.find_inode(ino).ok_or(Errno::ESTALE)?;
+
+    let opts = decode_open_options(flags)?;
+    let cred = vfs_ctx.cred().clone();
+    let ops = inode.open_ops(&opts, &cred).map_err(|e| e.to_errno())?;
+    let mount = fsc
+        .clone_root()
+        .and_then(|root| vfs_ctx.mount_ns.find_mount_for_root(&root))
+        .or_else(|| vfs_ctx.mount_ns.find_mount_for_root(&sb.root_dentry))
+        .ok_or(Errno::ESTALE)?;
+    // 打开句柄不经过路径，用独立 dentry 承载 inode（仅用于 fd 定位语义）。
+    let dentry = vfs::dentry::Dentry::new_positive("", None, Arc::clone(&inode));
+    let file = vfs::file::File::new(
+        Arc::clone(&inode),
+        opts,
+        cred,
+        ops,
+        dentry,
+        Arc::clone(&mount),
+    );
+    mount.inc_open();
+    let fd_flags = if opts.cloexec {
+        FdFlags::CLOEXEC
+    } else {
+        FdFlags::default()
+    };
+    let fd = fdt
+        .alloc_fd(Arc::new(file), fd_flags)
+        .map_err(|e| e.to_errno())?;
+    Ok(fd.as_raw() as usize)
 }
 
 pub(super) fn sys_memfd_create(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
