@@ -783,21 +783,26 @@ impl KeyManager {
         if !permission_ok(&key, cred, KEY_POS_WRITE) {
             return Err(Errno::EACCES);
         }
-        let inner = key.inner.lock();
-        if inner.key_type == KeyType::Keyring {
-            return Err(Errno::EOPNOTSUPP);
-        }
-        drop(inner);
-        // 更新也受配额约束。
+        let (uid, old_bytes) = {
+            let inner = key.inner.lock();
+            if inner.key_type == KeyType::Keyring {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            (inner.uid, inner.payload.len())
+        };
+        let new_bytes = payload.len();
+        // 更新只按负载差量结算：描述长度不变，不计入增量。避免反复 update 让
+        // 每 uid 字节配额单调增长。
         let mut guard = self.state.lock();
-        let uid = key.inner.lock().uid;
         let quota_bytes = guard.quota_bytes.get(&uid).copied().unwrap_or(0);
-        let bytes = payload.len().saturating_add(key.description().len());
-        if quota_bytes.saturating_add(bytes) > KEY_MAXBYTES_PER_UID {
+        let updated = quota_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
+        if updated > KEY_MAXBYTES_PER_UID {
             return Err(Errno::EDQUOT);
         }
         key.set_payload(payload);
-        guard.quota_bytes.insert(uid, quota_bytes + bytes);
+        guard.quota_bytes.insert(uid, updated);
         Ok(())
     }
 
@@ -1189,6 +1194,15 @@ mod tests {
         manager.user_keyring(uid, &cred(uid, 0)).unwrap()
     }
 
+    fn quota_bytes(manager: &KeyManager, uid: u32) -> usize {
+        manager
+            .quota_snapshot()
+            .into_iter()
+            .find(|(u, _, _)| *u == uid)
+            .map(|(_, _, bytes)| bytes)
+            .unwrap_or(0)
+    }
+
     #[test]
     fn instantiate_requires_uninstantiated_state() {
         let manager = KeyManager::new();
@@ -1288,5 +1302,26 @@ mod tests {
         let mut by_groups = cred(1000, 1000);
         by_groups.groups = vec![Gid(3000)];
         assert_eq!(manager.chown(key.id, None, Some(3000), &by_groups), Ok(()));
+    }
+
+    #[test]
+    fn update_quota_accounts_payload_delta() {
+        let manager = KeyManager::new();
+        let key = manager
+            .create_uninstantiated(KeyType::User, "k", 1000, 1000, KEY_DEFAULT_PERM)
+            .unwrap();
+        // create_key 记账：空负载 + 描述 "k"（1 字节）= 1 字节。
+        let base = quota_bytes(&manager, 1000);
+        assert_eq!(base, 1);
+        // 更新到 100 字节：delta = +100。
+        manager
+            .update(key.id, vec![0u8; 100], &cred(1000, 0))
+            .unwrap();
+        assert_eq!(quota_bytes(&manager, 1000), base + 100);
+        // 再更新到 10 字节：delta = -90，配额应回落而非单调增长。
+        manager
+            .update(key.id, vec![0u8; 10], &cred(1000, 0))
+            .unwrap();
+        assert_eq!(quota_bytes(&manager, 1000), base + 10);
     }
 }
