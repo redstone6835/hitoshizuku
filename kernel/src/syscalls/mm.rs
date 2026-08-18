@@ -204,6 +204,11 @@ pub(super) fn sys_mmap(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fixed_noreplace = (flags & MAP_FIXED_NOREPLACE) != 0;
     let anonymous = (flags & MAP_ANONYMOUS) != 0;
 
+    if !anonymous {
+        // Linux file_mmap_ok：文件映射 offset+len 回绕 → EOVERFLOW。
+        offset.checked_add(len as u64).ok_or(Errno::EOVERFLOW)?;
+    }
+
     if (fixed || fixed_noreplace) && req_addr % page_size != 0 {
         return Err(Errno::EINVAL);
     }
