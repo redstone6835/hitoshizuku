@@ -5485,7 +5485,7 @@ fn timer_settime_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     // 旧值快照（timer_settime 的 old_value 输出上一次挂载的剩余时间）。
     if old_value != 0 {
         let (remaining_ns, old_interval_ns) =
-            sched::posix_timer::gettime(timer_t).unwrap_or((0, 0));
+            sched::posix_timer::gettime(timer_t).ok_or(Errno::EINVAL)?;
         let mut old = [0u8; ITIMERSPEC_SIZE];
         write_timespec_pair(&mut old, ITIMERSPEC_INTERVAL_OFF, old_interval_ns);
         write_timespec_pair(&mut old, ITIMERSPEC_VALUE_OFF, remaining_ns);
