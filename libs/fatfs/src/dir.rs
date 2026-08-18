@@ -16,6 +16,7 @@ use crate::lfn::{
     decode_lfn_entry_fixed, encode_lfn_entry, lfn_checksum, str_to_ucs2, ucs2_to_string,
 };
 use crate::state::{BlockBackendError, FsState};
+use crate::time::FatTimestamp;
 
 pub(crate) const DIR_ENTRY_SIZE: usize = 32;
 
@@ -57,6 +58,8 @@ pub(crate) struct DirEntryView {
     pub attr: u8,
     pub first_cluster: u32,
     pub size: u32,
+    /// 目录项承载的 FAT 时间戳(创建/修改/访问日期)。
+    pub times: FatTimestamp,
     /// 起始物理位置:在目录区域内的 32 字节槽序号(LFN 第一条所在槽)。
     pub slot_start: u32,
     /// SFN 槽序号(LFN 之后的那一条)。
@@ -312,6 +315,20 @@ where
             } else {
                 None
             };
+            let ctime = u16::from_le_bytes([entry[OFF_CTIME], entry[OFF_CTIME + 1]]);
+            let cdate = u16::from_le_bytes([entry[OFF_CDATE], entry[OFF_CDATE + 1]]);
+            let ctime_tenths = entry[OFF_CTIME_TENTHS];
+            let mtime = u16::from_le_bytes([entry[OFF_MTIME], entry[OFF_MTIME + 1]]);
+            let mdate = u16::from_le_bytes([entry[OFF_MDATE], entry[OFF_MDATE + 1]]);
+            let adate = u16::from_le_bytes([entry[OFF_ADATE], entry[OFF_ADATE + 1]]);
+            let times = FatTimestamp {
+                time: ctime,
+                date: cdate,
+                tenths: ctime_tenths,
+                mtime,
+                mdate,
+                adate,
+            };
             let slot_start = lfn_start_slot.unwrap_or(slot);
             let name = long_name.unwrap_or_else(|| decode_sfn(&raw_name));
             let view = DirEntryView {
@@ -320,6 +337,7 @@ where
                 attr,
                 first_cluster,
                 size,
+                times,
                 slot_start,
                 slot_sfn: slot,
             };
@@ -710,30 +728,31 @@ pub(crate) fn update_sfn_metadata_with_scratch(
     buf[OFF_CLUSTER_HI..OFF_CLUSTER_HI + 2].copy_from_slice(&hi.to_le_bytes());
     buf[OFF_CLUSTER_LO..OFF_CLUSTER_LO + 2].copy_from_slice(&lo.to_le_bytes());
     buf[OFF_SIZE..OFF_SIZE + 4].copy_from_slice(&size.to_le_bytes());
-    let (t, d, _th) = crate::time::EPOCH_1980;
-    buf[OFF_MTIME..OFF_MTIME + 2].copy_from_slice(&t.to_le_bytes());
-    buf[OFF_MDATE..OFF_MDATE + 2].copy_from_slice(&d.to_le_bytes());
-    buf[OFF_ADATE..OFF_ADATE + 2].copy_from_slice(&d.to_le_bytes());
+    let times = FatTimestamp::now();
+    buf[OFF_MTIME..OFF_MTIME + 2].copy_from_slice(&times.mtime.to_le_bytes());
+    buf[OFF_MDATE..OFF_MDATE + 2].copy_from_slice(&times.mdate.to_le_bytes());
+    buf[OFF_ADATE..OFF_ADATE + 2].copy_from_slice(&times.adate.to_le_bytes());
     state.backend.write_sectors(lba, 1, sec)
 }
 
-/// 构造一个 SFN 条目的 32 字节:给定 11 字节 SFN、属性、first_cluster、size。
+/// 构造一个 SFN 条目的 32 字节:给定 11 字节 SFN、属性、first_cluster、size 与
+/// 时间戳。调用方负责传入要落盘的时间(新建条目用当前时间,rename 用源条目时间)。
 pub(crate) fn build_sfn_entry(
     sfn: [u8; 11],
     attr: u8,
     first_cluster: u32,
     size: u32,
+    times: &FatTimestamp,
 ) -> [u8; DIR_ENTRY_SIZE] {
     let mut e = [0u8; DIR_ENTRY_SIZE];
     e[OFF_NAME..OFF_NAME + 11].copy_from_slice(&sfn);
     e[OFF_ATTR] = attr;
-    let (t, d, th) = crate::time::EPOCH_1980;
-    e[OFF_CTIME_TENTHS] = th;
-    e[OFF_CTIME..OFF_CTIME + 2].copy_from_slice(&t.to_le_bytes());
-    e[OFF_CDATE..OFF_CDATE + 2].copy_from_slice(&d.to_le_bytes());
-    e[OFF_ADATE..OFF_ADATE + 2].copy_from_slice(&d.to_le_bytes());
-    e[OFF_MTIME..OFF_MTIME + 2].copy_from_slice(&t.to_le_bytes());
-    e[OFF_MDATE..OFF_MDATE + 2].copy_from_slice(&d.to_le_bytes());
+    e[OFF_CTIME_TENTHS] = times.tenths;
+    e[OFF_CTIME..OFF_CTIME + 2].copy_from_slice(&times.time.to_le_bytes());
+    e[OFF_CDATE..OFF_CDATE + 2].copy_from_slice(&times.date.to_le_bytes());
+    e[OFF_ADATE..OFF_ADATE + 2].copy_from_slice(&times.adate.to_le_bytes());
+    e[OFF_MTIME..OFF_MTIME + 2].copy_from_slice(&times.mtime.to_le_bytes());
+    e[OFF_MDATE..OFF_MDATE + 2].copy_from_slice(&times.mdate.to_le_bytes());
     let hi = (first_cluster >> 16) as u16;
     let lo = first_cluster as u16;
     e[OFF_CLUSTER_HI..OFF_CLUSTER_HI + 2].copy_from_slice(&hi.to_le_bytes());
