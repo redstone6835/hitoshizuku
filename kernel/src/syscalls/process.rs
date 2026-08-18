@@ -5455,7 +5455,11 @@ fn timer_create_common(ctx: &mut SyscallContext<'_>, _time64: bool) -> Result<us
         },
     };
     let timer_t = sched::posix_timer::create(clock, &caller, sigev, target_tid)?;
-    copy_to_user(timeridp, &timer_t.to_le_bytes()).map_err(|e| e.as_errno())?;
+    if let Err(e) = copy_to_user(timeridp, &timer_t.to_le_bytes()) {
+        // 拷贝失败（如 EFAULT）回滚已创建的定时器，避免在全局表中泄漏。
+        let _ = sched::posix_timer::delete(timer_t);
+        return Err(e.as_errno());
+    }
     Ok(0)
 }
 
