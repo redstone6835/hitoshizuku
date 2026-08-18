@@ -1052,6 +1052,9 @@ pub(super) fn sys_utimensat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         return Err(Errno::EINVAL);
     }
     let (atime, mtime) = decode_utimens_times(times_user)?;
+    if atime.is_none() && mtime.is_none() {
+        return Ok(0);
+    }
 
     if path_user == 0 {
         if flags != 0 {
