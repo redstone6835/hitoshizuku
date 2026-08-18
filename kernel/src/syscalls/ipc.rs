@@ -233,6 +233,16 @@ pub(super) fn sys_shmctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         SHM_LOCK | SHM_UNLOCK => {
             let lock = cmd == SHM_LOCK;
             if lock {
+                // Linux `shmctl(SHM_LOCK)` 顺序：先做权限判定（EPERM），再做
+                // `RLIMIT_MEMLOCK` 检查（ENOMEM）。无 `CAP_IPC_LOCK` 且非段属主
+                //（`euid` 既非 `shm_perm.uid` 也非 `cuid`）→ EPERM。
+                let perm = manager.perm_of(shmid)?;
+                if !cred.has_cap(vfs::cred::Capability::IpcLock)
+                    && !cred.is_owner(perm.uid)
+                    && !cred.is_owner(perm.cuid)
+                {
+                    return Err(Errno::EPERM);
+                }
                 // Linux `user_shm_lock`：锁定新增页数不得超出 `RLIMIT_MEMLOCK`
                 //（`CAP_IPC_LOCK` 或 `RLIM_INFINITY` 豁免）。超限返回 `ENOMEM`。
                 let additional = manager.would_lock_pages(shmid)?;
@@ -1067,6 +1077,15 @@ pub(super) fn sys_msgsnd(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let mut mtype_raw = [0u8; 8];
     copy_from_user(msgp, &mut mtype_raw).map_err(|e| e.as_errno())?;
     let mtype = i64::from_le_bytes(mtype_raw);
+    // 对齐 Linux `do_msgsnd`：先校验 `msgsz`/`mtype`（EINVAL），再读 data。
+    // 否则"坏指针 + 超限"同时发生时，会先因 data 的 `copy_from_user` 返回
+    // EFAULT，而 Linux 此处返回 EINVAL。
+    if msgsz > MSGMAX {
+        return Err(Errno::EINVAL);
+    }
+    if mtype < 1 {
+        return Err(Errno::EINVAL);
+    }
     let mut data = vec![0u8; msgsz];
     if msgsz > 0 {
         copy_from_user(msgp + 8, &mut data).map_err(|e| e.as_errno())?;
@@ -1155,11 +1174,13 @@ pub(super) fn sys_semctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 return Err(Errno::EFAULT);
             }
             let values = manager.get_all(id, &cred)?;
+            // `semun.array` 是 `unsigned short *`（2 字节/元素，Linux 语义）：
+            // 每个值按 2 字节小端写出（内部值经 `0..=SEMVMX` 校验，恰好 fit u16）。
             for (index, value) in values.iter().enumerate() {
                 let address = arg
-                    .checked_add(index * size_of::<i32>())
+                    .checked_add(index * size_of::<u16>())
                     .ok_or(Errno::EFAULT)?;
-                copy_to_user(address, &value.to_le_bytes()).map_err(|e| e.as_errno())?;
+                copy_to_user(address, &(*value as u16).to_le_bytes()).map_err(|e| e.as_errno())?;
             }
             Ok(0)
         }
@@ -1169,13 +1190,15 @@ pub(super) fn sys_semctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             }
             let nsems = manager.stat(id, &cred)?.nsems;
             let mut values = vec![0i32; nsems];
+            // `semun.array` 是 `unsigned short *`（2 字节/元素，Linux 语义）：
+            // 每个元素读 2 字节小端，汇入 `Vec<i32>`（范围校验由 `set_all` 保留）。
             for (index, slot) in values.iter_mut().enumerate() {
                 let address = arg
-                    .checked_add(index * size_of::<i32>())
+                    .checked_add(index * size_of::<u16>())
                     .ok_or(Errno::EFAULT)?;
-                let mut raw = [0u8; 4];
+                let mut raw = [0u8; 2];
                 copy_from_user(address, &mut raw).map_err(|e| e.as_errno())?;
-                *slot = i32::from_le_bytes(raw);
+                *slot = u16::from_le_bytes(raw) as i32;
             }
             let set = manager.set_all(id, &values, &cred, pid, now)?;
             sem_undo_table(ctx).clear(id);
