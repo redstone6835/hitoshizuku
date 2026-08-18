@@ -488,7 +488,11 @@ pub(super) fn sys_reboot(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             power::shutdown().map_err(map_power_error)?;
             halt_after_power_request()
         }
-        LINUX_REBOOT_CMD_SW_SUSPEND | LINUX_REBOOT_CMD_KEXEC => Err(Errno::EOPNOTSUPP),
+        // SW_SUSPEND：无休眠（hibernation）支持，Linux 同样返回 EOPNOTSUPP。
+        LINUX_REBOOT_CMD_SW_SUSPEND => Err(Errno::EOPNOTSUPP),
+        // KEXEC：无 kexec 内核重载机制，与 sys_kexec_load/file_load 一致返回
+        // ENOSYS（Linux 未启用 CONFIG_KEXEC 时的等价行为）。
+        LINUX_REBOOT_CMD_KEXEC => Err(Errno::ENOSYS),
         _ => Err(Errno::EINVAL),
     }
 }
@@ -817,11 +821,24 @@ pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     const MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED: usize = 1 << 2;
     const MEMBARRIER_CMD_PRIVATE_EXPEDITED: usize = 1 << 3;
     const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: usize = 1 << 4;
+    const MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE: usize = 1 << 5;
+    const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: usize = 1 << 6;
+    const MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ: usize = 1 << 7;
+    const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ: usize = 1 << 8;
+    const MEMBARRIER_CMD_GET_REGISTRATIONS: usize = 1 << 9;
+    // 取舍：SYNC_CORE / RSEQ 变体在目标 CPU 上还须执行序列化指令 / 打断 rseq
+    // 临界区；本内核 rendezvous 只做全内存屏障，二者按 PRIVATE_EXPEDITED 等价
+    // 处理并如实声明支持位。
     let supported = MEMBARRIER_CMD_GLOBAL
         | MEMBARRIER_CMD_GLOBAL_EXPEDITED
         | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
         | MEMBARRIER_CMD_PRIVATE_EXPEDITED
-        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED;
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ
+        | MEMBARRIER_CMD_GET_REGISTRATIONS;
 
     let cmd = ctx.args[0];
     let flags = ctx.args[1];
@@ -830,7 +847,10 @@ pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     }
     match cmd {
         MEMBARRIER_CMD_QUERY => Ok(supported),
-        MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED => {
+        MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ => {
             let vm = task_vm_space(ctx.task()).ok_or(Errno::EINVAL)?;
             vm.register_membarrier(cmd);
             Ok(0)
@@ -839,10 +859,19 @@ pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
             sched::synchronize_cpus()?;
             Ok(0)
         }
-        MEMBARRIER_CMD_GLOBAL_EXPEDITED | MEMBARRIER_CMD_PRIVATE_EXPEDITED => {
+        MEMBARRIER_CMD_GLOBAL_EXPEDITED
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ => {
             let required_registration = match cmd {
                 MEMBARRIER_CMD_GLOBAL_EXPEDITED => MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED,
                 MEMBARRIER_CMD_PRIVATE_EXPEDITED => MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED,
+                MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE => {
+                    MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+                }
+                MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ => {
+                    MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ
+                }
                 _ => unreachable!(),
             };
             let vm = task_vm_space(ctx.task()).ok_or(Errno::EINVAL)?;
@@ -850,6 +879,17 @@ pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
                 return Err(Errno::EPERM);
             }
             sched::synchronize_cpus()?;
+            Ok(0)
+        }
+        MEMBARRIER_CMD_GET_REGISTRATIONS => {
+            let vm = task_vm_space(ctx.task()).ok_or(Errno::EINVAL)?;
+            let mask = vm.membarrier_registration();
+            // Linux 返回注册位图（低 32 位），高位须为 0。
+            let out = ctx.args[2];
+            if out != 0 {
+                copy_to_user(out, &((mask & 0xffff_ffff) as u32).to_le_bytes())
+                    .map_err(|e| e.as_errno())?;
+            }
             Ok(0)
         }
         _ => Err(Errno::EINVAL),
@@ -1039,6 +1079,8 @@ pub(super) fn sys_clock_gettime(ctx: &mut SyscallContext<'_>) -> Result<usize, E
 
 const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
 const CLOCK_THREAD_CPUTIME_ID: usize = 3;
+/// Linux `CLOCK_TAI`：国际原子时，= `CLOCK_REALTIME` + TAI 偏移。
+const CLOCK_TAI: usize = 11;
 
 fn clock_time_ns_for_task(task: &Arc<Task>, clock_id: usize) -> Option<u64> {
     match clock_id {
@@ -1056,6 +1098,10 @@ fn clock_time_ns_for_task(task: &Arc<Task>, clock_id: usize) -> Option<u64> {
         CLOCK_THREAD_CPUTIME_ID => {
             let usage = task.usage_snapshot(sched::now_ns_direct());
             Some(usage.user_ns.saturating_add(usage.system_ns))
+        }
+        CLOCK_TAI => {
+            let realtime = crate::vdso::realtime_ns();
+            Some((realtime as i64).saturating_add(crate::adjtimex::tai_offset_ns()) as u64)
         }
         _ => crate::vdso::clock_time_ns(clock_id),
     }
@@ -1347,6 +1393,8 @@ pub(super) fn sys_clock_getres(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     let tp = ctx.args[1];
     let res_ns = match clock_id {
         CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => 1,
+        CLOCK_TAI => crate::vdso::clock_getres_ns(crate::vdso::CLOCK_REALTIME)
+            .ok_or(Errno::EINVAL)?,
         _ => crate::vdso::clock_getres_ns(clock_id).ok_or(Errno::EINVAL)?,
     } as i64;
     if tp != 0 {
@@ -1676,7 +1724,7 @@ pub(super) fn sys_sched_setparam(ctx: &mut SyscallContext<'_>) -> Result<usize, 
     let old = task.pi_base_attr();
     let mut attr = old;
     match attr.policy {
-        SchedPolicy::Fair | SchedPolicy::Idle => {
+        SchedPolicy::Fair | SchedPolicy::Batch | SchedPolicy::Idle => {
             if priority != 0 {
                 return Err(Errno::EINVAL);
             }
@@ -1714,7 +1762,9 @@ pub(super) fn sys_sched_setscheduler(ctx: &mut SyscallContext<'_>) -> Result<usi
     let mut raw = [0u8; 4];
     copy_from_user(param_user, &mut raw).map_err(|e| e.as_errno())?;
     let priority = i32::from_le_bytes(raw);
-    if matches!(policy, SchedPolicy::Fair | SchedPolicy::Idle) && priority != 0 {
+    if matches!(policy, SchedPolicy::Fair | SchedPolicy::Batch | SchedPolicy::Idle)
+        && priority != 0
+    {
         return Err(Errno::EINVAL);
     }
     let rt_priority = if matches!(policy, SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin) {
@@ -1980,7 +2030,7 @@ fn check_sched_attr_permission(
 
     let requested = requested.validate()?;
     match requested.policy {
-        SchedPolicy::Fair => {
+        SchedPolicy::Fair | SchedPolicy::Batch => {
             if requested.nice < old.nice && (requested.nice as i32) < nice_floor_from_rlimit(caller)
             {
                 return Err(Errno::EACCES);
@@ -2085,6 +2135,7 @@ fn decode_linux_sched_policy(raw: usize) -> Result<SchedPolicy, Errno> {
         0 => Ok(SchedPolicy::Fair),
         1 => Ok(SchedPolicy::RtFifo),
         2 => Ok(SchedPolicy::RtRoundRobin),
+        3 => Ok(SchedPolicy::Batch),
         5 => Ok(SchedPolicy::Idle),
         6 => Ok(SchedPolicy::Deadline),
         _ => Err(Errno::EINVAL),
@@ -2096,6 +2147,7 @@ fn encode_linux_sched_policy(policy: SchedPolicy) -> usize {
         SchedPolicy::Fair => 0,
         SchedPolicy::RtFifo => 1,
         SchedPolicy::RtRoundRobin => 2,
+        SchedPolicy::Batch => 3,
         SchedPolicy::Idle => 5,
         SchedPolicy::Deadline => 6,
     }
@@ -3480,7 +3532,7 @@ fn pi_urgency(attr: SchedAttr) -> u16 {
     match attr.policy {
         SchedPolicy::Deadline => 400,
         SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => 200 + attr.priority as u16,
-        SchedPolicy::Fair => 100 + (19i16 - attr.nice as i16).max(0) as u16,
+        SchedPolicy::Fair | SchedPolicy::Batch => 100 + (19i16 - attr.nice as i16).max(0) as u16,
         SchedPolicy::Idle => 0,
     }
 }
@@ -6249,8 +6301,8 @@ pub(super) fn sys_perf_event_open(_ctx: &mut SyscallContext<'_>) -> Result<usize
 
 pub(super) fn sys_clock_adjtime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let clockid = ctx.args[0] as i32;
-    if clockid != crate::vdso::CLOCK_REALTIME as i32 {
-        // Linux 仅支持 CLOCK_REALTIME 与 CLOCK_TAI；本内核未实现 TAI。
+    // Linux 的 clock_adjtime 支持 CLOCK_REALTIME 与 CLOCK_TAI。
+    if clockid != crate::vdso::CLOCK_REALTIME as i32 && clockid != CLOCK_TAI as i32 {
         return Err(Errno::EINVAL);
     }
     adjtimex_common(ctx, 1)
@@ -6279,6 +6331,9 @@ pub(super) fn sys_kcmp(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     const KCMP_FILES: usize = 2;
     const KCMP_FS: usize = 3;
     const KCMP_SIGHAND: usize = 4;
+    const KCMP_IO: usize = 5;
+    const KCMP_SYSVSEM: usize = 6;
+    const KCMP_EPOLL_TFD: usize = 7;
 
     let pid1 = ctx.args[0] as i32;
     let pid2 = ctx.args[1] as i32;
@@ -6320,6 +6375,15 @@ pub(super) fn sys_kcmp(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             let sig2 = task2.shared_signal();
             Ok(kcmp_arc(&sig1, &sig2))
         }
+        KCMP_IO => {
+            // 本内核无独立 io_context；同线程组（同进程）视为共享同一 I/O 上下文，
+            // 与 Linux 对同进程线程的 KCMP_IO 返回 0 一致。
+            Ok(kcmp_arc(&task1.thread_group(), &task2.thread_group()))
+        }
+        // 取舍：KCMP_SYSVSEM 需比对 SysV 信号量 undo 表（TASKEXT_SEM_UNDO 由
+        // ipc.rs 维护，属只读边界），KCMP_EPOLL_TFD 需读取 epoll 目标文件
+        // （libs/vfs epoll 只读边界）；二者保持 EOPNOTSUPP 并在注释说明。
+        KCMP_SYSVSEM | KCMP_EPOLL_TFD => Err(Errno::EOPNOTSUPP),
         _ => Err(Errno::EOPNOTSUPP),
     }
 }
