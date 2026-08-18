@@ -565,9 +565,10 @@ fn seccomp_filter_syscall(ctx: &mut SyscallContext<'_>) -> bool {
         if crate::seccomp::SeccompState::strict_allows(ctx.nr) {
             return false;
         }
+        // strict 模式违规：发不可捕获的 SIGKILL（Linux 语义），而非可捕获的 SIGSYS。
         let _ = sched::operation::tkill(
             task.pid_root().unwrap_or(0),
-            Some(sched::SignalNumber::from_raw(31).unwrap_or(sched::SignalNumber::SIGSEGV)),
+            Some(sched::SignalNumber::SIGKILL),
         );
         return true;
     }
