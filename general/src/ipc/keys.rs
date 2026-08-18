@@ -962,7 +962,8 @@ impl KeyManager {
         let inner = key.inner.lock();
         match inner.key_type {
             KeyType::User => Ok(inner.payload.clone()),
-            KeyType::Logon => Err(Errno::EACCES),
+            // Linux 读取 logon key 返回 EOPNOTSUPP。
+            KeyType::Logon => Err(Errno::EOPNOTSUPP),
             KeyType::Keyring => Ok(inner
                 .members
                 .iter()
@@ -1371,5 +1372,14 @@ mod tests {
         manager.unlink(ring, id2, &creds).unwrap();
         assert!(manager.key(id2).is_err());
         assert!(quota_bytes(&manager, 1000) < quota_mid);
+    }
+
+    #[test]
+    fn read_logon_key_returns_eopnotsupp() {
+        let manager = KeyManager::new();
+        let key = manager
+            .create_uninstantiated(KeyType::Logon, "l", 1000, 1000, KEY_DEFAULT_PERM)
+            .unwrap();
+        assert_eq!(manager.read(key.id, &cred(1000, 0)), Err(Errno::EOPNOTSUPP));
     }
 }

@@ -1427,7 +1427,7 @@ pub(super) fn sys_add_key(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let now = now_sec_u64();
 
     let key_type_name = copy_cstr_from_user(type_user, 32).map_err(|e| e.as_errno())?;
-    let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENODEV)?;
+    let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENOKEY)?;
     let description = copy_cstr_from_user(desc_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?;
     let mut payload = vec![0u8; plen];
     if plen > 0 {
@@ -1450,7 +1450,7 @@ pub(super) fn sys_request_key(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     let process = process_keyrings(ctx);
 
     let key_type_name = copy_cstr_from_user(type_user, 32).map_err(|e| e.as_errno())?;
-    let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENODEV)?;
+    let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENOKEY)?;
     let description = copy_cstr_from_user(desc_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?;
     let info = if info_user != 0 {
         copy_cstr_from_user(info_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?
@@ -1677,7 +1677,7 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             let desc_user = ctx.args[3];
             let dest_keyring_arg = ctx.args[4] as i32;
             let key_type_name = copy_cstr_from_user(type_user, 32).map_err(|e| e.as_errno())?;
-            let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENODEV)?;
+            let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENOKEY)?;
             let description =
                 copy_cstr_from_user(desc_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?;
             let search_keyring =
@@ -1875,7 +1875,8 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             copy_to_user(buffer, &caps[..n]).map_err(|e| e.as_errno())?;
             Ok(n)
         }
-        _ => Err(Errno::EINVAL),
+        // Linux `keyctl` 对未知命令返回 EOPNOTSUPP。
+        _ => Err(Errno::EOPNOTSUPP),
     }
 }
 
