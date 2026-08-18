@@ -47,7 +47,7 @@ pub const TIOCSPTLCK: usize = 0x4004_5431;
 pub const TIOCGPTLCK: usize = 0x8004_5439;
 pub const TIOCGPTPEER: usize = 0x5441;
 pub const TIOCSIG: usize = 0x4004_5436;
-const TIOCPKT: usize = 0x5410;
+const TIOCPKT: usize = 0x5420;
 const TIOCGWINSZ: usize = 0x5413;
 const TIOCSWINSZ: usize = 0x5414;
 
