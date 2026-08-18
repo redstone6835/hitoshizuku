@@ -173,9 +173,8 @@ pub(super) fn sys_rt_sigtimedwait(ctx: &mut SyscallContext<'_>) -> Result<usize,
     let mut raw = [0u8; 8];
     copy_from_user(uthese, &mut raw).map_err(|e| e.as_errno())?;
     let these = SigSet::from_raw(u64::from_le_bytes(raw));
-    if these.0 == 0 {
-        return Err(Errno::EINVAL);
-    }
+    // 空信号集不是 EINVAL：让它流入下面的 poll + wait 路径——带 timeout 时
+    // 超时返回 EAGAIN，NULL timeout 时按 Linux 语义永久等待（可被信号打断）。
     #[cfg(feature = "trace-signal-wait")]
     log::info!(
         "[syscall][sigtimedwait] enter pid={:?} set={:#x} timeout_ptr={:#x}",
@@ -218,23 +217,27 @@ pub(super) fn sys_rt_sigtimedwait(ctx: &mut SyscallContext<'_>) -> Result<usize,
         ctx.task().pid_root(),
         timeout_ns,
     );
-    let got = sched::operation::sigtimedwait_wait(these, timeout_ns);
-    #[cfg(feature = "trace-signal-wait")]
-    log::info!(
-        "[syscall][sigtimedwait] resume pid={:?} ready={}",
-        ctx.task().pid_root(),
-        got,
-    );
-    if !got {
-        return Err(Errno::EAGAIN);
+    loop {
+        let got = sched::operation::sigtimedwait_wait(these, timeout_ns);
+        #[cfg(feature = "trace-signal-wait")]
+        log::info!(
+            "[syscall][sigtimedwait] resume pid={:?} ready={}",
+            ctx.task().pid_root(),
+            got,
+        );
+        if !got {
+            return Err(Errno::EAGAIN);
+        }
+        // 再次轮询。wait 返回 true 理论上应命中；但共享 pending 可能被同组其它
+        // 线程抢先取走（虚假唤醒/竞态），此时重试等待而非 panic。
+        let Some(info) = sched::operation::sigtimedwait_poll(these) else {
+            continue;
+        };
+        if uinfo_user != 0 {
+            write_siginfo(uinfo_user, &info)?;
+        }
+        return Ok(info.sig.as_usize());
     }
-    // 再次轮询；理论上 wait 出来应该命中。
-    let info = sched::operation::sigtimedwait_poll(these)
-        .expect("[sigtimedwait] wait returned but poll found nothing");
-    if uinfo_user != 0 {
-        write_siginfo(uinfo_user, &info)?;
-    }
-    Ok(info.sig.as_usize())
 }
 
 pub(super) fn sys_sigaltstack(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
