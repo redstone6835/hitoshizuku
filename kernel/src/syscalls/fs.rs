@@ -800,6 +800,9 @@ pub(super) fn sys_unlinkat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(ctx.args[1])?;
     let flags = ctx.args[2];
+    if (flags & !AT_REMOVEDIR) != 0 {
+        return Err(Errno::EINVAL);
+    }
     if (flags & AT_REMOVEDIR) != 0 {
         operation::rmdir(&vfs_ctx, &dirfd, &path).map_err(|e| e.to_errno())?;
     } else {
