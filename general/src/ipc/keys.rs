@@ -908,7 +908,8 @@ impl KeyManager {
     /// `keyctl(KEYCTL_INVALIDATE)`。
     pub fn invalidate(&self, key_id: KeyId, cred: &Credentials) -> Result<(), Errno> {
         let key = self.key(key_id)?;
-        if !permission_ok(&key, cred, KEY_POS_WRITE) {
+        // Linux `key_validate` 用 KEY_NEED_SEARCH 校验 KEYCTL_INVALIDATE。
+        if !permission_ok(&key, cred, KEY_POS_SEARCH) {
             return Err(Errno::EACCES);
         }
         key.set_state(KeyState::Revoked);
@@ -1237,6 +1238,26 @@ mod tests {
         assert!(
             search_process_keyrings(&process, &creds, &manager, KeyType::User, "absent", 0)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn invalidate_requires_search_not_write() {
+        let manager = KeyManager::new();
+        // 拥有者只有 SEARCH、没有 WRITE，仍可 invalidate（Linux KEY_NEED_SEARCH）。
+        let key = manager
+            .create_uninstantiated(KeyType::User, "k", 1000, 1000, KEY_POS_SEARCH)
+            .unwrap();
+        assert_eq!(manager.invalidate(key.id, &cred(1000, 0)), Ok(()));
+        assert_eq!(key.state(), KeyState::Revoked);
+
+        // 没有任何权限的 key 不可 invalidate。
+        let no_perm = manager
+            .create_uninstantiated(KeyType::User, "k2", 1000, 1000, 0)
+            .unwrap();
+        assert_eq!(
+            manager.invalidate(no_perm.id, &cred(1000, 0)),
+            Err(Errno::EACCES)
         );
     }
 }
