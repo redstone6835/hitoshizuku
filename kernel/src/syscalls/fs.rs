@@ -4155,9 +4155,10 @@ pub(super) fn sys_move_mount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
 /// `open_tree(2)`：OPEN_TREE_CLONE 时创建目标挂载的克隆上下文 fd
 /// （move_mount 可将其挂到新位置）。
 pub(super) fn sys_open_tree(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let dirfd = ctx.args[0];
-    let path_user = ctx.args[1];
-    let flags = ctx.args[2] as u32;
+    open_tree_common(ctx.args[0], ctx.args[1], ctx.args[2] as u32)
+}
+
+fn open_tree_common(dirfd_raw: usize, path_user: usize, flags: u32) -> Result<usize, Errno> {
     // asm-generic（LoongArch/RISC-V）O_CLOEXEC=0x80000；x86 为 0o200000。
     const OPEN_TREE_CLOEXEC_ANY: u32 = 0o200000 | 0x80000;
     if flags & !(vfs::fs_context::OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC_ANY) != 0 {
@@ -4167,7 +4168,7 @@ pub(super) fn sys_open_tree(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let path = copy_path_from_user(path_user)?;
-    let dirfd = dirfd_arg(dirfd, &fdt)?;
+    let dirfd = dirfd_arg(dirfd_raw, &fdt)?;
     let result = vfs::path::lookup(&vfs_ctx, &dirfd, &path, LookupFlags::DIRECTORY)
         .map_err(|e| e.to_errno())?;
     // 目标路径所在挂载（若路径本身是挂载点则取覆盖其上的挂载）。
@@ -4592,7 +4593,10 @@ pub(super) fn sys_statmount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         return Err(Errno::EINVAL);
     }
     let snapshot = mount_snapshot(&vfs_ctx);
-    let entry = snapshot.iter().find(|e| e.id == mnt_id).ok_or(Errno::ENOENT)?;
+    let entry = snapshot
+        .iter()
+        .find(|e| e.id == mnt_id)
+        .ok_or(Errno::ENOENT)?;
     let m = &entry.mount;
 
     // 字符串区：fs_type 名、挂载根 "/"、挂载点路径。
@@ -4681,16 +4685,120 @@ pub(super) fn sys_listmount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     Ok(ids.len())
 }
 
-pub(super) fn sys_open_tree_attr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// `open_tree_attr(2)`：open_tree 的扩展入口。当前内核不处理追加的 mount_attr
+/// 参数，按 open_tree 语义落位（挂载属性通过后续 fsmount/mount_setattr 应用）。
+pub(super) fn sys_open_tree_attr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    open_tree_common(ctx.args[0], ctx.args[1], ctx.args[2] as u32)
 }
 
-pub(super) fn sys_file_getattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+// `file_getattr`/`file_setattr`（Linux 6.15+）按 fd 读取/设置扩展文件属性。
+// vendor linux-raw-sys 仅携带 XFS ioctl 的 `struct file_attr`（fa_xflags 等），
+// 未含新 syscall 的 ABI；此处按 Linux 6.15+ 文档的定长头部做 best-effort 映射：
+//   fa_valid(u64) + mode/uid/gid/xflags(u32×4) + size/atime/mtime/ctime(s64+s32)。
+const FILE_ATTR_SIZE: usize = 80;
+const FILE_ATTR_VALID_MODE: u64 = 1 << 0;
+const FILE_ATTR_VALID_UID: u64 = 1 << 1;
+const FILE_ATTR_VALID_GID: u64 = 1 << 2;
+const FILE_ATTR_VALID_XFLAGS: u64 = 1 << 3;
+const FILE_ATTR_VALID_SIZE: u64 = 1 << 4;
+const FILE_ATTR_VALID_ATIME: u64 = 1 << 5;
+const FILE_ATTR_VALID_MTIME: u64 = 1 << 6;
+const FILE_ATTR_VALID_CTIME: u64 = 1 << 7;
+
+pub(super) fn sys_file_getattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let fd = fd_arg(ctx.args[0])?;
+    let fa_user = ctx.args[3];
+    let size = ctx.args[4];
+    if fa_user == 0 || size < FILE_ATTR_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let st = operation::fstat(&fdt, fd).map_err(|e| e.to_errno())?;
+    let mut out = [0u8; FILE_ATTR_SIZE];
+    let valid = FILE_ATTR_VALID_MODE
+        | FILE_ATTR_VALID_UID
+        | FILE_ATTR_VALID_GID
+        | FILE_ATTR_VALID_SIZE
+        | FILE_ATTR_VALID_ATIME
+        | FILE_ATTR_VALID_MTIME
+        | FILE_ATTR_VALID_CTIME;
+    put_u64(&mut out, 0, valid);
+    put_u32(&mut out, 8, st.mode & 0o7777);
+    put_u32(&mut out, 12, st.uid);
+    put_u32(&mut out, 16, st.gid);
+    put_u32(&mut out, 20, 0);
+    put_i64(&mut out, 24, st.size);
+    put_i64(&mut out, 32, st.atime.secs);
+    put_u32(&mut out, 40, st.atime.nsecs);
+    put_i64(&mut out, 48, st.mtime.secs);
+    put_u32(&mut out, 56, st.mtime.nsecs);
+    put_i64(&mut out, 64, st.ctime.secs);
+    put_u32(&mut out, 72, st.ctime.nsecs);
+    copy_to_user(fa_user, &out).map_err(|e| e.as_errno())?;
+    Ok(0)
 }
 
-pub(super) fn sys_file_setattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_file_setattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let fd = fd_arg(ctx.args[0])?;
+    let fa_user = ctx.args[3];
+    let size = ctx.args[4];
+    if fa_user == 0 || size < FILE_ATTR_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let mut raw = [0u8; FILE_ATTR_SIZE];
+    copy_from_user(fa_user, &mut raw).map_err(|e| e.as_errno())?;
+    let valid = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+    if valid
+        & !(FILE_ATTR_VALID_MODE
+            | FILE_ATTR_VALID_UID
+            | FILE_ATTR_VALID_GID
+            | FILE_ATTR_VALID_SIZE
+            | FILE_ATTR_VALID_ATIME
+            | FILE_ATTR_VALID_MTIME)
+        != 0
+    {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if valid & (FILE_ATTR_VALID_MODE | FILE_ATTR_VALID_UID | FILE_ATTR_VALID_GID) != 0 {
+        let mode = FileMode::new(u32::from_le_bytes(raw[8..12].try_into().unwrap()) as u16);
+        let uid = u32::from_le_bytes(raw[12..16].try_into().unwrap());
+        let gid = u32::from_le_bytes(raw[16..20].try_into().unwrap());
+        let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+        if valid & FILE_ATTR_VALID_MODE != 0 {
+            operation::fchmod(&vfs_ctx, &fdt, fd, mode).map_err(|e| e.to_errno())?;
+        }
+        if valid & (FILE_ATTR_VALID_UID | FILE_ATTR_VALID_GID) != 0 {
+            let uid = (valid & FILE_ATTR_VALID_UID != 0).then_some(Uid(uid));
+            let gid = (valid & FILE_ATTR_VALID_GID != 0).then_some(Gid(gid));
+            if uid.is_some() || gid.is_some() {
+                operation::fchown(&vfs_ctx, &fdt, fd, uid, gid).map_err(|e| e.to_errno())?;
+            }
+        }
+        drop(file);
+    }
+    if valid & FILE_ATTR_VALID_SIZE != 0 {
+        let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+        let size = i64::from_le_bytes(raw[24..32].try_into().unwrap());
+        if size < 0 {
+            return Err(Errno::EINVAL);
+        }
+        file.truncate(size as u64).map_err(|e| e.to_errno())?;
+    }
+    if valid & (FILE_ATTR_VALID_ATIME | FILE_ATTR_VALID_MTIME) != 0 {
+        let atime = (valid & FILE_ATTR_VALID_ATIME != 0).then(|| Timespec {
+            secs: i64::from_le_bytes(raw[32..40].try_into().unwrap()),
+            nsecs: u32::from_le_bytes(raw[40..44].try_into().unwrap()),
+        });
+        let mtime = (valid & FILE_ATTR_VALID_MTIME != 0).then(|| Timespec {
+            secs: i64::from_le_bytes(raw[48..56].try_into().unwrap()),
+            nsecs: u32::from_le_bytes(raw[56..60].try_into().unwrap()),
+        });
+        operation::futimens(&vfs_ctx, &fdt, fd, atime, mtime).map_err(|e| e.to_errno())?;
+    }
+    Ok(0)
 }
 
 fn timeout_deadline(timeout_ms: i64) -> Option<u64> {
