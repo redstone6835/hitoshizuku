@@ -384,10 +384,17 @@ pub(super) fn sys_newfstatat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     let flags = ctx.args[3];
 
     let st = if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
-        let fd = fd_arg(raw_dirfd)?;
-        operation::fstat(&fdt, fd).map_err(|e| e.to_errno())?
+        if raw_dirfd as i32 == AT_FDCWD {
+            let r = vfs::path::lookup(&vfs_ctx, &Dirfd::Cwd, ".", LookupFlags::default())
+                .map_err(|e| e.to_errno())?;
+            let inode = r.dentry.inode().ok_or(Errno::ENOENT)?;
+            inode.stat().map_err(|e| e.to_errno())?
+        } else {
+            let fd = fd_arg(raw_dirfd)?;
+            operation::fstat(&fdt, fd).map_err(|e| e.to_errno())?
+        }
     } else {
-        let dirfd = dirfd_arg(raw_dirfd, &fdt)?;
+        let dirfd = dirfd_arg_for_path(raw_dirfd, &path, &fdt)?;
         operation::fstatat(&vfs_ctx, &dirfd, &path, (flags & AT_SYMLINK_NOFOLLOW) != 0)
             .map_err(|e| e.to_errno())?
     };
@@ -432,7 +439,7 @@ pub(super) fn sys_statx(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             )
         }
     } else {
-        let dirfd = dirfd_arg(raw_dirfd, &fdt)?;
+        let dirfd = dirfd_arg_for_path(raw_dirfd, &path, &fdt)?;
         let r = vfs::path::lookup(
             &vfs_ctx,
             &dirfd,
@@ -471,8 +478,8 @@ pub(super) fn sys_statx(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_readlinkat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(ctx.args[1])?;
+    let dirfd = dirfd_arg_for_path(ctx.args[0], &path, &fdt)?;
     let buf = ctx.args[2];
     let size = ctx.args[3];
 
@@ -5481,6 +5488,15 @@ fn dirfd_arg(raw: usize, fdt: &vfs::fdtable::FdTable) -> Result<Dirfd, Errno> {
     Ok(Dirfd::Fd(file))
 }
 
+/// 绝对路径时忽略 dirfd（Linux 语义：不校验 fd 是否有效）。
+fn dirfd_arg_for_path(raw: usize, path: &str, fdt: &vfs::fdtable::FdTable) -> Result<Dirfd, Errno> {
+    if path.starts_with('/') {
+        Ok(Dirfd::Cwd)
+    } else {
+        dirfd_arg(raw, fdt)
+    }
+}
+
 fn file_for_fd(fd: Fd) -> Result<Arc<vfs::file::File>, Errno> {
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     fdt.get_file(fd).ok_or(Errno::EBADF)
@@ -5544,14 +5560,21 @@ fn faccessat_common(ctx: &mut SyscallContext<'_>, has_flags: bool) -> Result<usi
     }
 
     let (st, readonly) = if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
-        let fd = fd_arg(raw_dirfd)?;
-        let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
-        (
-            file.stat().map_err(|e| e.to_errno())?,
-            file.mount().is_rdonly(),
-        )
+        if raw_dirfd as i32 == AT_FDCWD {
+            let r = vfs::path::lookup(&vfs_ctx, &Dirfd::Cwd, ".", LookupFlags::default())
+                .map_err(|e| e.to_errno())?;
+            let inode = r.dentry.inode().ok_or(Errno::ENOENT)?;
+            (inode.stat().map_err(|e| e.to_errno())?, r.mount.is_rdonly())
+        } else {
+            let fd = fd_arg(raw_dirfd)?;
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            (
+                file.stat().map_err(|e| e.to_errno())?,
+                file.mount().is_rdonly(),
+            )
+        }
     } else {
-        let dirfd = dirfd_arg(raw_dirfd, &fdt)?;
+        let dirfd = dirfd_arg_for_path(raw_dirfd, &path, &fdt)?;
         let lookup_flags = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
             LookupFlags::NO_FOLLOW
         } else {
