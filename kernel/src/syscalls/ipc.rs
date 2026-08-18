@@ -1155,11 +1155,13 @@ pub(super) fn sys_semctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 return Err(Errno::EFAULT);
             }
             let values = manager.get_all(id, &cred)?;
+            // `semun.array` 是 `unsigned short *`（2 字节/元素，Linux 语义）：
+            // 每个值按 2 字节小端写出（内部值经 `0..=SEMVMX` 校验，恰好 fit u16）。
             for (index, value) in values.iter().enumerate() {
                 let address = arg
-                    .checked_add(index * size_of::<i32>())
+                    .checked_add(index * size_of::<u16>())
                     .ok_or(Errno::EFAULT)?;
-                copy_to_user(address, &value.to_le_bytes()).map_err(|e| e.as_errno())?;
+                copy_to_user(address, &(*value as u16).to_le_bytes()).map_err(|e| e.as_errno())?;
             }
             Ok(0)
         }
@@ -1169,13 +1171,15 @@ pub(super) fn sys_semctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             }
             let nsems = manager.stat(id, &cred)?.nsems;
             let mut values = vec![0i32; nsems];
+            // `semun.array` 是 `unsigned short *`（2 字节/元素，Linux 语义）：
+            // 每个元素读 2 字节小端，汇入 `Vec<i32>`（范围校验由 `set_all` 保留）。
             for (index, slot) in values.iter_mut().enumerate() {
                 let address = arg
-                    .checked_add(index * size_of::<i32>())
+                    .checked_add(index * size_of::<u16>())
                     .ok_or(Errno::EFAULT)?;
-                let mut raw = [0u8; 4];
+                let mut raw = [0u8; 2];
                 copy_from_user(address, &mut raw).map_err(|e| e.as_errno())?;
-                *slot = i32::from_le_bytes(raw);
+                *slot = u16::from_le_bytes(raw) as i32;
             }
             let set = manager.set_all(id, &values, &cred, pid, now)?;
             sem_undo_table(ctx).clear(id);
