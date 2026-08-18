@@ -181,7 +181,7 @@ fn put_i32(buf: &mut [u8], off: usize, value: i32) {
 fn write_signalfd_siginfo(buf: &mut [u8], info: SigInfo) {
     buf.fill(0);
     put_u32(buf, 0, info.sig.raw() as u32);
-    put_i32(buf, 4, info.code);
+    put_i32(buf, 8, info.code);
     put_u32(buf, 12, info.sender_pid as u32);
     put_u32(buf, 16, info.sender_uid.0);
     if let Some(raw) = info.raw {
@@ -193,7 +193,7 @@ fn write_signalfd_siginfo(buf: &mut [u8], info: SigInfo) {
         }
         put_i32(
             buf,
-            4,
+            8,
             i32::from_ne_bytes(raw[8..12].try_into().unwrap_or([0; 4])),
         );
     }

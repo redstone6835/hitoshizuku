@@ -110,6 +110,7 @@ const CMSG_HEADER_LEN: usize = 16;
 const MAX_SCM_RIGHTS_FDS: usize = 253;
 const MAX_SOCKADDR_LEN: usize = 110;
 const SIOCATMARK: usize = 0x8905;
+const FIONREAD: usize = 0x541b;
 
 struct SocketFs {
     mount: Arc<Mount>,
@@ -406,6 +407,9 @@ impl FileOps for SocketFileOps {
     fn ioctl(&self, cmd: IoctlCmd, arg: usize) -> Result<usize, Errno> {
         if cmd.raw() == SIOCATMARK {
             return Ok(self.socket.sock_at_mark() as usize);
+        }
+        if cmd.raw() == FIONREAD {
+            return Ok(self.socket.readable_bytes());
         }
         crate::net_socket::dispatch_net_ioctl(cmd.raw() as u32, arg)
     }

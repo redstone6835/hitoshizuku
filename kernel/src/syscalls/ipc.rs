@@ -910,7 +910,7 @@ pub(super) fn sys_mq_getsetattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
         // Linux `mq_setattr` 只能改 `mq_flags`（O_NONBLOCK）；`mq_maxmsg`/
         // `mq_msgsize` 的改动被忽略（容量由 `mq_open` 时确定，不可再改）。
         if flags != old_flags {
-            file.set_status_flags(false, flags & O_NONBLOCK != 0, false, false);
+            file.set_status_flags(false, flags & O_NONBLOCK != 0, false, false, false);
         }
     }
 

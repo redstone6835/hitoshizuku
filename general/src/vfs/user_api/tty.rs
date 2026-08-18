@@ -464,6 +464,13 @@ where
             if pgid <= 0 {
                 return Err(Errno::EINVAL);
             }
+            // 目标进程组必须存在,否则 ESRCH。
+            operation::getpgid(pgid)?;
+            // 目标进程组必须属于当前会话,否则 EPERM。
+            let pgid_sid = operation::getsid(pgid)?;
+            if pgid_sid != ctx.session_id()? {
+                return Err(Errno::EPERM);
+            }
             state.set_foreground_pgrp(pgid);
             Ok(0)
         }
@@ -562,25 +569,36 @@ where
             Ok(0)
         }
         TIOCSCTTY => {
-            // Linux 语义:仅会话首进程可设置;arg=1 允许抢占已有控制终端。
+            // Linux 语义:仅会话首进程可设置。
             if !ctx.is_session_leader() {
                 return Err(Errno::EPERM);
             }
             let steal = arg != 0;
-            if !steal && ctx.session_ctty().is_some() {
+            // 无论是否抢占,调用者都不得已拥有控制终端。
+            if ctx.session_ctty().is_some() {
                 return Err(Errno::EPERM);
             }
-            if steal {
-                if let Some(old) = ctx.session_ctty() {
-                    if let Some(old_core) = crate::dev::tty::core::resolve_ctty_cookie(old) {
-                        old_core.signal_foreground(sched::SignalNumber::SIGHUP);
-                        old_core.set_session_sid(None);
-                    }
-                }
-            }
+            // 抢占对象是「目标终端」而非调用者旧 ctty。
             let Some(cookie) = state.ctty_cookie() else {
                 return Err(Errno::ENOTTY);
             };
+            if state.session_sid().is_some() {
+                // 目标终端已归属某会话:非抢占模式直接拒绝。
+                if !steal {
+                    return Err(Errno::EPERM);
+                }
+                // 抢占已有控制终端需要 CAP_SYS_ADMIN。
+                let has_sys_admin = crate::vfs::current_vfs_context()
+                    .map(|ctx| ctx.cred().has_cap(vfs::cred::Capability::SysAdmin))
+                    .unwrap_or(false);
+                if !has_sys_admin {
+                    return Err(Errno::EPERM);
+                }
+                // 本内核无逐会话 ctty 清除 API,以清目标终端 session_sid + SIGHUP
+                // 近似「抢占」,被抢占会话的 Session.ctty 字段不在此处清除。
+                state.signal_foreground(sched::SignalNumber::SIGHUP);
+                state.set_session_sid(None);
+            }
             ctx.set_session_ctty(Some(cookie))?;
             state.set_session_sid(operation::getsid(0).ok());
             if state.foreground_pgrp() <= 0 {
@@ -594,11 +612,15 @@ where
                 return Err(Errno::ENOTTY);
             }
             if ctx.is_session_leader() {
-                return Err(Errno::EINVAL);
+                // 会话首进程:向前台进程组发 SIGHUP + SIGCONT,然后全量脱离。
+                state.signal_foreground(sched::SignalNumber::SIGHUP);
+                state.signal_foreground(sched::SignalNumber::SIGCONT);
+                ctx.set_session_ctty(None)?;
+                state.set_session_sid(None);
+                return Ok(0);
             }
-            state.signal_foreground(sched::SignalNumber::SIGHUP);
-            ctx.set_session_ctty(None)?;
-            state.set_session_sid(None);
+            // 非首进程:本内核 ctty 存于 Session 级(无逐进程 ctty),只能整体维护。
+            // 不清会话级 ctty/session_sid 即等价于「自身脱离而不影响会话其余进程」。
             Ok(0)
         }
         _ => Err(Errno::ENOTTY),

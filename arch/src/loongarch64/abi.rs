@@ -78,6 +78,7 @@ pub fn decode_open_flags(raw: u32) -> OpenOptions {
         append: raw & 0o2000 != 0,
         nonblock: raw & 0o4000 != 0,
         direct: raw & 0o40000 != 0,
+        async_: raw & 0o20000 != 0,
         sync: raw & 0o4010000 != 0,
         directory: raw & 0o200000 != 0,
         nofollow: raw & 0o400000 != 0,

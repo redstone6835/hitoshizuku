@@ -69,6 +69,7 @@ const O_DIRECTORY: usize = 0o00200000;
 const O_NOFOLLOW: usize = 0o00400000;
 const O_NOCTTY: usize = 0o00000400;
 const O_DSYNC: usize = 0o00010000;
+const O_ASYNC: usize = 0o00020000;
 const O_DIRECT: usize = 0o00040000;
 const O_NOATIME: usize = 0o01000000;
 const O_CLOEXEC: usize = 0o02000000;
@@ -169,6 +170,13 @@ const F_ADD_SEALS: usize = 1033;
 const F_GET_SEALS: usize = 1034;
 const FD_CLOEXEC: usize = 1;
 const FIONBIO: usize = 0x5421;
+const FIOASYNC: usize = 0x5452;
+const FIOSETOWN: usize = 0x8901;
+const SIOCSPGRP: usize = 0x8902;
+const FIOGETOWN: usize = 0x8903;
+const SIOCGPGRP: usize = 0x8904;
+const FIONREAD: usize = 0x541b;
+const FIOQSIZE: usize = 0x5460;
 
 const F_RDLCK: i16 = 0;
 const F_WRLCK: i16 = 1;
@@ -587,6 +595,7 @@ pub(super) fn sys_fcntl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 (arg & O_NONBLOCK) != 0,
                 current.sync, // O_SYNC 不可经 F_SETFL 修改，保留 open 时值
                 (arg & O_DIRECT) != 0,
+                (arg & O_ASYNC) != 0,
             );
             Ok(0)
         }
@@ -704,8 +713,63 @@ pub(super) fn sys_ioctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if cmd.raw() == FIONBIO {
         let enabled = read_user_i32(ctx.args[2])? != 0;
         let flags = file.flags();
-        file.set_status_flags(flags.append, enabled, flags.sync, flags.direct);
+        file.set_status_flags(
+            flags.append,
+            enabled,
+            flags.sync,
+            flags.direct,
+            flags.async_,
+        );
         return Ok(0);
+    }
+    if cmd.raw() == FIOASYNC {
+        let on = read_user_i32(ctx.args[2])? != 0;
+        file.set_fasync(on);
+        return Ok(0);
+    }
+    if cmd.raw() == FIOSETOWN {
+        let owner = read_user_i32(ctx.args[2])?;
+        if owner < 0 {
+            file.set_owner(F_OWNER_PGRP, owner.wrapping_neg());
+        } else {
+            file.set_owner(F_OWNER_PID, owner);
+        }
+        return Ok(0);
+    }
+    if cmd.raw() == SIOCSPGRP {
+        let pgid = read_user_i32(ctx.args[2])?;
+        if pgid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        file.set_owner(F_OWNER_PGRP, pgid);
+        return Ok(0);
+    }
+    if cmd.raw() == FIOGETOWN {
+        let (t, pid) = file.owner();
+        let owner = if t == F_OWNER_PGRP {
+            pid.wrapping_neg()
+        } else {
+            pid
+        };
+        return Ok(owner as isize as usize);
+    }
+    if cmd.raw() == SIOCGPGRP {
+        let (_, pid) = file.owner();
+        return Ok(pid as usize);
+    }
+    if cmd.raw() == FIONREAD {
+        if let Some(pipe) = vfs::pipe::pipe_of(&file) {
+            let bytes = pipe.available_len() as u32;
+            copy_to_user(ctx.args[2], &bytes.to_ne_bytes()).map_err(|e| e.as_errno())?;
+            return Ok(0);
+        }
+    }
+    if cmd.raw() == FIOQSIZE {
+        if file.inode().kind() == FileType::Regular {
+            let size = file.inode().size() as i64;
+            copy_to_user(ctx.args[2], &size.to_ne_bytes()).map_err(|e| e.as_errno())?;
+            return Ok(0);
+        }
     }
     if cmd.raw() == general::dev::tty::TIOCGPTPEER {
         return sys_tiocgptpeer(ctx, &file);
@@ -1947,6 +2011,7 @@ pub(super) fn sys_signalfd4(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         (flags & O_NONBLOCK) != 0,
         current.sync,
         current.direct,
+        current.async_,
     );
     Ok(fd.as_raw() as usize)
 }
@@ -3620,6 +3685,19 @@ pub(super) fn sys_splice(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
     let in_file = file_for_fd(fd_in)?;
     let out_file = file_for_fd(fd_out)?;
+    // splice 至少一端必须是管道,否则 EINVAL。
+    let in_pipe = vfs::pipe::pipe_of(&in_file).is_some();
+    let out_pipe = vfs::pipe::pipe_of(&out_file).is_some();
+    if !in_pipe && !out_pipe {
+        return Err(Errno::EINVAL);
+    }
+    // 非 seekable 描述符不接受非 NULL offset,否则 ESPIPE。
+    if off_in_user != 0 && !in_file.is_seekable() {
+        return Err(Errno::ESPIPE);
+    }
+    if off_out_user != 0 && !out_file.is_seekable() {
+        return Err(Errno::ESPIPE);
+    }
     let mut in_off = read_optional_offset(off_in_user)?;
     let mut out_off = read_optional_offset(off_out_user)?;
     let copied = copy_between_files(
@@ -5716,6 +5794,9 @@ fn open_options_to_linux_flags(opts: &OpenOptions) -> usize {
     if opts.direct {
         raw |= O_DIRECT;
     }
+    if opts.async_ {
+        raw |= O_ASYNC;
+    }
     raw
 }
 
@@ -5739,6 +5820,7 @@ fn decode_open_options(raw: usize) -> Result<OpenOptions, Errno> {
         nonblock: (raw & O_NONBLOCK) != 0,
         sync: (raw & (O_SYNC | O_DSYNC)) != 0,
         direct: (raw & O_DIRECT) != 0,
+        async_: (raw & O_ASYNC) != 0,
         cloexec: (raw & O_CLOEXEC) != 0,
     })
 }
@@ -5787,6 +5869,7 @@ fn validate_openat2_flags(raw: usize) -> Result<(), Errno> {
         | O_APPEND
         | O_NONBLOCK
         | O_DSYNC
+        | O_ASYNC
         | O_DIRECT
         | O_DIRECTORY
         | O_NOFOLLOW
