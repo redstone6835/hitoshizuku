@@ -5816,6 +5816,11 @@ fn ptrace_target_task(pid: i32) -> Result<Arc<Task>, Errno> {
     if !sched::operation::ptrace_may_access(&me, &target) {
         return Err(Errno::EPERM);
     }
+    // 仅允许记录中的 tracer 操作（与 sched::operation::ptrace_target 的
+    // PEEK/POKE/GETREGS/GETSIGINFO 等入口保持一致）。
+    if !target.ptracer_is(&me) {
+        return Err(Errno::EPERM);
+    }
     Ok(target)
 }
 
