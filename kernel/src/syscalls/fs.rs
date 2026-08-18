@@ -384,10 +384,17 @@ pub(super) fn sys_newfstatat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     let flags = ctx.args[3];
 
     let st = if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
-        let fd = fd_arg(raw_dirfd)?;
-        operation::fstat(&fdt, fd).map_err(|e| e.to_errno())?
+        if raw_dirfd as i32 == AT_FDCWD {
+            let r = vfs::path::lookup(&vfs_ctx, &Dirfd::Cwd, ".", LookupFlags::default())
+                .map_err(|e| e.to_errno())?;
+            let inode = r.dentry.inode().ok_or(Errno::ENOENT)?;
+            inode.stat().map_err(|e| e.to_errno())?
+        } else {
+            let fd = fd_arg(raw_dirfd)?;
+            operation::fstat(&fdt, fd).map_err(|e| e.to_errno())?
+        }
     } else {
-        let dirfd = dirfd_arg(raw_dirfd, &fdt)?;
+        let dirfd = dirfd_arg_for_path(raw_dirfd, &path, &fdt)?;
         operation::fstatat(&vfs_ctx, &dirfd, &path, (flags & AT_SYMLINK_NOFOLLOW) != 0)
             .map_err(|e| e.to_errno())?
     };
@@ -432,7 +439,7 @@ pub(super) fn sys_statx(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             )
         }
     } else {
-        let dirfd = dirfd_arg(raw_dirfd, &fdt)?;
+        let dirfd = dirfd_arg_for_path(raw_dirfd, &path, &fdt)?;
         let r = vfs::path::lookup(
             &vfs_ctx,
             &dirfd,
@@ -471,8 +478,8 @@ pub(super) fn sys_statx(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_readlinkat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(ctx.args[1])?;
+    let dirfd = dirfd_arg_for_path(ctx.args[0], &path, &fdt)?;
     let buf = ctx.args[2];
     let size = ctx.args[3];
 
@@ -488,8 +495,14 @@ pub(super) fn sys_getcwd(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::ENOENT)?;
     let user = ctx.args[0];
     let size = ctx.args[1];
-    let mut path = namespace_path(&vfs_ctx, &vfs_ctx.cwd(), &vfs_ctx.cwd_mount())
-        .unwrap_or_else(|| String::from("/"));
+    if size == 0 {
+        return Err(Errno::EINVAL);
+    }
+    if !vfs_ctx.cwd().is_positive() {
+        return Err(Errno::ENOENT);
+    }
+    let mut path =
+        namespace_path(&vfs_ctx, &vfs_ctx.cwd(), &vfs_ctx.cwd_mount()).ok_or(Errno::ENOENT)?;
     if path.is_empty() {
         path.push('/');
     }
@@ -568,10 +581,11 @@ pub(super) fn sys_fcntl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         F_SETFL => {
             let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            let current = file.flags();
             file.set_status_flags(
                 (arg & O_APPEND) != 0,
                 (arg & O_NONBLOCK) != 0,
-                (arg & O_SYNC) != 0,
+                current.sync, // O_SYNC 不可经 F_SETFL 修改，保留 open 时值
                 (arg & O_DIRECT) != 0,
             );
             Ok(0)
@@ -786,6 +800,9 @@ pub(super) fn sys_unlinkat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(ctx.args[1])?;
     let flags = ctx.args[2];
+    if (flags & !AT_REMOVEDIR) != 0 {
+        return Err(Errno::EINVAL);
+    }
     if (flags & AT_REMOVEDIR) != 0 {
         operation::rmdir(&vfs_ctx, &dirfd, &path).map_err(|e| e.to_errno())?;
     } else {
@@ -1035,6 +1052,9 @@ pub(super) fn sys_utimensat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         return Err(Errno::EINVAL);
     }
     let (atime, mtime) = decode_utimens_times(times_user)?;
+    if atime.is_none() && mtime.is_none() {
+        return Ok(0);
+    }
 
     if path_user == 0 {
         if flags != 0 {
@@ -1108,6 +1128,9 @@ pub(super) fn sys_ftruncate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let fd = fd_arg(ctx.args[0])?;
     let size = nonnegative_i64_arg(ctx.args[1])?;
     let file = file_for_fd(fd)?;
+    if file.inode().kind() == FileType::Directory {
+        return Err(Errno::EISDIR);
+    }
     if !file.flags().writable() {
         return Err(Errno::EINVAL);
     }
@@ -5537,6 +5560,15 @@ fn dirfd_arg(raw: usize, fdt: &vfs::fdtable::FdTable) -> Result<Dirfd, Errno> {
     Ok(Dirfd::Fd(file))
 }
 
+/// 绝对路径时忽略 dirfd（Linux 语义：不校验 fd 是否有效）。
+fn dirfd_arg_for_path(raw: usize, path: &str, fdt: &vfs::fdtable::FdTable) -> Result<Dirfd, Errno> {
+    if path.starts_with('/') {
+        Ok(Dirfd::Cwd)
+    } else {
+        dirfd_arg(raw, fdt)
+    }
+}
+
 fn file_for_fd(fd: Fd) -> Result<Arc<vfs::file::File>, Errno> {
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     fdt.get_file(fd).ok_or(Errno::EBADF)
@@ -5578,10 +5610,8 @@ fn copy_readlink_target(buf: usize, size: usize, target: &str) -> Result<usize, 
     if size == 0 {
         return Err(Errno::EINVAL);
     }
-    let n = bytes.len().min(size - 1);
+    let n = bytes.len().min(size);
     copy_to_user(buf, &bytes[..n]).map_err(|e| e.as_errno())?;
-    // 尾加 NUL，兼容 POSIX readlink(2) 语义
-    copy_to_user(buf + n, &[0u8]).map_err(|e| e.as_errno())?;
     Ok(n)
 }
 
@@ -5600,14 +5630,21 @@ fn faccessat_common(ctx: &mut SyscallContext<'_>, has_flags: bool) -> Result<usi
     }
 
     let (st, readonly) = if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
-        let fd = fd_arg(raw_dirfd)?;
-        let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
-        (
-            file.stat().map_err(|e| e.to_errno())?,
-            file.mount().is_rdonly(),
-        )
+        if raw_dirfd as i32 == AT_FDCWD {
+            let r = vfs::path::lookup(&vfs_ctx, &Dirfd::Cwd, ".", LookupFlags::default())
+                .map_err(|e| e.to_errno())?;
+            let inode = r.dentry.inode().ok_or(Errno::ENOENT)?;
+            (inode.stat().map_err(|e| e.to_errno())?, r.mount.is_rdonly())
+        } else {
+            let fd = fd_arg(raw_dirfd)?;
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            (
+                file.stat().map_err(|e| e.to_errno())?,
+                file.mount().is_rdonly(),
+            )
+        }
     } else {
-        let dirfd = dirfd_arg(raw_dirfd, &fdt)?;
+        let dirfd = dirfd_arg_for_path(raw_dirfd, &path, &fdt)?;
         let lookup_flags = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
             LookupFlags::NO_FOLLOW
         } else {
@@ -6211,6 +6248,13 @@ fn write_iovecs(
     mut offset: Option<u64>,
     nowait: bool,
 ) -> Result<usize, Errno> {
+    // 进入循环前先累加各段 len 校验溢出，避免部分 I/O 之后才返回 EINVAL。
+    let mut total_len = 0usize;
+    for i in 0..iovcnt {
+        let (_, len) = read_iovec(iov, i)?;
+        total_len = total_len.checked_add(len).ok_or(Errno::EINVAL)?;
+    }
+
     let mut total = 0usize;
     for i in 0..iovcnt {
         let (base, len) = read_iovec(iov, i)?;
@@ -6243,6 +6287,13 @@ fn read_iovecs(
     mut offset: Option<u64>,
     nowait: bool,
 ) -> Result<usize, Errno> {
+    // 进入循环前先累加各段 len 校验溢出，避免部分 I/O 之后才返回 EINVAL。
+    let mut total_len = 0usize;
+    for i in 0..iovcnt {
+        let (_, len) = read_iovec(iov, i)?;
+        total_len = total_len.checked_add(len).ok_or(Errno::EINVAL)?;
+    }
+
     let mut total = 0usize;
     for i in 0..iovcnt {
         let (base, len) = read_iovec(iov, i)?;

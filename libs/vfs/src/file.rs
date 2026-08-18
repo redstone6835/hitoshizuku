@@ -858,14 +858,17 @@ impl File {
     pub fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
         #[cfg(feature = "performance-profile")]
         let mut profile = profiling::scope(profiling::Event::VfsWrite);
-        if !self.flags().writable() {
+        let flags = self.flags();
+        if !flags.writable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
         if !self.ops.is_seekable() {
             return Err(crate::vfs::error::VfsError::IllegalSeek);
         }
         let _data_mutation = (!buf.is_empty()).then(|| self.inode.begin_data_mutation());
-        let n = self.ops.write_at(buf, offset)?;
+        // O_APPEND 下 `pwrite64` 也应追加到文件末尾（u64::MAX 是本代码库约定的追加偏移）。
+        let effective_offset = if flags.append { u64::MAX } else { offset };
+        let n = self.ops.write_at(buf, effective_offset)?;
         #[cfg(feature = "performance-profile")]
         profile.set_bytes(n);
         if n > 0 && crate::fsnotify::is_enabled() {
