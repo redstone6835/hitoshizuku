@@ -3672,6 +3672,9 @@ impl VmSpace {
     /// MAP_FIXED 原子操作：在同一把 VMA 锁内先 unmap 再 insert，消除竞态窗口。
     pub fn map_fixed_anon(&self, range: Range<usize>, flags: VmFlags) -> Result<(), Errno> {
         self.validate_range(&range)?;
+        if range.end > vm_layout().user_mmap_limit {
+            return Err(Errno::ENOMEM);
+        }
         let flags = self.with_future_mlock(flags);
         let backing = if flags.has(VmFlags::SHARED) {
             VmBacking::SharedAnon {
@@ -3730,6 +3733,9 @@ impl VmSpace {
         flags: VmFlags,
     ) -> Result<(), Errno> {
         self.validate_range(&range)?;
+        if range.end > vm_layout().user_mmap_limit {
+            return Err(Errno::ENOMEM);
+        }
         let flags = self.with_future_mlock(flags);
         let shared_writable = flags.contains_all(VmFlags::SHARED | VmFlags::WRITE);
         let mapped_file = Arc::clone(&file);
@@ -3902,6 +3908,12 @@ impl VmSpace {
         }
         let old_len = old_range.end - old_range.start;
         if new_len <= old_len {
+            {
+                let vmas = self.vmas.lock();
+                if !vmas.contains_range(&old_range) {
+                    return Err(Errno::EFAULT);
+                }
+            }
             if new_len < old_len {
                 self.unmap(old_range.start + new_len..old_range.end)?;
             }
@@ -3945,7 +3957,7 @@ impl VmSpace {
         let (removed_target, mapped_tail, removed_pages, moved_pages) = {
             let mut vmas = self.vmas.lock();
             if !vmas.contains_range(&old_range) {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
             if Self::contains_sealed(&vmas, &new_range) {
                 return Err(Errno::EPERM);
@@ -3961,7 +3973,7 @@ impl VmSpace {
             let old_pieces = vmas.unmap_range(&old_range);
             let old_covered = covered_len(&old_pieces, &old_range);
             if old_covered != old_len {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
 
             let mut cursor = new_range.start;
@@ -4043,7 +4055,7 @@ impl VmSpace {
         {
             let set = self.vmas.lock();
             if !set.contains_range(&old_range) {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
             for area in set.iter_overlap(&old_range) {
                 if !matches!(area.backing, VmBacking::Anon { .. })
@@ -4071,7 +4083,7 @@ impl VmSpace {
         let (removed_target, empty_anon, tail, moved_pages) = {
             let mut vmas = self.vmas.lock();
             if !vmas.contains_range(&old_range) {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
             if Self::contains_sealed(&vmas, &new_range) {
                 return Err(Errno::EPERM);
@@ -4087,7 +4099,7 @@ impl VmSpace {
             let old_pieces = vmas.unmap_range(&old_range);
             let old_covered = covered_len(&old_pieces, &old_range);
             if old_covered != old_len {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
 
             // 1) 旧地址:插入空匿名 VMA(保留原权限/标志,换用全新合并域)。
@@ -5341,6 +5353,12 @@ impl VmSpace {
     /// [`Self::would_lock_pages`] 完成，这里只负责状态与记账。
     pub fn mlock_range(&self, range: Range<usize>, populate: bool) -> Result<(), Errno> {
         self.validate_range(&range)?;
+        {
+            let set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(Errno::ENOMEM);
+            }
+        }
         if populate {
             self.prefault_user_range(range.clone(), true)
                 .map_err(|_| Errno::EAGAIN)?;
@@ -7241,7 +7259,7 @@ impl VmSpace {
         let mapped_tail = {
             let mut vmas = self.vmas.lock();
             if !vmas.contains_range(old_range) {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
             if !vmas.is_range_free(tail_range) {
                 return Ok(false);
