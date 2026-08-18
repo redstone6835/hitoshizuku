@@ -407,7 +407,7 @@ impl MqRegistry {
             return Err(Errno::ENOENT);
         }
         if inner.len() >= MQ_QUEUES_MAX {
-            return Err(Errno::EMFILE);
+            return Err(Errno::ENOSPC);
         }
         let attr = attr.copied().unwrap_or(MqAttr::default_new());
         MqObject::validate_attr(&attr)?;

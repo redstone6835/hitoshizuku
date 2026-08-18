@@ -225,6 +225,7 @@ fn errno_to_vfs(error: Errno) -> VfsError {
         Errno::EEXIST => VfsError::AlreadyExists,
         Errno::ENAMETOOLONG => VfsError::NameTooLong,
         Errno::EMFILE => VfsError::TooManyOpenFiles,
+        Errno::ENOSPC => VfsError::NoSpace,
         Errno::EPERM => VfsError::OperationNotPermitted,
         _ => VfsError::Io,
     }
