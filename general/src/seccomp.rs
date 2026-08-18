@@ -135,12 +135,9 @@ impl SeccompState {
         action
     }
 
-    /// strict 模式：仅允许 read/write/_exit/sigreturn。
+    /// strict 模式：仅允许 read/write/_exit/rt_sigreturn。
     pub fn strict_allows(nr: usize) -> bool {
-        matches!(
-            nr,
-            63 | 93 | 94 | 139 | 172 | 173 | 174 // read/write/_exit/exit_group/syscall 等
-        )
+        matches!(nr, 63 | 64 | 93 | 139) // read/write/_exit/rt_sigreturn
     }
 }
 
