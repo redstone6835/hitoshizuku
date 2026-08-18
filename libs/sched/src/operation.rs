@@ -164,16 +164,39 @@ pub fn session_exists(sid: PidT) -> bool {
 /// 设置 pid 所在的进程组为 pgid。POSIX 语义：
 /// - pid==0 → 当前线程
 /// - pgid==0 → pgid 等于 pid（自成一组 leader）
-/// - target 与 caller 必须在同一 session
+/// - target 必须为线程组 leader，且与 caller 在同一 session
+/// - caller 只能改自身或其尚未 exec 的直接子进程；target 不得是会话首进程
 pub fn setpgid(pid: PidT, pgid: PidT) -> Result<(), Errno> {
     let target = lookup_pid(pid)?;
     let me = current_task();
+
+    // Linux `setpgid`：目标必须是线程组 leader，否则 EINVAL。
+    if !target.is_thread_group_leader() {
+        return Err(Errno::EINVAL);
+    }
 
     // 必须同 session。
     let my_session = me.process_group().session().ok_or(Errno::EPERM)?;
     let target_session = target.process_group().session().ok_or(Errno::EPERM)?;
     if !Arc::ptr_eq(&my_session, &target_session) {
         return Err(Errno::EPERM);
+    }
+
+    // 调用者只能改自身，或其尚未 exec 的直接子进程；否则 EPERM。
+    // “尚未 exec”用线程组 exec_generation 判定（fork 新建线程组时为 0，exec
+    // 时 advance_generation 递增）；不用 TASKEXT_EXEC_PATH，因为 fork 的 ext
+    // clone hook 会把父进程的 exec 路径整体共享给子进程，无法区分是否已 exec。
+    let is_self = Arc::ptr_eq(&target, &me);
+    let is_unexeced_child = me.has_child(&target) && target.thread_group().exec_generation() == 0;
+    if !is_self && !is_unexeced_child {
+        return Err(Errno::EPERM);
+    }
+
+    // 目标不得是会话首进程；否则 EPERM。
+    if let Some(leader) = target_session.leader() {
+        if Arc::ptr_eq(&leader.thread_group(), &target.thread_group()) {
+            return Err(Errno::EPERM);
+        }
     }
 
     // 决定实际 pgid：0 → target 自己的 pid。
