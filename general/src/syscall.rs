@@ -618,10 +618,28 @@ fn seccomp_filter_syscall(ctx: &mut SyscallContext<'_>) -> bool {
             true
         }
         SECCOMP_RET_TRAP => {
-            let _ = sched::operation::tkill(
-                task.pid_root().unwrap_or(0),
-                Some(sched::SignalNumber::from_raw(31).unwrap_or(sched::SignalNumber::SIGSEGV)),
-            );
+            // TRAP 投递带完整 siginfo 的 SIGSYS（si_code=SYS_SECCOMP、
+            // si_syscall、si_arch），供 ptrace/user handler 读取。
+            let mut raw = [0u8; 128];
+            raw[0..4].copy_from_slice(&31i32.to_le_bytes()); // si_signo = SIGSYS
+            raw[4..8].copy_from_slice(&0i32.to_le_bytes()); // si_errno
+            raw[8..12].copy_from_slice(&1i32.to_le_bytes()); // si_code = SYS_SECCOMP
+            // raw[12..16] 为对齐填充；raw[16..24] 为 si_call_addr（填 0）。
+            raw[24..28].copy_from_slice(&(ctx.nr as i32).to_le_bytes()); // si_syscall
+            raw[28..32].copy_from_slice(&AUDIT_ARCH.to_le_bytes()); // si_arch
+            let info = sched::SigInfo {
+                sig: sched::SignalNumber::SIGSYS,
+                code: 1, // SYS_SECCOMP
+                sender_pid: task.pid_root().unwrap_or(0),
+                sender_uid: task.credentials().uid,
+                raw: Some(raw),
+            };
+            let tgid = task
+                .thread_group()
+                .leader()
+                .and_then(|l| l.pid_root())
+                .unwrap_or_else(|| task.pid_root().unwrap_or(0));
+            let _ = sched::operation::tgqueueinfo(tgid, task.pid_root().unwrap_or(0), info);
             true
         }
         SECCOMP_RET_ERRNO => {
