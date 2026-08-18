@@ -1815,9 +1815,27 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(0)
         }
         KEYCTL_GET_PERSISTENT => {
-            let uid = ctx.args[1] as u32;
-            let _keyring = ctx.args[2] as i32;
+            let uid_arg = ctx.args[1] as u32;
+            let keyring_arg = ctx.args[2] as i32;
+            // uid == -1 表示当前 euid；非本人且无 CAP_SYS_ADMIN/CAP_SETUID → EPERM。
+            let uid = if uid_arg == u32::MAX {
+                cred.euid.0
+            } else {
+                uid_arg
+            };
+            if uid != cred.euid.0
+                && !cred.has_cap(vfs::cred::Capability::SysAdmin)
+                && !ctx.task().credentials().has_cap(sched::Capability::Setuid)
+            {
+                return Err(Errno::EPERM);
+            }
             let id = manager.user_keyring(uid, &cred)?;
+            // keyring 参数用于"新建时把 persistent keyring 链接进该 keyring"。
+            if keyring_arg != 0 {
+                let dest =
+                    resolve_keyring(&manager, &process_keyrings(ctx), keyring_arg, &cred, now)?;
+                manager.link(dest, id, &cred)?;
+            }
             Ok(id.0 as usize)
         }
         KEYCTL_RESTRICT_KEYRING => {
