@@ -396,12 +396,9 @@ fn apply_madvise(
         MADV_DONTNEED => vm.discard_resident_range(range),
         // DONTNEED_LOCKED：允许命中已锁区域（Linux 5.18+）。
         MADV_DONTNEED_LOCKED => vm.discard_resident_range_locked(range),
-        // FREE：页"可释放"但内容保留到回收发生。本内核无匿名页回收，内容
-        // 始终保留——与无内存压力的 Linux 可观测行为一致。
-        MADV_FREE => {
-            vm.contains_user_range(range)?;
-            Ok(())
-        }
+        // FREE：页"可释放"但内容保留到回收发生。本内核无匿名页回收，标记后可
+        // 由 MADV_DONTNEED/MADV_PAGEOUT/显式回收点丢弃，无压力时内容保留。
+        MADV_FREE => vm.madvise_free(range),
         // REMOVE：仅 tmpfs/shmem 文件（等价 fallocate(PUNCH_HOLE|KEEP_SIZE)）。
         MADV_REMOVE => vm.madvise_remove(range),
         MADV_DONTFORK => vm.update_area_flags(range, |flags| flags.with(VmFlags::DONTFORK)),
@@ -414,11 +411,8 @@ fn apply_madvise(
         MADV_DODUMP => vm.update_area_flags(range, |flags| flags.without(VmFlags::DONTDUMP)),
         MADV_WIPEONFORK => vm.update_area_flags(range, |flags| flags.with(VmFlags::WIPEONFORK)),
         MADV_KEEPONFORK => vm.update_area_flags(range, |flags| flags.without(VmFlags::WIPEONFORK)),
-        // COLD：无 LRU/回收器，仅校验（语义上"标记冷"无可观测效果）。
-        MADV_COLD => {
-            vm.contains_user_range(range)?;
-            Ok(())
-        }
+        // COLD：无 LRU/回收器，标记冷页供显式回收点（MADV_PAGEOUT）与观测使用。
+        MADV_COLD => vm.madvise_cold(range),
         MADV_PAGEOUT => vm.madvise_pagout(range),
         MADV_POPULATE_READ => vm.madvise_populate(range, false, true),
         MADV_POPULATE_WRITE => vm.madvise_populate(range, true, true),
@@ -518,12 +512,13 @@ pub(super) fn sys_swapon(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         -1
     };
     let path = copy_cstr_from_user(path_user, PATH_MAX).map_err(path_copy_errno)?;
-    // 以只读方式打开 swap 文件/分区并登记；fd 由调用方自行关闭，swap 表持有
-    // 自己的 Arc<File> 引用（Linux 同样在 swapoff 前持有文件引用）。
+    // 以读写方式打开 swap 文件/分区并登记；fd 由调用方自行关闭，swap 表持有
+    // 自己的 Arc<File> 引用（Linux 同样在 swapoff 前持有文件引用）。换出需要
+    // 写入 swap 空间，因此必须可写（Linux swapon 同样要求可写句柄）。
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let flags = OpenOptions {
-        access: AccessMode::ReadOnly,
+        access: AccessMode::ReadWrite,
         ..OpenOptions::default()
     };
     let fd = operation::openat(&vfs_ctx, &fdt, &Dirfd::Cwd, &path, flags, FileMode::new(0))
@@ -1282,9 +1277,19 @@ pub(super) fn sys_cachestat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         let file_like: &dyn mm::FileLike = file.as_ref();
         (file_like.cache_key(), file_like.private_page_cache_key())
     };
-    let (nr_cache, nr_dirty) = file_cache_stat(shared_key, private_key, off, len);
+    let (nr_cache, nr_dirty, nr_writeback, nr_evicted, nr_recently_evicted) =
+        file_cache_stat(shared_key, private_key, off, len);
     let mut out = [0u8; 40];
-    for (slot, value) in [nr_cache, nr_dirty, 0, 0, 0].iter().enumerate() {
+    for (slot, value) in [
+        nr_cache,
+        nr_dirty,
+        nr_writeback,
+        nr_evicted,
+        nr_recently_evicted,
+    ]
+    .iter()
+    .enumerate()
+    {
         out[slot * 8..slot * 8 + 8].copy_from_slice(&value.to_le_bytes());
     }
     copy_to_user(cstat_user, &out).map_err(|e| e.as_errno())?;
