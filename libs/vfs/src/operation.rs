@@ -956,7 +956,7 @@ fn chown_inode(
         && new_gid != inode_gid
     {
         let cred = ctx.cred();
-        let is_owner = cred.euid == inode_uid;
+        let is_owner = cred.fsuid == inode_uid;
         let gid_ok = cred.egid == new_gid || cred.groups.contains(&new_gid);
         if !(cred.has_cap(cred::Capability::Chown) || is_owner && gid_ok) {
             return Err(VfsError::OperationNotPermitted);
