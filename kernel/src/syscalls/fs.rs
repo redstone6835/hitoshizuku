@@ -4321,6 +4321,9 @@ pub(super) fn sys_fsconfig(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let cmd = ctx.args[1] as u32;
     let file = file_for_fd(fd)?;
     let fsc = vfs::fs_context::FsContextFileOps::from_file(&file).ok_or(Errno::EBADF)?;
+    if fsc.is_consumed() {
+        return Err(Errno::EBADF);
+    }
     match cmd {
         vfs::fs_context::FSCONFIG_SET_FLAG => {
             let key = copy_cstr_from_user(ctx.args[2], 64).map_err(|e| e.as_errno())?;
@@ -4393,9 +4396,23 @@ pub(super) fn sys_fsmount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     }
     let file = file_for_fd(fd)?;
     let fsc = vfs::fs_context::FsContextFileOps::from_file(&file).ok_or(Errno::EBADF)?;
+    if fsc.is_consumed() {
+        return Err(Errno::EBADF);
+    }
     apply_mount_attr_flags(&fsc, attr_flags)?;
-    fsc.mark_mount_ready()?;
-    Ok(fd.as_raw() as usize)
+    // fsmount 必须返回一个全新的 fd（不再复用 fsopen 传入的 fd）。这里派生
+    // 出挂载就绪的新上下文，分配新 fd 成功后消费原 fsopen 上下文。
+    let mount_ctx = fsc.derive_mount_context()?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let new_fd = vfs::fs_context::create_fs_context_fd(
+        &fdt,
+        vfs_ctx.cred(),
+        mount_ctx,
+        (flags & vfs::fs_context::FSMOUNT_CLOEXEC) != 0,
+    )?;
+    fsc.mark_consumed();
+    Ok(new_fd.as_raw() as usize)
 }
 
 /// `move_mount(2)`：MOVE_MOUNT_F_EMPTY_PATH 时把 fs_context 挂载落到目标
