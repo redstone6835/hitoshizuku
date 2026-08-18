@@ -1455,8 +1455,11 @@ fn deliver_to_thread_group(target: &Arc<Task>, info: SigInfo) -> bool {
 }
 
 fn check_pidfd_group_permission(group: &Arc<ThreadGroup>) -> Result<(), Errno> {
+    // pidfd_send_signal 对已退出（僵尸）进程应成功返回 0：稳定身份仍存在，
+    // 信号被静默丢弃，不再报 ESRCH（Linux 语义）。仅 terminated 组跳过权限
+    // 检查；非 terminated 路径的权限检查保持不变。
     if group.is_terminated() {
-        return Err(Errno::ESRCH);
+        return Ok(());
     }
     let target = group.leader().ok_or(Errno::ESRCH)?;
     check_kill_permission(&target)
