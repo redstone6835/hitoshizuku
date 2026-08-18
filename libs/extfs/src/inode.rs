@@ -1251,9 +1251,9 @@ impl InodeOps for ExtInodeOps {
         if file_type_from_mode(meta.mode) != FileType::Regular {
             return Err(VfsError::InvalidArgument);
         }
-        // fscrypt 无密钥不可写;fs-verity 已启用校验的文件不可变。
+        // fscrypt 无密钥不可写(ENOKEY);fs-verity 已启用校验的文件不可变。
         if meta.flags & EXT4_ENCRYPT_FL != 0 {
-            return Err(VfsError::NotSupported);
+            return Err(VfsError::Enokey);
         }
         if meta.flags & EXT4_VERITY_FL != 0 {
             return Err(VfsError::ReadOnlyFilesystem);

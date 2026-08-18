@@ -19,7 +19,7 @@
 //! | 读写(create/mkdir/unlink/rename/write/truncate/...) | 是 | 是 | 是 | 写路径不走日志(writeback 语义),崩溃依赖 s_state + fsck |
 //! | MMP | — | — | 挂载时检查 + 运行时心跳 | 挂载检查 + 活动驱动最小间隔心跳(见 [`mmp`]) |
 //! | CASEFOLD | — | — | 挂载 | 带标志目录按 Unicode 简单小写折叠(完整 casefold/NFKD 未实现,见 [`dir`]) |
-//! | ENCRYPT | — | — | 挂载 | 加密 inode 读写返回 `NotSupported`(EOPNOTSUPP;Linux 无密钥为 `ENOKEY`,VFS 只读无法映射) |
+//! | ENCRYPT | — | — | 挂载 | 加密 inode 读写/truncate 返回 `Enokey`(与 Linux 无密钥一致) |
 //! | VERITY | — | — | 挂载 | verity inode 写/截断返回 `ReadOnlyFilesystem` |
 //! | BIGALLOC / READONLY / HAS_SNAPSHOT / SHARED_BLOCKS | — | — | 强制只读 | 未知 ro_compat 位同样退化为只读 |
 //!

@@ -321,7 +321,7 @@ fn unknown_incompat_rejected() {
     assert!(m.is_err(), "未知 incompat 位必须拒绝挂载");
 }
 
-/// ENCRYPT:挂载成功;加密文件读写报 NotSupported,lookup 不受影响。
+/// ENCRYPT:挂载成功;加密文件读写报 Enokey(与 Linux 无密钥一致),lookup 不受影响。
 #[ktest]
 fn encrypt_inode_io_rejected_but_lookup_works() {
     let mut img = ExtImg::new();
@@ -341,9 +341,9 @@ fn encrypt_inode_io_rejected_but_lookup_works() {
         .expect("打开加密文件");
     let mut buf = vec![0u8; 4];
     let err = f.read_at(&mut buf, 0).expect_err("读加密文件必须失败");
-    assert_eq!(err, VfsError::NotSupported);
+    assert_eq!(err, VfsError::Enokey);
     let err = f.write_at(b"xxxx", 0).expect_err("写加密文件必须失败");
-    assert_eq!(err, VfsError::NotSupported);
+    assert_eq!(err, VfsError::Enokey);
 }
 
 /// VERITY:verity 文件读正常,写/截断报 ReadOnlyFilesystem。

@@ -191,8 +191,8 @@ fn parse(sb: &[u8]) -> Result<Superblock, BlockBackendError> {
     //
     // - RECOVER:挂载时回放日志(见 [`crate::journal`]);
     // - MMP:挂载时做序列检查 + 运行期活动心跳(见 [`crate::mmp`]);
-    // - ENCRYPT:可挂载,访问加密 inode 时再报错(Linux 无密钥为 ENOKEY,本驱动
-    //   受 VFS 错误枚举限制返回 EOPNOTSUPP,见 lib.rs 取舍说明);
+    // - ENCRYPT:可挂载,访问加密 inode 时 read/write/truncate 返回 ENOKEY(与
+    //   Linux 无密钥一致,经 VfsError::Enokey 映射);
     // - CASEFOLD:可挂载,带 CASEFOLD 标志目录按 Unicode 简单小写折叠匹配
     //   (完整 casefold/NFKD 未实现);
     // - LARGEDIR:读路径为线性扫描,天然兼容。
