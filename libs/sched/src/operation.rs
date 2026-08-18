@@ -1664,18 +1664,29 @@ fn ptrace_target(pid: PidT) -> Result<Arc<Task>, Errno> {
     if target.is_kernel_task() || !target.is_ptrace_traced() {
         return Err(Errno::ESRCH);
     }
-    check_kill_permission(&target)?;
+    let me = current_task();
+    if !ptrace_may_access(&me, &target) {
+        return Err(Errno::EPERM);
+    }
+    // 仅允许记录的 tracer 对目标执行 cont/syscall/detach 等操作。
+    if !target.ptracer_is(&me) {
+        return Err(Errno::EPERM);
+    }
     Ok(target)
 }
 
 pub fn ptrace_traceme() -> Result<(), Errno> {
     let me = current_task();
-    if me.is_kernel_task() || me.parent().is_none() {
+    if me.is_kernel_task() {
         return Err(Errno::EPERM);
     }
+    let Some(parent) = me.parent() else {
+        return Err(Errno::EPERM);
+    };
     if !me.enable_ptrace_traced() {
         return Err(Errno::EPERM);
     }
+    me.set_ptracer(Some(Arc::downgrade(&parent)));
     Ok(())
 }
 
@@ -1692,6 +1703,7 @@ pub fn ptrace_attach(pid: PidT) -> Result<(), Errno> {
     if !target.enable_ptrace_traced() {
         return Err(Errno::EPERM);
     }
+    target.set_ptracer(Some(Arc::downgrade(&me)));
     target.set_ptrace_seized(false);
     let _ = mark_task_stopped(&target, SignalNumber::SIGSTOP);
     // 等待 stop 生效（Linux `PTRACE_ATTACH` 在目标停下后才返回）。
@@ -1714,6 +1726,7 @@ pub fn ptrace_seize(pid: PidT) -> Result<(), Errno> {
     if !target.enable_ptrace_traced() {
         return Err(Errno::EPERM);
     }
+    target.set_ptracer(Some(Arc::downgrade(&me)));
     target.set_ptrace_seized(true);
     Ok(())
 }
@@ -1770,6 +1783,7 @@ pub fn ptrace_singlestep(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Err
 pub fn ptrace_detach(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
     let target = ptrace_target(pid)?;
     target.clear_ptrace_traced();
+    target.clear_ptracer();
     target.set_ptrace_syscall_stop(false);
     target.clear_singlestep();
     target.set_ptrace_stop_event(0);
