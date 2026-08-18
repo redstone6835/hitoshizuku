@@ -1513,7 +1513,21 @@ pub(super) fn sys_umount2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let _fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let path = copy_path_from_user(ctx.args[0])?;
     let flags = ctx.args[1];
-    let force = (flags & 1) != 0;
+    // Linux umount2(2) 标志：MNT_FORCE / MNT_DETACH / MNT_EXPIRE / UMOUNT_NOFOLLOW。
+    const MNT_FORCE: usize = 0x1;
+    const MNT_DETACH: usize = 0x2;
+    const MNT_EXPIRE: usize = 0x4;
+    const UMOUNT_NOFOLLOW: usize = 0x8;
+    const KNOWN_UMOUNT_FLAGS: usize = MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW;
+    // 未知位直接拒绝，不静默忽略。
+    if (flags & !KNOWN_UMOUNT_FLAGS) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let force = (flags & MNT_FORCE) != 0;
+    // 已知但当前内核未实现的位显式返回不支持，而不是当作 0 处理。
+    if (flags & (MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW)) != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
     let dirfd = Dirfd::Cwd;
     operation::umount(&vfs_ctx, &dirfd, &path, force).map_err(|e| e.to_errno())?;
     Ok(0)
