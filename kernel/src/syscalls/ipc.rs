@@ -19,7 +19,7 @@ use general::ipc::keys::{
     KEY_REQKEY_DEFL_PROCESS_KEYRING, KEY_REQKEY_DEFL_REQUESTOR_KEYRING,
     KEY_REQKEY_DEFL_SESSION_KEYRING, KEY_REQKEY_DEFL_THREAD_KEYRING, KEY_REQKEY_DEFL_USER_KEYRING,
     KEY_REQKEY_DEFL_USER_SESSION_KEYRING, KEY_SPEC_REQKEY_AUTH_KEY, KEY_SPEC_SESSION_KEYRING,
-    KeyId, KeyManager, KeyState, KeyType, ProcessKeyrings,
+    KeyId, KeyManager, KeyState, KeyType, ProcessKeyrings, search_process_keyrings,
 };
 use general::ipc::mqueue::{
     MQ_ATTR_CURMSGS, MQ_ATTR_FLAGS, MQ_ATTR_MAXMSG, MQ_ATTR_MSGSIZE, MQ_ATTR_SIZE, MQ_NAME_MAX,
@@ -233,6 +233,16 @@ pub(super) fn sys_shmctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         SHM_LOCK | SHM_UNLOCK => {
             let lock = cmd == SHM_LOCK;
             if lock {
+                // Linux `shmctl(SHM_LOCK)` 顺序：先做权限判定（EPERM），再做
+                // `RLIMIT_MEMLOCK` 检查（ENOMEM）。无 `CAP_IPC_LOCK` 且非段属主
+                //（`euid` 既非 `shm_perm.uid` 也非 `cuid`）→ EPERM。
+                let perm = manager.perm_of(shmid)?;
+                if !cred.has_cap(vfs::cred::Capability::IpcLock)
+                    && !cred.is_owner(perm.uid)
+                    && !cred.is_owner(perm.cuid)
+                {
+                    return Err(Errno::EPERM);
+                }
                 // Linux `user_shm_lock`：锁定新增页数不得超出 `RLIMIT_MEMLOCK`
                 //（`CAP_IPC_LOCK` 或 `RLIM_INFINITY` 豁免）。超限返回 `ENOMEM`。
                 let additional = manager.would_lock_pages(shmid)?;
@@ -663,9 +673,11 @@ pub(super) fn sys_mq_timedsend(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     let nonblock = file.flags().nonblock;
     let task = Arc::clone(ctx.task());
     let pid = task_pid(ctx);
+    let cred = vfs_cred_from_sched(&ctx.task().credentials());
+    let sender_uid = cred.uid.0;
 
     loop {
-        match queue.try_send(msg_prio, &data, pid, nonblock) {
+        match queue.try_send(msg_prio, &data, pid, sender_uid, nonblock) {
             Ok((true, notify)) => {
                 if let Some(notification) = notify {
                     dispatch_mq_notification(&notification);
@@ -695,7 +707,7 @@ pub(super) fn sys_mq_timedsend(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
             }
             None => false,
         };
-        match queue.try_send(msg_prio, &data, pid, nonblock) {
+        match queue.try_send(msg_prio, &data, pid, sender_uid, nonblock) {
             Ok((true, notify)) => {
                 queue.senders().finish_wait(&entry);
                 if deadline_armed {
@@ -842,7 +854,7 @@ pub(super) fn sys_mq_notify(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 
     if notification == 0 {
         // 取消注册（SIGEV_NONE 语义）。
-        return queue.register_notify(MqNotifyKind::None, 0, 0).map(|_| 0);
+        return queue.register_notify(MqNotifyKind::None, 0).map(|_| 0);
     }
 
     let mut raw = [0u8; SIGEV_SIZE];
@@ -867,11 +879,11 @@ pub(super) fn sys_mq_notify(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         _ => return Err(Errno::EINVAL),
     };
     if kind == MqNotifyKind::None {
-        return queue.register_notify(MqNotifyKind::None, 0, 0).map(|_| 0);
+        return queue.register_notify(MqNotifyKind::None, 0).map(|_| 0);
     }
     // Linux `ipc/mqueue.c`：注册通知要求读权限（ipcperms）。
     queue.check_access(false, &cred)?;
-    queue.register_notify(kind, pid, cred.uid.0).map(|_| 0)
+    queue.register_notify(kind, pid).map(|_| 0)
 }
 
 pub(super) fn sys_mq_getsetattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -885,7 +897,6 @@ pub(super) fn sys_mq_getsetattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     let queue: Arc<general::ipc::mqueue::MqObject> = Arc::clone(ops.queue());
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
 
-    let old = queue.attr();
     let old_flags = if file.flags().nonblock { O_NONBLOCK } else { 0 };
 
     if newattr_user != 0 {
@@ -893,18 +904,11 @@ pub(super) fn sys_mq_getsetattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
         let mut raw = [0u8; MQ_ATTR_SIZE];
         copy_from_user(newattr_user, &mut raw).map_err(|e| e.as_errno())?;
         let flags = read_i64(&raw, MQ_ATTR_FLAGS);
-        let maxmsg = read_i64(&raw, MQ_ATTR_MAXMSG);
-        let msgsize = read_i64(&raw, MQ_ATTR_MSGSIZE);
         if flags & !O_NONBLOCK != 0 {
             return Err(Errno::EINVAL);
         }
-        if maxmsg != old.maxmsg || msgsize != old.msgsize {
-            queue.set_attr(&MqAttr {
-                maxmsg,
-                msgsize,
-                curmsgs: 0,
-            })?;
-        }
+        // Linux `mq_setattr` 只能改 `mq_flags`（O_NONBLOCK）；`mq_maxmsg`/
+        // `mq_msgsize` 的改动被忽略（容量由 `mq_open` 时确定，不可再改）。
         if flags != old_flags {
             file.set_status_flags(false, flags & O_NONBLOCK != 0, false, false);
         }
@@ -1067,6 +1071,15 @@ pub(super) fn sys_msgsnd(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let mut mtype_raw = [0u8; 8];
     copy_from_user(msgp, &mut mtype_raw).map_err(|e| e.as_errno())?;
     let mtype = i64::from_le_bytes(mtype_raw);
+    // 对齐 Linux `do_msgsnd`：先校验 `msgsz`/`mtype`（EINVAL），再读 data。
+    // 否则"坏指针 + 超限"同时发生时，会先因 data 的 `copy_from_user` 返回
+    // EFAULT，而 Linux 此处返回 EINVAL。
+    if msgsz > MSGMAX {
+        return Err(Errno::EINVAL);
+    }
+    if mtype < 1 {
+        return Err(Errno::EINVAL);
+    }
     let mut data = vec![0u8; msgsz];
     if msgsz > 0 {
         copy_from_user(msgp + 8, &mut data).map_err(|e| e.as_errno())?;
@@ -1155,11 +1168,13 @@ pub(super) fn sys_semctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 return Err(Errno::EFAULT);
             }
             let values = manager.get_all(id, &cred)?;
+            // `semun.array` 是 `unsigned short *`（2 字节/元素，Linux 语义）：
+            // 每个值按 2 字节小端写出（内部值经 `0..=SEMVMX` 校验，恰好 fit u16）。
             for (index, value) in values.iter().enumerate() {
                 let address = arg
-                    .checked_add(index * size_of::<i32>())
+                    .checked_add(index * size_of::<u16>())
                     .ok_or(Errno::EFAULT)?;
-                copy_to_user(address, &value.to_le_bytes()).map_err(|e| e.as_errno())?;
+                copy_to_user(address, &(*value as u16).to_le_bytes()).map_err(|e| e.as_errno())?;
             }
             Ok(0)
         }
@@ -1169,13 +1184,15 @@ pub(super) fn sys_semctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             }
             let nsems = manager.stat(id, &cred)?.nsems;
             let mut values = vec![0i32; nsems];
+            // `semun.array` 是 `unsigned short *`（2 字节/元素，Linux 语义）：
+            // 每个元素读 2 字节小端，汇入 `Vec<i32>`（范围校验由 `set_all` 保留）。
             for (index, slot) in values.iter_mut().enumerate() {
                 let address = arg
-                    .checked_add(index * size_of::<i32>())
+                    .checked_add(index * size_of::<u16>())
                     .ok_or(Errno::EFAULT)?;
-                let mut raw = [0u8; 4];
+                let mut raw = [0u8; 2];
                 copy_from_user(address, &mut raw).map_err(|e| e.as_errno())?;
-                *slot = i32::from_le_bytes(raw);
+                *slot = u16::from_le_bytes(raw) as i32;
             }
             let set = manager.set_all(id, &values, &cred, pid, now)?;
             sem_undo_table(ctx).clear(id);
@@ -1404,11 +1421,11 @@ fn mq_notify_dispatcher(notification: &general::ipc::mqueue::MqNotification) {
                 sender_uid: Uid(notification.sender_uid),
                 raw: Some(raw),
             };
-            let _ = sched::operation::queueinfo(notification.sender_pid, info);
+            let _ = sched::operation::queueinfo(notification.notify_pid, info);
         }
         MqNotifyKind::Thread { function, value } => {
             // 注册者可能已退出；查找失败时静默丢弃（Linux 同样如此）。
-            let Ok(target) = sched::operation::lookup_pid(notification.sender_pid) else {
+            let Ok(target) = sched::operation::lookup_pid(notification.notify_pid) else {
                 return;
             };
             crate::sched::spawn_mq_notify_thread(&target, function, value);
@@ -1427,7 +1444,7 @@ pub(super) fn sys_add_key(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let now = now_sec_u64();
 
     let key_type_name = copy_cstr_from_user(type_user, 32).map_err(|e| e.as_errno())?;
-    let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENODEV)?;
+    let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENOKEY)?;
     let description = copy_cstr_from_user(desc_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?;
     let mut payload = vec![0u8; plen];
     if plen > 0 {
@@ -1442,8 +1459,7 @@ pub(super) fn sys_request_key(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     let type_user = ctx.args[0];
     let desc_user = ctx.args[1];
     let info_user = ctx.args[2];
-    let keyring_arg = ctx.args[3] as i32;
-    let dest_keyring_arg = ctx.args[4] as i32;
+    let destringid = ctx.args[3] as i32;
     let task = Arc::clone(ctx.task());
     let cred = vfs_cred_from_sched(&task.credentials());
     let manager = keys_manager();
@@ -1451,7 +1467,7 @@ pub(super) fn sys_request_key(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     let process = process_keyrings(ctx);
 
     let key_type_name = copy_cstr_from_user(type_user, 32).map_err(|e| e.as_errno())?;
-    let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENODEV)?;
+    let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENOKEY)?;
     let description = copy_cstr_from_user(desc_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?;
     let info = if info_user != 0 {
         copy_cstr_from_user(info_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?
@@ -1459,12 +1475,15 @@ pub(super) fn sys_request_key(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
         alloc::string::String::new()
     };
 
-    let search_keyring = resolve_keyring(&manager, &process, keyring_arg, &cred, now)?;
-    if let Ok(key) = manager.search(search_keyring, key_type, &description, &cred, now) {
-        return Ok(key.id.0 as usize);
+    // 搜索阶段：在进程 keyring 链（thread → process → session → user-session
+    // → user）上查找已实例化的 (type, desc) key。
+    if let Some(key_id) =
+        search_process_keyrings(&process, &cred, &manager, key_type, &description, now)
+    {
+        return Ok(key_id.0 as usize);
     }
     // 未命中：创建未实例化 key + 授权 key，spawn `/sbin/request-key` upcall。
-    let dest_keyring = resolve_keyring(&manager, &process, dest_keyring_arg, &cred, now)?;
+    let dest_keyring = resolve_keyring(&manager, &process, destringid, &cred, now)?;
     let key = manager.create_uninstantiated(
         key_type,
         &description,
@@ -1491,7 +1510,7 @@ pub(super) fn sys_request_key(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
         key.id.0.to_string(),
         cred.euid.0.to_string(),
         cred.egid.0.to_string(),
-        keyring_arg.to_string(),
+        destringid.to_string(),
         key_type_name,
         description.clone(),
         info,
@@ -1546,12 +1565,17 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     const KEYCTL_INSTANTIATE_IOV: usize = 20;
     const KEYCTL_INVALIDATE: usize = 21;
     const KEYCTL_GET_PERSISTENT: usize = 22;
+    const KEYCTL_DH_COMPUTE: usize = 23;
+    const KEYCTL_PKEY_QUERY: usize = 24;
+    const KEYCTL_PKEY_ENCRYPT: usize = 25;
+    const KEYCTL_PKEY_DECRYPT: usize = 26;
+    const KEYCTL_PKEY_SIGN: usize = 27;
+    const KEYCTL_PKEY_VERIFY: usize = 28;
     const KEYCTL_RESTRICT_KEYRING: usize = 29;
-    const KEYCTL_SUPPORTS_ENCRYPT: usize = 32;
-    const KEYCTL_SUPPORTS_DECRYPT: usize = 33;
-    const KEYCTL_SUPPORTS_SIGN: usize = 34;
-    const KEYCTL_SUPPORTS_VERIFY: usize = 35;
-    const KEYCTL_CAPABILITIES: usize = 36;
+    const KEYCTL_MOVE: usize = 30;
+    const KEYCTL_CAPABILITIES: usize = 31;
+    const KEYCTL_WATCH_KEY: usize = 32;
+    const KEYCTL_NOTIFY: usize = 33;
 
     let cmd = ctx.args[0];
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
@@ -1670,7 +1694,7 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             let desc_user = ctx.args[3];
             let dest_keyring_arg = ctx.args[4] as i32;
             let key_type_name = copy_cstr_from_user(type_user, 32).map_err(|e| e.as_errno())?;
-            let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENODEV)?;
+            let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENOKEY)?;
             let description =
                 copy_cstr_from_user(desc_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?;
             let search_keyring =
@@ -1684,9 +1708,9 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                     &cred,
                     now,
                 )?;
-                if let Ok(dest_keyring) = manager.key(dest) {
-                    dest_keyring.add_member(key.id, key_type.name(), &description);
-                }
+                // dest 链接等价 KEYCTL_LINK：要求 dest 写权限 + key link 权限 +
+                // keyring restriction；dest 非 keyring 时由 link 返回 ENOTDIR。
+                manager.link(dest, key.id, &cred)?;
             }
             Ok(key.id.0 as usize)
         }
@@ -1704,6 +1728,7 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         KEYCTL_INSTANTIATE => {
             let key_id = KeyId(ctx.args[1] as i32);
+            require_instantiate_authority(&manager, &process_keyrings(ctx), key_id)?;
             let payload_user = ctx.args[2];
             let plen = ctx.args[3];
             let keyring_id = KeyId(ctx.args[4] as i32);
@@ -1716,6 +1741,7 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         KEYCTL_NEGATE => {
             let key_id = KeyId(ctx.args[1] as i32);
+            require_instantiate_authority(&manager, &process_keyrings(ctx), key_id)?;
             let timeout = ctx.args[2] as u64;
             let keyring_id = KeyId(ctx.args[3] as i32);
             manager.instantiate(key_id, Vec::new(), false, keyring_id, Some(timeout), now)?;
@@ -1723,6 +1749,7 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         KEYCTL_REJECT => {
             let key_id = KeyId(ctx.args[1] as i32);
+            require_instantiate_authority(&manager, &process_keyrings(ctx), key_id)?;
             let timeout = ctx.args[2] as u64;
             let keyring_id = KeyId(ctx.args[4] as i32);
             manager.instantiate(key_id, Vec::new(), false, keyring_id, Some(timeout), now)?;
@@ -1789,8 +1816,10 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(0)
         }
         KEYCTL_INSTANTIATE_IOV => {
-            // iovec 版 instantiate：聚合成单个负载。
+            // iovec 版 instantiate：聚合成单个负载；与 INSTANTIATE 同样需要
+            // 授权 key。
             let key_id = KeyId(ctx.args[1] as i32);
+            require_instantiate_authority(&manager, &process_keyrings(ctx), key_id)?;
             let iov_user = ctx.args[2];
             let iovcnt = ctx.args[3];
             let keyring_id = KeyId(ctx.args[4] as i32);
@@ -1803,9 +1832,27 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(0)
         }
         KEYCTL_GET_PERSISTENT => {
-            let uid = ctx.args[1] as u32;
-            let _keyring = ctx.args[2] as i32;
+            let uid_arg = ctx.args[1] as u32;
+            let keyring_arg = ctx.args[2] as i32;
+            // uid == -1 表示当前 euid；非本人且无 CAP_SYS_ADMIN/CAP_SETUID → EPERM。
+            let uid = if uid_arg == u32::MAX {
+                cred.euid.0
+            } else {
+                uid_arg
+            };
+            if uid != cred.euid.0
+                && !cred.has_cap(vfs::cred::Capability::SysAdmin)
+                && !ctx.task().credentials().has_cap(sched::Capability::Setuid)
+            {
+                return Err(Errno::EPERM);
+            }
             let id = manager.user_keyring(uid, &cred)?;
+            // keyring 参数用于"新建时把 persistent keyring 链接进该 keyring"。
+            if keyring_arg != 0 {
+                let dest =
+                    resolve_keyring(&manager, &process_keyrings(ctx), keyring_arg, &cred, now)?;
+                manager.link(dest, id, &cred)?;
+            }
             Ok(id.0 as usize)
         }
         KEYCTL_RESTRICT_KEYRING => {
@@ -1827,12 +1874,11 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             manager.restrict_keyring(keyring_id, restriction, &cred)?;
             Ok(0)
         }
-        KEYCTL_SUPPORTS_ENCRYPT
-        | KEYCTL_SUPPORTS_DECRYPT
-        | KEYCTL_SUPPORTS_SIGN
-        | KEYCTL_SUPPORTS_VERIFY => {
-            // 本内核不提供 key 加密/解密/签名/验签（无 crypto key 类型）。
-            Ok(0)
+        KEYCTL_DH_COMPUTE | KEYCTL_PKEY_QUERY | KEYCTL_PKEY_ENCRYPT | KEYCTL_PKEY_DECRYPT
+        | KEYCTL_PKEY_SIGN | KEYCTL_PKEY_VERIFY | KEYCTL_MOVE | KEYCTL_WATCH_KEY
+        | KEYCTL_NOTIFY => {
+            // 本内核无 crypto/asymmetric-key/watch/notify 子系统支持。
+            Err(Errno::EOPNOTSUPP)
         }
         KEYCTL_CAPABILITIES => {
             let buffer = ctx.args[1];
@@ -1846,7 +1892,23 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             copy_to_user(buffer, &caps[..n]).map_err(|e| e.as_errno())?;
             Ok(n)
         }
-        _ => Err(Errno::EINVAL),
+        // Linux `keyctl` 对未知命令返回 EOPNOTSUPP。
+        _ => Err(Errno::EOPNOTSUPP),
+    }
+}
+
+/// 校验调用者持有指向目标 key 的授权 key（`KEY_SPEC_REQKEY_AUTH_KEY`）。
+///
+/// `request_key` 把授权 key id 记入 `ProcessKeyrings::reqkey_auth`；只有该
+/// 授权 key 描述为 `_reqkey_auth.<key_id>` 时才允许实例化/否定目标 key。
+fn require_instantiate_authority(
+    manager: &KeyManager,
+    process: &ProcessKeyrings,
+    key_id: KeyId,
+) -> Result<(), Errno> {
+    match *process.reqkey_auth.lock() {
+        Some(auth_id) if manager.auth_key_matches(auth_id, key_id) => Ok(()),
+        _ => Err(Errno::EACCES),
     }
 }
 
