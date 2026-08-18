@@ -424,10 +424,9 @@ fn map_socket_io_error(err: SocketError) -> VfsError {
         SocketError::TemporaryUnavailable => VfsError::WouldBlock,
         SocketError::Interrupted => VfsError::Interrupted,
         SocketError::PeerClosed => VfsError::BrokenPipe,
-        SocketError::DestinationRequired | SocketError::ConnectionMissing => {
-            VfsError::InvalidArgument
-        }
-        SocketError::PayloadTooLarge => VfsError::FileTooLarge,
+        SocketError::DestinationRequired => VfsError::DestinationRequired,
+        SocketError::ConnectionMissing => VfsError::ConnectionMissing,
+        SocketError::PayloadTooLarge => VfsError::MessageTooLong,
         SocketError::ResourceExhausted => VfsError::OutOfMemory,
         SocketError::AccessDenied => VfsError::PermissionDenied,
         _ => VfsError::InvalidArgument,
