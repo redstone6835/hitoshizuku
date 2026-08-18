@@ -1094,6 +1094,9 @@ pub(super) fn sys_clock_gettime(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     let clock_id = ctx.args[0];
     let tp = ctx.args[1];
     let ns = clock_time_ns_for_task(ctx.task(), clock_id).ok_or(Errno::EINVAL)?;
+    // 叠加时间命名空间偏移（CLONE_NEWTIME）：有符号饱和，结果 clamp 到非负。
+    let offset = crate::ns::task_ns(ctx.task()).time.offset(clock_id as i32);
+    let ns = (ns as i128 + offset as i128).max(0) as u64;
     let sec = (ns / 1_000_000_000) as i64;
     let nsec = (ns % 1_000_000_000) as i64;
     let mut out = [0u8; 16];
@@ -1622,6 +1625,9 @@ pub(super) fn sys_gettimeofday(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     let _tz = ctx.args[1];
     if tv != 0 {
         let ns = crate::vdso::realtime_ns();
+        // 叠加时间命名空间的 realtime 偏移（有符号饱和、非负 clamp）。
+        let offset = crate::ns::task_ns(ctx.task()).time.offset(0);
+        let ns = (ns as i128 + offset as i128).max(0) as u64;
         let mut out = [0u8; 16];
         out[0..8].copy_from_slice(&((ns / 1_000_000_000) as i64).to_le_bytes());
         out[8..16].copy_from_slice(&((ns % 1_000_000_000 / 1000) as i64).to_le_bytes());
