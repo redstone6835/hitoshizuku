@@ -959,6 +959,12 @@ pub(super) fn sys_prlimit64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         None
     };
 
+    // F3：写 rlimit 表之前先校验 NOFILE 的 u32 范围，避免部分更新。
+    if resource == sched::Resource::Nofile
+        && let Some(new) = new_pair
+    {
+        validate_nofile_rlimit(new)?;
+    }
     let old = sched::operation::prlimit64(pid, resource, new_pair)?;
     if resource == sched::Resource::Nofile
         && let Some(new) = new_pair
@@ -1020,6 +1026,10 @@ pub(super) fn sys_setrlimit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let cur = u64::from_le_bytes(raw[0..8].try_into().unwrap());
     let max = u64::from_le_bytes(raw[8..16].try_into().unwrap());
     let new = sched::RlimitPair::new(sched::Rlim::from_raw(cur), sched::Rlim::from_raw(max));
+    // F3：写 rlimit 表之前先校验 NOFILE 的 u32 范围，避免部分更新。
+    if resource == sched::Resource::Nofile {
+        validate_nofile_rlimit(new)?;
+    }
     let _old = sched::operation::set_rlimit(resource, new)?;
     if resource == sched::Resource::Nofile {
         sync_thread_group_fdtable_nofile_limit(ctx.task(), new)?;
@@ -1501,7 +1511,10 @@ pub(super) fn sys_getrusage(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     Ok(0)
 }
 
-/// 当前驻留页数折算为 KB（`ru_maxrss` best-effort）。
+/// 把当前驻留页数折算为 KB（`ru_maxrss` best-effort）。
+///
+/// 本内核无峰值记账，报告的是当前（而非峰值）驻留集，与 Linux `ru_maxrss`
+/// 的峰值驻留集语义存在偏差，属已注明的 best-effort 取舍。
 fn task_rss_kb(task: &Arc<Task>) -> u64 {
     task_vm_space(task)
         .map(|vm| (vm.mapped_pages() as u64).saturating_mul(hal::memory::page_size() as u64) / 1024)
@@ -1537,8 +1550,9 @@ fn write_rusage(user: usize, usage: sched::TaskUsage, maxrss_kb: u64) -> Result<
     let mut raw = [0u8; 144];
     write_timeval_pair(&mut raw, 0, usage.user_ns);
     write_timeval_pair(&mut raw, 16, usage.system_ns);
-    // ru_maxrss：Linux 报告峰值驻留集（KB）。本内核无峰值记账，取当前
-    // 驻留页数折算为 KB（best-effort，见任务书取舍说明）。
+    // ru_maxrss：Linux 报告峰值驻留集（KB）。本内核无峰值记账，报告当前
+    // （而非峰值）驻留集，与 Linux ru_maxrss 峰值语义存在偏差，属已注明的
+    // best-effort 取舍。
     put_i64(&mut raw, 32, maxrss_kb.min(i64::MAX as u64) as i64);
     put_i64(&mut raw, 64, usage.minflt.min(i64::MAX as u64) as i64);
     put_i64(&mut raw, 72, usage.majflt.min(i64::MAX as u64) as i64);
@@ -1729,7 +1743,8 @@ fn tasks_by_real_uid(uid: Uid) -> Vec<Arc<Task>> {
 /// 校验 setpriority 的目标权限与优先级提升权限。
 ///
 /// 普通调用者只能修改同属主任务；降低 nice（提高优先级）时，还必须满足
-/// `CAP_SYS_NICE` 或当前线程组的 `RLIMIT_NICE` 下限。
+/// `CAP_SYS_NICE` 或目标任务的 `RLIMIT_NICE` 下限。Linux `can_nice(p, nice)`
+/// 用目标进程 `p` 的 `task_rlimit(p, RLIMIT_NICE)` 判定，故此处取 `target`。
 fn check_setpriority_permission(
     caller: &Arc<Task>,
     target: &Arc<Task>,
@@ -1742,7 +1757,7 @@ fn check_setpriority_permission(
     check_sched_target_owner(&caller_creds, target)?;
 
     let current = target.pi_base_attr().nice as i32;
-    if requested_nice < current && requested_nice < nice_floor_from_rlimit(caller) {
+    if requested_nice < current && requested_nice < nice_floor_from_rlimit(target) {
         return Err(Errno::EACCES);
     }
     Ok(())
@@ -3129,7 +3144,11 @@ const LINUX_FS_CAP_MASK: u64 = (1u64 << Capability::Chown as u32)
     | (1u64 << 27) // CAP_MKNOD
     | (1u64 << 32); // CAP_MAC_OVERRIDE
 
-fn drop_caps_after_uid_gid_change(old: &Credentials, new: &mut Credentials) {
+/// `SECBIT_KEEP_CAPS`:setuid 从 root 降权时保留 permitted 能力集。
+const SECBIT_KEEP_CAPS: u32 = 1 << 0;
+
+fn drop_caps_after_uid_gid_change(task: &Arc<Task>, old: &Credentials, new: &mut Credentials) {
+    let keepcaps = task.keepcaps() || (old.securebits & SECBIT_KEEP_CAPS) != 0;
     let lost_root_uid = (old.uid == Uid::ROOT || old.euid == Uid::ROOT || old.suid == Uid::ROOT)
         && new.uid != Uid::ROOT
         && new.euid != Uid::ROOT
@@ -3137,9 +3156,15 @@ fn drop_caps_after_uid_gid_change(old: &Credentials, new: &mut Credentials) {
     let lost_effective_root = old.euid == Uid::ROOT && new.euid != Uid::ROOT;
     let gained_effective_root = old.euid != Uid::ROOT && new.euid == Uid::ROOT;
     if lost_root_uid {
-        new.caps = CapSet::EMPTY;
-        new.cap_permitted = CapSet::EMPTY;
-        new.cap_inheritable = CapSet::EMPTY;
+        if !keepcaps {
+            new.caps = CapSet::EMPTY;
+            new.cap_permitted = CapSet::EMPTY;
+            new.cap_inheritable = CapSet::EMPTY;
+        } else {
+            // keepcaps:保留 permitted/inheritable,仅清 effective(仍需后续
+            // lost_effective_root 语义清空 effective)。
+            new.caps = CapSet::EMPTY;
+        }
     } else if lost_effective_root {
         new.caps = CapSet::EMPTY;
     } else if gained_effective_root {
@@ -3172,7 +3197,7 @@ pub(super) fn sys_setuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     } else {
         return Err(Errno::EPERM);
     }
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -3195,7 +3220,7 @@ pub(super) fn sys_setgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     } else {
         return Err(Errno::EPERM);
     }
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -3223,7 +3248,7 @@ pub(super) fn sys_setreuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     if ruid != u32::MAX || (euid != u32::MAX && euid != creds.uid.0) {
         new.suid = new.euid;
     }
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -3251,7 +3276,7 @@ pub(super) fn sys_setregid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     if rgid != u32::MAX || (egid != u32::MAX && egid != creds.gid.0) {
         new.sgid = new.egid;
     }
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -3283,7 +3308,7 @@ pub(super) fn sys_setresuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         new.suid = Uid(suid);
     }
     new.fsuid = new.euid;
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -3315,7 +3340,7 @@ pub(super) fn sys_setresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         new.sgid = Gid(sgid);
     }
     new.fsgid = new.egid;
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -3333,7 +3358,7 @@ pub(super) fn sys_setfsuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     {
         let mut new = (*creds).clone();
         new.fsuid = uid;
-        drop_caps_after_uid_gid_change(&creds, &mut new);
+        // setfsuid/setfsgid 不改变 capabilities,与 Linux 主路径一致。
         install_credentials(ctx.task(), new);
     }
     Ok(old.0 as usize)
@@ -3378,7 +3403,7 @@ pub(super) fn sys_setgroups(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let size = ctx.args[0];
     let list = ctx.args[1];
     let creds = ctx.task().credentials();
-    if creds.euid != Uid::ROOT {
+    if !creds.has_cap(Capability::Setgid) {
         return Err(Errno::EPERM);
     }
     const NGROUPS_MAX: usize = 65536;
@@ -3389,7 +3414,11 @@ pub(super) fn sys_setgroups(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     for i in 0..size {
         let mut raw = [0u8; 4];
         copy_from_user(list + i * 4, &mut raw).map_err(|e| e.as_errno())?;
-        groups.push(Gid(u32::from_le_bytes(raw)));
+        let gid = u32::from_le_bytes(raw);
+        if gid == u32::MAX {
+            return Err(Errno::EINVAL);
+        }
+        groups.push(Gid(gid));
     }
     let mut new = (*creds).clone();
     new.groups = groups;
@@ -7228,6 +7257,14 @@ fn task_fdtable(task: &Arc<Task>) -> Option<Arc<vfs::FdTable>> {
     task.ext_lookup(sched::TASKEXT_VFS_FDTABLE)?
         .downcast::<vfs::FdTable>()
         .ok()
+}
+
+/// RLIMIT_NOFILE 的 fdtable 同步只能表达 u32 范围的软/硬限制(fdtable 内部用 u32)。
+/// 在写 rlimit 表之前校验,避免"表已更新、fdtable 同步失败"的部分更新。
+fn validate_nofile_rlimit(limit: sched::RlimitPair) -> Result<(), Errno> {
+    u32::try_from(limit.soft.raw()).map_err(|_| Errno::EINVAL)?;
+    u32::try_from(limit.hard.raw()).map_err(|_| Errno::EINVAL)?;
+    Ok(())
 }
 
 fn sync_thread_group_fdtable_nofile_limit(
