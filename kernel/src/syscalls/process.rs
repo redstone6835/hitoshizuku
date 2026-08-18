@@ -120,7 +120,13 @@ pub(super) fn sys_getpid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     // pending/父 ns 设置）；NsProxy.pid 只反映 fork 时的快照，unshare
     // (CLONE_NEWPID) 后子进程会得到新 ns，必须用任务自身 ns 查询。
     let ns = task.pid_ns();
-    if let Some(pid) = task.pid_in(&ns) {
+    // getpid 返回线程组 leader 的 pid（TGID），而非调用线程自身的 pid：
+    // CLONE_THREAD 的非 leader 线程在 ns 中的 pid 是 tid，不能直接返回。
+    if let Some(pid) = task
+        .thread_group()
+        .leader()
+        .and_then(|leader| leader.pid_in(&ns))
+    {
         return Ok(pid as usize);
     }
     Ok(task
