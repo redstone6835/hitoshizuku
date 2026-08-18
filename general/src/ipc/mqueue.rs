@@ -249,9 +249,6 @@ impl MqObject {
         }
 
         let mut inner = self.inner.lock();
-        if inner.removed {
-            return Err(Errno::EINVAL);
-        }
         if inner.curmsgs as i64 >= inner.maxmsg {
             if nonblock {
                 return Err(Errno::EAGAIN);
@@ -287,9 +284,6 @@ impl MqObject {
         }
 
         let mut inner = self.inner.lock();
-        if inner.removed {
-            return Err(Errno::EINVAL);
-        }
         let Some((&priority, queue)) = inner.messages.iter_mut().next_back() else {
             if nonblock {
                 return Err(Errno::EAGAIN);
