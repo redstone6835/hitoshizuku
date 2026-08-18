@@ -1548,12 +1548,17 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     const KEYCTL_INSTANTIATE_IOV: usize = 20;
     const KEYCTL_INVALIDATE: usize = 21;
     const KEYCTL_GET_PERSISTENT: usize = 22;
+    const KEYCTL_DH_COMPUTE: usize = 23;
+    const KEYCTL_PKEY_QUERY: usize = 24;
+    const KEYCTL_PKEY_ENCRYPT: usize = 25;
+    const KEYCTL_PKEY_DECRYPT: usize = 26;
+    const KEYCTL_PKEY_SIGN: usize = 27;
+    const KEYCTL_PKEY_VERIFY: usize = 28;
     const KEYCTL_RESTRICT_KEYRING: usize = 29;
-    const KEYCTL_SUPPORTS_ENCRYPT: usize = 32;
-    const KEYCTL_SUPPORTS_DECRYPT: usize = 33;
-    const KEYCTL_SUPPORTS_SIGN: usize = 34;
-    const KEYCTL_SUPPORTS_VERIFY: usize = 35;
-    const KEYCTL_CAPABILITIES: usize = 36;
+    const KEYCTL_MOVE: usize = 30;
+    const KEYCTL_CAPABILITIES: usize = 31;
+    const KEYCTL_WATCH_KEY: usize = 32;
+    const KEYCTL_NOTIFY: usize = 33;
 
     let cmd = ctx.args[0];
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
@@ -1829,12 +1834,11 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             manager.restrict_keyring(keyring_id, restriction, &cred)?;
             Ok(0)
         }
-        KEYCTL_SUPPORTS_ENCRYPT
-        | KEYCTL_SUPPORTS_DECRYPT
-        | KEYCTL_SUPPORTS_SIGN
-        | KEYCTL_SUPPORTS_VERIFY => {
-            // 本内核不提供 key 加密/解密/签名/验签（无 crypto key 类型）。
-            Ok(0)
+        KEYCTL_DH_COMPUTE | KEYCTL_PKEY_QUERY | KEYCTL_PKEY_ENCRYPT | KEYCTL_PKEY_DECRYPT
+        | KEYCTL_PKEY_SIGN | KEYCTL_PKEY_VERIFY | KEYCTL_MOVE | KEYCTL_WATCH_KEY
+        | KEYCTL_NOTIFY => {
+            // 本内核无 crypto/asymmetric-key/watch/notify 子系统支持。
+            Err(Errno::EOPNOTSUPP)
         }
         KEYCTL_CAPABILITIES => {
             let buffer = ctx.args[1];
