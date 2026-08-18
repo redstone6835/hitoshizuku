@@ -5869,20 +5869,27 @@ fn ptrace_regset(
 
     match note_type {
         NT_PRSTATUS => {
-            let frame = ptrace_target_frame(target)?;
-            let mut mcontext = [0u8; 1024];
-            if !frame.write_linux_mcontext(&mut mcontext) {
-                return Err(Errno::EIO);
-            }
-            let size = linux_mcontext_size();
+            // NT_PRSTATUS 在 ptrace 路径返回的是原始寄存器组
+            // （riscv64 `user_regs_struct` 256B / loongarch64 `user_pt_regs`
+            // 360B），不带 `struct elf_prstatus` 头。
+            //
+            // 说明：`struct elf_prstatus`（其 pr_reg 字段才嵌入寄存器组；
+            // loongarch64 上 offsetof(pr_reg)=112、sizeof=480，riscv64 上
+            // offsetof(pr_reg)=112、sizeof=376）只出现在 ELF core dump 的
+            // NT_PRSTATUS note 里。内核 `ptrace(PTRACE_GETREGSET, NT_PRSTATUS)`
+            // 直接向用户拷贝 regset->n * regset->size 字节的原始寄存器组（见
+            // kernel/ptrace.c 的 ptrace_regset），gdb/strace 也按原始寄存器组
+            // 解释该缓冲区。因此这里不追加 elf_prstatus 头，以免与 gdb/strace
+            // 的预期不符。
+            let size = linux_user_regs_size();
             if set {
                 if len < size {
                     return Err(Errno::EIO);
                 }
-                let mut input = [0u8; 1024];
+                let mut input = [0u8; 360];
                 copy_from_user(base, &mut input[..size]).map_err(|e| e.as_errno())?;
                 let mut frame = ptrace_target_frame(target)?;
-                if !frame.apply_linux_mcontext(&input) {
+                if !frame.apply_linux_user_regs(&input[..size]) {
                     return Err(Errno::EIO);
                 }
                 ptrace_store_frame(target, frame);
@@ -5892,7 +5899,12 @@ fn ptrace_regset(
                     write_iov_len(iov_user, len)?;
                     return Ok(());
                 }
-                copy_to_user(base, &mcontext[..size]).map_err(|e| e.as_errno())?;
+                let frame = ptrace_target_frame(target)?;
+                let mut out = [0u8; 360];
+                if !frame.write_linux_user_regs(&mut out[..size]) {
+                    return Err(Errno::EIO);
+                }
+                copy_to_user(base, &out[..size]).map_err(|e| e.as_errno())?;
             }
             Ok(())
         }
@@ -5927,16 +5939,18 @@ fn write_iov_len(iov_user: usize, len: usize) -> Result<(), Errno> {
     copy_to_user(iov_user + 8, &(len as u64).to_ne_bytes()).map_err(|e| e.as_errno())
 }
 
-/// Linux `struct user_regs_struct`（mcontext 布局）的大小。
-fn linux_mcontext_size() -> usize {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        8 + 32 * 8 + 4 // pc + regs + flags
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        8 + 32 * 8 // pc + regs
-    }
+/// ptrace 原始寄存器组的大小（字节）。
+///
+/// 与 hal::user_context 中的编解码保持单一事实源，这里只做转发：
+/// - riscv64：`struct user_regs_struct`（pc + 31 个通用寄存器）= 256；
+/// - loongarch64：`struct user_pt_regs`（regs[32] + orig_a0 + csr_era
+///   + csr_badv + reserved[10]）= 360。
+///
+/// 注意：这不是信号帧 mcontext/sigcontext 的大小——loongarch 的 sigcontext 是
+/// 268 字节（pc@0 + regs@8 + flags@264），信号路径的尺寸由
+/// hal::user_context 内部维护，不经过本函数。
+fn linux_user_regs_size() -> usize {
+    hal::user_context::UserTrapFrame::linux_user_regs_size()
 }
 
 /// Linux `struct user_fpregs_struct` 的大小。
