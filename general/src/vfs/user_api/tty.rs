@@ -9,8 +9,8 @@ use sched::operation;
 use vfs::file::IoctlCmd;
 
 use super::ioctl::{
-    put_u32, read_bytes_from_user, read_i32_from_user, read_u32, write_bytes_to_user,
-    write_i32_to_user, write_u32_to_user,
+    put_u32, read_bytes_from_user, read_i32_from_user, read_pod_from_user, read_u32,
+    write_bytes_to_user, write_i32_to_user, write_u32_to_user,
 };
 
 const TCGETS: usize = 0x5401;
@@ -26,8 +26,13 @@ const TIOCSCTTY: usize = 0x540e;
 const TIOCGPGRP: usize = 0x540f;
 const TIOCSPGRP: usize = 0x5410;
 const TIOCOUTQ: usize = 0x5411;
+const TIOCSTI: usize = 0x5412;
 const TIOCGWINSZ: usize = 0x5413;
 const TIOCSWINSZ: usize = 0x5414;
+const TIOCMGET: usize = 0x5415;
+const TIOCMSET: usize = 0x5416;
+const TIOCMBIC: usize = 0x5417;
+const TIOCMBIS: usize = 0x5418;
 const FIONREAD: usize = 0x541b;
 const TIOCNOTTY: usize = 0x5422;
 const TIOCSETD: usize = 0x5423;
@@ -48,6 +53,12 @@ const TCOFLUSH: usize = 1;
 const TCIOFLUSH: usize = 2;
 const TTY_DEFAULT_BREAK_MS: u32 = 250;
 const TTY_BREAK_UNIT_MS: u32 = 100;
+
+/// TCXONC 的动作参数(与 Linux termios 一致)。
+pub const TCOOFF: u32 = 0;
+pub const TCOON: u32 = 1;
+pub const TCIOFF: u32 = 2;
+pub const TCION: u32 = 3;
 
 pub const LINUX_TERMIOS_LEN: usize = 36;
 const LINUX_TERMIOS2_LEN: usize = 44;
@@ -291,6 +302,29 @@ pub trait TtyIoctlState {
 
     /// 向前台进程组发信号(TIOCNOTTY 的 SIGHUP 等)。
     fn signal_foreground(&self, _sig: sched::SignalNumber) {}
+
+    /// TIOCSTI:向终端行规程注入一个输入字节(如同用户键入)。
+    fn inject_input(&self, _byte: u8) -> Result<(), Errno> {
+        Err(Errno::ENOTTY)
+    }
+
+    /// TIOCMGET:读取 modem 控制线状态位图。
+    fn modem_lines(&self) -> u32 {
+        0
+    }
+
+    /// TIOCMSET/TIOCMBIS/TIOCMBIC:更新 modem 控制线状态位图。
+    fn set_modem_lines(&self, _lines: u32) -> Result<(), Errno> {
+        Err(Errno::ENOTTY)
+    }
+
+    /// TCXONC:流控动作(TCOOFF/TCOON/TCIOFF/TCION)。
+    fn transmit_control(&self, _action: u32) -> Result<(), Errno> {
+        Err(Errno::ENOTTY)
+    }
+
+    /// TIOCEXCL/TIOCNXCL:设置/清除本终端的独占打开标志。
+    fn set_exclusive(&self, _exclusive: bool) {}
 }
 
 /// TTY ioctl 外部上下文。
@@ -331,8 +365,13 @@ pub fn is_tty_ioctl(cmd: IoctlCmd) -> bool {
             | TIOCGPGRP
             | TIOCSPGRP
             | TIOCOUTQ
+            | TIOCSTI
             | TIOCGWINSZ
             | TIOCSWINSZ
+            | TIOCMGET
+            | TIOCMSET
+            | TIOCMBIC
+            | TIOCMBIS
             | FIONREAD
             | TIOCNOTTY
             | TIOCSETD
@@ -484,7 +523,44 @@ where
             }
             _ => Err(Errno::EINVAL),
         },
-        TCXONC | TIOCEXCL | TIOCNXCL => Ok(0),
+        TIOCSTI => {
+            let mut byte = [0u8; 1];
+            read_bytes_from_user(arg, &mut byte)?;
+            state.inject_input(byte[0])?;
+            Ok(0)
+        }
+        TIOCMGET => {
+            write_u32_to_user(arg, state.modem_lines())?;
+            Ok(0)
+        }
+        TIOCMSET => {
+            let lines = read_pod_from_user::<u32>(arg)?;
+            state.set_modem_lines(lines)?;
+            Ok(0)
+        }
+        TIOCMBIS => {
+            let bits = read_pod_from_user::<u32>(arg)?;
+            state.set_modem_lines(state.modem_lines() | bits)?;
+            Ok(0)
+        }
+        TIOCMBIC => {
+            let bits = read_pod_from_user::<u32>(arg)?;
+            state.set_modem_lines(state.modem_lines() & !bits)?;
+            Ok(0)
+        }
+        TCXONC => {
+            let action = u32::try_from(arg).unwrap_or(u32::MAX);
+            state.transmit_control(action)?;
+            Ok(0)
+        }
+        TIOCEXCL => {
+            state.set_exclusive(true);
+            Ok(0)
+        }
+        TIOCNXCL => {
+            state.set_exclusive(false);
+            Ok(0)
+        }
         TIOCSCTTY => {
             // Linux 语义:仅会话首进程可设置;arg=1 允许抢占已有控制终端。
             if !ctx.is_session_leader() {

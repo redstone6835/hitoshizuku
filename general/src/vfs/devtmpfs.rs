@@ -69,6 +69,7 @@ use crate::vfs::device_files::spec::{
     CustomDevNodeKind, CustomDevNodeNumbering, CustomDevNodeSpec, DevNodeSet, DevNodeSpec,
 };
 use crate::vfs::user_api::block_device::{BlockDeviceIoctlContext, handle_block_ioctl};
+use crate::vfs::user_api::device_numbers::DeviceNumberKind;
 use crate::vfs::user_api::tty::{TtyIoctlContext, TtyIoctlState, UserTermios, handle_tty_ioctl};
 
 // ───────── 全局实例计数器 ─────────
@@ -946,6 +947,9 @@ impl FileOps for CharDevFileOps {
     fn release(&self) {
         crate::dev::tty::vt::note_vt_opened(&self.dev, -1);
         crate::dev::tty::pty::note_pty_opened(&self.dev, -1);
+        if let Some(tty) = self.tty.as_deref() {
+            tty.release_open();
+        }
     }
     fn as_any(&self) -> &dyn core::any::Any {
         self
@@ -959,6 +963,10 @@ impl FileOps for CharDevFileOps {
 /// 未绑定设备时按设备号反查(呈现层索引);仍未命中返回 ENXIO。
 struct MknodInodeOps {
     target_name: String,
+    /// 节点类别,供设备号反查使用(呈现层索引)。
+    kind: DeviceNumberKind,
+    /// 用户 mknod 时指定的设备号。
+    dev: DevId,
 }
 
 impl InodeOps for MknodInodeOps {
@@ -976,9 +984,17 @@ impl InodeOps for MknodInodeOps {
         let sb_ops = sb
             .downcast_ops::<DevTmpfsSuperblockOps>()
             .ok_or(VfsError::InvalidArgument)?;
-        let target = sb_ops
-            .lookup_node_at(&self.target_name)
-            .map_err(|_| VfsError::NoSuchDeviceOrAddress)?;
+
+        // 先按 mknod 时登记的投影名委托;找不到时按保存的设备号反查呈现层,
+        // 支持 initramfs 按正确 dev_t 预建节点、驱动随后以不同投影名绑定的场景。
+        let target = sb_ops.lookup_node_at(&self.target_name).or_else(|_| {
+            let record = super::user_api::device_numbers::lookup_rdev(self.kind, self.dev)
+                .ok_or(VfsError::NoSuchDeviceOrAddress)?;
+            sb_ops
+                .lookup_node_at(&record.node_name)
+                .map_err(|_| VfsError::NoSuchDeviceOrAddress)
+        })?;
+
         if let Some(ops) = target.downcast_ops::<DevCharOps>() {
             return ops.open(&target, opts, cred);
         }
@@ -1044,6 +1060,13 @@ pub(crate) fn char_dev_file_ops(
         return Err(VfsError::NoDevice);
     }
     let tty = tty::shared_tty_core(&dev);
+    // TIOCEXCL 独占语义:已有打开者且独占标志置位时,新 open 返回 EBUSY。
+    if let Some(tty) = tty.as_deref() {
+        tty.try_open().map_err(|err| match err {
+            errno::Errno::EBUSY => VfsError::DeviceBusy,
+            _ => VfsError::InvalidArgument,
+        })?;
+    }
     Ok(Box::new(CharDevFileOps::new(dev, nonblock, tty)))
 }
 
@@ -2376,11 +2399,10 @@ impl DevTmpfsSuperblockOps {
                 .ok_or(VfsError::NoSpace)?;
             let existing_rdev =
                 super::user_api::device_numbers::lookup_node(user_name).map(|record| record.rdev);
-            return if existing_rdev == Some(expected) {
-                Ok(())
-            } else {
-                Err(VfsError::AlreadyExists)
-            };
+            if existing_rdev != Some(expected) {
+                return Err(VfsError::AlreadyExists);
+            }
+            return self.ensure_block_symlink(user_name, expected);
         }
         let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
         let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
@@ -2425,7 +2447,27 @@ impl DevTmpfsSuperblockOps {
             super::user_api::device_numbers::unregister_node(user_name);
             return Err(err);
         }
+        if let Err(err) = self.ensure_block_symlink(user_name, rdev) {
+            let _ = self.remove_node_at(user_name);
+            self.rollback_numbered_node(user_name);
+            return Err(err);
+        }
         Ok(())
+    }
+
+    /// 为块设备节点创建 Linux 兼容的 `/dev/block/<major>:<minor>` 符号链接。
+    ///
+    /// 目标采用相对路径 `../<user_name>`(块设备节点都投影在 devtmpfs 顶层),
+    /// 与 Linux devtmpfs 在创建设备节点时同步创建链接的行为一致。已存在同名
+    /// 链接时按幂等处理,不覆盖既有投影。
+    fn ensure_block_symlink(&self, user_name: &str, rdev: DevId) -> VfsResult<()> {
+        let link_path = alloc::format!("block/{}:{}", rdev.major, rdev.minor);
+        let target = alloc::format!("../{user_name}");
+        match self.bind_symlink(&link_path, &target) {
+            Ok(()) => Ok(()),
+            Err(VfsError::AlreadyExists) => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
     /// 在 devtmpfs 相对路径上创建一个符号链接节点。
@@ -2451,7 +2493,7 @@ impl DevTmpfsSuperblockOps {
     /// open 时按 `target_name`(已登记投影)或设备号(open 时反查)解析设备。
     fn new_mknod_inode(
         &self,
-        name: &str,
+        _name: &str,
         kind: FileType,
         mode: FileMode,
         dev: DevId,
@@ -2472,8 +2514,14 @@ impl DevTmpfsSuperblockOps {
             ctime: now,
             blocks: 0,
         };
+        let node_kind = match kind {
+            FileType::CharDevice => DeviceNumberKind::Char,
+            _ => DeviceNumberKind::Block,
+        };
         let ops = Arc::new(MknodInodeOps {
             target_name: devtmpfs_fallible_string(target_name)?,
+            kind: node_kind,
+            dev,
         });
         Ok(Inode::new(
             InodeId {

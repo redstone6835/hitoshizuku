@@ -568,10 +568,27 @@ fn block_function_devnodes(func: &dyn DeviceFunction) -> Result<Option<DevNodeSe
     let Some(block) = function_as::<BlockFunction>(func) else {
         return Ok(None);
     };
-    Ok(Some(DevNodeSet::try_single(DevNodeSpec::Block {
+    let dev = block.dev();
+    let mut nodes = Vec::new();
+    nodes.try_reserve(8).map_err(|_| VfsError::NoSpace)?;
+    nodes.push(DevNodeSpec::Block {
         name: fallible_box_str(block.projection_name())?,
-        dev: block.dev(),
-    })?))
+        dev: Arc::clone(&dev),
+    });
+    // 整盘设备扫描分区表并投影 /dev/<disk><part> 节点(如 vd0p1/sda1)。
+    // 分区扫描带缓存,仅在首次投影时读一次磁盘。
+    for part in crate::dev::partition::partitions_of(&dev) {
+        let name =
+            crate::dev::partition::partition_disk_name(block.projection_name(), part.number());
+        if name.is_empty() {
+            continue;
+        }
+        nodes.push(DevNodeSpec::Block {
+            name: fallible_box_str(&name)?,
+            dev: part.dev(),
+        });
+    }
+    DevNodeSet::try_new(nodes)
 }
 
 fn rtc_function_devnodes(func: &dyn DeviceFunction) -> Result<Option<DevNodeSet>, VfsError> {
