@@ -811,8 +811,9 @@ impl KeyManager {
         Ok(())
     }
 
-    /// `keyctl(KEYCTL_CHOWN)`：改 uid/gid 需 `CAP_SYS_ADMIN`（简化：owner 或
-    /// 相同 uid）；`KEY_USR_SETATTR` 权限。
+    /// `keyctl(KEYCTL_CHOWN)`：改 uid 需 `CAP_SYS_ADMIN`；改 gid 需
+    /// `CAP_SYS_ADMIN` 或调用者属于目标组（Linux `keyctl_chown` 语义）；
+    /// 操作本身还需 `KEY_POS_SETATTR` 权限。
     pub fn chown(
         &self,
         key_id: KeyId,
@@ -831,6 +832,13 @@ impl KeyManager {
         let new_uid = uid.unwrap_or(current.0);
         let new_gid = gid.unwrap_or(current.1);
         if new_uid != current.0 && !cred.has_cap(vfs::cred::Capability::SysAdmin) {
+            return Err(Errno::EPERM);
+        }
+        if new_gid != current.1
+            && !cred.has_cap(vfs::cred::Capability::SysAdmin)
+            && cred.egid.0 != new_gid
+            && !cred.groups.iter().any(|g| g.0 == new_gid)
+        {
             return Err(Errno::EPERM);
         }
         key.set_uid_gid(new_uid, new_gid);
@@ -1259,5 +1267,26 @@ mod tests {
             manager.invalidate(no_perm.id, &cred(1000, 0)),
             Err(Errno::EACCES)
         );
+    }
+
+    #[test]
+    fn chown_gid_requires_cap_or_membership() {
+        let manager = KeyManager::new();
+        let key = manager
+            .create_uninstantiated(KeyType::User, "k", 1000, 1000, KEY_DEFAULT_PERM)
+            .unwrap();
+        // 无 CAP_SYS_ADMIN、目标 gid 不属于调用者 → EPERM。
+        assert_eq!(
+            manager.chown(key.id, None, Some(2000), &cred(1000, 1000)),
+            Err(Errno::EPERM)
+        );
+        // 目标 gid 是调用者 egid → 允许。
+        let mut by_egid = cred(1000, 1000);
+        by_egid.egid = Gid(2000);
+        assert_eq!(manager.chown(key.id, None, Some(2000), &by_egid), Ok(()));
+        // 目标 gid 在附加组列表 → 允许。
+        let mut by_groups = cred(1000, 1000);
+        by_groups.groups = vec![Gid(3000)];
+        assert_eq!(manager.chown(key.id, None, Some(3000), &by_groups), Ok(()));
     }
 }
