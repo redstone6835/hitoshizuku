@@ -706,6 +706,9 @@ impl File {
             .store(offset.saturating_add(n as u64), Ordering::Release);
         #[cfg(feature = "performance-profile")]
         profile.set_bytes(n);
+        if n > 0 {
+            self.touch_atime_on_read();
+        }
         if n > 0 && crate::fsnotify::is_enabled() {
             crate::fsnotify::emit_at_with_parents(
                 &self.inode,
@@ -782,6 +785,9 @@ impl File {
         let n = self.ops.read_at(buf, offset)?;
         #[cfg(feature = "performance-profile")]
         profile.set_bytes(n);
+        if n > 0 {
+            self.touch_atime_on_read();
+        }
         if n > 0 && crate::fsnotify::is_enabled() {
             crate::fsnotify::emit(&self.inode, crate::fsnotify::IN_ACCESS, 0);
         }
@@ -810,7 +816,35 @@ impl File {
         self.ops.read_pages_at(offset, pages, valid_len)?;
         #[cfg(feature = "performance-profile")]
         profile.set_bytes(valid_len);
+        if valid_len > 0 {
+            self.touch_atime_on_read();
+        }
         Ok(())
+    }
+
+    /// 通用读路径的 atime 更新。
+    ///
+    /// 遵守 `noatime` / `nodiratime` 挂载标志,豁免伪文件(无底层设备的
+    /// 内存/合成文件系统),其余按 Linux 默认 relatime 语义由
+    /// [`Inode::touch_atime_relatime`] 决定是否真正更新。
+    fn touch_atime_on_read(&self) {
+        use crate::vfs::mount::MountFlags;
+        use crate::vfs::stat::FileType;
+
+        let flags = self.mount.flags_snapshot();
+        if flags.has(MountFlags::NOATIME) {
+            return;
+        }
+        if flags.has(MountFlags::NODIRATIME) && self.inode.kind() == FileType::Directory {
+            return;
+        }
+        // 伪文件/内存文件系统(无底层设备)不维护持久 atime。
+        match self.inode.superblock() {
+            Some(sb) if sb.dev_id.is_none() => return,
+            None => return,
+            _ => {}
+        }
+        self.inode.touch_atime_relatime();
     }
 
     /// 在指定偏移量处写入，不改变描述符的当前偏移量（`pwrite64`）。

@@ -46,7 +46,9 @@
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicIsize, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use crate::vfs::cred::{Credentials, Gid, Uid};
 use crate::vfs::error::{VfsError, VfsResult};
@@ -174,6 +176,23 @@ fn allocate_private_page_cache_id() -> usize {
 /// 在 Inode 创建时直接缓存到只读字段中。
 pub(crate) fn derive_stat_dev(fs_id: FsId, dev_id: Option<DevId>) -> DevId {
     dev_id.unwrap_or_else(|| DevId::new((fs_id.raw() >> 32) as u32, fs_id.raw() as u32))
+}
+
+/// 严格小于比较(`Timespec` 未派生 `Ord`,relatime 需要)。
+#[inline]
+fn timespec_lt(a: Timespec, b: Timespec) -> bool {
+    a.secs < b.secs || (a.secs == b.secs && a.nsecs < b.nsecs)
+}
+
+/// Linux 默认 relatime 判定:是否需要把 atime 更新为 `now`。
+///
+/// 仅当 `atime` 早于 `mtime` 或 `ctime`,或距上次访问已满 24 小时时返回 true。
+#[inline]
+fn atime_needs_update(atime: Timespec, mtime: Timespec, ctime: Timespec, now: Timespec) -> bool {
+    const RELATIME_UPDATE_SECS: i64 = 24 * 60 * 60;
+    timespec_lt(atime, mtime)
+        || timespec_lt(atime, ctime)
+        || now.secs.saturating_sub(atime.secs) >= RELATIME_UPDATE_SECS
 }
 
 /// 文件系统对象的核心内存表示。
@@ -677,6 +696,20 @@ impl Inode {
         self.meta.lock().atime = Timespec::now();
     }
 
+    /// 按 Linux 默认 relatime 语义更新访问时间。
+    ///
+    /// 仅当 `atime` 早于 `mtime` 或 `ctime`,或距上次访问已满 24 小时时才更新;
+    /// 否则跳过以降低读密集负载的元数据写回。`noatime` / `nodiratime` 挂载标志
+    /// 与伪文件豁免由调用方(通用 `File` 读路径)在持有 `Mount` 时判断,本方法
+    /// 只负责时间比较与更新。
+    pub(crate) fn touch_atime_relatime(&self) {
+        let now = Timespec::now();
+        let mut meta = self.meta.lock();
+        if atime_needs_update(meta.atime, meta.mtime, meta.ctime, now) {
+            meta.atime = now;
+        }
+    }
+
     /// 更新修改时间为当前时间。
     pub fn touch_mtime(&self) {
         self.meta.lock().mtime = Timespec::now();
@@ -1056,5 +1089,61 @@ mod data_state_tests {
         assert_eq!(data_state_generation(next), DATA_GENERATION_MAX);
         assert_eq!(data_state_active(next), 0);
         assert!(data_state_disabled(next));
+    }
+}
+
+#[cfg(test)]
+mod relatime_tests {
+    use super::{atime_needs_update, timespec_lt};
+    use crate::vfs::stat::Timespec;
+
+    fn ts(secs: i64, nsecs: u32) -> Timespec {
+        Timespec { secs, nsecs }
+    }
+
+    #[test]
+    fn timespec_lt_compares_seconds_then_nanoseconds() {
+        assert!(timespec_lt(ts(1, 0), ts(2, 0)));
+        assert!(timespec_lt(ts(1, 999), ts(2, 0)));
+        assert!(timespec_lt(ts(1, 0), ts(1, 1)));
+        assert!(!timespec_lt(ts(1, 1), ts(1, 0)));
+        assert!(!timespec_lt(ts(1, 0), ts(1, 0)));
+    }
+
+    #[test]
+    fn relatime_updates_when_atime_older_than_mtime_or_ctime() {
+        let now = ts(1_000, 0);
+        // atime 早于 mtime → 更新。
+        assert!(atime_needs_update(ts(100, 0), ts(200, 0), ts(300, 0), now));
+        // atime 早于 ctime → 更新。
+        assert!(atime_needs_update(ts(250, 0), ts(200, 0), ts(300, 0), now));
+        // atime 不早于 mtime/ctime 且未满 24h → 不更新。
+        assert!(!atime_needs_update(ts(500, 0), ts(200, 0), ts(300, 0), now));
+    }
+
+    #[test]
+    fn relatime_updates_after_24h_idle() {
+        let now = ts(100_000, 0);
+        // atime 距今恰好 86400s → 更新。
+        assert!(atime_needs_update(
+            ts(100_000 - 86_400, 0),
+            ts(1, 0),
+            ts(1, 0),
+            now
+        ));
+        // 距今 86399s → 不更新。
+        assert!(!atime_needs_update(
+            ts(100_000 - 86_399, 0),
+            ts(1, 0),
+            ts(1, 0),
+            now
+        ));
+    }
+
+    #[test]
+    fn relatime_ignores_future_atime_clock_skew() {
+        let now = ts(1_000, 0);
+        // atime 在未来(时钟回拨):不因 24h 判定误更新。
+        assert!(!atime_needs_update(ts(2_000, 0), ts(1, 0), ts(1, 0), now));
     }
 }
