@@ -1320,7 +1320,7 @@ pub fn setsockopt(
     }
     if file.downcast_ops::<NetSocketFileOps>().is_some() {
         let net_ops = file.downcast_ops::<NetSocketFileOps>().unwrap();
-        return inet_setsockopt(net_ops, level, optname, value);
+        return inet_setsockopt(net_ops, level, optname, value, file.cred().as_ref());
     }
 
     let socket = socket_from_file(&file)?;
@@ -1767,6 +1767,7 @@ fn inet_setsockopt(
     level: i32,
     optname: i32,
     value: &[u8],
+    cred: &Credentials,
 ) -> Result<(), Errno> {
     if level == SOL_IPV6 && net_ops.family() != crate::addr::AF_INET6 {
         return Err(Errno::ENOPROTOOPT);
@@ -1797,6 +1798,9 @@ fn inet_setsockopt(
                 Ok(())
             }
             SO_BINDTODEVICE => {
+                if !cred.has_cap(crate::vfs::cred::Capability::NetRaw) {
+                    return Err(Errno::EPERM);
+                }
                 let end = value
                     .iter()
                     .position(|byte| *byte == 0)
