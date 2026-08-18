@@ -3896,6 +3896,139 @@ impl VmSpace {
         Ok(new_range.start)
     }
 
+    /// `mremap(MREMAP_DONTUNMAP)`：把私有匿名映射搬到新地址，同时把旧地址替换为
+    /// 一段不驻留的空匿名映射（Linux 5.7+ 的原地扩展双映射语义）。
+    ///
+    /// 限制与取舍：仅支持私有匿名映射（Linux 同样要求）；不支持 `new_len <
+    /// old_len` 的收缩（返回 `EINVAL`）。迁移后旧地址首次访问得到零页，新地址
+    /// 持有原页。
+    pub fn mremap_dontunmap(
+        &self,
+        old_range: Range<usize>,
+        new_len: usize,
+        fixed_addr: Option<usize>,
+    ) -> Result<usize, Errno> {
+        self.validate_range(&old_range)?;
+        let page_size = page_size();
+        if new_len == 0 || new_len % page_size != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let old_len = old_range.end - old_range.start;
+        if new_len < old_len {
+            return Err(Errno::EINVAL);
+        }
+        // 旧范围必须被私有匿名 VMA 连续覆盖。
+        {
+            let set = self.vmas.lock();
+            if !set.contains_range(&old_range) {
+                return Err(Errno::ENOMEM);
+            }
+            for area in set.iter_overlap(&old_range) {
+                if !matches!(area.backing, VmBacking::Anon { .. })
+                    || area.flags.has(VmFlags::SHARED)
+                {
+                    return Err(Errno::EINVAL);
+                }
+            }
+            if Self::contains_sealed(&set, &old_range) {
+                return Err(Errno::EPERM);
+            }
+        }
+        let new_start = if let Some(addr) = fixed_addr {
+            addr
+        } else {
+            self.alloc_mmap_range(new_len)?.start
+        };
+        let new_end = new_start.checked_add(new_len).ok_or(Errno::EINVAL)?;
+        let new_range = new_start..new_end;
+        self.validate_range(&new_range)?;
+        if ranges_overlap(&old_range, &new_range) {
+            return Err(Errno::EINVAL);
+        }
+
+        let (removed_target, empty_anon, tail, moved_pages) = {
+            let mut vmas = self.vmas.lock();
+            if !vmas.contains_range(&old_range) {
+                return Err(Errno::ENOMEM);
+            }
+            if Self::contains_sealed(&vmas, &new_range) {
+                return Err(Errno::EPERM);
+            }
+            let removed_target = if fixed_addr.is_some() {
+                vmas.unmap_range(&new_range)
+            } else {
+                if !vmas.is_range_free(&new_range) {
+                    return Err(Errno::EEXIST);
+                }
+                Vec::new()
+            };
+            let old_pieces = vmas.unmap_range(&old_range);
+            let old_covered = covered_len(&old_pieces, &old_range);
+            if old_covered != old_len {
+                return Err(Errno::ENOMEM);
+            }
+
+            // 1) 旧地址:插入空匿名 VMA(保留原权限/标志,换用全新合并域)。
+            let mut empty_anon = Vec::with_capacity(old_pieces.len());
+            let mut cursor = old_range.start;
+            for mut area in old_pieces.clone() {
+                let len = area.range.end - area.range.start;
+                area.backing = VmBacking::anonymous();
+                area.flags = area.flags.without(VmFlags::SHARED).with(VmFlags::ANON);
+                area.range = cursor..cursor + len;
+                cursor += len;
+                vmas.insert(area.clone())?;
+                empty_anon.push(area);
+            }
+            // 2) 新地址:插入搬移后的原 VMA。
+            let mut cursor = new_range.start;
+            let mut last_inserted = None;
+            for mut area in old_pieces {
+                let len = area.range.end - area.range.start;
+                area.range = cursor..cursor + len;
+                cursor += len;
+                last_inserted = Some(area.clone());
+                vmas.insert(area)?;
+            }
+            let tail = if cursor < new_range.end {
+                let last = last_inserted.ok_or(Errno::ENOMEM)?;
+                let last_len = last.range.end - last.range.start;
+                let backing = last.backing.checked_shift(last_len).ok_or(Errno::EINVAL)?;
+                let tail = VmArea {
+                    range: cursor..new_range.end,
+                    flags: last.flags,
+                    backing,
+                };
+                vmas.insert(tail.clone())?;
+                Some(tail)
+            } else {
+                None
+            };
+            let removed_pages = self.unmap_page_mappings(new_range.clone())?;
+            let moved_pages =
+                self.move_page_mappings_locked(&vmas, old_range.start, new_range.start, old_len)?;
+            (removed_target, empty_anon, tail, moved_pages)
+        };
+        for area in &removed_target {
+            self.account_area_remove(area);
+        }
+        for area in &empty_anon {
+            self.account_area_insert(area);
+        }
+        if let Some(tail) = &tail {
+            self.account_area_insert(tail);
+        }
+        Self::notify_file_unmapped(&removed_target);
+        if moved_pages {
+            self.invalidate_user_range(old_range.start, old_len);
+            self.invalidate_user_range(new_range.start, old_len);
+        }
+        drop(removed_target);
+        prune_shared_anon_pages();
+        self.mmap_next.store(new_range.end, Ordering::Release);
+        Ok(new_range.start)
+    }
+
     /// 修改权限。要求整个 range 已被 VMA 连续覆盖。
     #[kernel_symbols::export(name = "general.mm.VmSpace.mprotect", contract = "kernel.mm.mapping@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn mprotect(&self, range: Range<usize>, new_flags: VmFlags) -> Result<(), Errno> {
@@ -4761,6 +4894,37 @@ impl VmSpace {
         Ok(len as u64)
     }
 
+    /// `UFFDIO_CONTINUE`：为 MINOR 模式缺页安装"页缓存中已存在"的页。
+    ///
+    /// 与 Linux 的差异：Linux 的 MINOR 缺页针对 shmem/file 后端（页已在页缓存、
+    /// 只差映射）；本内核仅支持私有匿名后端，没有共享页缓存页可 continue，因此
+    /// 退化为对非驻留页安装零页（等价 ZEROPAGE），并据此注明 shmem/file 后端缺失。
+    pub(crate) fn uffd_continue(&self, start: usize, len: usize) -> Result<u64, Errno> {
+        let page_size = page_size();
+        if start % page_size != 0 || len == 0 || len % page_size != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = start.checked_add(len).ok_or(Errno::EINVAL)?;
+        {
+            let pages = self.pages.lock();
+            let mut va = start;
+            while va < end {
+                if pages.contains_key(va) {
+                    return Err(Errno::EEXIST);
+                }
+                va += page_size;
+            }
+        }
+        let mut va = start;
+        while va < end {
+            let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+            let page = ResidentPage::new_anon(paddr);
+            self.uffd_install_page(va, page, false)?;
+            va += page_size;
+        }
+        Ok(len as u64)
+    }
+
     /// `UFFDIO_WRITEPROTECT`：设置/清除范围内驻留页的写保护。
     ///
     /// 要求范围命中登记了 WP 模式且属于 `state` 的区域（否则 `EINVAL`）。
@@ -4910,6 +5074,57 @@ impl VmSpace {
         } else {
             0
         };
+        state.enqueue_fault(flags, page);
+        let page_present = || self.pages.lock().contains_key(page);
+        let region_alive = || {
+            if !state.alive() {
+                return false;
+            }
+            self.uffd_regions
+                .lock()
+                .iter()
+                .any(|region| region.range.contains(&page) && Arc::ptr_eq(&region.state, &state))
+        };
+        state.wait_fault(|| page_present() || !region_alive());
+        page_present()
+    }
+
+    /// MINOR 拦截：`page` 命中 MINOR 登记区域且未驻留时，入队 MINOR 事件并挂起，
+    /// 由用户态通过 `UFFDIO_CONTINUE`/`UFFDIO_COPY` 解决。
+    ///
+    /// 与 Linux 的差异：Linux 的 MINOR 缺页表示"页已在页缓存、只差映射"；本内核
+    /// 仅支持私有匿名后端，无共享页缓存，因此 MINOR 拦截退化为对非驻留页触发，
+    /// 等价 MISSING 但事件带 `UFFD_PAGEFAULT_FLAG_MINOR`。
+    fn uffd_minor_intercept(&self, page: usize, kind: FaultKind) -> bool {
+        let region = {
+            let regions = self.uffd_regions.lock();
+            if regions.is_empty() {
+                return false;
+            }
+            let Some(region) = regions.iter().find(|region| {
+                region.range.contains(&page) && region.mode & UFFDIO_REGISTER_MODE_MINOR != 0
+            }) else {
+                return false;
+            };
+            region.clone()
+        };
+        if self.pages.lock().contains_key(page) {
+            return false;
+        }
+        {
+            let set = self.vmas.lock();
+            let Some(area) = set.find(page) else {
+                return false;
+            };
+            if !matches!(area.backing, VmBacking::Anon { .. }) || area.flags.has(VmFlags::SHARED) {
+                return false;
+            }
+        }
+        let state = Arc::clone(&region.state);
+        let mut flags = UFFD_PAGEFAULT_FLAG_MINOR;
+        if matches!(kind, FaultKind::Store | FaultKind::PermWrite) {
+            flags |= UFFD_PAGEFAULT_FLAG_WRITE;
+        }
         state.enqueue_fault(flags, page);
         let page_present = || self.pages.lock().contains_key(page);
         let region_alive = || {
@@ -5240,6 +5455,9 @@ impl VmSpace {
         // userfaultfd 拦截：MISSING 区域的缺页与 WP 区域的写保护缺页先入队
         // 事件并挂起本任务，由用户态解决后返回 Fixed 让硬件重试。
         if self.uffd_missing_intercept(page, kind) {
+            return FaultOutcome::Fixed;
+        }
+        if self.uffd_minor_intercept(page, kind) {
             return FaultOutcome::Fixed;
         }
         if self.uffd_wp_intercept(page, kind) {

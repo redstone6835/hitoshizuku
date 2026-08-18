@@ -447,8 +447,9 @@ pub(super) fn sys_mremap(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if (flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP)) != 0 {
         return Err(Errno::EINVAL);
     }
-    if (flags & MREMAP_DONTUNMAP) != 0 {
-        return Err(Errno::EOPNOTSUPP);
+    // MREMAP_DONTUNMAP 必须搭配 MREMAP_MAYMOVE（Linux 5.7+ 语义）。
+    if (flags & MREMAP_DONTUNMAP) != 0 && (flags & MREMAP_MAYMOVE) == 0 {
+        return Err(Errno::EINVAL);
     }
     if (flags & MREMAP_FIXED) != 0 && (flags & MREMAP_MAYMOVE) == 0 {
         return Err(Errno::EINVAL);
@@ -473,12 +474,16 @@ pub(super) fn sys_mremap(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     } else {
         None
     };
-    let mapped = vm.mremap(
-        old_addr..old_end,
-        new_len,
-        (flags & MREMAP_MAYMOVE) != 0,
-        fixed,
-    )?;
+    let mapped = if (flags & MREMAP_DONTUNMAP) != 0 {
+        vm.mremap_dontunmap(old_addr..old_end, new_len, fixed)?
+    } else {
+        vm.mremap(
+            old_addr..old_end,
+            new_len,
+            (flags & MREMAP_MAYMOVE) != 0,
+            fixed,
+        )?
+    };
     #[cfg(feature = "performance-profile")]
     {
         let mapped_end = mapped.checked_add(new_len).ok_or(Errno::EINVAL)?;
