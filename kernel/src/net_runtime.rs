@@ -3636,6 +3636,7 @@ pub fn start_workers() {
     general::vfs::procfs::install_proc_net_route_provider(netlink_route_snapshot);
     general::vfs::procfs::install_proc_net_neighbor_provider(procfs_neighbor_snapshot);
     general::vfs::procfs::install_proc_net_dns_provider(procfs_dns_snapshot);
+    general::vfs::procfs::install_proc_net_addr_provider(netlink_address_snapshot);
     vfs::packet_socket::install_packet_tx_handler(packet_tx_frame);
     vfs::packet_socket::install_packet_interface_mac(packet_interface_mac);
     vfs::net_socket::install_net_realtime_clock(crate::vdso::realtime_ns);
