@@ -5347,6 +5347,12 @@ impl VmSpace {
     /// [`Self::would_lock_pages`] 完成，这里只负责状态与记账。
     pub fn mlock_range(&self, range: Range<usize>, populate: bool) -> Result<(), Errno> {
         self.validate_range(&range)?;
+        {
+            let set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(Errno::ENOMEM);
+            }
+        }
         if populate {
             self.prefault_user_range(range.clone(), true)
                 .map_err(|_| Errno::EAGAIN)?;
