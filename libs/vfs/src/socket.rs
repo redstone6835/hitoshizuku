@@ -1497,6 +1497,16 @@ fn parse_ipv4_membership(value: &[u8]) -> Result<net::MulticastMembership, Errno
         if index < 0 {
             return Err(Errno::ENODEV);
         }
+        // 正数 ifindex 必须指向真实存在的接口，否则返回 ENODEV（对齐
+        // IP_MULTICAST_IF 对负值返回 ENODEV 的语义，避免随后把坏索引
+        // 透传给 add_multicast_membership 映射成 EADDRNOTAVAIL）。
+        if index != 0
+            && !net::device::snapshot_devices()
+                .iter()
+                .any(|device| device.id.raw() == index as u32)
+        {
+            return Err(Errno::ENODEV);
+        }
         (index != 0).then_some(net::InterfaceId(index as u32))
     } else if value[4..8] == [0; 4] {
         None
