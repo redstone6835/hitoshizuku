@@ -4337,8 +4337,121 @@ pub(super) fn sys_epoll_pwait2(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     Ok(ready.len())
 }
 
-pub(super) fn sys_mount_setattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// `mount_setattr(2)`：批量修改挂载属性（只读/访问约束位 + 传播类型）。
+pub(super) fn sys_mount_setattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    if !vfs_ctx.cred().has_cap(vfs::cred::Capability::SysAdmin) {
+        return Err(Errno::EPERM);
+    }
+    let dfd = ctx.args[0];
+    let path = copy_path_from_user(ctx.args[1])?;
+    let flags = ctx.args[2];
+    let attr_user = ctx.args[3];
+    let size = ctx.args[4];
+    const MOUNT_ATTR_SIZE_VER0: usize = 32;
+    if size < MOUNT_ATTR_SIZE_VER0 {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & !(AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW)) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let mut raw = [0u8; 32];
+    copy_from_user(attr_user, &mut raw).map_err(|e| e.as_errno())?;
+    let attr_set = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let attr_clr = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    let propagation = u64::from_le_bytes(raw[16..24].try_into().unwrap());
+    let userns_fd = u64::from_le_bytes(raw[24..32].try_into().unwrap());
+    if userns_fd != 0 {
+        // 无 userns idmap 挂载支持。
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if (attr_set & !MOUNT_ATTR_SUPPORTED as u64) != 0
+        || (attr_clr & !MOUNT_ATTR_SUPPORTED as u64) != 0
+    {
+        return Err(Errno::EOPNOTSUPP);
+    }
+
+    // 定位目标挂载：AT_EMPTY_PATH + 空路径表示 dfd 即 open_tree/fsmount 挂载 fd。
+    let mount = if (flags & AT_EMPTY_PATH) != 0 && path.is_empty() {
+        let file = fdt.get_file(fd_arg(dfd)?).ok_or(Errno::EBADF)?;
+        let fsc = vfs::fs_context::FsContextFileOps::from_file(&file).ok_or(Errno::EINVAL)?;
+        let root = fsc.clone_root().ok_or(Errno::EINVAL)?;
+        vfs_ctx
+            .mount_ns
+            .find_mount_for_root(&root)
+            .ok_or(Errno::EINVAL)?
+    } else {
+        let dirfd = dirfd_arg(dfd, &fdt)?;
+        let r = vfs::path::lookup(&vfs_ctx, &dirfd, &path, LookupFlags::NO_MOUNT_LAST)
+            .map_err(|e| e.to_errno())?;
+        vfs_ctx
+            .mount_ns
+            .lookup_mount(&r.dentry)
+            .ok_or(Errno::EINVAL)?
+    };
+
+    let rec = (flags & AT_RECURSIVE) != 0;
+    apply_mount_setattr_one(&mount, attr_set, attr_clr, propagation)?;
+    if rec {
+        let children: Vec<Arc<vfs::mount::Mount>> = mount.children.lock().clone();
+        for child in children {
+            apply_mount_setattr_recursive(&child, attr_set, attr_clr, propagation)?;
+        }
+    }
+    Ok(0)
+}
+
+fn apply_mount_setattr_one(
+    mount: &Arc<vfs::mount::Mount>,
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+) -> Result<(), Errno> {
+    let mut flags = mount.flags_snapshot();
+    for (bit, flag) in [
+        (MOUNT_ATTR_RDONLY as u64, MountFlags::RDONLY),
+        (MOUNT_ATTR_NOSUID as u64, MountFlags::NOSUID),
+        (MOUNT_ATTR_NODEV as u64, MountFlags::NODEV),
+        (MOUNT_ATTR_NOEXEC as u64, MountFlags::NOEXEC),
+        (MOUNT_ATTR_NOATIME as u64, MountFlags::NOATIME),
+        (MOUNT_ATTR_NODIRATIME as u64, MountFlags::NODIRATIME),
+    ] {
+        if attr_set & bit != 0 {
+            flags = flags.with(flag);
+        }
+        if attr_clr & bit != 0 {
+            flags = flags.without(flag);
+        }
+    }
+    mount.superblock.remount(flags).map_err(|e| e.to_errno())?;
+    mount.set_flags(flags);
+
+    if propagation != 0 {
+        let kind = match propagation as usize {
+            MS_SHARED => vfs::mount::PROP_SHARED,
+            MS_PRIVATE => vfs::mount::PROP_PRIVATE,
+            MS_SLAVE => vfs::mount::PROP_SLAVE,
+            MS_UNBINDABLE => vfs::mount::PROP_UNBINDABLE,
+            _ => return Err(Errno::EINVAL),
+        };
+        vfs::mount::set_mount_propagation(mount, kind);
+    }
+    Ok(())
+}
+
+fn apply_mount_setattr_recursive(
+    mount: &Arc<vfs::mount::Mount>,
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+) -> Result<(), Errno> {
+    apply_mount_setattr_one(mount, attr_set, attr_clr, propagation)?;
+    let children: Vec<Arc<vfs::mount::Mount>> = mount.children.lock().clone();
+    for child in children {
+        apply_mount_setattr_recursive(&child, attr_set, attr_clr, propagation)?;
+    }
+    Ok(())
 }
 
 pub(super) fn sys_quotactl_fd(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
