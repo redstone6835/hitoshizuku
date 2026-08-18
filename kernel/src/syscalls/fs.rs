@@ -1545,7 +1545,9 @@ pub(super) fn sys_sync(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_syncfs(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fd = fd_arg(ctx.args[0])?;
     let file = file_for_fd(fd)?;
-    file.sync().map_err(|e| e.to_errno())?;
+    // syncfs(2) 同步 fd 所属的整个文件系统，而非单个文件。
+    let sb = file.inode().superblock().ok_or(Errno::ENOENT)?;
+    sb.sync().map_err(|e| e.to_errno())?;
     Ok(0)
 }
 
