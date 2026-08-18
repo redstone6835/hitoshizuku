@@ -640,15 +640,44 @@ fn notify_terminated_thread_group(group: &Arc<ThreadGroup>) {
     }
 }
 
+/// 找到将死任务的最近存活 subreaper 祖先；找不到则回退 init。
+///
+/// Linux `find_new_reaper` 语义：从将死任务沿父链向上，最近的
+/// `is_subreaper()==true` 且仍存活（非 Zombie/Dead）的祖先收养孤儿，
+/// 否则交给 init。从 `parent()` 起步即跳过将死任务自身，避免自收养成环。
+fn nearest_subreaper_or_init(task: &Arc<Task>) -> Arc<Task> {
+    let init = init_task();
+    let mut cursor = task.parent();
+    while let Some(parent) = cursor {
+        if Arc::ptr_eq(&parent, &init) {
+            return init;
+        }
+        let alive = !matches!(parent.state(), TaskState::Zombie | TaskState::Dead);
+        if parent.is_subreaper() && alive {
+            return parent;
+        }
+        cursor = parent.parent();
+    }
+    init
+}
+
 /// Native owner 线程组全部退出后，按普通进程亲缘模型把尚未回收的 child 交给
-/// system reaper。迁移 parent 指针与 init 的 children 登记由身份事务一起保护，
-/// 防止 child 的退出通知落在半迁移状态。
-fn reparent_native_children_to_init(owner: &Arc<ThreadGroup>) {
+/// 最近的存活 subreaper（找不到则 init）。迁移 parent 指针与新父的 children
+/// 登记由身份事务一起保护，防止 child 的退出通知落在半迁移状态。
+fn reparent_native_children_to_reaper(owner: &Arc<ThreadGroup>) {
     if !owner.has_native_children() {
         return;
     }
     let init = init_task();
     if Arc::ptr_eq(&init.thread_group(), owner) {
+        return;
+    }
+    // 从线程组 leader 出发找最近的存活 subreaper；leader 缺失时回退 init。
+    let new_parent = owner
+        .leader()
+        .map(|leader| nearest_subreaper_or_init(&leader))
+        .unwrap_or_else(|| Arc::clone(&init));
+    if Arc::ptr_eq(&new_parent.thread_group(), owner) {
         return;
     }
     let children = owner.take_native_children_for_reparent();
@@ -658,8 +687,8 @@ fn reparent_native_children_to_init(owner: &Arc<ThreadGroup>) {
     {
         let identity = crate::pid::lock_process_identity();
         for child in children.iter() {
-            child.reparent_to_in(&identity, &init);
-            init.add_child_in(&identity, Arc::clone(child));
+            child.reparent_to_in(&identity, &new_parent);
+            new_parent.add_child_in(&identity, Arc::clone(child));
         }
     }
     for child in children {
@@ -707,19 +736,19 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
 
     crate::scheduler::deadline_admission().release(task);
 
-    // 1) 先把自己的子任务托管给 init，让它们在父死后仍有 reaper。
-    //    init 任务本身退出（正常情况下不会发生）时跳过，避免自引用成环。
+    // 1) 先把自己的子任务托管给最近的存活 subreaper（找不到则 init），让它们在
+    //    父死后仍有 reaper。新父若就是 task 自身（init 退出时）跳过，避免自引用成环。
     let children = if preserve_exec_identity {
         Vec::new()
     } else {
         task.snapshot_children()
     };
     if !children.is_empty() {
-        let init = init_task();
-        if !Arc::ptr_eq(&init, task) {
-            task.reparent_children_to(&init);
-            // 已经是 Zombie 的子需要让 init 感知——否则它们的 SIGCHLD 之前投给
-            // 了旧父，init 不会来 reap。这里只对刚被过继的 Zombie 重投一次。
+        let new_parent = nearest_subreaper_or_init(task);
+        if !Arc::ptr_eq(&new_parent, task) {
+            task.reparent_children_to(&new_parent);
+            // 已经是 Zombie 的子需要让新父感知——否则它们的 SIGCHLD 之前投给
+            // 了旧父，新父不会来 reap。这里只对刚被过继的 Zombie 重投一次。
             for c in children.iter() {
                 if c.is_waitable_zombie() {
                     if let Some(sig) = SignalNumber::from_raw(SignalNumber::SIGCHLD.raw() as i32) {
@@ -730,7 +759,7 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
                             sender_uid: crate::ids::Uid::ROOT,
                             raw: None,
                         };
-                        deliver_shared_signal_to_group(&init.thread_group(), info);
+                        deliver_shared_signal_to_group(&new_parent.thread_group(), info);
                     }
                 }
             }
@@ -740,7 +769,7 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
     mark_task_exited(task, code);
     let group_terminated = group.mark_terminated_if_all_members_terminal();
     if group_terminated {
-        reparent_native_children_to_init(&group);
+        reparent_native_children_to_reaper(&group);
     }
     if !is_current_on_any_cpu(task) {
         task.cleanup_exit_extensions();
