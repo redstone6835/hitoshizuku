@@ -607,6 +607,14 @@ pub fn socket(
 ) -> Result<Fd, Errno> {
     // AF_NETLINK 需要接受 SOCK_RAW/SOCK_DGRAM，单独处理
     if domain as u16 == 16 {
+        // netlink 协议号校验：Linux MAX_LINKS 约 32；本内核仅实现
+        // NETLINK_ROUTE(=0)，其余协议号（含合法但未实现者）返回
+        // EPROTONOSUPPORT，不静默接受无法提供对应语义的协议。
+        const NETLINK_ROUTE: usize = 0;
+        const MAX_LINKS: usize = 32;
+        if protocol >= MAX_LINKS || protocol != NETLINK_ROUTE {
+            return Err(Errno::EPROTONOSUPPORT);
+        }
         let nonblock = (ty & SOCK_NONBLOCK) != 0;
         let cloexec = (ty & SOCK_CLOEXEC) != 0;
         let fd_flags = if cloexec {
@@ -663,6 +671,10 @@ pub fn socket(
             // AF_PACKET：L2 原始帧收发（SOCK_RAW 完整帧 / SOCK_DGRAM 补剥头）。
             if !matches!(kind, SocketType::Raw | SocketType::Datagram) {
                 return Err(Errno::EINVAL);
+            }
+            // 原始 L2 帧访问需要 CAP_NET_RAW，否则 EPERM（对齐 Linux）。
+            if !ctx.cred().has_cap(crate::vfs::cred::Capability::NetRaw) {
+                return Err(Errno::EPERM);
             }
             let ops = crate::packet_socket::create_packet_socket(
                 protocol as u16,
@@ -1254,6 +1266,13 @@ fn recv_inner(
 pub fn getsockopt(fdt: &FdTable, fd: Fd, level: i32, optname: i32) -> Result<Vec<u8>, Errno> {
     let file = file_from_fd(fdt, fd)?;
 
+    // AF_PACKET socket
+    if let Some(packet_ops) = file.downcast_ops::<crate::packet_socket::PacketSocketFileOps>() {
+        if level != crate::packet_socket::SOL_PACKET {
+            return Err(Errno::ENOPROTOOPT);
+        }
+        return packet_ops.packet_getsockopt(optname);
+    }
     // AF_NETLINK socket
     if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
         return crate::netlink_socket::netlink_getsockopt(nl_ops, level, optname);
@@ -1315,6 +1334,13 @@ pub fn setsockopt(
 ) -> Result<(), Errno> {
     let file = file_from_fd(fdt, fd)?;
 
+    // AF_PACKET socket
+    if let Some(packet_ops) = file.downcast_ops::<crate::packet_socket::PacketSocketFileOps>() {
+        if level != crate::packet_socket::SOL_PACKET {
+            return Err(Errno::ENOPROTOOPT);
+        }
+        return packet_ops.packet_setsockopt(optname, value);
+    }
     if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
         return crate::netlink_socket::netlink_setsockopt(nl_ops, level, optname, value);
     }
@@ -1469,6 +1495,16 @@ fn parse_ipv4_membership(value: &[u8]) -> Result<net::MulticastMembership, Errno
     let interface = if value.len() >= 12 {
         let index = i32::from_ne_bytes(value[8..12].try_into().unwrap());
         if index < 0 {
+            return Err(Errno::ENODEV);
+        }
+        // 正数 ifindex 必须指向真实存在的接口，否则返回 ENODEV（对齐
+        // IP_MULTICAST_IF 对负值返回 ENODEV 的语义，避免随后把坏索引
+        // 透传给 add_multicast_membership 映射成 EADDRNOTAVAIL）。
+        if index != 0
+            && !net::device::snapshot_devices()
+                .iter()
+                .any(|device| device.id.raw() == index as u32)
+        {
             return Err(Errno::ENODEV);
         }
         (index != 0).then_some(net::InterfaceId(index as u32))

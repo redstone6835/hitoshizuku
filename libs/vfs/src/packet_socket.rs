@@ -64,7 +64,7 @@ const PACKET_FANOUT_RNG: u32 = 3;
 const PACKET_FANOUT_ROLLOVER: u32 = 4;
 const PACKET_FANOUT_FLAG_DEFRAG: u32 = 0x8000;
 
-const SOL_PACKET: i32 = 263;
+pub const SOL_PACKET: i32 = 263;
 
 // ── 发送回调（内核 net_runtime 安装）────────────────────────────────────────
 
@@ -256,7 +256,18 @@ impl PacketSocketFileOps {
     /// 发送一帧。SOCK_RAW 期望完整以太网帧；SOCK_DGRAM 期望 IP 报文（内核补头）。
     pub fn sendto(&self, data: &[u8], dest: &[u8]) -> Result<usize, Errno> {
         let handler = PACKET_TX_HANDLER.lock().ok_or(Errno::EOPNOTSUPP)?;
-        let interface = self.bound_ifindex.ok_or(Errno::EDESTADDRREQ)?;
+        // sockaddr_ll.sll_ifindex 位于 dest 偏移 4..8；非零时优先作为发送接口，
+        // 否则回退到 bind 的接口（未绑定则 EDESTADDRREQ）。
+        let dest_ifindex = if dest.len() >= 8 {
+            u32::from_ne_bytes(dest[4..8].try_into().unwrap())
+        } else {
+            0
+        };
+        let interface = if dest_ifindex != 0 {
+            net::InterfaceId(dest_ifindex)
+        } else {
+            self.bound_ifindex.ok_or(Errno::EDESTADDRREQ)?
+        };
         let frame = if self.sock_raw {
             if data.len() < 14 {
                 return Err(Errno::EINVAL);
@@ -318,9 +329,14 @@ impl PacketSocketFileOps {
                     sll_out[4..8].copy_from_slice(&ifindex.to_ne_bytes());
                     sll_out[8] = 1; // ARPHRD_ETHER
                     sll_out[9] = PACKET_HOST;
-                    sll_out[10] = 6;
-                    if !self.sock_raw && frame.len() >= 6 {
-                        sll_out[11..17].copy_from_slice(&frame[..6]);
+                    // sockaddr_ll.sll_addr 应为帧源地址（发送方 MAC）：SOCK_RAW 取
+                    // 帧偏移 6..12；SOCK_DGRAM 已剥头，源 MAC 不再暴露，按 Linux
+                    // 语义留空。仅当缓冲足够（>= 20，完整 sockaddr_ll）才写 6 字节
+                    // 源 MAC，且 sll_halen 与写入字节数一致，避免越界。
+                    sll_out[10] = 0;
+                    if sll_out.len() >= 20 && self.sock_raw && frame.len() >= 12 {
+                        sll_out[10] = 6;
+                        sll_out[11..17].copy_from_slice(&frame[6..12]);
                     }
                 }
                 let _ = frame_len;
@@ -773,6 +789,52 @@ mod tests {
         let mut buf = [0u8; 64];
         let len = socket.recvfrom(&mut buf, &mut [], true, None).unwrap();
         assert_eq!(len, ip_frame.len());
+    }
+
+    #[test]
+    fn recvfrom_raw_fills_source_mac_in_sll_addr() {
+        let socket = create_packet_socket(ETH_P_IP, true, true);
+        // 源 MAC 为 LOCAL_MAC（帧偏移 6..12），目的 MAC 为广播。
+        let ip_frame = frame(MAC_BROADCAST, ETH_P_IP);
+        let _ = packet_socket_deliver(net::InterfaceId(1), ETH_P_IP, &ip_frame, LOCAL_MAC);
+        let mut buf = [0u8; 64];
+        let mut sll = [0u8; 20];
+        let len = socket.recvfrom(&mut buf, &mut sll, true, None).unwrap();
+        assert_eq!(len, ip_frame.len());
+        assert_eq!(sll[10], 6); // sll_halen 与写入字节数一致
+        assert_eq!(&sll[11..17], &LOCAL_MAC); // 源地址，而非目的地址
+    }
+
+    #[test]
+    fn recvfrom_dgram_leaves_sll_addr_zero() {
+        let socket = create_packet_socket(ETH_P_IP, false, true);
+        let ip_frame = frame(MAC_BROADCAST, ETH_P_IP);
+        let _ = packet_socket_deliver(net::InterfaceId(1), ETH_P_IP, &ip_frame, LOCAL_MAC);
+        let mut buf = [0u8; 64];
+        let mut sll = [0u8; 20];
+        let len = socket.recvfrom(&mut buf, &mut sll, true, None).unwrap();
+        // SOCK_DGRAM 已剥头，源 MAC 不暴露；sll_addr 与 sll_halen 应为 0。
+        assert_eq!(len, ip_frame.len() - 14);
+        assert_eq!(sll[10], 0);
+        assert_eq!(&sll[11..17], &[0; 6]);
+    }
+
+    #[test]
+    fn sendto_prefers_sll_ifindex_over_bound() {
+        use core::sync::atomic::AtomicUsize;
+        static LAST_IFINDEX: AtomicUsize = AtomicUsize::new(usize::MAX);
+        install_packet_tx_handler(|interface, _frame| {
+            LAST_IFINDEX.store(interface.0 as usize, Ordering::Relaxed);
+            Ok(())
+        });
+        install_packet_interface_mac(|_interface| LOCAL_MAC);
+        let socket = create_packet_socket(ETH_P_IP, false, true);
+        socket.set_bound_ifindex(Some(net::InterfaceId(1)));
+        let payload = [0x45u8, 0, 0, 4, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 2, 15];
+        let mut sll = [0u8; 20];
+        sll[4..8].copy_from_slice(&7u32.to_ne_bytes()); // sll_ifindex = 7
+        socket.sendto(&payload, &sll).unwrap();
+        assert_eq!(LAST_IFINDEX.load(Ordering::Relaxed), 7);
     }
 
     #[test]
