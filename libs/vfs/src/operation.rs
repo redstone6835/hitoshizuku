@@ -637,6 +637,13 @@ pub fn renameat(
     }
     let old_inode = old_result.dentry.inode().ok_or(VfsError::NotFound)?;
 
+    // 目录不能改名为其自身或自身的子目录，否则会破坏目录树（Linux rename(2) 返回 EINVAL）。
+    if old_inode.kind == stat::FileType::Directory
+        && new_parent_dentry.is_descendant_of(&old_result.dentry)
+    {
+        return Err(VfsError::InvalidArgument);
+    }
+
     if Arc::ptr_eq(&old_parent_dentry, &new_parent_dentry) && old_name == new_name {
         return Ok(());
     }
