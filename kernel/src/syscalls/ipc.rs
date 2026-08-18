@@ -19,7 +19,7 @@ use general::ipc::keys::{
     KEY_REQKEY_DEFL_PROCESS_KEYRING, KEY_REQKEY_DEFL_REQUESTOR_KEYRING,
     KEY_REQKEY_DEFL_SESSION_KEYRING, KEY_REQKEY_DEFL_THREAD_KEYRING, KEY_REQKEY_DEFL_USER_KEYRING,
     KEY_REQKEY_DEFL_USER_SESSION_KEYRING, KEY_SPEC_REQKEY_AUTH_KEY, KEY_SPEC_SESSION_KEYRING,
-    KeyId, KeyManager, KeyState, KeyType, ProcessKeyrings,
+    KeyId, KeyManager, KeyState, KeyType, ProcessKeyrings, search_process_keyrings,
 };
 use general::ipc::mqueue::{
     MQ_ATTR_CURMSGS, MQ_ATTR_FLAGS, MQ_ATTR_MAXMSG, MQ_ATTR_MSGSIZE, MQ_ATTR_SIZE, MQ_NAME_MAX,
@@ -1444,7 +1444,7 @@ pub(super) fn sys_add_key(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let now = now_sec_u64();
 
     let key_type_name = copy_cstr_from_user(type_user, 32).map_err(|e| e.as_errno())?;
-    let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENODEV)?;
+    let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENOKEY)?;
     let description = copy_cstr_from_user(desc_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?;
     let mut payload = vec![0u8; plen];
     if plen > 0 {
@@ -1459,8 +1459,7 @@ pub(super) fn sys_request_key(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     let type_user = ctx.args[0];
     let desc_user = ctx.args[1];
     let info_user = ctx.args[2];
-    let keyring_arg = ctx.args[3] as i32;
-    let dest_keyring_arg = ctx.args[4] as i32;
+    let destringid = ctx.args[3] as i32;
     let task = Arc::clone(ctx.task());
     let cred = vfs_cred_from_sched(&task.credentials());
     let manager = keys_manager();
@@ -1468,7 +1467,7 @@ pub(super) fn sys_request_key(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     let process = process_keyrings(ctx);
 
     let key_type_name = copy_cstr_from_user(type_user, 32).map_err(|e| e.as_errno())?;
-    let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENODEV)?;
+    let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENOKEY)?;
     let description = copy_cstr_from_user(desc_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?;
     let info = if info_user != 0 {
         copy_cstr_from_user(info_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?
@@ -1476,12 +1475,15 @@ pub(super) fn sys_request_key(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
         alloc::string::String::new()
     };
 
-    let search_keyring = resolve_keyring(&manager, &process, keyring_arg, &cred, now)?;
-    if let Ok(key) = manager.search(search_keyring, key_type, &description, &cred, now) {
-        return Ok(key.id.0 as usize);
+    // 搜索阶段：在进程 keyring 链（thread → process → session → user-session
+    // → user）上查找已实例化的 (type, desc) key。
+    if let Some(key_id) =
+        search_process_keyrings(&process, &cred, &manager, key_type, &description, now)
+    {
+        return Ok(key_id.0 as usize);
     }
     // 未命中：创建未实例化 key + 授权 key，spawn `/sbin/request-key` upcall。
-    let dest_keyring = resolve_keyring(&manager, &process, dest_keyring_arg, &cred, now)?;
+    let dest_keyring = resolve_keyring(&manager, &process, destringid, &cred, now)?;
     let key = manager.create_uninstantiated(
         key_type,
         &description,
@@ -1508,7 +1510,7 @@ pub(super) fn sys_request_key(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
         key.id.0.to_string(),
         cred.euid.0.to_string(),
         cred.egid.0.to_string(),
-        keyring_arg.to_string(),
+        destringid.to_string(),
         key_type_name,
         description.clone(),
         info,
@@ -1563,12 +1565,17 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     const KEYCTL_INSTANTIATE_IOV: usize = 20;
     const KEYCTL_INVALIDATE: usize = 21;
     const KEYCTL_GET_PERSISTENT: usize = 22;
+    const KEYCTL_DH_COMPUTE: usize = 23;
+    const KEYCTL_PKEY_QUERY: usize = 24;
+    const KEYCTL_PKEY_ENCRYPT: usize = 25;
+    const KEYCTL_PKEY_DECRYPT: usize = 26;
+    const KEYCTL_PKEY_SIGN: usize = 27;
+    const KEYCTL_PKEY_VERIFY: usize = 28;
     const KEYCTL_RESTRICT_KEYRING: usize = 29;
-    const KEYCTL_SUPPORTS_ENCRYPT: usize = 32;
-    const KEYCTL_SUPPORTS_DECRYPT: usize = 33;
-    const KEYCTL_SUPPORTS_SIGN: usize = 34;
-    const KEYCTL_SUPPORTS_VERIFY: usize = 35;
-    const KEYCTL_CAPABILITIES: usize = 36;
+    const KEYCTL_MOVE: usize = 30;
+    const KEYCTL_CAPABILITIES: usize = 31;
+    const KEYCTL_WATCH_KEY: usize = 32;
+    const KEYCTL_NOTIFY: usize = 33;
 
     let cmd = ctx.args[0];
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
@@ -1687,7 +1694,7 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             let desc_user = ctx.args[3];
             let dest_keyring_arg = ctx.args[4] as i32;
             let key_type_name = copy_cstr_from_user(type_user, 32).map_err(|e| e.as_errno())?;
-            let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENODEV)?;
+            let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENOKEY)?;
             let description =
                 copy_cstr_from_user(desc_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?;
             let search_keyring =
@@ -1701,9 +1708,9 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                     &cred,
                     now,
                 )?;
-                if let Ok(dest_keyring) = manager.key(dest) {
-                    dest_keyring.add_member(key.id, key_type.name(), &description);
-                }
+                // dest 链接等价 KEYCTL_LINK：要求 dest 写权限 + key link 权限 +
+                // keyring restriction；dest 非 keyring 时由 link 返回 ENOTDIR。
+                manager.link(dest, key.id, &cred)?;
             }
             Ok(key.id.0 as usize)
         }
@@ -1721,6 +1728,7 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         KEYCTL_INSTANTIATE => {
             let key_id = KeyId(ctx.args[1] as i32);
+            require_instantiate_authority(&manager, &process_keyrings(ctx), key_id)?;
             let payload_user = ctx.args[2];
             let plen = ctx.args[3];
             let keyring_id = KeyId(ctx.args[4] as i32);
@@ -1733,6 +1741,7 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         KEYCTL_NEGATE => {
             let key_id = KeyId(ctx.args[1] as i32);
+            require_instantiate_authority(&manager, &process_keyrings(ctx), key_id)?;
             let timeout = ctx.args[2] as u64;
             let keyring_id = KeyId(ctx.args[3] as i32);
             manager.instantiate(key_id, Vec::new(), false, keyring_id, Some(timeout), now)?;
@@ -1740,6 +1749,7 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         KEYCTL_REJECT => {
             let key_id = KeyId(ctx.args[1] as i32);
+            require_instantiate_authority(&manager, &process_keyrings(ctx), key_id)?;
             let timeout = ctx.args[2] as u64;
             let keyring_id = KeyId(ctx.args[4] as i32);
             manager.instantiate(key_id, Vec::new(), false, keyring_id, Some(timeout), now)?;
@@ -1806,8 +1816,10 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(0)
         }
         KEYCTL_INSTANTIATE_IOV => {
-            // iovec 版 instantiate：聚合成单个负载。
+            // iovec 版 instantiate：聚合成单个负载；与 INSTANTIATE 同样需要
+            // 授权 key。
             let key_id = KeyId(ctx.args[1] as i32);
+            require_instantiate_authority(&manager, &process_keyrings(ctx), key_id)?;
             let iov_user = ctx.args[2];
             let iovcnt = ctx.args[3];
             let keyring_id = KeyId(ctx.args[4] as i32);
@@ -1820,9 +1832,27 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(0)
         }
         KEYCTL_GET_PERSISTENT => {
-            let uid = ctx.args[1] as u32;
-            let _keyring = ctx.args[2] as i32;
+            let uid_arg = ctx.args[1] as u32;
+            let keyring_arg = ctx.args[2] as i32;
+            // uid == -1 表示当前 euid；非本人且无 CAP_SYS_ADMIN/CAP_SETUID → EPERM。
+            let uid = if uid_arg == u32::MAX {
+                cred.euid.0
+            } else {
+                uid_arg
+            };
+            if uid != cred.euid.0
+                && !cred.has_cap(vfs::cred::Capability::SysAdmin)
+                && !ctx.task().credentials().has_cap(sched::Capability::Setuid)
+            {
+                return Err(Errno::EPERM);
+            }
             let id = manager.user_keyring(uid, &cred)?;
+            // keyring 参数用于"新建时把 persistent keyring 链接进该 keyring"。
+            if keyring_arg != 0 {
+                let dest =
+                    resolve_keyring(&manager, &process_keyrings(ctx), keyring_arg, &cred, now)?;
+                manager.link(dest, id, &cred)?;
+            }
             Ok(id.0 as usize)
         }
         KEYCTL_RESTRICT_KEYRING => {
@@ -1844,12 +1874,11 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             manager.restrict_keyring(keyring_id, restriction, &cred)?;
             Ok(0)
         }
-        KEYCTL_SUPPORTS_ENCRYPT
-        | KEYCTL_SUPPORTS_DECRYPT
-        | KEYCTL_SUPPORTS_SIGN
-        | KEYCTL_SUPPORTS_VERIFY => {
-            // 本内核不提供 key 加密/解密/签名/验签（无 crypto key 类型）。
-            Ok(0)
+        KEYCTL_DH_COMPUTE | KEYCTL_PKEY_QUERY | KEYCTL_PKEY_ENCRYPT | KEYCTL_PKEY_DECRYPT
+        | KEYCTL_PKEY_SIGN | KEYCTL_PKEY_VERIFY | KEYCTL_MOVE | KEYCTL_WATCH_KEY
+        | KEYCTL_NOTIFY => {
+            // 本内核无 crypto/asymmetric-key/watch/notify 子系统支持。
+            Err(Errno::EOPNOTSUPP)
         }
         KEYCTL_CAPABILITIES => {
             let buffer = ctx.args[1];
@@ -1863,7 +1892,23 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             copy_to_user(buffer, &caps[..n]).map_err(|e| e.as_errno())?;
             Ok(n)
         }
-        _ => Err(Errno::EINVAL),
+        // Linux `keyctl` 对未知命令返回 EOPNOTSUPP。
+        _ => Err(Errno::EOPNOTSUPP),
+    }
+}
+
+/// 校验调用者持有指向目标 key 的授权 key（`KEY_SPEC_REQKEY_AUTH_KEY`）。
+///
+/// `request_key` 把授权 key id 记入 `ProcessKeyrings::reqkey_auth`；只有该
+/// 授权 key 描述为 `_reqkey_auth.<key_id>` 时才允许实例化/否定目标 key。
+fn require_instantiate_authority(
+    manager: &KeyManager,
+    process: &ProcessKeyrings,
+    key_id: KeyId,
+) -> Result<(), Errno> {
+    match *process.reqkey_auth.lock() {
+        Some(auth_id) if manager.auth_key_matches(auth_id, key_id) => Ok(()),
+        _ => Err(Errno::EACCES),
     }
 }
 
