@@ -16,6 +16,7 @@ use alloc::sync::Arc;
 use core::fmt;
 
 use crate::group::ThreadGroup;
+use crate::ids::Uid;
 use crate::pid::PidT;
 use crate::signal::SignalNumber;
 use crate::task::TaskUsage;
@@ -33,6 +34,7 @@ impl WaitOptions {
     pub const WNOWAIT: u32 = 0x01000000;
     pub const __WCLONE: u32 = 0x80000000;
     pub const __WALL: u32 = 0x40000000;
+    pub const __WNOTHREAD: u32 = 0x20000000;
 
     pub const EMPTY: Self = Self(0);
     pub const fn from_raw(bits: u32) -> Self {
@@ -183,4 +185,9 @@ pub struct WaitResult {
     pub pid: PidT,
     pub status: WaitStatus,
     pub usage: TaskUsage,
+    /// 被等待子进程的真实 uid。`waitid` 的 `si_uid` 需要 child 的 uid 而非
+    /// waiter 的 uid，因此必须把 child 的凭据透出到 syscall 层（child 在返回前
+    /// 已被 reap、pid 已释放，无法再由 pid 反查）。`pid == 0`（WNOHANG 无结果）
+    /// 时无 child，置为 `Uid::ROOT`。
+    pub child_uid: Uid,
 }

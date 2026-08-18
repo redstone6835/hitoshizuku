@@ -4767,7 +4767,7 @@ pub(super) fn sys_pidfd_getfd(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     }
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let pid_file = fdt.get_file(pidfd).ok_or(Errno::EBADF)?;
-    let target_group = pidfd::group_from_file(&pid_file).ok_or(Errno::EINVAL)?;
+    let target_group = pidfd::group_from_file(&pid_file).ok_or(Errno::EBADF)?;
     let target = target_group
         .with_running_leader(|leader| (task_may_access(ctx.task(), leader), task_fdtable(leader)))
         .ok_or_else(|| {

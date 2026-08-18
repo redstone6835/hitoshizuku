@@ -965,11 +965,17 @@ fn process_setup_signal_frame(
     let mut next = saved;
     next.set_pc(handler_pc);
     next.set_sp(new_sp);
-    next.set_args(
-        info.sig.raw() as usize,
-        new_sp + SIGFRAME_SIGINFO_OFF,
-        new_sp + SIGFRAME_UCONTEXT_OFF,
-    );
+    if action.flags.has(SigActionFlags::SA_SIGINFO) {
+        next.set_args(
+            info.sig.raw() as usize,
+            new_sp + SIGFRAME_SIGINFO_OFF,
+            new_sp + SIGFRAME_UCONTEXT_OFF,
+        );
+    } else {
+        // 未设 SA_SIGINFO 时 handler 只收 1 个参数（signo）。`set_args` 固定写
+        // 3 个寄存器，后两参置 0（多余参数寄存器对 1 参 handler 无意义）。
+        next.set_args(info.sig.raw() as usize, 0, 0);
+    }
     next.set_ra(restorer);
     next.apply_to_context(user_ctx.as_usize());
     Ok(())

@@ -786,6 +786,17 @@ impl ThreadGroup {
         &self.process_exit_waiters
     }
 
+    /// 唤醒线程组全体成员的 `exit_waiters`。
+    ///
+    /// POSIX wait4/waitid 阻塞在调用线程自己的 `exit_waiters` 上，而 child 登记在
+    /// 实际 fork 它的那个线程名下。子退出时必须广播唤醒同组所有成员，任意线程
+    /// 的 wait 才能被唤醒后重新扫描线程组 children 并集。
+    pub fn wake_member_exit_waiters(&self) {
+        for member in self.snapshot() {
+            member.exit_waiters.wake_all();
+        }
+    }
+
     /// 订阅进程终止事件；订阅与终止并发时允许幂等补发，但不会漏失事件。
     pub fn try_subscribe_process_exit(
         &self,

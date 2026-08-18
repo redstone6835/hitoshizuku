@@ -120,7 +120,13 @@ pub(super) fn sys_getpid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     // pending/父 ns 设置）；NsProxy.pid 只反映 fork 时的快照，unshare
     // (CLONE_NEWPID) 后子进程会得到新 ns，必须用任务自身 ns 查询。
     let ns = task.pid_ns();
-    if let Some(pid) = task.pid_in(&ns) {
+    // getpid 返回线程组 leader 的 pid（TGID），而非调用线程自身的 pid：
+    // CLONE_THREAD 的非 leader 线程在 ns 中的 pid 是 tid，不能直接返回。
+    if let Some(pid) = task
+        .thread_group()
+        .leader()
+        .and_then(|leader| leader.pid_in(&ns))
+    {
         return Ok(pid as usize);
     }
     Ok(task
@@ -599,7 +605,7 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             let fdt = vfs::current_fdtable().ok_or(Errno::ENOSYS)?;
             let file = fdt.get_file(Fd::from_raw(id as u32)).ok_or(Errno::EBADF)?;
             let nonblock_pidfd = file.flags().nonblock;
-            let group = pidfd::group_from_file(&file).ok_or(Errno::EINVAL)?;
+            let group = pidfd::group_from_file(&file).ok_or(Errno::EBADF)?;
             if nonblock_pidfd && !options.has(WaitOptions::WNOHANG) {
                 let probe_options = WaitOptions::from_raw(options.raw() | WaitOptions::WNOHANG);
                 let probe =
@@ -613,7 +619,7 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                     write_i32(&mut raw, 4, 0);
                     write_i32(&mut raw, 8, waitid_code(probe.status));
                     write_i32(&mut raw, 16, probe.pid);
-                    write_u32(&mut raw, 20, ctx.task().credentials().uid.0);
+                    write_u32(&mut raw, 20, probe.child_uid.0);
                     write_i32(&mut raw, 24, waitid_status(probe.status));
                     copy_to_user(infop, &raw).map_err(|e| e.as_errno())?;
                 }
@@ -634,7 +640,7 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             write_i32(&mut raw, 4, 0);
             write_i32(&mut raw, 8, waitid_code(result.status));
             write_i32(&mut raw, 16, result.pid);
-            write_u32(&mut raw, 20, ctx.task().credentials().uid.0);
+            write_u32(&mut raw, 20, result.child_uid.0);
             write_i32(&mut raw, 24, waitid_status(result.status));
         }
         copy_to_user(infop, &raw).map_err(|e| e.as_errno())?;
@@ -1522,6 +1528,16 @@ fn task_rss_kb(task: &Arc<Task>) -> u64 {
 }
 
 /// 累加整个线程组的 usage（`RUSAGE_SELF`）。
+///
+/// `Task::usage_snapshot` 逐任务只记账总 CPU 时间（无 per-task 用户/系统态
+/// 拆分），因此其 `user_ns` 字段实际是逐任务总 CPU 求和。这里利用线程组已有
+/// 的 tick 级用户态记账 `ThreadGroup::user_cpu_ns` 把组总 CPU 拆成两部分：
+///
+///   ru_utime = 组用户态时间（`user_cpu_ns`，100Hz tick 粒度）
+///   ru_stime = 组总 CPU - 组用户态时间
+///
+/// 系统态时间无法逐任务拆分（内核无 per-task 用户态记账），只在线程组级
+/// 合理近似；`RUSAGE_THREAD`/`sys_times` 等逐任务路径仍报告 system = 0。
 fn aggregate_thread_group_usage(task: &Arc<Task>, now_ns: u64) -> sched::TaskUsage {
     let mut total = sched::TaskUsage {
         user_ns: 0,
@@ -1534,6 +1550,9 @@ fn aggregate_thread_group_usage(task: &Arc<Task>, now_ns: u64) -> sched::TaskUsa
     for member in task.thread_group().snapshot() {
         total.add_assign(member.usage_snapshot(now_ns));
     }
+    let user_ns = task.thread_group().user_cpu_ns();
+    total.system_ns = total.user_ns.saturating_sub(user_ns);
+    total.user_ns = user_ns;
     total
 }
 
@@ -1550,9 +1569,10 @@ fn write_rusage(user: usize, usage: sched::TaskUsage, maxrss_kb: u64) -> Result<
     let mut raw = [0u8; 144];
     write_timeval_pair(&mut raw, 0, usage.user_ns);
     write_timeval_pair(&mut raw, 16, usage.system_ns);
-    // ru_maxrss：Linux 报告峰值驻留集（KB）。本内核无峰值记账，报告当前
-    // （而非峰值）驻留集，与 Linux ru_maxrss 峰值语义存在偏差，属已注明的
-    // best-effort 取舍。
+    // ru_maxrss：Linux 报告峰值驻留集（KB）。本内核无峰值记账，只能取当前
+    // 驻留页数折算为 KB（best-effort）。getrusage(SELF/THREAD) 由调用方透传
+    // `task_rss_kb`；wait4/waitid 的子进程已退出、VmSpace 已在 exit 路径回收
+    // 且无峰值记录，故调用方传 0。
     put_i64(&mut raw, 32, maxrss_kb.min(i64::MAX as u64) as i64);
     put_i64(&mut raw, 64, usage.minflt.min(i64::MAX as u64) as i64);
     put_i64(&mut raw, 72, usage.majflt.min(i64::MAX as u64) as i64);

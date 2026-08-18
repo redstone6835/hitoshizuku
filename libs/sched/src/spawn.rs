@@ -18,9 +18,10 @@ use crate::scheduler::{
     enqueue_task_with_hint, init_task, is_current_on_any_cpu, mark_task_exited, now_ns_public,
     root_pid_ns, schedule_once,
 };
-use crate::signal::SignalNumber;
+use crate::signal::{SigInfo, SignalNumber};
 use crate::sync::Spinlock;
 use crate::task::{Task, ext_clone_hook};
+use crate::wait_flags::WaitStatus;
 use crate::{ExitCode, TaskState};
 
 /// 派生类型：新进程 vs 新线程。
@@ -602,6 +603,36 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
 
 // ── exit / reap ──────────────────────────────────────────────────────────────
 
+/// 依子进程退出原因构造发给父进程的退出信号 `SigInfo`。
+///
+/// `code` 按退出原因给 CLD_EXITED / CLD_KILLED / CLD_DUMPED（被信号终止且带 core
+/// 时为 CLD_DUMPED）；`sender_uid` 取子进程真实 uid，而非硬编码 root。
+fn child_exit_siginfo(task: &Arc<Task>) -> Option<SigInfo> {
+    let exit_sig = task.exit_signal();
+    if exit_sig <= 0 {
+        return None;
+    }
+    let sig = SignalNumber::from_raw(exit_sig)?;
+    // 退出码在 mark_exited 后已可用；据此还原退出原因。
+    let status = task.exit_wait_status().unwrap_or(WaitStatus::from_exit(0));
+    let code = if status.wifsignaled() {
+        if status.wcoredump() {
+            3 // CLD_DUMPED
+        } else {
+            2 // CLD_KILLED
+        }
+    } else {
+        1 // CLD_EXITED
+    };
+    Some(SigInfo {
+        sig,
+        code,
+        sender_pid: task.pid_root().unwrap_or(0),
+        sender_uid: task.credentials().uid,
+        raw: None,
+    })
+}
+
 /// 向单个可等待任务的父进程发布退出事件。
 fn notify_task_parent(task: &Arc<Task>) {
     let Some(parent) = task.parent() else {
@@ -614,20 +645,12 @@ fn notify_task_parent(task: &Arc<Task>) {
         parent.pid_root(),
         task.state(),
     );
-    let exit_sig = task.exit_signal();
-    if exit_sig > 0
-        && let Some(sig) = SignalNumber::from_raw(exit_sig)
-    {
-        let info = crate::signal::SigInfo {
-            sig,
-            code: 1, // CLD_EXITED
-            sender_pid: task.pid_root().unwrap_or(0),
-            sender_uid: crate::ids::Uid::ROOT,
-            raw: None,
-        };
+    if let Some(info) = child_exit_siginfo(task) {
         deliver_shared_signal_to_group(&parent.thread_group(), info);
     }
-    parent.exit_waiters.wake_all();
+    // POSIX wait4/waitid 可被线程组内任意线程调用，因此广播唤醒全体成员，
+    // 而非只唤醒登记 child 的那个父线程。
+    parent.thread_group().wake_member_exit_waiters();
 }
 
 /// 最后一个线程完成退出后，重新发布此前被延迟的 leader 退出事件。
@@ -640,15 +663,44 @@ fn notify_terminated_thread_group(group: &Arc<ThreadGroup>) {
     }
 }
 
+/// 找到将死任务的最近存活 subreaper 祖先；找不到则回退 init。
+///
+/// Linux `find_new_reaper` 语义：从将死任务沿父链向上，最近的
+/// `is_subreaper()==true` 且仍存活（非 Zombie/Dead）的祖先收养孤儿，
+/// 否则交给 init。从 `parent()` 起步即跳过将死任务自身，避免自收养成环。
+fn nearest_subreaper_or_init(task: &Arc<Task>) -> Arc<Task> {
+    let init = init_task();
+    let mut cursor = task.parent();
+    while let Some(parent) = cursor {
+        if Arc::ptr_eq(&parent, &init) {
+            return init;
+        }
+        let alive = !matches!(parent.state(), TaskState::Zombie | TaskState::Dead);
+        if parent.is_subreaper() && alive {
+            return parent;
+        }
+        cursor = parent.parent();
+    }
+    init
+}
+
 /// Native owner 线程组全部退出后，按普通进程亲缘模型把尚未回收的 child 交给
-/// system reaper。迁移 parent 指针与 init 的 children 登记由身份事务一起保护，
-/// 防止 child 的退出通知落在半迁移状态。
-fn reparent_native_children_to_init(owner: &Arc<ThreadGroup>) {
+/// 最近的存活 subreaper（找不到则 init）。迁移 parent 指针与新父的 children
+/// 登记由身份事务一起保护，防止 child 的退出通知落在半迁移状态。
+fn reparent_native_children_to_reaper(owner: &Arc<ThreadGroup>) {
     if !owner.has_native_children() {
         return;
     }
     let init = init_task();
     if Arc::ptr_eq(&init.thread_group(), owner) {
+        return;
+    }
+    // 从线程组 leader 出发找最近的存活 subreaper；leader 缺失时回退 init。
+    let new_parent = owner
+        .leader()
+        .map(|leader| nearest_subreaper_or_init(&leader))
+        .unwrap_or_else(|| Arc::clone(&init));
+    if Arc::ptr_eq(&new_parent.thread_group(), owner) {
         return;
     }
     let children = owner.take_native_children_for_reparent();
@@ -658,8 +710,8 @@ fn reparent_native_children_to_init(owner: &Arc<ThreadGroup>) {
     {
         let identity = crate::pid::lock_process_identity();
         for child in children.iter() {
-            child.reparent_to_in(&identity, &init);
-            init.add_child_in(&identity, Arc::clone(child));
+            child.reparent_to_in(&identity, &new_parent);
+            new_parent.add_child_in(&identity, Arc::clone(child));
         }
     }
     for child in children {
@@ -707,30 +759,23 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
 
     crate::scheduler::deadline_admission().release(task);
 
-    // 1) 先把自己的子任务托管给 init，让它们在父死后仍有 reaper。
-    //    init 任务本身退出（正常情况下不会发生）时跳过，避免自引用成环。
+    // 1) 先把自己的子任务托管给最近的存活 subreaper（找不到则 init），让它们在
+    //    父死后仍有 reaper。新父若就是 task 自身（init 退出时）跳过，避免自引用成环。
     let children = if preserve_exec_identity {
         Vec::new()
     } else {
         task.snapshot_children()
     };
     if !children.is_empty() {
-        let init = init_task();
-        if !Arc::ptr_eq(&init, task) {
-            task.reparent_children_to(&init);
-            // 已经是 Zombie 的子需要让 init 感知——否则它们的 SIGCHLD 之前投给
-            // 了旧父，init 不会来 reap。这里只对刚被过继的 Zombie 重投一次。
+        let new_parent = nearest_subreaper_or_init(task);
+        if !Arc::ptr_eq(&new_parent, task) {
+            task.reparent_children_to(&new_parent);
+            // 已经是 Zombie 的子需要让新父感知——否则它们的 SIGCHLD 之前投给
+            // 了旧父，新父不会来 reap。这里只对刚被过继的 Zombie 重投一次。
             for c in children.iter() {
                 if c.is_waitable_zombie() {
-                    if let Some(sig) = SignalNumber::from_raw(SignalNumber::SIGCHLD.raw() as i32) {
-                        let info = crate::signal::SigInfo {
-                            sig,
-                            code: 1, // CLD_EXITED
-                            sender_pid: c.pid_root().unwrap_or(0),
-                            sender_uid: crate::ids::Uid::ROOT,
-                            raw: None,
-                        };
-                        deliver_shared_signal_to_group(&init.thread_group(), info);
+                    if let Some(info) = child_exit_siginfo(c) {
+                        deliver_shared_signal_to_group(&new_parent.thread_group(), info);
                     }
                 }
             }
@@ -740,7 +785,7 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
     mark_task_exited(task, code);
     let group_terminated = group.mark_terminated_if_all_members_terminal();
     if group_terminated {
-        reparent_native_children_to_init(&group);
+        reparent_native_children_to_reaper(&group);
     }
     if !is_current_on_any_cpu(task) {
         task.cleanup_exit_extensions();
@@ -825,6 +870,24 @@ where
         code.0,
     );
     Some((zombie, code))
+}
+
+/// 跨线程组成员 reap：按 `members`（已按 `__WNOTHREAD`/`__WCLONE` 过滤出的 owner
+/// 成员，由 wait 路径计算）顺序，逐个在其 children 表里 reap 首个匹配的 Zombie。
+///
+/// POSIX wait 看到的是整个线程组名下 children 的并集，而 child 登记在实际 fork
+/// 它的那个线程名下；因此 reap 也必须能遍历同组其它成员的 children 表。与
+/// [`reap_matching`] 一样，命中后完成 pid 释放与 tg/pg 索引清理。
+pub fn reap_matching_across<F>(members: &[Arc<Task>], pred: &F) -> Option<(Arc<Task>, ExitCode)>
+where
+    F: Fn(&Arc<Task>) -> bool,
+{
+    for member in members {
+        if let Some((zombie, code)) = reap_matching(member, pred) {
+            return Some((zombie, code));
+        }
+    }
+    None
 }
 
 /// Native owner 线程组侧的 reap。Tomori 的 Task parent/children 表保持不变；
