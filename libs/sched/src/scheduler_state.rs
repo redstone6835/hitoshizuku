@@ -639,12 +639,17 @@ mod tests {
     use super::CpuSchedState;
 
     #[test]
-    fn balance_request_arms_user_return_work_without_reschedule() {
+    fn balance_only_return_work_can_be_fully_consumed() {
         let cpu = CpuSchedState::new();
         cpu.request_balance();
         assert!(cpu.user_return_work_authoritative());
         assert!(!cpu.needs_resched());
+
+        // 模拟 RISC-V syscall 返回慢路径：先在安全调度边界消费 balance，
+        // 随后清除并权威复查聚合 hint。不能因没有 need_resched 而跳过前者。
         assert!(cpu.take_balance());
-        assert!(!cpu.take_balance());
+        assert!(cpu.take_user_return_work());
+        assert!(!cpu.user_return_work_authoritative());
+        assert!(!cpu.user_return_work_pending_acquire());
     }
 }
