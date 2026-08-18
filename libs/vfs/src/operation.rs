@@ -851,14 +851,19 @@ fn chmod_inode(
     mut mode: FileMode,
 ) -> VfsResult<()> {
     let inode_uid = inode.meta_snapshot().uid;
+    let inode_gid = inode.meta_snapshot().gid;
     let cred = ctx.cred();
     if !cred.is_owner(inode_uid) {
         return Err(VfsError::OperationNotPermitted);
     }
 
-    // POSIX：非特权进程 chmod 时必须清除 setuid/setgid 位，防止权限提升
-    if !cred.has_cap(cred::Capability::FSetId) {
-        mode = mode.without(FileMode::SUID_SGID);
+    // POSIX：chmod 不清除 SUID；SGID 仅在进程无 CAP_FSETID 且不是文件组成员时
+    // 清除，防止非成员借组权限提升。
+    if !cred.has_cap(cred::Capability::FSetId)
+        && cred.egid != inode_gid
+        && !cred.groups.contains(&inode_gid)
+    {
+        mode = mode.without(FileMode::ISGID);
     }
 
     inode.ops.chmod(inode, mode)?;
@@ -958,7 +963,7 @@ fn chown_inode(
         && new_gid != inode_gid
     {
         let cred = ctx.cred();
-        let is_owner = cred.euid == inode_uid;
+        let is_owner = cred.fsuid == inode_uid;
         let gid_ok = cred.egid == new_gid || cred.groups.contains(&new_gid);
         if !(cred.has_cap(cred::Capability::Chown) || is_owner && gid_ok) {
             return Err(VfsError::OperationNotPermitted);
@@ -1445,13 +1450,13 @@ pub fn removexattr(
 
 /// `fgetxattr`：按 fd 读取属性。
 pub fn fgetxattr(
-    _ctx: &VfsContext,
+    ctx: &VfsContext,
     fdt: &FdTable,
     fd: Fd,
     name: &[u8],
 ) -> VfsResult<Option<Vec<u8>>> {
     let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
-    let cred = file.cred();
+    let cred = ctx.cred();
     crate::xattr::getxattr(file.inode().as_ref(), name, cred.as_ref())
 }
 
@@ -1465,7 +1470,7 @@ pub fn fsetxattr(
     flags: u32,
 ) -> VfsResult<()> {
     let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
-    let cred = file.cred();
+    let cred = ctx.cred();
     crate::xattr::setxattr(file.inode().as_ref(), name, value, flags, cred.as_ref())
 }
 
@@ -1476,9 +1481,9 @@ pub fn flistxattr(_ctx: &VfsContext, fdt: &FdTable, fd: Fd) -> VfsResult<Vec<Vec
 }
 
 /// `fremovexattr`：按 fd 删除属性。
-pub fn fremovexattr(_ctx: &VfsContext, fdt: &FdTable, fd: Fd, name: &[u8]) -> VfsResult<()> {
+pub fn fremovexattr(ctx: &VfsContext, fdt: &FdTable, fd: Fd, name: &[u8]) -> VfsResult<()> {
     let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
-    let cred = file.cred();
+    let cred = ctx.cred();
     crate::xattr::removexattr(file.inode().as_ref(), name, cred.as_ref())
 }
 
