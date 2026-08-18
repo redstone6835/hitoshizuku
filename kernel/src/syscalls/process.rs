@@ -5850,44 +5850,40 @@ fn ptrace_store_frame(target: &Arc<Task>, frame: hal::user_context::UserTrapFram
     target.ext_install(sched::TASKEXT_USER_TRAP_FRAME, erased);
 }
 
-/// `PTRACE_PEEKUSR`：按 mcontext 布局读寄存器字（pc@0、regs@8、每项 8 字节）。
+/// `PTRACE_PEEKUSR`：按 ptrace 原始寄存器组布局读一个寄存器字。
+///
+/// - riscv64：offset 0 = pc，8..256 依次为 31 个通用寄存器（user_regs_struct）；
+/// - loongarch64：offset 0..256 = regs[0..32]、256 = orig_a0、264 = csr_era、
+///   272 = csr_badv（user_pt_regs）。
 fn ptrace_peek_usr(target: &Arc<Task>, offset: usize) -> Result<usize, Errno> {
     let frame = ptrace_target_frame(target)?;
-    let mut mcontext = [0u8; 1024];
-    if !frame.write_linux_mcontext(&mut mcontext) {
+    let size = linux_user_regs_size();
+    let mut regs = [0u8; 360]; // 覆盖 riscv 256 / loongarch 360
+    if !frame.write_linux_user_regs(&mut regs[..size]) {
         return Err(Errno::EIO);
     }
-    // mcontext 布局：pc@0；regs@8（32 项）；可能还有 flags 等尾部。
-    let regs_len = 8 + 32 * 8;
-    if offset < 8 {
-        return Ok(u64::from_ne_bytes(mcontext[0..8].try_into().unwrap()) as usize);
-    }
-    if offset < regs_len && (offset - 8) % 8 == 0 {
-        let index = (offset - 8) / 8;
-        let start = 8 + index * 8;
-        return Ok(u64::from_ne_bytes(mcontext[start..start + 8].try_into().unwrap()) as usize);
+    if offset % 8 == 0 && offset + 8 <= size {
+        let start = offset;
+        return Ok(u64::from_le_bytes(regs[start..start + 8].try_into().unwrap()) as usize);
     }
     Err(Errno::EIO)
 }
 
-/// `PTRACE_POKEUSR`：按 mcontext 布局写寄存器字。
+/// `PTRACE_POKEUSR`：按 ptrace 原始寄存器组布局写一个寄存器字（`peek_usr` 的反向）。
 fn ptrace_poke_usr(target: &Arc<Task>, offset: usize, value: usize) -> Result<(), Errno> {
     let mut frame = ptrace_target_frame(target)?;
-    let mut mcontext = [0u8; 1024];
-    if !frame.write_linux_mcontext(&mut mcontext) {
+    let size = linux_user_regs_size();
+    let mut regs = [0u8; 360];
+    if !frame.write_linux_user_regs(&mut regs[..size]) {
         return Err(Errno::EIO);
     }
-    let regs_len = 8 + 32 * 8;
-    if offset < 8 {
-        mcontext[0..8].copy_from_slice(&(value as u64).to_ne_bytes());
-    } else if offset < regs_len && (offset - 8) % 8 == 0 {
-        let index = (offset - 8) / 8;
-        let start = 8 + index * 8;
-        mcontext[start..start + 8].copy_from_slice(&(value as u64).to_ne_bytes());
+    if offset % 8 == 0 && offset + 8 <= size {
+        let start = offset;
+        regs[start..start + 8].copy_from_slice(&(value as u64).to_le_bytes());
     } else {
         return Err(Errno::EIO);
     }
-    if !frame.apply_linux_mcontext(&mcontext) {
+    if !frame.apply_linux_user_regs(&regs[..size]) {
         return Err(Errno::EIO);
     }
     ptrace_store_frame(target, frame);
