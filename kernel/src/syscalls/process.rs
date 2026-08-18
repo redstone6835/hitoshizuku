@@ -599,7 +599,7 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             let fdt = vfs::current_fdtable().ok_or(Errno::ENOSYS)?;
             let file = fdt.get_file(Fd::from_raw(id as u32)).ok_or(Errno::EBADF)?;
             let nonblock_pidfd = file.flags().nonblock;
-            let group = pidfd::group_from_file(&file).ok_or(Errno::EINVAL)?;
+            let group = pidfd::group_from_file(&file).ok_or(Errno::EBADF)?;
             if nonblock_pidfd && !options.has(WaitOptions::WNOHANG) {
                 let probe_options = WaitOptions::from_raw(options.raw() | WaitOptions::WNOHANG);
                 let probe =
@@ -613,7 +613,7 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                     write_i32(&mut raw, 4, 0);
                     write_i32(&mut raw, 8, waitid_code(probe.status));
                     write_i32(&mut raw, 16, probe.pid);
-                    write_u32(&mut raw, 20, ctx.task().credentials().uid.0);
+                    write_u32(&mut raw, 20, probe.child_uid.0);
                     write_i32(&mut raw, 24, waitid_status(probe.status));
                     copy_to_user(infop, &raw).map_err(|e| e.as_errno())?;
                 }
@@ -634,7 +634,7 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             write_i32(&mut raw, 4, 0);
             write_i32(&mut raw, 8, waitid_code(result.status));
             write_i32(&mut raw, 16, result.pid);
-            write_u32(&mut raw, 20, ctx.task().credentials().uid.0);
+            write_u32(&mut raw, 20, result.child_uid.0);
             write_i32(&mut raw, 24, waitid_status(result.status));
         }
         copy_to_user(infop, &raw).map_err(|e| e.as_errno())?;
