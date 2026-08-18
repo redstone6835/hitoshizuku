@@ -428,10 +428,9 @@ fn map_socket_io_error(err: SocketError) -> VfsError {
         SocketError::TemporaryUnavailable => VfsError::WouldBlock,
         SocketError::Interrupted => VfsError::Interrupted,
         SocketError::PeerClosed => VfsError::BrokenPipe,
-        SocketError::DestinationRequired | SocketError::ConnectionMissing => {
-            VfsError::InvalidArgument
-        }
-        SocketError::PayloadTooLarge => VfsError::FileTooLarge,
+        SocketError::DestinationRequired => VfsError::DestinationRequired,
+        SocketError::ConnectionMissing => VfsError::ConnectionMissing,
+        SocketError::PayloadTooLarge => VfsError::MessageTooLong,
         SocketError::ResourceExhausted => VfsError::OutOfMemory,
         SocketError::AccessDenied => VfsError::PermissionDenied,
         _ => VfsError::InvalidArgument,
@@ -612,6 +611,14 @@ pub fn socket(
 ) -> Result<Fd, Errno> {
     // AF_NETLINK 需要接受 SOCK_RAW/SOCK_DGRAM，单独处理
     if domain as u16 == 16 {
+        // netlink 协议号校验：Linux MAX_LINKS 约 32；本内核仅实现
+        // NETLINK_ROUTE(=0)，其余协议号（含合法但未实现者）返回
+        // EPROTONOSUPPORT，不静默接受无法提供对应语义的协议。
+        const NETLINK_ROUTE: usize = 0;
+        const MAX_LINKS: usize = 32;
+        if protocol >= MAX_LINKS || protocol != NETLINK_ROUTE {
+            return Err(Errno::EPROTONOSUPPORT);
+        }
         let nonblock = (ty & SOCK_NONBLOCK) != 0;
         let cloexec = (ty & SOCK_CLOEXEC) != 0;
         let fd_flags = if cloexec {
@@ -638,7 +645,8 @@ pub fn socket(
                 kind,
                 SocketType::Datagram | SocketType::Stream | SocketType::Raw
             ) {
-                return Err(Errno::Other(93));
+                // SOCK_SEQPACKET 等类型在 INET 域不受支持，返回 ESOCKTNOSUPPORT。
+                return Err(Errno::ESOCKTNOSUPPORT);
             }
             let ops = crate::net_socket::create_net_socket(
                 domain as u16,
@@ -667,6 +675,10 @@ pub fn socket(
             // AF_PACKET：L2 原始帧收发（SOCK_RAW 完整帧 / SOCK_DGRAM 补剥头）。
             if !matches!(kind, SocketType::Raw | SocketType::Datagram) {
                 return Err(Errno::EINVAL);
+            }
+            // 原始 L2 帧访问需要 CAP_NET_RAW，否则 EPERM（对齐 Linux）。
+            if !ctx.cred().has_cap(crate::vfs::cred::Capability::NetRaw) {
+                return Err(Errno::EPERM);
             }
             let ops = crate::packet_socket::create_packet_socket(
                 protocol as u16,
@@ -1258,6 +1270,13 @@ fn recv_inner(
 pub fn getsockopt(fdt: &FdTable, fd: Fd, level: i32, optname: i32) -> Result<Vec<u8>, Errno> {
     let file = file_from_fd(fdt, fd)?;
 
+    // AF_PACKET socket
+    if let Some(packet_ops) = file.downcast_ops::<crate::packet_socket::PacketSocketFileOps>() {
+        if level != crate::packet_socket::SOL_PACKET {
+            return Err(Errno::ENOPROTOOPT);
+        }
+        return packet_ops.packet_getsockopt(optname);
+    }
     // AF_NETLINK socket
     if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
         return crate::netlink_socket::netlink_getsockopt(nl_ops, level, optname);
@@ -1319,12 +1338,19 @@ pub fn setsockopt(
 ) -> Result<(), Errno> {
     let file = file_from_fd(fdt, fd)?;
 
+    // AF_PACKET socket
+    if let Some(packet_ops) = file.downcast_ops::<crate::packet_socket::PacketSocketFileOps>() {
+        if level != crate::packet_socket::SOL_PACKET {
+            return Err(Errno::ENOPROTOOPT);
+        }
+        return packet_ops.packet_setsockopt(optname, value);
+    }
     if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
         return crate::netlink_socket::netlink_setsockopt(nl_ops, level, optname, value);
     }
     if file.downcast_ops::<NetSocketFileOps>().is_some() {
         let net_ops = file.downcast_ops::<NetSocketFileOps>().unwrap();
-        return inet_setsockopt(net_ops, level, optname, value);
+        return inet_setsockopt(net_ops, level, optname, value, file.cred().as_ref());
     }
 
     let socket = socket_from_file(&file)?;
@@ -1475,6 +1501,16 @@ fn parse_ipv4_membership(value: &[u8]) -> Result<net::MulticastMembership, Errno
         if index < 0 {
             return Err(Errno::ENODEV);
         }
+        // 正数 ifindex 必须指向真实存在的接口，否则返回 ENODEV（对齐
+        // IP_MULTICAST_IF 对负值返回 ENODEV 的语义，避免随后把坏索引
+        // 透传给 add_multicast_membership 映射成 EADDRNOTAVAIL）。
+        if index != 0
+            && !net::device::snapshot_devices()
+                .iter()
+                .any(|device| device.id.raw() == index as u32)
+        {
+            return Err(Errno::ENODEV);
+        }
         (index != 0).then_some(net::InterfaceId(index as u32))
     } else if value[4..8] == [0; 4] {
         None
@@ -1550,21 +1586,27 @@ fn parse_multicast_group_req(
     })
 }
 
-/// 解析 `struct timeval { tv_sec; tv_usec; }`（每个字段 8 字节，LP64 ABI）。
-fn parse_timeval_ns(value: &[u8]) -> u64 {
+/// 解析 `struct timeval { tv_sec; tv_usec; }`（每个字段 8 字节，LP64 ABI），
+/// 返回以纳秒为单位的超时值；两个字段均为 0 表示"无超时"（`Ok(None)`）。
+///
+/// 与 UNIX 路径的 [`parse_timeval`] 语义对齐：长度不足、负的秒数或不在
+/// `0..1_000_000` 范围的微秒数都返回 `Err(Errno::EINVAL)`。
+fn parse_timeval_ns(value: &[u8]) -> Result<Option<u64>, Errno> {
     if value.len() < 16 {
-        return 0;
+        return Err(Errno::EINVAL);
     }
-    let secs = i64::from_ne_bytes([
-        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
-    ])
-    .max(0) as u64;
-    let usecs = i64::from_ne_bytes([
-        value[8], value[9], value[10], value[11], value[12], value[13], value[14], value[15],
-    ])
-    .max(0) as u64;
-    secs.saturating_mul(1_000_000_000)
-        .saturating_add(usecs.saturating_mul(1_000))
+    let secs = i64::from_ne_bytes(value[0..8].try_into().unwrap());
+    let usecs = i64::from_ne_bytes(value[8..16].try_into().unwrap());
+    if secs < 0 || !(0..1_000_000).contains(&usecs) {
+        return Err(Errno::EINVAL);
+    }
+    if secs == 0 && usecs == 0 {
+        return Ok(None);
+    }
+    let ns = (secs as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add((usecs as u64).saturating_mul(1_000));
+    Ok(Some(ns))
 }
 
 fn timeval_from_ns(ns: u64) -> [u8; 16] {
@@ -1771,6 +1813,7 @@ fn inet_setsockopt(
     level: i32,
     optname: i32,
     value: &[u8],
+    cred: &Credentials,
 ) -> Result<(), Errno> {
     if level == SOL_IPV6 && net_ops.family() != crate::addr::AF_INET6 {
         return Err(Errno::ENOPROTOOPT);
@@ -1801,6 +1844,9 @@ fn inet_setsockopt(
                 Ok(())
             }
             SO_BINDTODEVICE => {
+                if !cred.has_cap(crate::vfs::cred::Capability::NetRaw) {
+                    return Err(Errno::EPERM);
+                }
                 let end = value
                     .iter()
                     .position(|byte| *byte == 0)
@@ -1821,6 +1867,9 @@ fn inet_setsockopt(
                 Ok(())
             }
             SO_MARK => {
+                if !cred.has_cap(crate::vfs::cred::Capability::NetAdmin) {
+                    return Err(Errno::EPERM);
+                }
                 if value.len() < 4 {
                     return Err(Errno::EINVAL);
                 }
@@ -1833,6 +1882,10 @@ fn inet_setsockopt(
                 if priority < 0 {
                     return Err(Errno::EINVAL);
                 }
+                // Linux：`SO_PRIORITY` 大于 TC_PRIO_BESTEFFORT(6) 需要 CAP_NET_ADMIN。
+                if priority > 6 && !cred.has_cap(crate::vfs::cred::Capability::NetAdmin) {
+                    return Err(Errno::EPERM);
+                }
                 opts.priority = priority;
                 net_ops.proxy().set_socket_priority(priority);
                 Ok(())
@@ -1842,17 +1895,17 @@ fn inet_setsockopt(
                 Ok(())
             }
             SO_RCVTIMEO => {
-                let ns = parse_timeval_ns(value);
+                let ns = parse_timeval_ns(value)?;
                 net_ops
                     .recv_timeout_ns()
-                    .store(ns, core::sync::atomic::Ordering::Relaxed);
+                    .store(ns.unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             SO_SNDTIMEO => {
-                let ns = parse_timeval_ns(value);
+                let ns = parse_timeval_ns(value)?;
                 net_ops
                     .send_timeout_ns()
-                    .store(ns, core::sync::atomic::Ordering::Relaxed);
+                    .store(ns.unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             SO_SNDBUF => {
@@ -2730,12 +2783,16 @@ fn parse_inet_send_cmsgs(family: u16, control: &[u8]) -> Result<net::DatagramSen
     let mut offset = 0usize;
     while offset + CMSG_HEADER_LEN <= control.len() {
         let len = usize::from_ne_bytes(control[offset..offset + 8].try_into().expect("cmsg len"));
-        if len < CMSG_HEADER_LEN || offset + len > control.len() {
-            break;
+        if len < CMSG_HEADER_LEN {
+            return Err(Errno::EINVAL);
+        }
+        let end = offset.checked_add(len).ok_or(Errno::EINVAL)?;
+        if end > control.len() {
+            return Err(Errno::EINVAL);
         }
         let level = i32::from_ne_bytes(control[offset + 8..offset + 12].try_into().unwrap());
         let kind = i32::from_ne_bytes(control[offset + 12..offset + 16].try_into().unwrap());
-        let payload = &control[offset + CMSG_HEADER_LEN..offset + len];
+        let payload = &control[offset + CMSG_HEADER_LEN..end];
         match (level, kind) {
             (SOL_IP, IP_PKTINFO) if family == crate::addr::AF_INET => {
                 if payload.len() >= 12 {

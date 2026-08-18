@@ -145,6 +145,16 @@ pub enum VfsError {
     /// 消息（mqueue）长度超过接收缓冲区上限（EMSGSIZE）。
     MessageTooLong,
 
+    /// 需要先指定目标地址（EDESTADDRREQ）。
+    ///
+    /// 例如未连接的 socket 在 `send` 时未提供目的地址。
+    DestinationRequired,
+
+    /// 套接字尚未建立连接（ENOTCONN）。
+    ///
+    /// 例如对未连接的面向连接套接字执行 `shutdown`。
+    ConnectionMissing,
+
     /// 连接被对端重置（ECONNRESET）。
     ConnectionReset,
 
@@ -192,6 +202,8 @@ impl VfsError {
             VfsError::TimedOut => Errno::ETIMEDOUT,
             VfsError::BrokenPipe => Errno::EPIPE,
             VfsError::MessageTooLong => Errno::EMSGSIZE,
+            VfsError::DestinationRequired => Errno::EDESTADDRREQ,
+            VfsError::ConnectionMissing => Errno::ENOTCONN,
             VfsError::ConnectionReset => Errno::ECONNRESET,
             VfsError::Canceled => Errno::ECANCELED,
             VfsError::NoData => Errno::ENODATA,

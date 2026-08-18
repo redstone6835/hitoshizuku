@@ -89,6 +89,10 @@ pub enum Capability {
     SysPtrace,
     /// 检查点/恢复类诊断接口（如 `msgrcv(MSG_COPY)`）。
     CheckpointRestore,
+    /// 创建原始/数据包套接字（AF_PACKET/SOCK_RAW）并绑定到任意接口（SO_BINDTODEVICE）。
+    NetRaw,
+    /// 网络管理操作（SO_MARK、SO_PRIORITY > 6 等需要管理员权限的套接字选项）。
+    NetAdmin,
 }
 
 impl Capability {
@@ -110,6 +114,8 @@ impl Capability {
             Self::IpcLock => 1 << 10,
             Self::SysPtrace => 1 << 11,
             Self::CheckpointRestore => 1 << 12,
+            Self::NetRaw => 1 << 13,
+            Self::NetAdmin => 1 << 14,
         }
     }
 }

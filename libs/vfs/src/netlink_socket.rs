@@ -413,11 +413,17 @@ impl NetlinkSocketFileOps {
         if buf.len() < 16 {
             return Err(VfsError::InvalidArgument);
         }
+        // nlmsghdr.nlmsg_len（u32）必须完整包含 16 字节头且不越出输入缓冲，
+        // 并按该长度界定消息体，避免把缓冲区尾部无关字节当作 payload 处理。
+        let msg_len = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
+        if msg_len < 16 || msg_len > buf.len() {
+            return Err(VfsError::InvalidArgument);
+        }
         let msg_type = u16::from_ne_bytes([buf[4], buf[5]]);
         let flags = u16::from_ne_bytes([buf[6], buf[7]]);
         let seq = u32::from_ne_bytes([buf[8], buf[9], buf[10], buf[11]]);
         let local_pid = self.local_pid.load(Ordering::Acquire);
-        let responses = dispatch_message(msg_type, flags, seq, local_pid, &buf[16..]);
+        let responses = dispatch_message(msg_type, flags, seq, local_pid, &buf[16..msg_len]);
         let mut combined = Vec::new();
         for response in responses {
             combined.extend_from_slice(&response);
@@ -552,10 +558,10 @@ fn dispatch_message(
 ) -> Vec<Vec<u8>> {
     if flags & NLM_F_REQUEST != 0 {
         match msg_type {
-            RTM_GETLINK => return get_link(seq, local_pid),
-            RTM_GETADDR => return get_addr(seq, local_pid),
-            RTM_GETROUTE => return get_route(seq, local_pid),
-            RTM_GETNEIGH => return get_neigh(seq, local_pid),
+            RTM_GETLINK => return get_link(seq, local_pid, payload),
+            RTM_GETADDR => return get_addr(seq, local_pid, payload),
+            RTM_GETROUTE => return get_route(seq, local_pid, payload),
+            RTM_GETNEIGH => return get_neigh(seq, local_pid, payload),
             _ => {}
         }
     }
@@ -596,21 +602,35 @@ fn nlmsg_ack_or_error(result: Result<(), i32>, seq: u32, local_pid: u32) -> Vec<
     }
 }
 
-fn get_link(seq: u32, local_pid: u32) -> Vec<Vec<u8>> {
+fn get_link(seq: u32, local_pid: u32, payload: &[u8]) -> Vec<Vec<u8>> {
+    // ifinfomsg.ifi_index 位于 payload 偏移 4..8；非零时只返回该接口。
+    let requested = if payload.len() >= 8 {
+        i32::from_ne_bytes(payload[4..8].try_into().unwrap())
+    } else {
+        0
+    };
     let mut messages = net::device::snapshot_devices()
         .into_iter()
+        .filter(|device| requested == 0 || device.id.raw() == requested as u32)
         .map(|device| build_ifinfomsg(&device, seq, local_pid))
         .collect::<Vec<_>>();
     messages.push(build_nlmsg_done(seq, local_pid));
     messages
 }
 
-fn get_addr(seq: u32, local_pid: u32) -> Vec<Vec<u8>> {
+fn get_addr(seq: u32, local_pid: u32, payload: &[u8]) -> Vec<Vec<u8>> {
+    // ifaddrmsg.ifa_index 位于 payload 偏移 4..8；非零时只返回该接口。
+    let requested = if payload.len() >= 8 {
+        u32::from_ne_bytes(payload[4..8].try_into().unwrap())
+    } else {
+        0
+    };
     let mut messages = ADDRESS_SNAPSHOT_PROVIDER
         .lock()
         .map(|provider| provider())
         .unwrap_or_default()
         .into_iter()
+        .filter(|entry| requested == 0 || entry.interface.0 == requested)
         .filter_map(|entry| {
             let device = net::device::snapshot_devices()
                 .into_iter()
@@ -622,24 +642,44 @@ fn get_addr(seq: u32, local_pid: u32) -> Vec<Vec<u8>> {
     messages
 }
 
-fn get_route(seq: u32, local_pid: u32) -> Vec<Vec<u8>> {
+fn get_route(seq: u32, local_pid: u32, payload: &[u8]) -> Vec<Vec<u8>> {
+    // RTM_GETROUTE 的接口过滤由 RTA_OIF 属性携带（rtmsg 头无固定 ifindex 字段）。
+    let requested = if payload.len() >= 12 {
+        parse_attributes(&payload[12..])
+            .into_iter()
+            .find(|(kind, _)| *kind == RTA_OIF)
+            .and_then(|(_, data)| {
+                (data.len() >= 4).then(|| u32::from_ne_bytes(data[..4].try_into().unwrap()))
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let mut messages = ROUTE_SNAPSHOT_PROVIDER
         .lock()
         .map(|provider| provider())
         .unwrap_or_default()
         .into_iter()
+        .filter(|route| requested == 0 || route.interface.0 == requested)
         .map(|route| build_rtmsg(route, seq, local_pid))
         .collect::<Vec<_>>();
     messages.push(build_nlmsg_done(seq, local_pid));
     messages
 }
 
-fn get_neigh(seq: u32, local_pid: u32) -> Vec<Vec<u8>> {
+fn get_neigh(seq: u32, local_pid: u32, payload: &[u8]) -> Vec<Vec<u8>> {
+    // ndmsg.ndm_ifindex 位于 payload 偏移 4..8；非零时只返回该接口。
+    let requested = if payload.len() >= 8 {
+        i32::from_ne_bytes(payload[4..8].try_into().unwrap())
+    } else {
+        0
+    };
     let mut messages = NEIGHBOR_SNAPSHOT_PROVIDER
         .lock()
         .map(|provider| provider())
         .unwrap_or_default()
         .into_iter()
+        .filter(|neighbor| requested == 0 || neighbor.interface.0 == requested as u32)
         .map(|neighbor| build_ndmsg(neighbor, seq, local_pid))
         .collect::<Vec<_>>();
     messages.push(build_nlmsg_done(seq, local_pid));
@@ -1235,6 +1275,19 @@ mod tests {
             u16::from_ne_bytes(responses[0][4..6].try_into().unwrap()),
             NLMSG_DONE
         );
+    }
+
+    #[test]
+    fn dispatch_rejects_malformed_nlmsg_len() {
+        let ops = NetlinkSocketFileOps::new(0, false);
+        // nlmsg_len 小于 16 字节头。
+        let mut too_short = [0u8; 16];
+        too_short[0..4].copy_from_slice(&4u32.to_ne_bytes());
+        assert_eq!(ops.dispatch(&too_short), Err(VfsError::InvalidArgument));
+        // nlmsg_len 超出输入缓冲。
+        let mut too_long = [0u8; 16];
+        too_long[0..4].copy_from_slice(&100u32.to_ne_bytes());
+        assert_eq!(ops.dispatch(&too_long), Err(VfsError::InvalidArgument));
     }
 
     #[test]
