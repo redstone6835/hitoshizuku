@@ -6110,6 +6110,10 @@ impl SocketFacade {
         if !read && !write {
             return Err(SocketError::InvalidState);
         }
+        // Linux：未连接的 TCP 套接字 shutdown 返回 ENOTCONN（Datagram/Raw 不要求已连接）。
+        if self.kind == SocketKind::Stream && !self.stream_connected.load(Ordering::Acquire) {
+            return Err(SocketError::NotConnected);
+        }
         if read {
             self.read_shutdown.store(true, Ordering::Release);
             self.local_read_handoff.lock().take();
