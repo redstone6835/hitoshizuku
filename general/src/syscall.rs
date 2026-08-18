@@ -565,9 +565,10 @@ fn seccomp_filter_syscall(ctx: &mut SyscallContext<'_>) -> bool {
         if crate::seccomp::SeccompState::strict_allows(ctx.nr) {
             return false;
         }
+        // strict 模式违规：发不可捕获的 SIGKILL（Linux 语义），而非可捕获的 SIGSYS。
         let _ = sched::operation::tkill(
             task.pid_root().unwrap_or(0),
-            Some(sched::SignalNumber::from_raw(31).unwrap_or(sched::SignalNumber::SIGSEGV)),
+            Some(sched::SignalNumber::SIGKILL),
         );
         return true;
     }
@@ -598,18 +599,47 @@ fn seccomp_filter_syscall(ctx: &mut SyscallContext<'_>) -> bool {
     let action = result & SECCOMP_RET_ACTION_FULL;
     let data_bits = result & SECCOMP_RET_DATA;
     match action {
-        SECCOMP_RET_KILL_PROCESS | SECCOMP_RET_KILL_THREAD => {
+        SECCOMP_RET_KILL_THREAD => {
+            // 仅终止当前线程，SIGSYS 默认动作终止（seccomp 的 KILL 语义）。
             let _ = sched::operation::tkill(
                 task.pid_root().unwrap_or(0),
-                Some(sched::SignalNumber::from_raw(31).unwrap_or(sched::SignalNumber::SIGSEGV)),
+                Some(sched::SignalNumber::SIGSYS),
             );
             true
         }
+        SECCOMP_RET_KILL_PROCESS => {
+            // 终止整个线程组：向线程组 leader 发 SIGSYS。
+            let tgid = task
+                .thread_group()
+                .leader()
+                .and_then(|l| l.pid_root())
+                .unwrap_or_else(|| task.pid_root().unwrap_or(0));
+            let _ = sched::operation::kill(tgid, Some(sched::SignalNumber::SIGSYS));
+            true
+        }
         SECCOMP_RET_TRAP => {
-            let _ = sched::operation::tkill(
-                task.pid_root().unwrap_or(0),
-                Some(sched::SignalNumber::from_raw(31).unwrap_or(sched::SignalNumber::SIGSEGV)),
-            );
+            // TRAP 投递带完整 siginfo 的 SIGSYS（si_code=SYS_SECCOMP、
+            // si_syscall、si_arch），供 ptrace/user handler 读取。
+            let mut raw = [0u8; 128];
+            raw[0..4].copy_from_slice(&31i32.to_le_bytes()); // si_signo = SIGSYS
+            raw[4..8].copy_from_slice(&0i32.to_le_bytes()); // si_errno
+            raw[8..12].copy_from_slice(&1i32.to_le_bytes()); // si_code = SYS_SECCOMP
+            // raw[12..16] 为对齐填充；raw[16..24] 为 si_call_addr（填 0）。
+            raw[24..28].copy_from_slice(&(ctx.nr as i32).to_le_bytes()); // si_syscall
+            raw[28..32].copy_from_slice(&AUDIT_ARCH.to_le_bytes()); // si_arch
+            let info = sched::SigInfo {
+                sig: sched::SignalNumber::SIGSYS,
+                code: 1, // SYS_SECCOMP
+                sender_pid: task.pid_root().unwrap_or(0),
+                sender_uid: task.credentials().uid,
+                raw: Some(raw),
+            };
+            let tgid = task
+                .thread_group()
+                .leader()
+                .and_then(|l| l.pid_root())
+                .unwrap_or_else(|| task.pid_root().unwrap_or(0));
+            let _ = sched::operation::tgqueueinfo(tgid, task.pid_root().unwrap_or(0), info);
             true
         }
         SECCOMP_RET_ERRNO => {
