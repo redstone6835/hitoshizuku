@@ -169,6 +169,8 @@ const F_ADD_SEALS: usize = 1033;
 const F_GET_SEALS: usize = 1034;
 const FD_CLOEXEC: usize = 1;
 const FIONBIO: usize = 0x5421;
+const FIONREAD: usize = 0x541b;
+const FIOQSIZE: usize = 0x5460;
 
 const F_RDLCK: i16 = 0;
 const F_WRLCK: i16 = 1;
@@ -692,6 +694,20 @@ pub(super) fn sys_ioctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         let flags = file.flags();
         file.set_status_flags(flags.append, enabled, flags.sync, flags.direct);
         return Ok(0);
+    }
+    if cmd.raw() == FIONREAD {
+        if let Some(pipe) = vfs::pipe::pipe_of(&file) {
+            let bytes = pipe.available_len() as u32;
+            copy_to_user(ctx.args[2], &bytes.to_ne_bytes()).map_err(|e| e.as_errno())?;
+            return Ok(0);
+        }
+    }
+    if cmd.raw() == FIOQSIZE {
+        if file.inode().kind() == FileType::Regular {
+            let size = file.inode().size() as i64;
+            copy_to_user(ctx.args[2], &size.to_ne_bytes()).map_err(|e| e.as_errno())?;
+            return Ok(0);
+        }
     }
     if cmd.raw() == general::dev::tty::TIOCGPTPEER {
         return sys_tiocgptpeer(ctx, &file);
