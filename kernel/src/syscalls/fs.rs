@@ -1516,7 +1516,21 @@ pub(super) fn sys_umount2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let _fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let path = copy_path_from_user(ctx.args[0])?;
     let flags = ctx.args[1];
-    let force = (flags & 1) != 0;
+    // Linux umount2(2) 标志：MNT_FORCE / MNT_DETACH / MNT_EXPIRE / UMOUNT_NOFOLLOW。
+    const MNT_FORCE: usize = 0x1;
+    const MNT_DETACH: usize = 0x2;
+    const MNT_EXPIRE: usize = 0x4;
+    const UMOUNT_NOFOLLOW: usize = 0x8;
+    const KNOWN_UMOUNT_FLAGS: usize = MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW;
+    // 未知位直接拒绝，不静默忽略。
+    if (flags & !KNOWN_UMOUNT_FLAGS) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let force = (flags & MNT_FORCE) != 0;
+    // 已知但当前内核未实现的位显式返回不支持，而不是当作 0 处理。
+    if (flags & (MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW)) != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
     let dirfd = Dirfd::Cwd;
     operation::umount(&vfs_ctx, &dirfd, &path, force).map_err(|e| e.to_errno())?;
     Ok(0)
@@ -1534,7 +1548,9 @@ pub(super) fn sys_sync(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_syncfs(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fd = fd_arg(ctx.args[0])?;
     let file = file_for_fd(fd)?;
-    file.sync().map_err(|e| e.to_errno())?;
+    // syncfs(2) 同步 fd 所属的整个文件系统，而非单个文件。
+    let sb = file.inode().superblock().ok_or(Errno::ENOENT)?;
+    sb.sync().map_err(|e| e.to_errno())?;
     Ok(0)
 }
 
@@ -4315,6 +4331,9 @@ pub(super) fn sys_fsconfig(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let cmd = ctx.args[1] as u32;
     let file = file_for_fd(fd)?;
     let fsc = vfs::fs_context::FsContextFileOps::from_file(&file).ok_or(Errno::EBADF)?;
+    if fsc.is_consumed() {
+        return Err(Errno::EBADF);
+    }
     match cmd {
         vfs::fs_context::FSCONFIG_SET_FLAG => {
             let key = copy_cstr_from_user(ctx.args[2], 64).map_err(|e| e.as_errno())?;
@@ -4391,9 +4410,23 @@ pub(super) fn sys_fsmount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     }
     let file = file_for_fd(fd)?;
     let fsc = vfs::fs_context::FsContextFileOps::from_file(&file).ok_or(Errno::EBADF)?;
+    if fsc.is_consumed() {
+        return Err(Errno::EBADF);
+    }
     apply_mount_attr_flags(&fsc, attr_flags)?;
-    fsc.mark_mount_ready()?;
-    Ok(fd.as_raw() as usize)
+    // fsmount 必须返回一个全新的 fd（不再复用 fsopen 传入的 fd）。这里派生
+    // 出挂载就绪的新上下文，分配新 fd 成功后消费原 fsopen 上下文。
+    let mount_ctx = fsc.derive_mount_context()?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let new_fd = vfs::fs_context::create_fs_context_fd(
+        &fdt,
+        vfs_ctx.cred(),
+        mount_ctx,
+        (flags & vfs::fs_context::FSMOUNT_CLOEXEC) != 0,
+    )?;
+    fsc.mark_consumed();
+    Ok(new_fd.as_raw() as usize)
 }
 
 /// `move_mount(2)`：MOVE_MOUNT_F_EMPTY_PATH 时把 fs_context 挂载落到目标

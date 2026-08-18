@@ -59,6 +59,9 @@ pub struct FsContext {
     mount_ready: Spinlock<bool>,
     /// open_tree 克隆模式：挂载根 dentry（供 move_mount 落位）。
     clone_root: Spinlock<Option<Arc<crate::vfs::dentry::Dentry>>>,
+    /// fsmount 成功后置 true：原 fsopen 上下文已被消费，不可再用于
+    /// fsconfig / fsmount / land_mount。
+    consumed: Spinlock<bool>,
 }
 
 impl FsContext {
@@ -69,6 +72,7 @@ impl FsContext {
             superblock: Spinlock::new(None),
             mount_ready: Spinlock::new(false),
             clone_root: Spinlock::new(None),
+            consumed: Spinlock::new(false),
         })
     }
 
@@ -149,6 +153,38 @@ impl FsContext {
         }
         *self.mount_ready.lock() = true;
         Ok(())
+    }
+
+    /// 是否已被 fsmount 消费。
+    pub fn is_consumed(&self) -> bool {
+        *self.consumed.lock()
+    }
+
+    /// 标记原 fsopen 上下文已被 fsmount 消费。
+    pub fn mark_consumed(&self) {
+        *self.consumed.lock() = true;
+    }
+
+    /// `fsmount` 前派生挂载 fd 上下文：携带已创建的 superblock、挂载标志与
+    /// 挂载就绪标记。原 fsopen 上下文的失效由调用方在 fd 分配成功后通过
+    /// [`Self::mark_consumed`] 完成，避免 fd 分配失败导致上下文被提前消费。
+    pub fn derive_mount_context(&self) -> Result<Arc<Self>, Errno> {
+        if self.is_consumed() {
+            return Err(Errno::EBADF);
+        }
+        let sb = self.take_superblock().ok_or(Errno::EINVAL)?;
+        let mount_ctx = Self::new(self.fs_type.clone());
+        {
+            let src = self.config.lock();
+            let mut dst = mount_ctx.config.lock();
+            dst.source = src.source.clone();
+            dst.data = src.data.clone();
+            dst.flags = src.flags;
+        }
+        *mount_ctx.superblock.lock() = Some(Arc::clone(&sb));
+        *mount_ctx.clone_root.lock() = Some(Arc::clone(&sb.root_dentry));
+        *mount_ctx.mount_ready.lock() = true;
+        Ok(mount_ctx)
     }
 
     pub fn take_superblock(&self) -> Option<Arc<Superblock>> {
@@ -275,6 +311,9 @@ pub fn land_mount(
     target: Arc<crate::vfs::dentry::Dentry>,
     target_mount: &Arc<Mount>,
 ) -> VfsResult<()> {
+    if ctx.is_consumed() {
+        return Err(VfsError::BadFileDescriptor);
+    }
     let sb = ctx.take_superblock().ok_or(VfsError::InvalidArgument)?;
     let mount_root = match ctx.clone_root() {
         Some(root) => root,
