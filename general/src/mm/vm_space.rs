@@ -3672,6 +3672,9 @@ impl VmSpace {
     /// MAP_FIXED 原子操作：在同一把 VMA 锁内先 unmap 再 insert，消除竞态窗口。
     pub fn map_fixed_anon(&self, range: Range<usize>, flags: VmFlags) -> Result<(), Errno> {
         self.validate_range(&range)?;
+        if range.end > vm_layout().user_mmap_limit {
+            return Err(Errno::ENOMEM);
+        }
         let flags = self.with_future_mlock(flags);
         let backing = if flags.has(VmFlags::SHARED) {
             VmBacking::SharedAnon {
@@ -3730,6 +3733,9 @@ impl VmSpace {
         flags: VmFlags,
     ) -> Result<(), Errno> {
         self.validate_range(&range)?;
+        if range.end > vm_layout().user_mmap_limit {
+            return Err(Errno::ENOMEM);
+        }
         let flags = self.with_future_mlock(flags);
         let shared_writable = flags.contains_all(VmFlags::SHARED | VmFlags::WRITE);
         let mapped_file = Arc::clone(&file);
