@@ -6395,6 +6395,7 @@ fn sched_policy_name(policy: SchedPolicy) -> &'static str {
         SchedPolicy::RtRoundRobin => "SCHED_RR",
         SchedPolicy::Deadline => "SCHED_DEADLINE",
         SchedPolicy::Idle => "SCHED_IDLE",
+        SchedPolicy::Batch => "SCHED_BATCH",
     }
 }
 
@@ -6406,6 +6407,7 @@ fn sched_policy_linux_id(policy: SchedPolicy) -> u32 {
         SchedPolicy::RtRoundRobin => 2,
         SchedPolicy::Deadline => 6,
         SchedPolicy::Idle => 5,
+        SchedPolicy::Batch => 3, // SCHED_BATCH
     }
 }
 
