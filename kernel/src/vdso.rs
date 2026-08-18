@@ -122,6 +122,10 @@ pub fn unregister_realtime_source(source_id: usize) {
 }
 
 pub fn clock_time_ns(clock_id: usize) -> Option<u64> {
+    // 取舍：CLOCK_MONOTONIC_RAW 与 CLOCK_MONOTONIC 恒等。本内核的频率误差只
+    // 折进 REALTIME 偏移（见 `adjtimex::fold_locked`）、从不进入单调时钟域，
+    // 因此不存在“未经 NTP 校正的原始单调钟”与之区分，二者返回同一 `monotonic_ns()`
+    // 是语义可接受的简化。
     match clock_id {
         CLOCK_REALTIME | CLOCK_REALTIME_COARSE => Some(realtime_ns()),
         CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
