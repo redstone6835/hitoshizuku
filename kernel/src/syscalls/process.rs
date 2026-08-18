@@ -959,6 +959,12 @@ pub(super) fn sys_prlimit64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         None
     };
 
+    // F3：写 rlimit 表之前先校验 NOFILE 的 u32 范围，避免部分更新。
+    if resource == sched::Resource::Nofile
+        && let Some(new) = new_pair
+    {
+        validate_nofile_rlimit(new)?;
+    }
     let old = sched::operation::prlimit64(pid, resource, new_pair)?;
     if resource == sched::Resource::Nofile
         && let Some(new) = new_pair
@@ -1020,6 +1026,10 @@ pub(super) fn sys_setrlimit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let cur = u64::from_le_bytes(raw[0..8].try_into().unwrap());
     let max = u64::from_le_bytes(raw[8..16].try_into().unwrap());
     let new = sched::RlimitPair::new(sched::Rlim::from_raw(cur), sched::Rlim::from_raw(max));
+    // F3：写 rlimit 表之前先校验 NOFILE 的 u32 范围，避免部分更新。
+    if resource == sched::Resource::Nofile {
+        validate_nofile_rlimit(new)?;
+    }
     let _old = sched::operation::set_rlimit(resource, new)?;
     if resource == sched::Resource::Nofile {
         sync_thread_group_fdtable_nofile_limit(ctx.task(), new)?;
@@ -7190,6 +7200,14 @@ fn task_fdtable(task: &Arc<Task>) -> Option<Arc<vfs::FdTable>> {
     task.ext_lookup(sched::TASKEXT_VFS_FDTABLE)?
         .downcast::<vfs::FdTable>()
         .ok()
+}
+
+/// RLIMIT_NOFILE 的 fdtable 同步只能表达 u32 范围的软/硬限制(fdtable 内部用 u32)。
+/// 在写 rlimit 表之前校验,避免"表已更新、fdtable 同步失败"的部分更新。
+fn validate_nofile_rlimit(limit: sched::RlimitPair) -> Result<(), Errno> {
+    u32::try_from(limit.soft.raw()).map_err(|_| Errno::EINVAL)?;
+    u32::try_from(limit.hard.raw()).map_err(|_| Errno::EINVAL)?;
+    Ok(())
 }
 
 fn sync_thread_group_fdtable_nofile_limit(
