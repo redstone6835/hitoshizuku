@@ -1128,6 +1128,9 @@ pub(super) fn sys_ftruncate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let fd = fd_arg(ctx.args[0])?;
     let size = nonnegative_i64_arg(ctx.args[1])?;
     let file = file_for_fd(fd)?;
+    if file.inode().kind() == FileType::Directory {
+        return Err(Errno::EISDIR);
+    }
     if !file.flags().writable() {
         return Err(Errno::EINVAL);
     }
