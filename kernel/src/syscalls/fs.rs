@@ -5554,10 +5554,8 @@ fn copy_readlink_target(buf: usize, size: usize, target: &str) -> Result<usize, 
     if size == 0 {
         return Err(Errno::EINVAL);
     }
-    let n = bytes.len().min(size - 1);
+    let n = bytes.len().min(size);
     copy_to_user(buf, &bytes[..n]).map_err(|e| e.as_errno())?;
-    // 尾加 NUL，兼容 POSIX readlink(2) 语义
-    copy_to_user(buf + n, &[0u8]).map_err(|e| e.as_errno())?;
     Ok(n)
 }
 
