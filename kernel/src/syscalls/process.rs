@@ -5617,7 +5617,10 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(0)
         }
         PTRACE_LISTEN => {
-            sched::operation::ptrace_cont(pid, None)?;
+            // LISTEN 语义：在 PTRACE_INTERRUPT 之后让 tracee 恢复到先前的停止态，
+            // 但保持停止、不恢复执行。最小正确实现：仅校验目标可达性后返回 0，
+            // 不调用 ptrace_cont（不 resume）。
+            let _target = ptrace_target_task(pid)?;
             Ok(0)
         }
         PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
