@@ -37,6 +37,25 @@ pub trait FileLike: Send + Sync {
     /// 该 hook 可能在 VMA 锁内执行，必须无阻塞且不能回调 VM。
     fn disable_private_page_cache(&self) {}
 
+    /// 共享文件页缓存（`MAP_SHARED`）使用的内容代际。
+    ///
+    /// 与 [`Self::private_page_cache_generation`] 的语义不同：本方法的 `None`
+    /// 表示实现**未提供**该信号，而不是"不要缓存"。返回 `None` 时，VM 一律按
+    /// 代际 `0` 使用共享页缓存，缓存退化为永不因外部写而失效——与既有行为
+    /// 完全一致。
+    ///
+    /// 返回 `Some` 的实现必须保证：任何可能修改文件内容的路径（`write()`、
+    /// `truncate()`、`fallocate()` 等）都要在**开始修改内容之前**让本方法的
+    /// 返回值递增，并且一旦递增，旧代际不得复活（单调不降、不回绕）。VM 据此
+    /// 在按 `(文件, 偏移, 代际)` 查找共享页缓存时自动丢弃旧代际的驻留页，使
+    /// 后续 `MAP_SHARED` 缺页重新读到变更后的内容；已在进程页表中驻留的旧页
+    /// 仍由各自 VMA 持有，并在被淘汰/回写时按其**加载时**的代际正确回收。
+    ///
+    /// 该 hook 在缺页路径中调用，必须无阻塞、不能回调 VM。
+    fn shared_page_cache_generation(&self) -> Option<u64> {
+        None
+    }
+
     /// 从 `offset` 处读最多 `buf.len()` 字节到 `buf`，返回实际读取字节数。
     /// 短读允许；EOF 时返 0。
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno>;
@@ -224,5 +243,62 @@ mod tests {
             reader.read_pages_at(u64::MAX, &mut [&mut page], 2),
             Err(Errno::EOVERFLOW)
         );
+    }
+
+    struct SharedGenReader {
+        data: &'static [u8],
+        shared_generation: u64,
+    }
+
+    impl FileLike for SharedGenReader {
+        fn cache_key(&self) -> usize {
+            self.data.as_ptr() as usize
+        }
+
+        fn shared_page_cache_generation(&self) -> Option<u64> {
+            Some(self.shared_generation)
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+            let start = usize::try_from(offset).map_err(|_| Errno::EOVERFLOW)?;
+            if start >= self.data.len() {
+                return Ok(0);
+            }
+            let count = buf.len().min(self.data.len() - start);
+            buf[..count].copy_from_slice(&self.data[start..start + count]);
+            Ok(count)
+        }
+
+        fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, Errno> {
+            Err(Errno::EROFS)
+        }
+
+        fn sync(&self) -> Result<(), Errno> {
+            Ok(())
+        }
+
+        fn size(&self) -> u64 {
+            self.data.len() as u64
+        }
+    }
+
+    #[test]
+    fn shared_page_cache_generation_defaults_to_none() {
+        // 未覆盖契约方法的实现必须返回 `None`，让 VM 退化为代际 `0`（旧行为）。
+        let reader = ShortReader {
+            data: b"abcd",
+            max_read: 4,
+        };
+        assert_eq!(reader.shared_page_cache_generation(), None);
+    }
+
+    #[test]
+    fn shared_page_cache_generation_returns_implemented_value() {
+        // 覆盖契约方法的实现应原样返回其代际，供 VM 按代际查找共享页缓存。
+        let reader = SharedGenReader {
+            data: b"abcd",
+            shared_generation: 42,
+        };
+        assert_eq!(reader.shared_page_cache_generation(), Some(42));
     }
 }
