@@ -673,9 +673,11 @@ pub(super) fn sys_mq_timedsend(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     let nonblock = file.flags().nonblock;
     let task = Arc::clone(ctx.task());
     let pid = task_pid(ctx);
+    let cred = vfs_cred_from_sched(&ctx.task().credentials());
+    let sender_uid = cred.uid.0;
 
     loop {
-        match queue.try_send(msg_prio, &data, pid, nonblock) {
+        match queue.try_send(msg_prio, &data, pid, sender_uid, nonblock) {
             Ok((true, notify)) => {
                 if let Some(notification) = notify {
                     dispatch_mq_notification(&notification);
@@ -705,7 +707,7 @@ pub(super) fn sys_mq_timedsend(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
             }
             None => false,
         };
-        match queue.try_send(msg_prio, &data, pid, nonblock) {
+        match queue.try_send(msg_prio, &data, pid, sender_uid, nonblock) {
             Ok((true, notify)) => {
                 queue.senders().finish_wait(&entry);
                 if deadline_armed {
@@ -852,7 +854,7 @@ pub(super) fn sys_mq_notify(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 
     if notification == 0 {
         // 取消注册（SIGEV_NONE 语义）。
-        return queue.register_notify(MqNotifyKind::None, 0, 0).map(|_| 0);
+        return queue.register_notify(MqNotifyKind::None, 0).map(|_| 0);
     }
 
     let mut raw = [0u8; SIGEV_SIZE];
@@ -877,11 +879,11 @@ pub(super) fn sys_mq_notify(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         _ => return Err(Errno::EINVAL),
     };
     if kind == MqNotifyKind::None {
-        return queue.register_notify(MqNotifyKind::None, 0, 0).map(|_| 0);
+        return queue.register_notify(MqNotifyKind::None, 0).map(|_| 0);
     }
     // Linux `ipc/mqueue.c`：注册通知要求读权限（ipcperms）。
     queue.check_access(false, &cred)?;
-    queue.register_notify(kind, pid, cred.uid.0).map(|_| 0)
+    queue.register_notify(kind, pid).map(|_| 0)
 }
 
 pub(super) fn sys_mq_getsetattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -895,7 +897,6 @@ pub(super) fn sys_mq_getsetattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     let queue: Arc<general::ipc::mqueue::MqObject> = Arc::clone(ops.queue());
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
 
-    let old = queue.attr();
     let old_flags = if file.flags().nonblock { O_NONBLOCK } else { 0 };
 
     if newattr_user != 0 {
@@ -903,18 +904,11 @@ pub(super) fn sys_mq_getsetattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
         let mut raw = [0u8; MQ_ATTR_SIZE];
         copy_from_user(newattr_user, &mut raw).map_err(|e| e.as_errno())?;
         let flags = read_i64(&raw, MQ_ATTR_FLAGS);
-        let maxmsg = read_i64(&raw, MQ_ATTR_MAXMSG);
-        let msgsize = read_i64(&raw, MQ_ATTR_MSGSIZE);
         if flags & !O_NONBLOCK != 0 {
             return Err(Errno::EINVAL);
         }
-        if maxmsg != old.maxmsg || msgsize != old.msgsize {
-            queue.set_attr(&MqAttr {
-                maxmsg,
-                msgsize,
-                curmsgs: 0,
-            })?;
-        }
+        // Linux `mq_setattr` 只能改 `mq_flags`（O_NONBLOCK）；`mq_maxmsg`/
+        // `mq_msgsize` 的改动被忽略（容量由 `mq_open` 时确定，不可再改）。
         if flags != old_flags {
             file.set_status_flags(false, flags & O_NONBLOCK != 0, false, false);
         }
@@ -1427,11 +1421,11 @@ fn mq_notify_dispatcher(notification: &general::ipc::mqueue::MqNotification) {
                 sender_uid: Uid(notification.sender_uid),
                 raw: Some(raw),
             };
-            let _ = sched::operation::queueinfo(notification.sender_pid, info);
+            let _ = sched::operation::queueinfo(notification.notify_pid, info);
         }
         MqNotifyKind::Thread { function, value } => {
             // 注册者可能已退出；查找失败时静默丢弃（Linux 同样如此）。
-            let Ok(target) = sched::operation::lookup_pid(notification.sender_pid) else {
+            let Ok(target) = sched::operation::lookup_pid(notification.notify_pid) else {
                 return;
             };
             crate::sched::spawn_mq_notify_thread(&target, function, value);
