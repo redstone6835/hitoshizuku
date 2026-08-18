@@ -62,6 +62,10 @@ const PTRACE_POKEUSR: usize = 6;
 const PTRACE_CONT: usize = 7;
 const PTRACE_KILL: usize = 8;
 const PTRACE_SINGLESTEP: usize = 9;
+const PTRACE_GETREGS: usize = 12;
+const PTRACE_SETREGS: usize = 13;
+const PTRACE_GETFPREGS: usize = 14;
+const PTRACE_SETFPREGS: usize = 15;
 const PTRACE_ATTACH: usize = 16;
 const PTRACE_DETACH: usize = 17;
 const PTRACE_OLDSETOPTIONS: usize = 21;
@@ -5613,7 +5617,10 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(0)
         }
         PTRACE_LISTEN => {
-            sched::operation::ptrace_cont(pid, None)?;
+            // LISTEN 语义：在 PTRACE_INTERRUPT 之后让 tracee 恢复到先前的停止态，
+            // 但保持停止、不恢复执行。最小正确实现：仅校验目标可达性后返回 0，
+            // 不调用 ptrace_cont（不 resume）。
+            let _target = ptrace_target_task(pid)?;
             Ok(0)
         }
         PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
@@ -5650,6 +5657,44 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             let note_type = addr;
             let iov_user = data;
             ptrace_regset(&target, note_type, request == PTRACE_SETREGSET, iov_user)?;
+            Ok(0)
+        }
+        PTRACE_GETREGS | PTRACE_SETREGS => {
+            // GETREGS/SETREGS 的第 4 个参数 data 直接指向原始寄存器组缓冲区
+            // （riscv64 `user_regs_struct` / loongarch64 `user_pt_regs`），
+            // 不带 iovec 包装、不带 elf_prstatus 头。
+            let target = ptrace_target_task(pid)?;
+            let size = linux_user_regs_size();
+            let mut buf = [0u8; 360]; // 覆盖 riscv 256 / loongarch 360
+            if request == PTRACE_SETREGS {
+                copy_from_user(data, &mut buf[..size]).map_err(|e| e.as_errno())?;
+                let mut frame = ptrace_target_frame(&target)?;
+                if !frame.apply_linux_user_regs(&buf[..size]) {
+                    return Err(Errno::EIO);
+                }
+                ptrace_store_frame(&target, frame);
+            } else {
+                let frame = ptrace_target_frame(&target)?;
+                if !frame.write_linux_user_regs(&mut buf[..size]) {
+                    return Err(Errno::EIO);
+                }
+                copy_to_user(data, &buf[..size]).map_err(|e| e.as_errno())?;
+            }
+            Ok(0)
+        }
+        PTRACE_GETFPREGS | PTRACE_SETFPREGS => {
+            // GETFPREGS/SETFPREGS 的第 4 个参数 data 直接指向浮点寄存器组缓冲区
+            // （`struct user_fpregs_struct` / loongarch `user_fp_state`）。
+            let target = ptrace_target_task(pid)?;
+            let size = linux_fpregset_size();
+            if request == PTRACE_SETFPREGS {
+                let mut buf = [0u8; 272]; // 覆盖 riscv 264 / loongarch 272
+                copy_from_user(data, &mut buf[..size]).map_err(|e| e.as_errno())?;
+                ptrace_write_arch_fpregs(&target, &buf[..size])?;
+            } else {
+                let out = ptrace_read_arch_fpregs(&target)?;
+                copy_to_user(data, &out).map_err(|e| e.as_errno())?;
+            }
             Ok(0)
         }
         PTRACE_GETSIGINFO => {
@@ -5808,44 +5853,40 @@ fn ptrace_store_frame(target: &Arc<Task>, frame: hal::user_context::UserTrapFram
     target.ext_install(sched::TASKEXT_USER_TRAP_FRAME, erased);
 }
 
-/// `PTRACE_PEEKUSR`：按 mcontext 布局读寄存器字（pc@0、regs@8、每项 8 字节）。
+/// `PTRACE_PEEKUSR`：按 ptrace 原始寄存器组布局读一个寄存器字。
+///
+/// - riscv64：offset 0 = pc，8..256 依次为 31 个通用寄存器（user_regs_struct）；
+/// - loongarch64：offset 0..256 = regs[0..32]、256 = orig_a0、264 = csr_era、
+///   272 = csr_badv（user_pt_regs）。
 fn ptrace_peek_usr(target: &Arc<Task>, offset: usize) -> Result<usize, Errno> {
     let frame = ptrace_target_frame(target)?;
-    let mut mcontext = [0u8; 1024];
-    if !frame.write_linux_mcontext(&mut mcontext) {
+    let size = linux_user_regs_size();
+    let mut regs = [0u8; 360]; // 覆盖 riscv 256 / loongarch 360
+    if !frame.write_linux_user_regs(&mut regs[..size]) {
         return Err(Errno::EIO);
     }
-    // mcontext 布局：pc@0；regs@8（32 项）；可能还有 flags 等尾部。
-    let regs_len = 8 + 32 * 8;
-    if offset < 8 {
-        return Ok(u64::from_ne_bytes(mcontext[0..8].try_into().unwrap()) as usize);
-    }
-    if offset < regs_len && (offset - 8) % 8 == 0 {
-        let index = (offset - 8) / 8;
-        let start = 8 + index * 8;
-        return Ok(u64::from_ne_bytes(mcontext[start..start + 8].try_into().unwrap()) as usize);
+    if offset % 8 == 0 && offset + 8 <= size {
+        let start = offset;
+        return Ok(u64::from_le_bytes(regs[start..start + 8].try_into().unwrap()) as usize);
     }
     Err(Errno::EIO)
 }
 
-/// `PTRACE_POKEUSR`：按 mcontext 布局写寄存器字。
+/// `PTRACE_POKEUSR`：按 ptrace 原始寄存器组布局写一个寄存器字（`peek_usr` 的反向）。
 fn ptrace_poke_usr(target: &Arc<Task>, offset: usize, value: usize) -> Result<(), Errno> {
     let mut frame = ptrace_target_frame(target)?;
-    let mut mcontext = [0u8; 1024];
-    if !frame.write_linux_mcontext(&mut mcontext) {
+    let size = linux_user_regs_size();
+    let mut regs = [0u8; 360];
+    if !frame.write_linux_user_regs(&mut regs[..size]) {
         return Err(Errno::EIO);
     }
-    let regs_len = 8 + 32 * 8;
-    if offset < 8 {
-        mcontext[0..8].copy_from_slice(&(value as u64).to_ne_bytes());
-    } else if offset < regs_len && (offset - 8) % 8 == 0 {
-        let index = (offset - 8) / 8;
-        let start = 8 + index * 8;
-        mcontext[start..start + 8].copy_from_slice(&(value as u64).to_ne_bytes());
+    if offset % 8 == 0 && offset + 8 <= size {
+        let start = offset;
+        regs[start..start + 8].copy_from_slice(&(value as u64).to_le_bytes());
     } else {
         return Err(Errno::EIO);
     }
-    if !frame.apply_linux_mcontext(&mcontext) {
+    if !frame.apply_linux_user_regs(&regs[..size]) {
         return Err(Errno::EIO);
     }
     ptrace_store_frame(target, frame);
@@ -5869,20 +5910,27 @@ fn ptrace_regset(
 
     match note_type {
         NT_PRSTATUS => {
-            let frame = ptrace_target_frame(target)?;
-            let mut mcontext = [0u8; 1024];
-            if !frame.write_linux_mcontext(&mut mcontext) {
-                return Err(Errno::EIO);
-            }
-            let size = linux_mcontext_size();
+            // NT_PRSTATUS 在 ptrace 路径返回的是原始寄存器组
+            // （riscv64 `user_regs_struct` 256B / loongarch64 `user_pt_regs`
+            // 360B），不带 `struct elf_prstatus` 头。
+            //
+            // 说明：`struct elf_prstatus`（其 pr_reg 字段才嵌入寄存器组；
+            // loongarch64 上 offsetof(pr_reg)=112、sizeof=480，riscv64 上
+            // offsetof(pr_reg)=112、sizeof=376）只出现在 ELF core dump 的
+            // NT_PRSTATUS note 里。内核 `ptrace(PTRACE_GETREGSET, NT_PRSTATUS)`
+            // 直接向用户拷贝 regset->n * regset->size 字节的原始寄存器组（见
+            // kernel/ptrace.c 的 ptrace_regset），gdb/strace 也按原始寄存器组
+            // 解释该缓冲区。因此这里不追加 elf_prstatus 头，以免与 gdb/strace
+            // 的预期不符。
+            let size = linux_user_regs_size();
             if set {
                 if len < size {
                     return Err(Errno::EIO);
                 }
-                let mut input = [0u8; 1024];
+                let mut input = [0u8; 360];
                 copy_from_user(base, &mut input[..size]).map_err(|e| e.as_errno())?;
                 let mut frame = ptrace_target_frame(target)?;
-                if !frame.apply_linux_mcontext(&input) {
+                if !frame.apply_linux_user_regs(&input[..size]) {
                     return Err(Errno::EIO);
                 }
                 ptrace_store_frame(target, frame);
@@ -5892,7 +5940,12 @@ fn ptrace_regset(
                     write_iov_len(iov_user, len)?;
                     return Ok(());
                 }
-                copy_to_user(base, &mcontext[..size]).map_err(|e| e.as_errno())?;
+                let frame = ptrace_target_frame(target)?;
+                let mut out = [0u8; 360];
+                if !frame.write_linux_user_regs(&mut out[..size]) {
+                    return Err(Errno::EIO);
+                }
+                copy_to_user(base, &out[..size]).map_err(|e| e.as_errno())?;
             }
             Ok(())
         }
@@ -5927,16 +5980,18 @@ fn write_iov_len(iov_user: usize, len: usize) -> Result<(), Errno> {
     copy_to_user(iov_user + 8, &(len as u64).to_ne_bytes()).map_err(|e| e.as_errno())
 }
 
-/// Linux `struct user_regs_struct`（mcontext 布局）的大小。
-fn linux_mcontext_size() -> usize {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        8 + 32 * 8 + 4 // pc + regs + flags
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        8 + 32 * 8 // pc + regs
-    }
+/// ptrace 原始寄存器组的大小（字节）。
+///
+/// 与 hal::user_context 中的编解码保持单一事实源，这里只做转发：
+/// - riscv64：`struct user_regs_struct`（pc + 31 个通用寄存器）= 256；
+/// - loongarch64：`struct user_pt_regs`（regs[32] + orig_a0 + csr_era
+///   + csr_badv + reserved[10]）= 360。
+///
+/// 注意：这不是信号帧 mcontext/sigcontext 的大小——loongarch 的 sigcontext 是
+/// 268 字节（pc@0 + regs@8 + flags@264），信号路径的尺寸由
+/// hal::user_context 内部维护，不经过本函数。
+fn linux_user_regs_size() -> usize {
+    hal::user_context::UserTrapFrame::linux_user_regs_size()
 }
 
 /// Linux `struct user_fpregs_struct` 的大小。
@@ -6019,7 +6074,9 @@ fn ptrace_write_arch_fpregs(target: &Arc<Task>, bytes: &[u8]) -> Result<(), Errn
         for (index, reg) in new.f.iter_mut().enumerate() {
             *reg = u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap());
         }
-        new.fcsr = u32::from_le_bytes(bytes[256..260].try_into().unwrap());
+        // user_fpregs_struct.fcsr 是 u64（8 字节），与读路径对称地从 8 字节
+        // 读回后截断为 TrapFrame.fcsr（u32）。
+        new.fcsr = u64::from_le_bytes(bytes[256..264].try_into().unwrap()) as u32;
         let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(new);
         target
             .ext_replace(sched::TASKEXT_PTRACE_FRAME, erased)
