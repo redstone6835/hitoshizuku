@@ -4289,6 +4289,9 @@ pub(super) fn sys_fsopen(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    if !vfs_ctx.cred().has_cap(vfs::cred::Capability::SysAdmin) {
+        return Err(Errno::EPERM);
+    }
     if vfs::FS_REGISTRY.find(&fs_name).is_none() {
         return Err(Errno::ENODEV);
     }
@@ -4304,6 +4307,10 @@ pub(super) fn sys_fsopen(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 
 /// `fsconfig(2)`：配置 fs_context（SET_FLAG / SET_STRING / CMD_CREATE）。
 pub(super) fn sys_fsconfig(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    if !vfs_ctx.cred().has_cap(vfs::cred::Capability::SysAdmin) {
+        return Err(Errno::EPERM);
+    }
     let fd = fd_arg(ctx.args[0])?;
     let cmd = ctx.args[1] as u32;
     let file = file_for_fd(fd)?;
@@ -4372,6 +4379,10 @@ fn apply_mount_attr_flags(
 /// `fsmount(2)`：校验 fs_context 已 CREATE，应用 MOUNT_ATTR_* 属性，标记挂载
 /// 就绪并返回挂载 fd。
 pub(super) fn sys_fsmount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    if !vfs_ctx.cred().has_cap(vfs::cred::Capability::SysAdmin) {
+        return Err(Errno::EPERM);
+    }
     let fd = fd_arg(ctx.args[0])?;
     let flags = ctx.args[1] as u32;
     let attr_flags = ctx.args[2];
@@ -4394,6 +4405,9 @@ pub(super) fn sys_move_mount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     let to_path_user = ctx.args[3];
     let flags = ctx.args[4] as u32;
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    if !vfs_ctx.cred().has_cap(vfs::cred::Capability::SysAdmin) {
+        return Err(Errno::EPERM);
+    }
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
 
     if flags & vfs::fs_context::MOVE_MOUNT_F_EMPTY_PATH != 0 {
@@ -4467,6 +4481,9 @@ fn open_tree_common(dirfd_raw: usize, path_user: usize, flags: u32) -> Result<us
     let cloexec = (flags & (0o200000 | 0x80000)) != 0;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    if !vfs_ctx.cred().has_cap(vfs::cred::Capability::SysAdmin) {
+        return Err(Errno::EPERM);
+    }
     let path = copy_path_from_user(path_user)?;
     let dirfd = dirfd_arg(dirfd_raw, &fdt)?;
     let result = vfs::path::lookup(&vfs_ctx, &dirfd, &path, LookupFlags::DIRECTORY)
@@ -4493,6 +4510,9 @@ pub(super) fn sys_fspick(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    if !vfs_ctx.cred().has_cap(vfs::cred::Capability::SysAdmin) {
+        return Err(Errno::EPERM);
+    }
     let path = copy_path_from_user(path_user)?;
     let dirfd = dirfd_arg(dirfd, &fdt)?;
     let result = vfs::path::lookup(&vfs_ctx, &dirfd, &path, LookupFlags::DIRECTORY)
