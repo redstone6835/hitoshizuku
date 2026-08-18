@@ -6348,10 +6348,12 @@ pub(super) fn sys_umask(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 
 pub(super) fn sys_settimeofday(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let tv = ctx.args[0];
+    // Linux 语义：无论 tv/tz 是否为 NULL，settimeofday 都要求 CAP_SYS_TIME，
+    // 故权限检查必须早于 `tv == 0` 的空指针早退。
+    require_cap(ctx.task(), Capability::SysTime)?;
     if tv == 0 {
         return Ok(0);
     }
-    require_cap(ctx.task(), Capability::SysTime)?;
     let mut raw = [0u8; TIMEVAL_SIZE];
     copy_from_user(tv, &mut raw).map_err(|e| e.as_errno())?;
     let new_ns = timeval_to_ns(&raw)?;
