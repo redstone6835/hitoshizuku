@@ -3353,7 +3353,7 @@ pub(super) fn sys_setgroups(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let size = ctx.args[0];
     let list = ctx.args[1];
     let creds = ctx.task().credentials();
-    if creds.euid != Uid::ROOT {
+    if !creds.has_cap(Capability::Setgid) {
         return Err(Errno::EPERM);
     }
     const NGROUPS_MAX: usize = 65536;
@@ -3364,7 +3364,11 @@ pub(super) fn sys_setgroups(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     for i in 0..size {
         let mut raw = [0u8; 4];
         copy_from_user(list + i * 4, &mut raw).map_err(|e| e.as_errno())?;
-        groups.push(Gid(u32::from_le_bytes(raw)));
+        let gid = u32::from_le_bytes(raw);
+        if gid == u32::MAX {
+            return Err(Errno::EINVAL);
+        }
+        groups.push(Gid(gid));
     }
     let mut new = (*creds).clone();
     new.groups = groups;
