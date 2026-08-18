@@ -208,10 +208,21 @@ struct IrqRegistration {
     bottom_half: Option<Arc<dyn IrqBottomHalf>>,
 }
 
+/// IRQ 回调的只读热路径快照。
+///
+/// 注册/注销只在冷路径重建该数组；dispatch 只需取得一次 bucket 锁并持有
+/// 一个 Arc，避免每个共享 handler 都重新查 HashTable、克隆 Arc 和竞争全局
+/// registry 锁。旧快照在并发注销期间仍保持有效，符合 IRQ 回调不能睡眠的约束。
+struct IrqDispatchRegistration {
+    handler: Arc<dyn IrqHandler>,
+    bottom_half: Option<Arc<dyn IrqBottomHalf>>,
+}
+
 struct IrqBucket {
     line: IrqLine,
     proc_irq: u32,
     handlers: Vec<IrqRegistration>,
+    dispatch: Arc<[IrqDispatchRegistration]>,
     counts: [u64; sched::NR_CPUS],
 }
 
@@ -242,6 +253,22 @@ fn irq_line_hash(line: IrqLine) -> u64 {
 #[inline]
 fn irq_bucket_hash(bucket: &IrqBucket) -> u64 {
     irq_line_hash(bucket.line)
+}
+
+fn build_dispatch_snapshot(
+    handlers: &[IrqRegistration],
+) -> Result<Arc<[IrqDispatchRegistration]>, IrqError> {
+    let mut snapshot = Vec::new();
+    snapshot
+        .try_reserve(handlers.len())
+        .map_err(|_| IrqError::OutOfMemory)?;
+    for entry in handlers {
+        snapshot.push(IrqDispatchRegistration {
+            handler: Arc::clone(&entry.handler),
+            bottom_half: entry.bottom_half.as_ref().map(Arc::clone),
+        });
+    }
+    Ok(Arc::from(snapshot.into_boxed_slice()))
 }
 
 impl IrqRegistry {
@@ -286,6 +313,14 @@ impl IrqRegistry {
                 handler: request.handler,
                 bottom_half: request.bottom_half,
             });
+            let dispatch = match build_dispatch_snapshot(&bucket.handlers) {
+                Ok(dispatch) => dispatch,
+                Err(error) => {
+                    bucket.handlers.pop();
+                    return Err(error);
+                }
+            };
+            bucket.dispatch = dispatch;
             drop(lines);
             enable_irq_line(line);
             return Ok(IrqHandle { id, line });
@@ -313,12 +348,14 @@ impl IrqRegistry {
             handler: request.handler,
             bottom_half: request.bottom_half,
         });
+        let dispatch = build_dispatch_snapshot(&handlers)?;
         lines.insert_unique(
             hash,
             IrqBucket {
                 line,
                 proc_irq,
                 handlers,
+                dispatch,
                 counts: [0; sched::NR_CPUS],
             },
             irq_bucket_hash,
@@ -349,9 +386,17 @@ impl IrqRegistry {
         else {
             return Err(IrqError::NotFound);
         };
-        bucket.handlers.remove(index);
+        let removed = bucket.handlers.remove(index);
         let still_used = !bucket.handlers.is_empty();
-        if !still_used {
+        if still_used {
+            match build_dispatch_snapshot(&bucket.handlers) {
+                Ok(dispatch) => bucket.dispatch = dispatch,
+                Err(error) => {
+                    bucket.handlers.insert(index, removed);
+                    return Err(error);
+                }
+            }
+        } else {
             let entry = lines
                 .find_entry(hash, |bucket| bucket.line == handle.line)
                 .map_err(|_| IrqError::NotFound)?;
@@ -366,35 +411,24 @@ impl IrqRegistry {
 
     pub fn dispatch_line(&self, line: IrqLine) -> bool {
         let hash = irq_line_hash(line);
+        let dispatch = {
+            let lines = self.lines.lock();
+            lines
+                .find(hash, |bucket| bucket.line == line)
+                .map(|bucket| Arc::clone(&bucket.dispatch))
+        };
+        let Some(dispatch) = dispatch else {
+            return false;
+        };
         let mut handled = false;
-        let mut last_id = 0;
-
-        loop {
-            let next = {
-                let lines = self.lines.lock();
-                lines
-                    .find(hash, |bucket| bucket.line == line)
-                    .and_then(|bucket| bucket.handlers.iter().find(|entry| entry.id > last_id))
-                    .map(|entry| {
-                        (
-                            entry.id,
-                            Arc::clone(&entry.handler),
-                            entry.bottom_half.as_ref().map(Arc::clone),
-                        )
-                    })
-            };
-            let Some((id, handler, bottom_half)) = next else {
-                break;
-            };
-
+        for entry in dispatch.iter() {
             // 级联 interrupt-controller handler 会继续调用 dispatch_irq_line()
             // 分发子线。handler 调用必须发生在 registry 锁外，否则 PCH/EIOINTC
             // 这类树形 IRQ 拓扑会递归拿同一把 Spinlock 并死锁。
-            last_id = id;
-            let status = handler.handle_irq(line);
+            let status = entry.handler.handle_irq(line);
             if status.is_handled() {
                 handled = true;
-                if let Some(bottom_half) = bottom_half {
+                if let Some(bottom_half) = entry.bottom_half.as_ref() {
                     bottom_half.run_bottom_half(line);
                 }
             }
