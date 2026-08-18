@@ -134,6 +134,8 @@ pub struct Credentials {
     pub cap_inheritable: CapSet,
     /// Linux capability bounding set, modified by PR_CAPBSET_DROP.
     pub cap_bset: CapSet,
+    /// Linux ambient capability set（`PR_CAP_AMBIENT`）。
+    pub cap_ambient: CapSet,
     /// `PR_SET_SECUREBITS` 的安全位（`SECBIT_*`）。
     pub securebits: u32,
 }
@@ -155,6 +157,7 @@ impl Credentials {
             cap_permitted: CapSet::FULL,
             cap_inheritable: CapSet::EMPTY,
             cap_bset: CapSet::FULL,
+            cap_ambient: CapSet::EMPTY,
             securebits: 0,
         }
     }
@@ -175,6 +178,7 @@ impl Credentials {
             cap_permitted: CapSet::EMPTY,
             cap_inheritable: CapSet::EMPTY,
             cap_bset: CapSet::EMPTY,
+            cap_ambient: CapSet::EMPTY,
             securebits: 0,
         }
     }
