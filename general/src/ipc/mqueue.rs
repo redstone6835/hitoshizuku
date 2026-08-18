@@ -334,11 +334,7 @@ impl MqObject {
 
     /// `mq_notify`：注册/替换通知。已有**其它**注册者时返回 `EBUSY`。
     /// 读权限校验由 syscall 层在调用前完成。
-    pub fn register_notify(
-        &self,
-        kind: MqNotifyKind,
-        notify_pid: i32,
-    ) -> Result<(), Errno> {
+    pub fn register_notify(&self, kind: MqNotifyKind, notify_pid: i32) -> Result<(), Errno> {
         if kind == MqNotifyKind::None {
             // SIGEV_NONE：清除注册（Linux 语义）。
             self.inner.lock().notify = None;
@@ -461,5 +457,127 @@ impl MqRegistry {
 impl Default for MqRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 宿主测试（`cargo test -p general --target x86_64-unknown-linux-gnu`）。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vfs::cred::{Credentials, Gid, Uid};
+    use vfs::stat::FileMode;
+
+    fn new_queue(maxmsg: i64, msgsize: i64) -> MqObject {
+        MqObject::new(
+            MqAttr {
+                maxmsg,
+                msgsize,
+                curmsgs: 0,
+            },
+            FileMode::new(0o600),
+            &Credentials::root(),
+        )
+    }
+
+    /// F5：`mq_unlink` 只摘除名字，已打开的句柄继续可收发。
+    #[test]
+    fn unlink_keeps_open_handles_usable() {
+        let registry = MqRegistry::new();
+        let cred = Credentials::root();
+        let queue = registry
+            .open("/q", true, false, None, FileMode::new(0o600), &cred)
+            .expect("创建队列");
+        registry.unlink("/q").expect("摘除名字");
+
+        let (sent, _) = queue.try_send(0, b"hello", 1, 1, true).expect("发送");
+        assert!(sent);
+        let received = queue
+            .try_receive(8192, true)
+            .expect("接收")
+            .expect("有消息");
+        assert_eq!(received.data, b"hello");
+    }
+
+    /// F6：通知携带的是"触发消息的发送者"身份，投递目标仍是注册者。
+    #[test]
+    fn notify_reports_sender_identity() {
+        let queue = new_queue(1, 16);
+        queue
+            .register_notify(
+                MqNotifyKind::Signal {
+                    signo: 1,
+                    value: 42,
+                },
+                100,
+            )
+            .expect("注册通知");
+
+        let (sent, notify) = queue.try_send(0, b"x", 200, 300, true).expect("发送");
+        assert!(sent);
+        let notification = notify.expect("队列从空变非空应触发通知");
+        assert_eq!(notification.notify_pid, 100);
+        assert_eq!(notification.sender_pid, 200);
+        assert_eq!(notification.sender_uid, 300);
+    }
+
+    /// F7：优先级必须按无符号语义校验，高位为 1 的 u32 不得绕过。
+    #[test]
+    fn priority_at_or_above_max_is_rejected() {
+        assert_eq!(MqObject::validate_priority(0), Ok(()));
+        assert_eq!(MqObject::validate_priority(MQ_PRIO_MAX as u32 - 1), Ok(()));
+        assert_eq!(
+            MqObject::validate_priority(MQ_PRIO_MAX as u32),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(MqObject::validate_priority(u32::MAX), Err(Errno::EINVAL));
+    }
+
+    /// F8：队列总数达到上限时返回 `ENOSPC` 而非 `EMFILE`。
+    #[test]
+    fn queue_count_limit_returns_enospc() {
+        let registry = MqRegistry::new();
+        let cred = Credentials::root();
+        for i in 0..MQ_QUEUES_MAX {
+            registry
+                .open(
+                    &alloc::format!("/q{i}"),
+                    true,
+                    false,
+                    None,
+                    FileMode::new(0o600),
+                    &cred,
+                )
+                .unwrap_or_else(|e| panic!("第 {i} 个队列创建失败: {e:?}"));
+        }
+        let overflow = registry.open("/overflow", true, false, None, FileMode::new(0o600), &cred);
+        assert!(matches!(overflow, Err(Errno::ENOSPC)));
+    }
+
+    /// F9：`CAP_SYS_RESOURCE` 可超过默认上限，但不得超过系统上限。
+    #[test]
+    fn attr_sys_resource_raises_limits() {
+        let root = Credentials::root();
+        let nobody = Credentials::unprivileged(Uid(1000), Gid(1000));
+        let big = MqAttr {
+            maxmsg: MQ_DEFAULT_MAXMSG + 1,
+            msgsize: MQ_DEFAULT_MSGSIZE,
+            curmsgs: 0,
+        };
+        assert_eq!(MqObject::validate_attr(&big, &nobody), Err(Errno::EINVAL));
+        assert_eq!(MqObject::validate_attr(&big, &root), Ok(()));
+
+        let huge = MqAttr {
+            maxmsg: MQ_MAXMSG_MAX + 1,
+            msgsize: MQ_DEFAULT_MSGSIZE,
+            curmsgs: 0,
+        };
+        assert_eq!(MqObject::validate_attr(&huge, &root), Err(Errno::EINVAL));
+
+        let zero = MqAttr {
+            maxmsg: 0,
+            msgsize: MQ_DEFAULT_MSGSIZE,
+            curmsgs: 0,
+        };
+        assert_eq!(MqObject::validate_attr(&zero, &root), Err(Errno::EINVAL));
     }
 }
