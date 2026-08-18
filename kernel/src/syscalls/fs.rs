@@ -28,6 +28,8 @@ use vfs::stat::{DevId, FileMode, FileStat, FileType, FsStat, Timespec};
 /// 单次最多从用户态拷到内核临时缓冲的字节数。
 const COPY_CHUNK: usize = 8192;
 const MAX_SOCKET_IO: usize = 256 * 1024;
+/// 单个 sendmsg/recvmsg 等系统调用允许的 iovec 数量上限（Linux 的 `IOV_MAX`）。
+const IOV_MAX: usize = 1024;
 const MAX_SOCKET_CONTROL: usize = 4096;
 const MAX_SOCKET_ADDR: usize = 128;
 const PATH_MAX: usize = 4096;
@@ -2553,6 +2555,9 @@ pub(super) fn sys_sendmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
     let hdr = read_msghdr(ctx.args[1])?;
+    if hdr.iovlen > IOV_MAX {
+        return Err(Errno::EMSGSIZE);
+    }
     ctx.ensure_network_execution_scope();
     if hdr.iovlen <= 1024
         && hdr.controllen == 0
@@ -2619,6 +2624,9 @@ pub(super) fn sys_sendmmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     for index in 0..vlen {
         let user = msgvec_ptr(msgvec_user, index)?;
         let hdr = read_mmsghdr(user)?;
+        if hdr.msg_hdr.iovlen > IOV_MAX {
+            return Err(Errno::EMSGSIZE);
+        }
         let data = copy_send_iovecs(hdr.msg_hdr.iov, hdr.msg_hdr.iovlen)?;
         let control = copy_user_region(hdr.msg_hdr.control, hdr.msg_hdr.controllen)?;
         let addr = if hdr.msg_hdr.name == 0 || hdr.msg_hdr.namelen == 0 {
@@ -2649,6 +2657,9 @@ pub(super) fn sys_recvmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
     let mut hdr = read_msghdr(ctx.args[1])?;
+    if hdr.iovlen > IOV_MAX {
+        return Err(Errno::EMSGSIZE);
+    }
     ctx.ensure_network_execution_scope();
     let total = iov_total_len_capped(hdr.iov, hdr.iovlen, MAX_SOCKET_IO)?;
     if hdr.iovlen <= 1024
@@ -2725,6 +2736,9 @@ pub(super) fn sys_recvmmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     for index in 0..vlen {
         let user = msgvec_ptr(msgvec_user, index)?;
         let mut hdr = read_mmsghdr(user)?;
+        if hdr.msg_hdr.iovlen > IOV_MAX {
+            return Err(Errno::EMSGSIZE);
+        }
         let total = iov_total_len_capped(hdr.msg_hdr.iov, hdr.msg_hdr.iovlen, MAX_SOCKET_IO)?;
         let mut data = zeroed_vec(total)?;
         let want_addr = hdr.msg_hdr.name != 0 && hdr.msg_hdr.namelen != 0;

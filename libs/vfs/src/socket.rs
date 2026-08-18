@@ -424,10 +424,9 @@ fn map_socket_io_error(err: SocketError) -> VfsError {
         SocketError::TemporaryUnavailable => VfsError::WouldBlock,
         SocketError::Interrupted => VfsError::Interrupted,
         SocketError::PeerClosed => VfsError::BrokenPipe,
-        SocketError::DestinationRequired | SocketError::ConnectionMissing => {
-            VfsError::InvalidArgument
-        }
-        SocketError::PayloadTooLarge => VfsError::FileTooLarge,
+        SocketError::DestinationRequired => VfsError::DestinationRequired,
+        SocketError::ConnectionMissing => VfsError::ConnectionMissing,
+        SocketError::PayloadTooLarge => VfsError::MessageTooLong,
         SocketError::ResourceExhausted => VfsError::OutOfMemory,
         SocketError::AccessDenied => VfsError::PermissionDenied,
         _ => VfsError::InvalidArgument,
@@ -634,7 +633,8 @@ pub fn socket(
                 kind,
                 SocketType::Datagram | SocketType::Stream | SocketType::Raw
             ) {
-                return Err(Errno::Other(93));
+                // SOCK_SEQPACKET 等类型在 INET 域不受支持，返回 ESOCKTNOSUPPORT。
+                return Err(Errno::ESOCKTNOSUPPORT);
             }
             let ops = crate::net_socket::create_net_socket(
                 domain as u16,
@@ -2743,12 +2743,16 @@ fn parse_inet_send_cmsgs(family: u16, control: &[u8]) -> Result<net::DatagramSen
     let mut offset = 0usize;
     while offset + CMSG_HEADER_LEN <= control.len() {
         let len = usize::from_ne_bytes(control[offset..offset + 8].try_into().expect("cmsg len"));
-        if len < CMSG_HEADER_LEN || offset + len > control.len() {
-            break;
+        if len < CMSG_HEADER_LEN {
+            return Err(Errno::EINVAL);
+        }
+        let end = offset.checked_add(len).ok_or(Errno::EINVAL)?;
+        if end > control.len() {
+            return Err(Errno::EINVAL);
         }
         let level = i32::from_ne_bytes(control[offset + 8..offset + 12].try_into().unwrap());
         let kind = i32::from_ne_bytes(control[offset + 12..offset + 16].try_into().unwrap());
-        let payload = &control[offset + CMSG_HEADER_LEN..offset + len];
+        let payload = &control[offset + CMSG_HEADER_LEN..end];
         match (level, kind) {
             (SOL_IP, IP_PKTINFO) if family == crate::addr::AF_INET => {
                 if payload.len() >= 12 {
