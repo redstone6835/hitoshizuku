@@ -288,6 +288,73 @@ fn task_vm_space(task: &Arc<Task>) -> Option<Arc<VmSpace>> {
         .ok()
 }
 
+/// 从新映像的用户栈上读出 exec 布好的 auxv（argc/argv/envp 之后），持久化到
+/// 任务扩展供 `PR_GET_AUXV` 读取。best-effort：读栈失败时挂空 auxv，绝不
+/// 让 PONR 后的安装序列因此失败。
+fn capture_exec_auxv(task: &Arc<Task>, frame: &UserTrapFrame, vm: &Arc<VmSpace>) {
+    let mut auxv = Vec::new();
+    let mut raw = [0u8; 8];
+    let mut cur = frame.sp();
+    if !read_stack_word(vm, cur, &mut raw) {
+        install_exec_auxv(task, auxv);
+        return;
+    }
+    let argc = u64::from_ne_bytes(raw) as usize;
+    // argv（argc 项）+ 空指针。
+    let Some(after_argv) = cur
+        .checked_add(8)
+        .and_then(|a| a.checked_add(argc.checked_mul(8)?))
+    else {
+        install_exec_auxv(task, auxv);
+        return;
+    };
+    // 跳过 argv 尾部的空指针。
+    let mut envp = after_argv.saturating_add(8);
+    // envp 直到空指针。
+    loop {
+        if !read_stack_word(vm, envp, &mut raw) {
+            install_exec_auxv(task, auxv);
+            return;
+        }
+        if u64::from_ne_bytes(raw) == 0 {
+            break;
+        }
+        envp = envp.saturating_add(8);
+    }
+    // 跳过 envp 尾部的空指针，进入 auxv。
+    cur = envp.saturating_add(8);
+    loop {
+        let key_addr = cur;
+        let val_addr = cur.saturating_add(8);
+        if !read_stack_word(vm, key_addr, &mut raw) {
+            break;
+        }
+        let key = u64::from_ne_bytes(raw);
+        if key == 0 {
+            // AT_NULL 终止。
+            break;
+        }
+        if !read_stack_word(vm, val_addr, &mut raw) {
+            break;
+        }
+        let value = u64::from_ne_bytes(raw);
+        auxv.push(key);
+        auxv.push(value);
+        cur = val_addr.saturating_add(8);
+    }
+    install_exec_auxv(task, auxv);
+}
+
+fn read_stack_word(vm: &Arc<VmSpace>, addr: usize, raw: &mut [u8; 8]) -> bool {
+    vm.copy_user_bytes_in(addr, raw).is_ok()
+}
+
+fn install_exec_auxv(task: &Arc<Task>, auxv: Vec<u64>) {
+    let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(sched::sync::Spinlock::new(auxv));
+    let _ = task.ext_remove(crate::syscalls::process::TASKEXT_EXEC_AUXV);
+    task.ext_install(crate::syscalls::process::TASKEXT_EXEC_AUXV, erased);
+}
+
 fn task_fdtable(task: &Arc<Task>) -> Option<Arc<FdTable>> {
     task.ext_lookup(TASKEXT_VFS_FDTABLE)?
         .downcast::<FdTable>()
@@ -545,7 +612,12 @@ pub(crate) fn prepare_exec(task: &Arc<Task>, request: ExecRequest) -> Result<Pre
 
     let kernel_stack_top = task.ensure_kernel_stack();
     let loaded = match loaded {
-        LoadedExecutionImage::Tomori { image, argv, envp, file_owner } => {
+        LoadedExecutionImage::Tomori {
+            image,
+            argv,
+            envp,
+            file_owner,
+        } => {
             let prepared_fdtable = observed
                 .fdtable
                 .as_ref()
@@ -913,6 +985,8 @@ pub(crate) fn commit_exec(
                 if prepared.image.sync_icache {
                     arch::CurrentTaskOps::sync_icache();
                 }
+                // 新 VM 激活后即可读回 exec 布好的 auxv，供 PR_GET_AUXV 使用。
+                capture_exec_auxv(task, &prepared.initial_thread.frame, &prepared.image.vm);
             }
             InstallStep::ExecutableAccess => {
                 replace_required_extension(task, TASKEXT_EXEC_ACCESS, &prepared.image.exec_access)?;
