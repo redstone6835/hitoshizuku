@@ -6200,7 +6200,7 @@ fn ptrace_notify_fork(parent: &Arc<Task>, flags: CloneFlags, child_pid: i32) {
     sched::operation::ptrace_mark_stopped(parent, sched::SignalNumber::SIGTRAP);
 }
 
-/// `PTRACE_GET_SYSCALL_INFO`：`struct ptrace_syscall_info`（80 字节）。
+/// `PTRACE_GET_SYSCALL_INFO`：`struct ptrace_syscall_info`（88 字节）。
 fn write_ptrace_syscall_info(target: &Arc<Task>, user: usize) -> Result<(), Errno> {
     const PTRACE_SYSCALL_INFO_NONE: u8 = 0;
     const PTRACE_SYSCALL_INFO_ENTRY: u8 = 1;
@@ -6215,7 +6215,7 @@ fn write_ptrace_syscall_info(target: &Arc<Task>, user: usize) -> Result<(), Errn
     let frame = ptrace_target_frame(target)?;
     let ip = frame.pc() as u64;
     let sp = frame.sp() as u64;
-    let mut raw = [0u8; 80];
+    let mut raw = [0u8; 88];
     match state {
         PTRACE_SYSCALL_INFO_ENTRY => {
             raw[0] = PTRACE_SYSCALL_INFO_ENTRY;
@@ -6244,6 +6244,9 @@ fn write_ptrace_syscall_info(target: &Arc<Task>, user: usize) -> Result<(), Errn
             for (index, arg) in args.iter().enumerate() {
                 raw[32 + index * 8..40 + index * 8].copy_from_slice(&arg.to_le_bytes());
             }
+            // ret_data = seccomp 动作的 SECCOMP_RET_DATA（低 16 位）。
+            let ret_data = (target.ptrace_event_msg() as u64 & 0xffff) as u32;
+            raw[80..84].copy_from_slice(&ret_data.to_le_bytes());
         }
         _ => raw[0] = PTRACE_SYSCALL_INFO_NONE,
     }
@@ -6614,9 +6617,9 @@ pub(super) fn sys_seccomp(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
                 return Err(Errno::EFAULT);
             }
             let mut sizes = [0u8; 8];
-            sizes[0..2].copy_from_slice(&16u16.to_le_bytes());
-            sizes[2..4].copy_from_slice(&16u16.to_le_bytes());
-            sizes[4..6].copy_from_slice(&64u16.to_le_bytes());
+            sizes[0..2].copy_from_slice(&80u16.to_le_bytes()); // struct seccomp_notif
+            sizes[2..4].copy_from_slice(&24u16.to_le_bytes()); // struct seccomp_notif_resp
+            sizes[4..6].copy_from_slice(&64u16.to_le_bytes()); // struct seccomp_data
             copy_to_user(filter_user, &sizes[..6]).map_err(|e| e.as_errno())?;
             Ok(0)
         }
