@@ -608,6 +608,14 @@ pub fn socket(
 ) -> Result<Fd, Errno> {
     // AF_NETLINK 需要接受 SOCK_RAW/SOCK_DGRAM，单独处理
     if domain as u16 == 16 {
+        // netlink 协议号校验：Linux MAX_LINKS 约 32；本内核仅实现
+        // NETLINK_ROUTE(=0)，其余协议号（含合法但未实现者）返回
+        // EPROTONOSUPPORT，不静默接受无法提供对应语义的协议。
+        const NETLINK_ROUTE: usize = 0;
+        const MAX_LINKS: usize = 32;
+        if protocol >= MAX_LINKS || protocol != NETLINK_ROUTE {
+            return Err(Errno::EPROTONOSUPPORT);
+        }
         let nonblock = (ty & SOCK_NONBLOCK) != 0;
         let cloexec = (ty & SOCK_CLOEXEC) != 0;
         let fd_flags = if cloexec {
@@ -663,6 +671,10 @@ pub fn socket(
             // AF_PACKET：L2 原始帧收发（SOCK_RAW 完整帧 / SOCK_DGRAM 补剥头）。
             if !matches!(kind, SocketType::Raw | SocketType::Datagram) {
                 return Err(Errno::EINVAL);
+            }
+            // 原始 L2 帧访问需要 CAP_NET_RAW，否则 EPERM（对齐 Linux）。
+            if !ctx.cred().has_cap(crate::vfs::cred::Capability::NetRaw) {
+                return Err(Errno::EPERM);
             }
             let ops = crate::packet_socket::create_packet_socket(
                 protocol as u16,
