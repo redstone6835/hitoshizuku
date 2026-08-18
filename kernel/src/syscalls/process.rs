@@ -1094,6 +1094,9 @@ pub(super) fn sys_clock_gettime(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     let clock_id = ctx.args[0];
     let tp = ctx.args[1];
     let ns = clock_time_ns_for_task(ctx.task(), clock_id).ok_or(Errno::EINVAL)?;
+    // 叠加时间命名空间偏移（CLONE_NEWTIME）：有符号饱和，结果 clamp 到非负。
+    let offset = crate::ns::task_ns(ctx.task()).time.offset(clock_id as i32);
+    let ns = (ns as i128 + offset as i128).max(0) as u64;
     let sec = (ns / 1_000_000_000) as i64;
     let nsec = (ns % 1_000_000_000) as i64;
     let mut out = [0u8; 16];
@@ -1295,15 +1298,18 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
     if flags & !TIMER_ABSTIME != 0 {
         return Err(Errno::EINVAL);
     }
-    if clock_id == CLOCK_THREAD_CPUTIME_ID as i32 {
-        return Err(Errno::EOPNOTSUPP);
-    }
-    if clock_id != crate::vdso::CLOCK_REALTIME as i32
-        && clock_id != crate::vdso::CLOCK_MONOTONIC as i32
-        && clock_id != crate::vdso::CLOCK_MONOTONIC_RAW as i32
+    // Linux 语义：clock_nanosleep 接受 CLOCK_REALTIME、CLOCK_MONOTONIC、
+    // CLOCK_PROCESS_CPUTIME_ID；其余 clockid（含 CLOCK_MONOTONIC_RAW、
+    // CLOCK_THREAD_CPUTIME_ID）一律返回 EINVAL。
+    let is_cpu_clock = if clock_id == crate::vdso::CLOCK_REALTIME as i32
+        || clock_id == crate::vdso::CLOCK_MONOTONIC as i32
     {
+        false
+    } else if clock_id == CLOCK_PROCESS_CPUTIME_ID as i32 {
+        true
+    } else {
         return Err(Errno::EINVAL);
-    }
+    };
     if req_user == 0 {
         // 空指针是用户内存访问失败；只有读取到的 timespec 内容非法才返回 EINVAL。
         return Err(Errno::EFAULT);
@@ -1318,6 +1324,13 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
     let absolute = (flags & TIMER_ABSTIME) != 0;
     let deadline = if absolute {
         sec.saturating_mul(1_000_000_000i64).saturating_add(nsec) as u64
+    } else if is_cpu_clock {
+        // CPU 时间域：相对模式以“进程累计 CPU 时间”作为现在，deadline 落在
+        // 进程 CPU 时间轴上（而非单调时钟）。
+        let now_cpu =
+            clock_time_ns_for_task(ctx.task(), CLOCK_PROCESS_CPUTIME_ID).ok_or(Errno::EINVAL)?;
+        let ns_total = sec.saturating_mul(1_000_000_000i64).saturating_add(nsec);
+        now_cpu.saturating_add(ns_total as u64)
     } else {
         let ns_total = sec.saturating_mul(1_000_000_000i64).saturating_add(nsec);
         sched::now_ns_direct().saturating_add(ns_total as u64)
@@ -1325,8 +1338,13 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
     if !absolute && sec == 0 && nsec == 0 {
         return Ok(0);
     }
-    let now_fn = || {
-        if absolute {
+    let task = Arc::clone(ctx.task());
+    let now_fn = move || {
+        if is_cpu_clock {
+            // 睡眠判定同样使用进程 CPU 时间，否则相对/绝对 deadline 的语义域
+            // 不一致。
+            clock_time_ns_for_task(&task, CLOCK_PROCESS_CPUTIME_ID).ok_or(Errno::EINVAL)
+        } else if absolute {
             crate::vdso::clock_time_ns(clock_id as usize).ok_or(Errno::EINVAL)
         } else {
             Ok(sched::now_ns_direct())
@@ -1336,10 +1354,14 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
         Ok(()) => Ok(0),
         Err(Errno::EINTR) => {
             if !absolute {
-                write_remaining_timespec(
-                    rem_user,
-                    deadline.saturating_sub(sched::now_ns_direct()),
-                )?;
+                let remaining = if is_cpu_clock {
+                    let now_cpu = clock_time_ns_for_task(ctx.task(), CLOCK_PROCESS_CPUTIME_ID)
+                        .unwrap_or(deadline);
+                    deadline.saturating_sub(now_cpu)
+                } else {
+                    deadline.saturating_sub(sched::now_ns_direct())
+                };
+                write_remaining_timespec(rem_user, remaining)?;
             }
             Err(Errno::EINTR)
         }
@@ -1603,6 +1625,9 @@ pub(super) fn sys_gettimeofday(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     let _tz = ctx.args[1];
     if tv != 0 {
         let ns = crate::vdso::realtime_ns();
+        // 叠加时间命名空间的 realtime 偏移（有符号饱和、非负 clamp）。
+        let offset = crate::ns::task_ns(ctx.task()).time.offset(0);
+        let ns = (ns as i128 + offset as i128).max(0) as u64;
         let mut out = [0u8; 16];
         out[0..8].copy_from_slice(&((ns / 1_000_000_000) as i64).to_le_bytes());
         out[8..16].copy_from_slice(&((ns % 1_000_000_000 / 1000) as i64).to_le_bytes());
@@ -5399,18 +5424,25 @@ fn timer_create_common(ctx: &mut SyscallContext<'_>, _time64: bool) -> Result<us
                 .try_into()
                 .unwrap(),
         );
-        signo = SignalNumber::from_raw(i32::from_le_bytes(
-            buf[SIGEV_SIGNO_OFF..SIGEV_SIGNO_OFF + 4]
-                .try_into()
-                .unwrap(),
-        ))
-        .ok_or(Errno::EINVAL)?;
         notify = i32::from_le_bytes(
             buf[SIGEV_NOTIFY_OFF..SIGEV_NOTIFY_OFF + 4]
                 .try_into()
                 .unwrap(),
         );
         thread_id = i32::from_le_bytes(buf[SIGEV_TID_OFF..SIGEV_TID_OFF + 4].try_into().unwrap());
+        // 仅信号类 notify 需要校验 signo；SIGEV_NONE 忽略 signo 与 sigev_value。
+        if notify == SIGEV_SIGNAL || notify == SIGEV_THREAD_ID {
+            signo = SignalNumber::from_raw(i32::from_le_bytes(
+                buf[SIGEV_SIGNO_OFF..SIGEV_SIGNO_OFF + 4]
+                    .try_into()
+                    .unwrap(),
+            ))
+            .ok_or(Errno::EINVAL)?;
+            // SIGKILL/SIGSTOP 不可作为定时器投递信号。
+            if signo == SignalNumber::SIGKILL || signo == SignalNumber::SIGSTOP {
+                return Err(Errno::EINVAL);
+            }
+        }
     }
 
     let caller = ctx.task();
@@ -5448,7 +5480,11 @@ fn timer_create_common(ctx: &mut SyscallContext<'_>, _time64: bool) -> Result<us
         },
     };
     let timer_t = sched::posix_timer::create(clock, &caller, sigev, target_tid)?;
-    copy_to_user(timeridp, &timer_t.to_le_bytes()).map_err(|e| e.as_errno())?;
+    if let Err(e) = copy_to_user(timeridp, &timer_t.to_le_bytes()) {
+        // 拷贝失败（如 EFAULT）回滚已创建的定时器，避免在全局表中泄漏。
+        let _ = sched::posix_timer::delete(timer_t);
+        return Err(e.as_errno());
+    }
     Ok(0)
 }
 
@@ -5478,7 +5514,7 @@ fn timer_settime_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     // 旧值快照（timer_settime 的 old_value 输出上一次挂载的剩余时间）。
     if old_value != 0 {
         let (remaining_ns, old_interval_ns) =
-            sched::posix_timer::gettime(timer_t).unwrap_or((0, 0));
+            sched::posix_timer::gettime(timer_t).ok_or(Errno::EINVAL)?;
         let mut old = [0u8; ITIMERSPEC_SIZE];
         write_timespec_pair(&mut old, ITIMERSPEC_INTERVAL_OFF, old_interval_ns);
         write_timespec_pair(&mut old, ITIMERSPEC_VALUE_OFF, remaining_ns);
@@ -6323,10 +6359,12 @@ pub(super) fn sys_umask(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 
 pub(super) fn sys_settimeofday(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let tv = ctx.args[0];
+    // Linux 语义：无论 tv/tz 是否为 NULL，settimeofday 都要求 CAP_SYS_TIME，
+    // 故权限检查必须早于 `tv == 0` 的空指针早退。
+    require_cap(ctx.task(), Capability::SysTime)?;
     if tv == 0 {
         return Ok(0);
     }
-    require_cap(ctx.task(), Capability::SysTime)?;
     let mut raw = [0u8; TIMEVAL_SIZE];
     copy_from_user(tv, &mut raw).map_err(|e| e.as_errno())?;
     let new_ns = timeval_to_ns(&raw)?;
