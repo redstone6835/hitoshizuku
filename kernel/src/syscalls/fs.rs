@@ -699,7 +699,13 @@ pub(super) fn sys_ioctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if cmd.raw() == FIONBIO {
         let enabled = read_user_i32(ctx.args[2])? != 0;
         let flags = file.flags();
-        file.set_status_flags(flags.append, enabled, flags.sync, flags.direct, flags.async_);
+        file.set_status_flags(
+            flags.append,
+            enabled,
+            flags.sync,
+            flags.direct,
+            flags.async_,
+        );
         return Ok(0);
     }
     if cmd.raw() == FIOASYNC {
