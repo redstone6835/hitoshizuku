@@ -1711,6 +1711,7 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         KEYCTL_INSTANTIATE => {
             let key_id = KeyId(ctx.args[1] as i32);
+            require_instantiate_authority(&manager, &process_keyrings(ctx), key_id)?;
             let payload_user = ctx.args[2];
             let plen = ctx.args[3];
             let keyring_id = KeyId(ctx.args[4] as i32);
@@ -1723,6 +1724,7 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         KEYCTL_NEGATE => {
             let key_id = KeyId(ctx.args[1] as i32);
+            require_instantiate_authority(&manager, &process_keyrings(ctx), key_id)?;
             let timeout = ctx.args[2] as u64;
             let keyring_id = KeyId(ctx.args[3] as i32);
             manager.instantiate(key_id, Vec::new(), false, keyring_id, Some(timeout), now)?;
@@ -1730,6 +1732,7 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         KEYCTL_REJECT => {
             let key_id = KeyId(ctx.args[1] as i32);
+            require_instantiate_authority(&manager, &process_keyrings(ctx), key_id)?;
             let timeout = ctx.args[2] as u64;
             let keyring_id = KeyId(ctx.args[4] as i32);
             manager.instantiate(key_id, Vec::new(), false, keyring_id, Some(timeout), now)?;
@@ -1796,8 +1799,10 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(0)
         }
         KEYCTL_INSTANTIATE_IOV => {
-            // iovec 版 instantiate：聚合成单个负载。
+            // iovec 版 instantiate：聚合成单个负载；与 INSTANTIATE 同样需要
+            // 授权 key。
             let key_id = KeyId(ctx.args[1] as i32);
+            require_instantiate_authority(&manager, &process_keyrings(ctx), key_id)?;
             let iov_user = ctx.args[2];
             let iovcnt = ctx.args[3];
             let keyring_id = KeyId(ctx.args[4] as i32);
@@ -1853,6 +1858,21 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(n)
         }
         _ => Err(Errno::EINVAL),
+    }
+}
+
+/// 校验调用者持有指向目标 key 的授权 key（`KEY_SPEC_REQKEY_AUTH_KEY`）。
+///
+/// `request_key` 把授权 key id 记入 `ProcessKeyrings::reqkey_auth`；只有该
+/// 授权 key 描述为 `_reqkey_auth.<key_id>` 时才允许实例化/否定目标 key。
+fn require_instantiate_authority(
+    manager: &KeyManager,
+    process: &ProcessKeyrings,
+    key_id: KeyId,
+) -> Result<(), Errno> {
+    match *process.reqkey_auth.lock() {
+        Some(auth_id) if manager.auth_key_matches(auth_id, key_id) => Ok(()),
+        _ => Err(Errno::EACCES),
     }
 }
 

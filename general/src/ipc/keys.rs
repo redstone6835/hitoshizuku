@@ -253,7 +253,8 @@ impl Key {
         self.inner.lock().payload.clone()
     }
 
-    fn description(&self) -> String {
+    /// key 的描述字符串（授权 key 校验、`add_member` 等使用）。
+    pub fn description(&self) -> String {
         self.inner.lock().description.clone()
     }
 
@@ -402,6 +403,11 @@ impl KeyManager {
         now_sec: u64,
     ) -> Result<(), Errno> {
         let key = self.key(key_id)?;
+        // 只有未实例化的 key 才能被实例化/否定；已实例化/否定/撤销的 key
+        // 再 instantiate 视为越权（Linux `key_reject_and_link` 语义）。
+        if key.state() != KeyState::Uninstantiated {
+            return Err(Errno::EACCES);
+        }
         key.set_state(if instantiate {
             KeyState::Instantiated
         } else {
@@ -421,6 +427,18 @@ impl KeyManager {
             }
         }
         Ok(())
+    }
+
+    /// 校验授权 key（描述 `_reqkey_auth.<key_id>`）是否指向目标 key。
+    ///
+    /// `request_key` 创建未实例化 key 时同时创建一个描述为
+    /// `_reqkey_auth.<key_id>` 的 User 授权 key；`KEYCTL_INSTANTIATE`/
+    /// `NEGATE`/`REJECT` 经 [`ProcessKeyrings::reqkey_auth`] 携带它。
+    pub fn auth_key_matches(&self, auth_id: KeyId, key_id: KeyId) -> bool {
+        match self.key(auth_id) {
+            Ok(auth) => auth.description() == format!("_reqkey_auth.{}", key_id.0),
+            Err(_) => false,
+        }
     }
 
     /// 创建一个 key（不加入任何 keyring）。配额按 key 的 uid 记账。
@@ -1134,4 +1152,91 @@ pub fn default_keyring_chain(
     manager
         .user_session(cred.euid.0, cred, now_sec)
         .unwrap_or(KeyId(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::format;
+    use alloc::vec;
+    use vfs::cred::{CapSet, Credentials, Gid, Uid};
+
+    fn cred(uid: u32, gid: u32) -> Credentials {
+        Credentials {
+            uid: Uid(uid),
+            euid: Uid(uid),
+            suid: Uid(uid),
+            fsuid: Uid(uid),
+            gid: Gid(gid),
+            egid: Gid(gid),
+            sgid: Gid(gid),
+            fsgid: Gid(gid),
+            groups: Vec::new(),
+            caps: CapSet::EMPTY,
+        }
+    }
+
+    fn make_keyring(manager: &KeyManager, uid: u32) -> KeyId {
+        manager.user_keyring(uid, &cred(uid, 0)).unwrap()
+    }
+
+    #[test]
+    fn instantiate_requires_uninstantiated_state() {
+        let manager = KeyManager::new();
+        let key = manager
+            .create_uninstantiated(KeyType::User, "k", 1000, 1000, KEY_DEFAULT_PERM)
+            .unwrap();
+        assert_eq!(key.state(), KeyState::Uninstantiated);
+        manager
+            .instantiate(key.id, vec![1, 2, 3], true, KeyId(0), None, 0)
+            .unwrap();
+        assert_eq!(key.state(), KeyState::Instantiated);
+        // 已实例化的 key 再 instantiate 应 EACCES。
+        assert_eq!(
+            manager.instantiate(key.id, vec![4], true, KeyId(0), None, 0),
+            Err(Errno::EACCES)
+        );
+    }
+
+    #[test]
+    fn auth_key_matches_target_description() {
+        let manager = KeyManager::new();
+        let key = manager
+            .create_uninstantiated(KeyType::User, "k", 1000, 1000, KEY_DEFAULT_PERM)
+            .unwrap();
+        let auth = manager
+            .create_uninstantiated(
+                KeyType::User,
+                &format!("_reqkey_auth.{}", key.id.0),
+                1000,
+                1000,
+                KEY_DEFAULT_PERM,
+            )
+            .unwrap();
+        assert!(manager.auth_key_matches(auth.id, key.id));
+        assert!(!manager.auth_key_matches(KeyId(9999), key.id));
+        let other = manager
+            .create_uninstantiated(KeyType::User, "k2", 1000, 1000, KEY_DEFAULT_PERM)
+            .unwrap();
+        assert!(!manager.auth_key_matches(auth.id, other.id));
+    }
+
+    #[test]
+    fn search_process_keyrings_walks_default_chain() {
+        let manager = KeyManager::new();
+        let process = ProcessKeyrings::new();
+        let creds = cred(1000, 1000);
+        // 命中链上最后一环（user keyring）。
+        let ring = make_keyring(&manager, 1000);
+        manager
+            .add_key(KeyType::User, "needle", b"v".to_vec(), ring, &creds, 0)
+            .unwrap();
+        let found = search_process_keyrings(&process, &creds, &manager, KeyType::User, "needle", 0);
+        assert!(found.is_some());
+        // 未命中返回 None。
+        assert!(
+            search_process_keyrings(&process, &creds, &manager, KeyType::User, "absent", 0)
+                .is_none()
+        );
+    }
 }
