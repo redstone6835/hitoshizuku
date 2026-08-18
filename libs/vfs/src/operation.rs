@@ -1443,13 +1443,13 @@ pub fn removexattr(
 
 /// `fgetxattr`：按 fd 读取属性。
 pub fn fgetxattr(
-    _ctx: &VfsContext,
+    ctx: &VfsContext,
     fdt: &FdTable,
     fd: Fd,
     name: &[u8],
 ) -> VfsResult<Option<Vec<u8>>> {
     let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
-    let cred = file.cred();
+    let cred = ctx.cred();
     crate::xattr::getxattr(file.inode().as_ref(), name, cred.as_ref())
 }
 
@@ -1463,7 +1463,7 @@ pub fn fsetxattr(
     flags: u32,
 ) -> VfsResult<()> {
     let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
-    let cred = file.cred();
+    let cred = ctx.cred();
     crate::xattr::setxattr(file.inode().as_ref(), name, value, flags, cred.as_ref())
 }
 
@@ -1474,9 +1474,9 @@ pub fn flistxattr(_ctx: &VfsContext, fdt: &FdTable, fd: Fd) -> VfsResult<Vec<Vec
 }
 
 /// `fremovexattr`：按 fd 删除属性。
-pub fn fremovexattr(_ctx: &VfsContext, fdt: &FdTable, fd: Fd, name: &[u8]) -> VfsResult<()> {
+pub fn fremovexattr(ctx: &VfsContext, fdt: &FdTable, fd: Fd, name: &[u8]) -> VfsResult<()> {
     let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
-    let cred = file.cred();
+    let cred = ctx.cred();
     crate::xattr::removexattr(file.inode().as_ref(), name, cred.as_ref())
 }
 
