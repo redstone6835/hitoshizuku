@@ -2962,6 +2962,11 @@ impl Task {
     }
 
     pub fn usage_snapshot(&self, now_ns: u64) -> TaskUsage {
+        // `user_ns` 实为总 CPU 时间（`elapsed_usage_ns`），`system_ns` 恒 0：
+        // 内核没有 per-task 的用户/系统态拆分（用户态 tick 记账只存在于线程组
+        // 级 `ThreadGroup::user_cpu_ns`）。组级拆分由 kernel 侧
+        // `aggregate_thread_group_usage` 用「组总 CPU - 组用户时间」完成；此处
+        // 保持 per-task 语义不变，避免逐任务求和时 system_ns 被重复累加。
         TaskUsage {
             user_ns: self.elapsed_usage_ns(now_ns),
             system_ns: 0,

@@ -1493,6 +1493,16 @@ fn task_rss_kb(task: &Arc<Task>) -> u64 {
 }
 
 /// 累加整个线程组的 usage（`RUSAGE_SELF`）。
+///
+/// `Task::usage_snapshot` 逐任务只记账总 CPU 时间（无 per-task 用户/系统态
+/// 拆分），因此其 `user_ns` 字段实际是逐任务总 CPU 求和。这里利用线程组已有
+/// 的 tick 级用户态记账 `ThreadGroup::user_cpu_ns` 把组总 CPU 拆成两部分：
+///
+///   ru_utime = 组用户态时间（`user_cpu_ns`，100Hz tick 粒度）
+///   ru_stime = 组总 CPU - 组用户态时间
+///
+/// 系统态时间无法逐任务拆分（内核无 per-task 用户态记账），只在线程组级
+/// 合理近似；`RUSAGE_THREAD`/`sys_times` 等逐任务路径仍报告 system = 0。
 fn aggregate_thread_group_usage(task: &Arc<Task>, now_ns: u64) -> sched::TaskUsage {
     let mut total = sched::TaskUsage {
         user_ns: 0,
@@ -1505,6 +1515,9 @@ fn aggregate_thread_group_usage(task: &Arc<Task>, now_ns: u64) -> sched::TaskUsa
     for member in task.thread_group().snapshot() {
         total.add_assign(member.usage_snapshot(now_ns));
     }
+    let user_ns = task.thread_group().user_cpu_ns();
+    total.system_ns = total.user_ns.saturating_sub(user_ns);
+    total.user_ns = user_ns;
     total
 }
 
@@ -1521,8 +1534,10 @@ fn write_rusage(user: usize, usage: sched::TaskUsage, maxrss_kb: u64) -> Result<
     let mut raw = [0u8; 144];
     write_timeval_pair(&mut raw, 0, usage.user_ns);
     write_timeval_pair(&mut raw, 16, usage.system_ns);
-    // ru_maxrss：Linux 报告峰值驻留集（KB）。本内核无峰值记账，取当前
-    // 驻留页数折算为 KB（best-effort，见任务书取舍说明）。
+    // ru_maxrss：Linux 报告峰值驻留集（KB）。本内核无峰值记账，只能取当前
+    // 驻留页数折算为 KB（best-effort）。getrusage(SELF/THREAD) 由调用方透传
+    // `task_rss_kb`；wait4/waitid 的子进程已退出、VmSpace 已在 exit 路径回收
+    // 且无峰值记录，故调用方传 0。
     put_i64(&mut raw, 32, maxrss_kb.min(i64::MAX as u64) as i64);
     put_i64(&mut raw, 64, usage.minflt.min(i64::MAX as u64) as i64);
     put_i64(&mut raw, 72, usage.majflt.min(i64::MAX as u64) as i64);
