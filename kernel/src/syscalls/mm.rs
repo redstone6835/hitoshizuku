@@ -359,8 +359,11 @@ pub(super) fn sys_mprotect(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let page_size = hal::memory::page_size();
     let len = align_up(ctx.args[1], page_size).ok_or(Errno::EINVAL)?;
     let prot = ctx.args[2];
-    if addr % page_size != 0 || len == 0 {
+    if addr % page_size != 0 {
         return Err(Errno::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
     }
     let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
     vm.mprotect(addr..end, prot_to_vm_flags(prot).with(VmFlags::USER))?;
