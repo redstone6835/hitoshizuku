@@ -171,6 +171,10 @@ const F_GET_SEALS: usize = 1034;
 const FD_CLOEXEC: usize = 1;
 const FIONBIO: usize = 0x5421;
 const FIOASYNC: usize = 0x5452;
+const FIOSETOWN: usize = 0x8901;
+const SIOCSPGRP: usize = 0x8902;
+const FIOGETOWN: usize = 0x8903;
+const SIOCGPGRP: usize = 0x8904;
 
 const F_RDLCK: i16 = 0;
 const F_WRLCK: i16 = 1;
@@ -700,6 +704,36 @@ pub(super) fn sys_ioctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         let on = read_user_i32(ctx.args[2])? != 0;
         file.set_fasync(on);
         return Ok(0);
+    }
+    if cmd.raw() == FIOSETOWN {
+        let owner = read_user_i32(ctx.args[2])?;
+        if owner < 0 {
+            file.set_owner(F_OWNER_PGRP, owner.wrapping_neg());
+        } else {
+            file.set_owner(F_OWNER_PID, owner);
+        }
+        return Ok(0);
+    }
+    if cmd.raw() == SIOCSPGRP {
+        let pgid = read_user_i32(ctx.args[2])?;
+        if pgid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        file.set_owner(F_OWNER_PGRP, pgid);
+        return Ok(0);
+    }
+    if cmd.raw() == FIOGETOWN {
+        let (t, pid) = file.owner();
+        let owner = if t == F_OWNER_PGRP {
+            pid.wrapping_neg()
+        } else {
+            pid
+        };
+        return Ok(owner as isize as usize);
+    }
+    if cmd.raw() == SIOCGPGRP {
+        let (_, pid) = file.owner();
+        return Ok(pid as usize);
     }
     if cmd.raw() == general::dev::tty::TIOCGPTPEER {
         return sys_tiocgptpeer(ctx, &file);
