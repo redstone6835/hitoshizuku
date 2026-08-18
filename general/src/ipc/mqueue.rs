@@ -337,32 +337,6 @@ impl MqObject {
         Ok(())
     }
 
-    /// `mq_getsetattr` 设置新属性：仅允许调整 `maxmsg`/`msgsize`，且队列必须
-    /// 为空（Linux 语义）。读权限校验由 syscall 层在调用前完成。
-    pub fn set_attr(&self, attr: &MqAttr) -> Result<MqAttr, Errno> {
-        if attr.curmsgs != 0 {
-            return Err(Errno::EINVAL);
-        }
-        Self::validate_attr(attr)?;
-        let mut inner = self.inner.lock();
-        if inner.removed {
-            return Err(Errno::EINVAL);
-        }
-        if inner.curmsgs != 0 {
-            return Err(Errno::EINVAL);
-        }
-        let old = MqAttr {
-            maxmsg: inner.maxmsg,
-            msgsize: inner.msgsize,
-            curmsgs: inner.curmsgs as i64,
-        };
-        inner.maxmsg = attr.maxmsg;
-        inner.msgsize = attr.msgsize;
-        drop(inner);
-        self.notify_state_changed();
-        Ok(old)
-    }
-
     /// 队列是否可读（有消息）——供 poll/select 使用。
     pub fn has_messages(&self) -> bool {
         self.inner.lock().curmsgs != 0

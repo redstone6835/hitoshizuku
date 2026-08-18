@@ -885,7 +885,6 @@ pub(super) fn sys_mq_getsetattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     let queue: Arc<general::ipc::mqueue::MqObject> = Arc::clone(ops.queue());
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
 
-    let old = queue.attr();
     let old_flags = if file.flags().nonblock { O_NONBLOCK } else { 0 };
 
     if newattr_user != 0 {
@@ -893,18 +892,11 @@ pub(super) fn sys_mq_getsetattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
         let mut raw = [0u8; MQ_ATTR_SIZE];
         copy_from_user(newattr_user, &mut raw).map_err(|e| e.as_errno())?;
         let flags = read_i64(&raw, MQ_ATTR_FLAGS);
-        let maxmsg = read_i64(&raw, MQ_ATTR_MAXMSG);
-        let msgsize = read_i64(&raw, MQ_ATTR_MSGSIZE);
         if flags & !O_NONBLOCK != 0 {
             return Err(Errno::EINVAL);
         }
-        if maxmsg != old.maxmsg || msgsize != old.msgsize {
-            queue.set_attr(&MqAttr {
-                maxmsg,
-                msgsize,
-                curmsgs: 0,
-            })?;
-        }
+        // Linux `mq_setattr` 只能改 `mq_flags`（O_NONBLOCK）；`mq_maxmsg`/
+        // `mq_msgsize` 的改动被忽略（容量由 `mq_open` 时确定，不可再改）。
         if flags != old_flags {
             file.set_status_flags(false, flags & O_NONBLOCK != 0, false, false);
         }
