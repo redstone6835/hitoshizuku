@@ -34,7 +34,7 @@ use crate::signal::{
     DefaultAction, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet,
     SignalNumber, default_action,
 };
-use crate::spawn::{abort_new_task, activate_task, clone_task, exit_task, reap_matching};
+use crate::spawn::{abort_new_task, activate_task, clone_task, exit_task, reap_matching_across};
 use crate::task::{Task, TaskUsage};
 use crate::wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};
 use crate::{ExitCode, TaskState};
@@ -1118,7 +1118,11 @@ pub(crate) fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
 
 // ── wait4 / waitid ───────────────────────────────────────────────────────────
 
-fn matches_waitid(child: &Arc<Task>, target: &WaitId, parent: &Arc<Task>) -> bool {
+/// `waitid` 目标匹配。
+///
+/// `caller` 是实际发起 wait 的线程；`WaitId::SameGroup` 与 `caller` 的进程组
+/// 比较（线程组全体成员共享同一进程组，因此用 caller 与用任一成员等价）。
+fn matches_waitid(child: &Arc<Task>, target: &WaitId, caller: &Arc<Task>) -> bool {
     if child.is_kernel_task() {
         return false;
     }
@@ -1126,23 +1130,59 @@ fn matches_waitid(child: &Arc<Task>, target: &WaitId, parent: &Arc<Task>) -> boo
         WaitId::All => true,
         WaitId::Pid(pid) => child.pid_root() == Some(*pid),
         WaitId::Pgid(pgid) => child.process_group().pgid() == *pgid,
-        WaitId::SameGroup => Arc::ptr_eq(&child.process_group(), &parent.process_group()),
+        WaitId::SameGroup => Arc::ptr_eq(&child.process_group(), &caller.process_group()),
         WaitId::Pidfd(group) => Arc::ptr_eq(&child.thread_group(), group),
     }
 }
 
+/// 按 `__WNOTHREAD` / `__WCLONE` 过滤出 wait 范围内的线程组成员。
+///
+/// 语义取舍（本内核的简化模型）：
+/// - 默认（无这些标志）及 `__WALL`：匹配线程组全体成员名下 children 的并集，
+///   即 `wait4(pid=-1)` 的默认行为；
+/// - `__WNOTHREAD`：只匹配线程组 leader 名下的 children，跳过 CLONE_THREAD 兄弟
+///   线程各自登记的 children；
+/// - `__WCLONE`：只匹配非 leader（CLONE_THREAD 兄弟）名下的 children；
+/// - 两者同时给出时退化为空集（没有成员在范围内）。
+fn wait_scope_members(me: &Arc<Task>, options: WaitOptions) -> Vec<Arc<Task>> {
+    let only_leader = options.has(WaitOptions::__WNOTHREAD);
+    let only_clone = options.has(WaitOptions::__WCLONE);
+    me.thread_group()
+        .snapshot()
+        .into_iter()
+        .filter(|member| {
+            let is_leader = member.is_thread_group_leader();
+            !(only_leader && !is_leader) && !(only_clone && is_leader)
+        })
+        .collect()
+}
+
+/// 线程组视角下可等待 children 的并集（去重）。POSIX wait 看到的是整个进程
+/// （线程组）名下 children 的并集，而非单个线程自己的 children 表。
+fn group_wait_children(scope: &[Arc<Task>]) -> Vec<Arc<Task>> {
+    let mut out: Vec<Arc<Task>> = Vec::new();
+    for member in scope {
+        for child in member.snapshot_children() {
+            if !out.iter().any(|c| Arc::ptr_eq(c, &child)) {
+                out.push(child);
+            }
+        }
+    }
+    out
+}
+
 fn wait_child_observable(
-    parent: &Arc<Task>,
-    target: WaitId,
+    children: &[Arc<Task>],
+    target: &WaitId,
+    caller: &Arc<Task>,
     wait_exited: bool,
     wait_stopped: bool,
     wait_continued: bool,
 ) -> bool {
-    let children = parent.snapshot_children();
     let mut any_match = false;
     for child in children
         .iter()
-        .filter(|c| matches_waitid(c, &target, parent))
+        .filter(|c| matches_waitid(c, target, caller))
     {
         any_match = true;
         if wait_exited && child.is_waitable_zombie() {
@@ -1194,26 +1234,27 @@ fn wait_common(
     let nowait = options.has(WaitOptions::WNOWAIT);
 
     loop {
-        // 1. 先看是否有退出事件匹配。wait4 的 options=0 隐含 WEXITED；
-        //    waitid 必须由调用方显式传 WEXITED/WSTOPPED/WCONTINUED。
+        // 1. 线程组视角：先算出 wait 范围内的 owner 成员与可等待 children 并集。
+        //    wait4 的 options=0 隐含 WEXITED；waitid 必须由调用方显式传
+        //    WEXITED/WSTOPPED/WCONTINUED。
+        let scope = wait_scope_members(&me, options);
+        let children = group_wait_children(&scope);
         let pred = |c: &Arc<Task>| matches_waitid(c, &target, &me);
+
         if wait_exited {
             if nowait {
-                if let Some(child) = me
-                    .snapshot_children()
-                    .into_iter()
-                    .find(|c| c.is_waitable_zombie() && pred(c))
-                {
+                if let Some(child) = children.iter().find(|c| c.is_waitable_zombie() && pred(c)) {
                     let code = child
                         .exit_code()
                         .expect("[sched][wait] zombie without exit code");
                     return Ok(WaitResult {
                         pid: child.pid_root().unwrap_or(0),
-                        status: child_exit_status(&child, code),
+                        status: child_exit_status(child, code),
                         usage: child.usage_snapshot(crate::scheduler::now_ns_public()),
+                        child_uid: child.credentials().uid,
                     });
                 }
-            } else if let Some((child, code)) = reap_matching(&me, pred) {
+            } else if let Some((child, code)) = reap_matching_across(&scope, &pred) {
                 #[cfg(feature = "trace-task-lifecycle")]
                 log::info!(
                     "[sched][wait] reap parent={:?} child={:?} target={:?}",
@@ -1225,37 +1266,39 @@ fn wait_common(
                     pid: child.pid_root().unwrap_or(0),
                     status: child_exit_status(&child, code),
                     usage: child.usage_snapshot(crate::scheduler::now_ns_public()),
+                    child_uid: child.credentials().uid,
                 });
             }
         }
 
         // 2. stopped / continued 是父侧可消费的状态变化事件，不会 reap child。
-        let children = me.snapshot_children();
-        for child in children.iter().filter(|c| matches_waitid(c, &target, &me)) {
+        for child in children.iter().filter(|c| pred(c)) {
             if wait_stopped || child.is_ptrace_traced() {
                 if let Some(status) = child.wait_stopped_status(nowait) {
                     return Ok(WaitResult {
                         pid: child.pid_root().unwrap_or(0),
                         status,
                         usage: child.usage_snapshot(crate::scheduler::now_ns_public()),
+                        child_uid: child.credentials().uid,
                     });
                 }
             }
         }
         if wait_continued {
-            for child in children.iter().filter(|c| matches_waitid(c, &target, &me)) {
+            for child in children.iter().filter(|c| pred(c)) {
                 if let Some(status) = child.wait_continued_status(nowait) {
                     return Ok(WaitResult {
                         pid: child.pid_root().unwrap_or(0),
                         status,
                         usage: child.usage_snapshot(crate::scheduler::now_ns_public()),
+                        child_uid: child.credentials().uid,
                     });
                 }
             }
         }
 
         // 3. 是否还有匹配的子？没有任何匹配子 → ECHILD。
-        let any_match = children.iter().any(|c| matches_waitid(c, &target, &me));
+        let any_match = children.iter().any(|c| pred(c));
         if !any_match {
             return Err(Errno::ECHILD);
         }
@@ -1266,6 +1309,7 @@ fn wait_common(
                 pid: 0,
                 status: WaitStatus(0),
                 usage: TaskUsage::default(),
+                child_uid: Uid::ROOT,
             });
         }
 
@@ -1281,8 +1325,9 @@ fn wait_common(
             return Err(Errno::EINTR);
         }
         if wait_child_observable(
+            &children,
+            &target,
             &me,
-            target.clone(),
             wait_exited,
             wait_stopped,
             wait_continued,
@@ -1298,10 +1343,7 @@ fn wait_common(
                 target,
                 children.len(),
             );
-            for child in children
-                .iter()
-                .filter(|child| matches_waitid(child, &target, &me))
-            {
+            for child in children.iter().filter(|child| pred(child)) {
                 log::info!(
                     "[sched][wait] child={:?} state={:?} exit_ready={} threads={}",
                     child.pid_root(),
@@ -1311,6 +1353,7 @@ fn wait_common(
                 );
             }
         }
+        drop(pred);
         drop(me);
         schedule_once(crate::scheduler::now_ns_public());
         me = current_task();
