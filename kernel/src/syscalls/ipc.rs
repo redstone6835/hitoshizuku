@@ -233,6 +233,16 @@ pub(super) fn sys_shmctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         SHM_LOCK | SHM_UNLOCK => {
             let lock = cmd == SHM_LOCK;
             if lock {
+                // Linux `shmctl(SHM_LOCK)` 顺序：先做权限判定（EPERM），再做
+                // `RLIMIT_MEMLOCK` 检查（ENOMEM）。无 `CAP_IPC_LOCK` 且非段属主
+                //（`euid` 既非 `shm_perm.uid` 也非 `cuid`）→ EPERM。
+                let perm = manager.perm_of(shmid)?;
+                if !cred.has_cap(vfs::cred::Capability::IpcLock)
+                    && !cred.is_owner(perm.uid)
+                    && !cred.is_owner(perm.cuid)
+                {
+                    return Err(Errno::EPERM);
+                }
                 // Linux `user_shm_lock`：锁定新增页数不得超出 `RLIMIT_MEMLOCK`
                 //（`CAP_IPC_LOCK` 或 `RLIM_INFINITY` 豁免）。超限返回 `ENOMEM`。
                 let additional = manager.would_lock_pages(shmid)?;

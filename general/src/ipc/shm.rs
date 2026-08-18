@@ -541,6 +541,19 @@ impl ShmManager {
         Ok(metadata_from_entry(id, entry))
     }
 
+    /// 返回段的权限元数据，供 syscall 层做 `SHM_LOCK` 的属主判定。
+    ///
+    /// 与 [`Self::stat`] 不同，本方法不检查读权限——Linux `shmctl(SHM_LOCK)` 只
+    /// 比较 `euid` 与 `shm_perm.uid`/`cuid`，与段 mode 的读权限无关。
+    pub fn perm_of(&self, id: ShmId) -> Result<ShmPerm, Errno> {
+        let state = self.state.lock();
+        let entry = state.by_id.get(&id).ok_or(Errno::EINVAL)?;
+        if entry.marked_for_removal {
+            return Err(Errno::EIDRM);
+        }
+        Ok(entry.perm)
+    }
+
     #[kernel_symbols::export(name = "general.ipc.ShmManager.set", contract = "kernel.ipc.sysv-shm@1", version = 1, capabilities = kernel_symbols::capability::IPC, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn set(
         &self,
@@ -602,9 +615,10 @@ impl ShmManager {
 
     /// `SHM_LOCK`/`SHM_UNLOCK`：设置/清除段的锁定标志并做锁页记账。
     ///
-    /// Linux 语义：需要 `CAP_IPC_LOCK`；本内核没有页换出，因此"锁定"的可观测
-    /// 部分是 `SHM_LOCKED` 状态记账（`ipcs` 可见）与 `RLIMIT_MEMLOCK` 记账
-    /// （锁定过多段时由 syscall 层返回 `ENOMEM`）。返回是否处于锁定状态。
+    /// Linux 语义：需要 `CAP_IPC_LOCK`，或段属主（`euid == shm_perm.uid` 或
+    /// `cuid`）；本内核没有页换出，因此"锁定"的可观测部分是 `SHM_LOCKED` 状态
+    /// 记账（`ipcs` 可见）与 `RLIMIT_MEMLOCK` 记账（锁定过多段时由 syscall 层
+    /// 返回 `ENOMEM`）。返回是否处于锁定状态。
     #[kernel_symbols::export(name = "general.ipc.ShmManager.lock", contract = "kernel.ipc.sysv-shm@1", version = 1, capabilities = kernel_symbols::capability::IPC, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn lock(&self, id: ShmId, locked: bool, cred: &Credentials) -> Result<bool, Errno> {
         let mut state = self.state.lock();
@@ -613,7 +627,10 @@ impl ShmManager {
             if entry.marked_for_removal {
                 return Err(Errno::EIDRM);
             }
-            if !cred.has_cap(Capability::IpcLock) {
+            if !cred.has_cap(Capability::IpcLock)
+                && !cred.is_owner(entry.perm.uid)
+                && !cred.is_owner(entry.perm.cuid)
+            {
                 return Err(Errno::EPERM);
             }
             if locked == entry.locked {
@@ -807,4 +824,45 @@ fn check_control_owner(cred: &Credentials, perm: &ShmPerm) -> Result<(), Errno> 
         return Ok(());
     }
     Err(Errno::EPERM)
+}
+
+/// 宿主测试（`cargo test -p general --target x86_64-unknown-linux-gnu`）。
+#[cfg(test)]
+mod host_tests {
+    use super::{IPC_CREAT, ShmId, ShmKey, ShmLimits, ShmManager};
+    use vfs::cred::{CapSet, Capability, Credentials, Gid, Uid};
+
+    fn cred_with(uid: u32, caps: CapSet) -> Credentials {
+        let mut cred = Credentials::unprivileged(Uid(uid), Gid(uid));
+        cred.caps = caps;
+        cred
+    }
+
+    fn create(manager: &ShmManager, cred: &Credentials) -> ShmId {
+        manager
+            .shmget(ShmKey::PRIVATE, 4096, IPC_CREAT | 0o700, cred)
+            .expect("创建段")
+    }
+
+    #[test]
+    fn shm_lock_requires_cap_or_ownership() {
+        let manager = ShmManager::new(ShmLimits::default());
+        let owner = cred_with(1000, CapSet::EMPTY);
+        let id = create(&manager, &owner);
+
+        // 属主（无 `CAP_IPC_LOCK`）可锁定。
+        assert_eq!(manager.lock(id, true, &owner), Ok(true));
+
+        // 非属主且无 `CAP_IPC_LOCK` → EPERM。
+        let stranger = cred_with(2000, CapSet::EMPTY);
+        assert_eq!(manager.lock(id, true, &stranger), Err(errno::Errno::EPERM));
+
+        // 非属主但持有 `CAP_IPC_LOCK` → 可锁定（已锁定则幂等返回 true）。
+        let privileged = cred_with(2000, CapSet::single(Capability::IpcLock));
+        assert_eq!(manager.lock(id, true, &privileged), Ok(true));
+
+        // 解锁同样走属主/能力判定。
+        assert_eq!(manager.lock(id, false, &stranger), Err(errno::Errno::EPERM));
+        assert_eq!(manager.lock(id, false, &owner), Ok(false));
+    }
 }
