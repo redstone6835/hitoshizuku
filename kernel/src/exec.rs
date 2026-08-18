@@ -398,16 +398,16 @@ fn collect_user_byte_string_array(
         }
         let remaining = EXEC_MAX_ARG_BYTES
             .checked_sub(*used_bytes)
-            .ok_or(Errno::EINVAL)?;
+            .ok_or(Errno::E2BIG)?;
         if remaining == 0 {
-            return Err(Errno::EINVAL);
+            return Err(Errno::E2BIG);
         }
         let value = copy_user_cstring_bytes(string_user, remaining)?;
         *used_bytes = used_bytes
             .checked_add(value.len() + 1)
             .ok_or(Errno::EINVAL)?;
         if *used_bytes > EXEC_MAX_ARG_BYTES {
-            return Err(Errno::EINVAL);
+            return Err(Errno::E2BIG);
         }
         strings.push(value);
     }
