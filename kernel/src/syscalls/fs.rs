@@ -495,8 +495,14 @@ pub(super) fn sys_getcwd(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::ENOENT)?;
     let user = ctx.args[0];
     let size = ctx.args[1];
-    let mut path = namespace_path(&vfs_ctx, &vfs_ctx.cwd(), &vfs_ctx.cwd_mount())
-        .unwrap_or_else(|| String::from("/"));
+    if size == 0 {
+        return Err(Errno::EINVAL);
+    }
+    if !vfs_ctx.cwd().is_positive() {
+        return Err(Errno::ENOENT);
+    }
+    let mut path =
+        namespace_path(&vfs_ctx, &vfs_ctx.cwd(), &vfs_ctx.cwd_mount()).ok_or(Errno::ENOENT)?;
     if path.is_empty() {
         path.push('/');
     }
