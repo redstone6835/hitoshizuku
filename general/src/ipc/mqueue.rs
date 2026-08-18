@@ -81,9 +81,15 @@ pub struct MqMessage {
 pub enum MqNotifyKind {
     None,
     /// `SIGEV_SIGNAL`：向注册者投递 `signo`，`siginfo.si_value = value`。
-    Signal { signo: i32, value: usize },
+    Signal {
+        signo: i32,
+        value: usize,
+    },
     /// `SIGEV_THREAD`：在注册者进程上下文创建线程执行 `function(value)`。
-    Thread { function: usize, value: usize },
+    Thread {
+        function: usize,
+        value: usize,
+    },
 }
 
 /// 一次已注册的队列通知。
@@ -128,12 +134,13 @@ pub struct MqObject {
 }
 
 impl MqObject {
-    fn new(attr: MqAttr, cred: &Credentials) -> Self {
+    /// `mode` 是创建者经 umask 掩码后的队列权限位（Linux `mq_open` 语义）。
+    fn new(attr: MqAttr, mode: FileMode, cred: &Credentials) -> Self {
         Self {
             inner: Mutex::new(MqInner {
                 perm_uid: cred.euid,
                 perm_gid: cred.egid,
-                perm_mode: FileMode::new(0o600),
+                perm_mode: mode.mask(FileMode::PERM_MASK),
                 maxmsg: attr.maxmsg,
                 msgsize: attr.msgsize,
                 messages: BTreeMap::new(),
@@ -156,7 +163,9 @@ impl MqObject {
     fn notify_state_changed(&self) {
         let observers: Vec<Arc<dyn MqStateObserver>> = {
             let mut inner = self.inner.lock();
-            inner.observers.retain(|observer| observer.strong_count() != 0);
+            inner
+                .observers
+                .retain(|observer| observer.strong_count() != 0);
             inner
                 .observers
                 .iter()
@@ -220,11 +229,7 @@ impl MqObject {
         } else {
             cred.can_read(inner.perm_uid, inner.perm_gid, inner.perm_mode)
         };
-        if allowed {
-            Ok(())
-        } else {
-            Err(Errno::EACCES)
-        }
+        if allowed { Ok(()) } else { Err(Errno::EACCES) }
     }
 
     /// 原子尝试发送一条消息。
@@ -264,11 +269,7 @@ impl MqObject {
                 data: data.to_vec(),
             });
         inner.curmsgs += 1;
-        let notify = if was_empty {
-            inner.notify.take()
-        } else {
-            None
-        };
+        let notify = if was_empty { inner.notify.take() } else { None };
         drop(inner);
         self.receivers.wake_all();
         self.notify_state_changed();
@@ -280,11 +281,7 @@ impl MqObject {
     /// 成功返回 `Some(消息)`；队列为空且 `nonblock` 时返回 `EAGAIN`，否则返回
     /// `None` 供调用方决定阻塞。`maxsize < msgsize` 时返回 `EMSGSIZE`
     /// （Linux 语义：即使消息实际更短也拒绝，见 `ipc/mqueue.c`）。
-    pub fn try_receive(
-        &self,
-        maxsize: usize,
-        nonblock: bool,
-    ) -> Result<Option<MqMessage>, Errno> {
+    pub fn try_receive(&self, maxsize: usize, nonblock: bool) -> Result<Option<MqMessage>, Errno> {
         if (maxsize as i64) < self.inner.lock().msgsize {
             return Err(Errno::EMSGSIZE);
         }
@@ -299,9 +296,7 @@ impl MqObject {
             }
             return Ok(None);
         };
-        let message = queue
-            .pop_front()
-            .expect("最高优先级队列非空必有消息");
+        let message = queue.pop_front().expect("最高优先级队列非空必有消息");
         if queue.is_empty() {
             inner.messages.remove(&priority);
         }
@@ -407,12 +402,15 @@ impl MqRegistry {
     }
 
     /// `mq_open`：按 `O_CREAT/O_EXCL` 查找或创建队列。
+    ///
+    /// `mode` 仅在创建时生效（已由调用方按 umask 掩码）；查找已有队列时忽略。
     pub fn open(
         &self,
         name: &str,
         create: bool,
         excl: bool,
         attr: Option<&MqAttr>,
+        mode: FileMode,
         cred: &Credentials,
     ) -> Result<Arc<MqObject>, Errno> {
         Self::validate_name(name)?;
@@ -431,7 +429,7 @@ impl MqRegistry {
         }
         let attr = attr.copied().unwrap_or(MqAttr::default_new());
         MqObject::validate_attr(&attr)?;
-        let queue = Arc::new(MqObject::new(attr, cred));
+        let queue = Arc::new(MqObject::new(attr, mode, cred));
         inner.insert(name.to_string(), Arc::clone(&queue));
         Ok(queue)
     }

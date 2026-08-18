@@ -77,6 +77,18 @@ const O_SYNC: usize = 0o4010000;
 
 const FALLOC_FL_KEEP_SIZE: usize = 0x01;
 const FALLOC_FL_PUNCH_HOLE: usize = 0x02;
+const FALLOC_FL_NO_HIDE_STALE: usize = 0x04;
+const FALLOC_FL_COLLAPSE_RANGE: usize = 0x08;
+const FALLOC_FL_ZERO_RANGE: usize = 0x10;
+const FALLOC_FL_INSERT_RANGE: usize = 0x20;
+const FALLOC_FL_UNSHARE_RANGE: usize = 0x40;
+const FALLOC_FL_SUPPORTED: usize = FALLOC_FL_KEEP_SIZE
+    | FALLOC_FL_PUNCH_HOLE
+    | FALLOC_FL_NO_HIDE_STALE
+    | FALLOC_FL_COLLAPSE_RANGE
+    | FALLOC_FL_ZERO_RANGE
+    | FALLOC_FL_INSERT_RANGE
+    | FALLOC_FL_UNSHARE_RANGE;
 
 const MS_RDONLY: usize = 1 << 0;
 const MS_NOSUID: usize = 1 << 1;
@@ -101,6 +113,26 @@ const MS_NOREMOTELOCK: usize = 1 << 27;
 const MS_NOSEC: usize = 1 << 28;
 const MS_BORN: usize = 1 << 29;
 const MS_ACTIVE: usize = 1 << 30;
+
+// mount_setattr(2) / fsmount(2) 的 MOUNT_ATTR_* 位（Linux uapi/linux/mount.h）。
+const MOUNT_ATTR_RDONLY: usize = 0x0000_0001;
+const MOUNT_ATTR_NOSUID: usize = 0x0000_0002;
+const MOUNT_ATTR_NODEV: usize = 0x0000_0004;
+const MOUNT_ATTR_NOEXEC: usize = 0x0000_0008;
+const MOUNT_ATTR_NOATIME: usize = 0x0000_0010;
+const MOUNT_ATTR_STRICTATIME: usize = 0x0000_0020;
+const MOUNT_ATTR_NODIRATIME: usize = 0x0000_0080;
+const MOUNT_ATTR_IDMAP: usize = 0x0010_0000;
+const MOUNT_ATTR_NOSYMFOLLOW: usize = 0x0020_0000;
+// 本内核可映射到 VFS MountFlags 的挂载属性位；其余返回 EOPNOTSUPP。
+const MOUNT_ATTR_SUPPORTED: usize = MOUNT_ATTR_RDONLY
+    | MOUNT_ATTR_NOSUID
+    | MOUNT_ATTR_NODEV
+    | MOUNT_ATTR_NOEXEC
+    | MOUNT_ATTR_NOATIME
+    | MOUNT_ATTR_NODIRATIME;
+
+const AT_RECURSIVE: usize = 0x8000;
 
 const OPEN_HOW_SIZE: usize = 24;
 const OPEN_HOW_MAX_SIZE: usize = 4096;
@@ -148,6 +180,8 @@ const F_OWNER_PGRP: i32 = 2;
 const MFD_CLOEXEC: usize = 0x0001;
 const MFD_ALLOW_SEALING: usize = 0x0002;
 const MFD_HUGETLB: usize = 0x0004;
+const MFD_NOEXEC_SEAL: usize = 0x0008;
+const MFD_EXEC: usize = 0x0010;
 const MFD_UNSUPPORTED: usize = MFD_HUGETLB;
 
 const TFD_TIMER_ABSTIME: usize = 1;
@@ -194,6 +228,11 @@ const STATX_BASIC_STATS: u32 = STATX_TYPE
     | STATX_INO
     | STATX_SIZE
     | STATX_BLOCKS;
+const STATX_BTIME: u32 = 0x0800;
+const STATX_MNT_ID: u32 = 0x1000;
+const STATX_DIOALIGN: u32 = 0x2000;
+// 高于所有合法 STATX_* 位的保留位（Linux 返回 EINVAL）。
+const STATX__RESERVED: u32 = 0xffff_0000;
 
 const MSGHDR_SIZE_64: usize = 56;
 const MMSGHDR_SIZE_64: usize = 64;
@@ -222,7 +261,7 @@ pub(super) fn sys_read(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if len != 0 {
         ensure_network_execution_scope_for_file(ctx, &file);
     }
-    read_to_user(&file, buf, len, None)
+    read_to_user(&file, buf, len, None, false)
 }
 
 pub(super) fn sys_pread64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -231,7 +270,7 @@ pub(super) fn sys_pread64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let len = ctx.args[2];
     let offset = nonnegative_i64_arg(ctx.args[3])?;
     let file = file_for_fd(fd)?;
-    read_to_user(&file, buf, len, Some(offset))
+    read_to_user(&file, buf, len, Some(offset), false)
 }
 
 pub(super) fn sys_pwrite64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -240,7 +279,7 @@ pub(super) fn sys_pwrite64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let len = ctx.args[2];
     let offset = nonnegative_i64_arg(ctx.args[3])?;
     let file = file_for_fd(fd)?;
-    write_from_user_at(&file, buf, len, Some(offset))
+    write_from_user_at(&file, buf, len, Some(offset), false)
 }
 
 pub(super) fn sys_writev(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -251,7 +290,7 @@ pub(super) fn sys_writev(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         return Err(Errno::EINVAL);
     }
     let file = file_for_fd(fd)?;
-    write_iovecs(ctx, &file, iov, iovcnt, None)
+    write_iovecs(ctx, &file, iov, iovcnt, None, false)
 }
 
 pub(super) fn sys_readv(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -262,7 +301,7 @@ pub(super) fn sys_readv(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         return Err(Errno::EINVAL);
     }
     let file = file_for_fd(fd)?;
-    read_iovecs(ctx, &file, iov, iovcnt, None)
+    read_iovecs(ctx, &file, iov, iovcnt, None, false)
 }
 
 pub(super) fn sys_close(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -362,6 +401,7 @@ pub(super) fn sys_statx(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let raw_dirfd = ctx.args[0];
     let path = copy_path_from_user(ctx.args[1])?;
     let flags = ctx.args[2];
+    let requested_mask = ctx.args[3] as u32;
     let statx_user = ctx.args[4];
 
     const ALLOWED_FLAGS: usize = AT_SYMLINK_NOFOLLOW
@@ -372,20 +412,59 @@ pub(super) fn sys_statx(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if (flags & !ALLOWED_FLAGS) != 0 {
         return Err(Errno::EINVAL);
     }
+    if (requested_mask & STATX__RESERVED) != 0 {
+        return Err(Errno::EINVAL);
+    }
 
-    let st = if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+    // 解析得到 FileStat + 所属 superblock（用于 mnt_id 与 DIO 对齐）。
+    let (st, sb) = if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
         if raw_dirfd as i32 == AT_FDCWD {
-            operation::fstatat(&vfs_ctx, &Dirfd::Cwd, ".", false).map_err(|e| e.to_errno())?
+            let r = vfs::path::lookup(&vfs_ctx, &Dirfd::Cwd, ".", LookupFlags::default())
+                .map_err(|e| e.to_errno())?;
+            let inode = r.dentry.inode().ok_or(Errno::ENOENT)?;
+            (inode.stat().map_err(|e| e.to_errno())?, inode.superblock())
         } else {
             let fd = fd_arg(raw_dirfd)?;
-            operation::fstat(&fdt, fd).map_err(|e| e.to_errno())?
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            (
+                file.stat().map_err(|e| e.to_errno())?,
+                file.inode().superblock(),
+            )
         }
     } else {
         let dirfd = dirfd_arg(raw_dirfd, &fdt)?;
-        operation::fstatat(&vfs_ctx, &dirfd, &path, (flags & AT_SYMLINK_NOFOLLOW) != 0)
-            .map_err(|e| e.to_errno())?
+        let r = vfs::path::lookup(
+            &vfs_ctx,
+            &dirfd,
+            &path,
+            if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
+                LookupFlags::NO_FOLLOW
+            } else {
+                LookupFlags::default()
+            },
+        )
+        .map_err(|e| e.to_errno())?;
+        let inode = r.dentry.inode().ok_or(Errno::ENOENT)?;
+        (inode.stat().map_err(|e| e.to_errno())?, inode.superblock())
     };
-    write_linux_statx(statx_user, &st)?;
+
+    // mnt_id 以 superblock 实例 ID 近似（本 VFS 无 per-mount id 注册表）；
+    // DIO 对齐取自文件系统块大小，仅当后端声明支持直接 I/O 时声明 STATX_DIOALIGN。
+    let mnt_id = sb.as_ref().map(|s| s.fs_id.raw()).unwrap_or(0);
+    let dio_align = sb
+        .as_ref()
+        .filter(|s| s.ops.supports_direct_io())
+        .map(|s| (s.block_size.max(512), s.block_size.max(512)))
+        .unwrap_or((0, 0));
+
+    write_linux_statx(
+        statx_user,
+        &st,
+        mnt_id,
+        dio_align.0,
+        dio_align.1,
+        requested_mask,
+    )?;
     Ok(0)
 }
 
@@ -540,17 +619,29 @@ pub(super) fn sys_fcntl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             write_f_owner_ex(arg, owner_type, owner_pid)?;
             Ok(0)
         }
-        F_GETLK | F_GETLK64 | F_OFD_GETLK => {
+        F_GETLK | F_GETLK64 => {
             let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
-            fcntl_getlk(ctx, &file, arg)
+            fcntl_getlk(ctx, &file, arg, false)
         }
-        F_SETLK | F_SETLK64 | F_OFD_SETLK => {
+        F_OFD_GETLK => {
             let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
-            fcntl_setlk(ctx, &file, arg, false)
+            fcntl_getlk(ctx, &file, arg, true)
         }
-        F_SETLKW | F_SETLKW64 | F_OFD_SETLKW => {
+        F_SETLK | F_SETLK64 => {
             let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
-            fcntl_setlk(ctx, &file, arg, true)
+            fcntl_setlk(ctx, &file, arg, false, false)
+        }
+        F_OFD_SETLK => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            fcntl_setlk(ctx, &file, arg, false, true)
+        }
+        F_SETLKW | F_SETLKW64 => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            fcntl_setlk(ctx, &file, arg, true, false)
+        }
+        F_OFD_SETLKW => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            fcntl_setlk(ctx, &file, arg, true, true)
         }
         F_SETLEASE => {
             let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
@@ -713,6 +804,22 @@ pub(super) fn sys_renameat2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     )
 }
 
+const RENAME_NOREPLACE: usize = 1;
+const RENAME_EXCHANGE: usize = 2;
+const RENAME_WHITEOUT: usize = 4;
+
+static RENAME_TMP_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// 生成 EXCHANGE 用的临时名（落在 new_path 所在目录，避免跨目录碰撞）。
+fn exchange_tmp_path(new_path: &str) -> String {
+    let seq = RENAME_TMP_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let tmp_name = alloc::format!(".mygo_xchg_{}", seq);
+    match new_path.rfind('/') {
+        Some(idx) => alloc::format!("{}{}", &new_path[..idx + 1], tmp_name),
+        None => tmp_name,
+    }
+}
+
 fn renameat_common(
     old_dirfd_raw: usize,
     old_path_user: usize,
@@ -726,11 +833,85 @@ fn renameat_common(
     let old_path = copy_path_from_user(old_path_user)?;
     let new_dirfd = dirfd_arg(new_dirfd_raw, &fdt)?;
     let new_path = copy_path_from_user(new_path_user)?;
-    if flags != 0 {
+    if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0 {
         return Err(Errno::EINVAL);
+    }
+    if flags & RENAME_WHITEOUT != 0 {
+        // RENAME_WHITEOUT 需要 overlayfs 的 whiteout 设备语义，本内核无此机制。
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if flags & RENAME_NOREPLACE != 0 && flags & RENAME_EXCHANGE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & RENAME_NOREPLACE != 0 {
+        // Linux RENAME_NOREPLACE：目标存在即 EEXIST。这里在调用 renameat 前做
+        // 存在性检查（非原子，与 Linux 的原子 no-replace 存在 TOCTOU 差异，已注明）。
+        match vfs::path::lookup(
+            &vfs_ctx,
+            &new_dirfd,
+            &new_path,
+            LookupFlags::NO_FOLLOW.with(LookupFlags::NO_MOUNT_LAST),
+        ) {
+            Ok(_) => return Err(Errno::EEXIST),
+            Err(VfsError::NotFound) => {}
+            Err(e) => return Err(e.to_errno()),
+        }
+    }
+    if flags & RENAME_EXCHANGE != 0 {
+        return rename_exchange(&vfs_ctx, &old_dirfd, &old_path, &new_dirfd, &new_path);
     }
     operation::renameat(&vfs_ctx, &old_dirfd, &old_path, &new_dirfd, &new_path)
         .map_err(|e| e.to_errno())?;
+    Ok(0)
+}
+
+/// `RENAME_EXCHANGE`：原子交换两个路径。当前 VFS 的 `renameat` 只支持单向重命名，
+/// 这里用“临时名三段搬移”实现，非原子；任一步失败尽力回滚。两路径须存在且同
+/// 文件系统（Linux 语义）。
+fn rename_exchange(
+    vfs_ctx: &Arc<vfs::VfsContext>,
+    old_dirfd: &Dirfd,
+    old_path: &str,
+    new_dirfd: &Dirfd,
+    new_path: &str,
+) -> Result<usize, Errno> {
+    // 两端都必须存在，且位于同一文件系统。
+    let old_inode = vfs::path::lookup(
+        vfs_ctx,
+        old_dirfd,
+        old_path,
+        LookupFlags::NO_FOLLOW.with(LookupFlags::NO_MOUNT_LAST),
+    )
+    .and_then(|r| r.dentry.inode().ok_or(VfsError::NotFound))
+    .map_err(|e| e.to_errno())?;
+    let new_inode = vfs::path::lookup(
+        vfs_ctx,
+        new_dirfd,
+        new_path,
+        LookupFlags::NO_FOLLOW.with(LookupFlags::NO_MOUNT_LAST),
+    )
+    .and_then(|r| r.dentry.inode().ok_or(VfsError::NotFound))
+    .map_err(|e| e.to_errno())?;
+    if old_inode.fs_id() != new_inode.fs_id() {
+        return Err(Errno::EXDEV);
+    }
+
+    let tmp = exchange_tmp_path(new_path);
+    // 1. old → tmp（tmp 落在 new 所在目录，保证同一文件系统）。
+    operation::renameat(vfs_ctx, old_dirfd, old_path, new_dirfd, &tmp).map_err(|e| e.to_errno())?;
+    // 2. new → old。
+    if let Err(e) = operation::renameat(vfs_ctx, new_dirfd, new_path, old_dirfd, old_path) {
+        // 回滚 1。
+        let _ = operation::renameat(vfs_ctx, new_dirfd, &tmp, old_dirfd, old_path);
+        return Err(e.to_errno());
+    }
+    // 3. tmp → new。
+    if let Err(e) = operation::renameat(vfs_ctx, new_dirfd, &tmp, new_dirfd, new_path) {
+        // 回滚 2 与 1。
+        let _ = operation::renameat(vfs_ctx, old_dirfd, old_path, new_dirfd, new_path);
+        let _ = operation::renameat(vfs_ctx, new_dirfd, &tmp, old_dirfd, old_path);
+        return Err(e.to_errno());
+    }
     Ok(0)
 }
 
@@ -1414,7 +1595,12 @@ pub(super) fn sys_copy_file_range(ctx: &mut SyscallContext<'_>) -> Result<usize,
     let fd_out = fd_arg(ctx.args[2])?;
     let off_out_user = ctx.args[3];
     let len = ctx.args[4];
-    let _flags = ctx.args[5];
+    let flags = ctx.args[5];
+    // Linux 规定 copy_file_range 的 flags 必须为 0（历史 COPY_FILE_RANGE_REFLINK
+    // 已移除）；非零值返回 EINVAL，不能静默当作 0 处理。
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
 
     let in_file = file_for_fd(fd_in)?;
     let out_file = file_for_fd(fd_out)?;
@@ -1492,17 +1678,30 @@ pub(super) fn sys_fallocate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let raw_mode = ctx.args[1];
     let offset = nonnegative_i64_arg(ctx.args[2])?;
     let len = nonnegative_i64_arg(ctx.args[3])?;
-    if raw_mode & !(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE) != 0 {
+    // Linux 模式校验（fs/open.c do_fallocate）：未知位 EOPNOTSUPP；
+    // PUNCH_HOLE 必须搭配 KEEP_SIZE；COLLAPSE/INSERT/UNSHARE 必须独占使用。
+    if raw_mode & !FALLOC_FL_SUPPORTED != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
     if raw_mode & FALLOC_FL_PUNCH_HOLE != 0 && raw_mode & FALLOC_FL_KEEP_SIZE == 0 {
         return Err(Errno::EOPNOTSUPP);
+    }
+    if raw_mode & FALLOC_FL_COLLAPSE_RANGE != 0 && raw_mode & !FALLOC_FL_COLLAPSE_RANGE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if raw_mode & FALLOC_FL_INSERT_RANGE != 0 && raw_mode & !FALLOC_FL_INSERT_RANGE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if raw_mode & FALLOC_FL_UNSHARE_RANGE != 0 && raw_mode & !FALLOC_FL_UNSHARE_RANGE != 0 {
+        return Err(Errno::EINVAL);
     }
     let mode = FallocateMode::from_bits(raw_mode as u32);
     let file = file_for_fd(fd)?;
     if !file.flags().writable() {
         return Err(Errno::EBADF);
     }
+    // 具体模式是否可用由后端（extfs/memfd 等）决定；不支持的模式返回
+    // VfsError::NotSupported → EOPNOTSUPP（Linux 语义）。
     file.fallocate(mode, offset, len)
         .map_err(|e| e.to_errno())?;
     Ok(0)
@@ -3188,6 +3387,9 @@ fn dirfd_as_fd(dirfd: &Dirfd, fdt: &vfs::fdtable::FdTable) -> Option<Fd> {
 }
 
 pub(super) fn sys_lookup_dcookie(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // lookup_dcookie(2) 把 perf/oprofile 的 64-bit cookie 反查为文件路径。本内核
+    // 没有 perf 子系统产生 cookie，维护一个 cookie→路径注册表只会留下无生产者
+    // 的死状态；因此保持 ENOSYS（Linux 在无 CONFIG_PROFILING 时同样不可用）。
     Err(Errno::ENOSYS)
 }
 
@@ -3306,8 +3508,19 @@ pub(super) fn sys_nfsservctl(_ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_vhangup(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_vhangup(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // Linux 要求 CAP_SYS_TTY_CONFIG；本内核能力集以 SysAdmin 近似该管理能力。
+    if !ctx.task().credentials().has_cap(Capability::SysAdmin) {
+        return Err(Errno::EPERM);
+    }
+    // 对当前会话的控制终端执行挂起（SIGHUP 到前台进程组 + 撤销后续访问）。
+    // 无控制终端时按 Linux 语义视为 no-op 成功。
+    if let Some(cookie) = sched::operation::current_session_ctty()
+        && let Some(core) = general::dev::tty::resolve_ctty_cookie(cookie)
+    {
+        core.hangup();
+    }
+    Ok(0)
 }
 
 pub(super) fn sys_quotactl(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -3323,7 +3536,7 @@ pub(super) fn sys_preadv(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
     let offset = nonnegative_split_offset_arg(ctx.args[3], ctx.args[4])?;
     let file = file_for_fd(fd)?;
-    read_iovecs(ctx, &file, iov, iovcnt, Some(offset))
+    read_iovecs(ctx, &file, iov, iovcnt, Some(offset), false)
 }
 
 pub(super) fn sys_pwritev(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -3335,7 +3548,7 @@ pub(super) fn sys_pwritev(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     }
     let offset = nonnegative_split_offset_arg(ctx.args[3], ctx.args[4])?;
     let file = file_for_fd(fd)?;
-    write_iovecs(ctx, &file, iov, iovcnt, Some(offset))
+    write_iovecs(ctx, &file, iov, iovcnt, Some(offset), false)
 }
 
 pub(super) fn sys_vmsplice(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -3350,7 +3563,7 @@ pub(super) fn sys_vmsplice(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         return Err(Errno::EINVAL);
     }
     let file = file_for_fd(fd)?;
-    write_iovecs(ctx, &file, iov, iovcnt, None)
+    write_iovecs(ctx, &file, iov, iovcnt, None, false)
 }
 
 pub(super) fn sys_splice(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -3381,27 +3594,47 @@ pub(super) fn sys_splice(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Ok(copied)
 }
 
-pub(super) fn sys_tee(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let fd_in = fd_arg(ctx.args[0])?;
-    let fd_out = fd_arg(ctx.args[1])?;
-    let len = ctx.args[2];
-    let flags = ctx.args[3];
+pub(super) fn sys_tee(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd_in = fd_arg(_ctx.args[0])?;
+    let fd_out = fd_arg(_ctx.args[1])?;
+    let len = _ctx.args[2];
+    let flags = _ctx.args[3];
     if (flags & !SPLICE_F_SUPPORTED) != 0 {
         return Err(Errno::EINVAL);
     }
     let in_file = file_for_fd(fd_in)?;
     let out_file = file_for_fd(fd_out)?;
-    let mut in_off = Some(in_file.pos());
-    let mut out_off = None;
-    copy_between_files(
-        ctx,
-        &in_file,
-        &out_file,
-        len,
-        &mut in_off,
-        &mut out_off,
-        (flags & SPLICE_F_NONBLOCK) != 0,
-    )
+    // Linux tee(2)：两端都必须是 pipe，否则 EINVAL；且不消费源数据（与 splice
+    // 不同）。本内核按已缓冲字节非消费地复制，实现真实 tee 语义。
+    let in_pipe = vfs::pipe::pipe_of(&in_file).ok_or(Errno::EINVAL)?;
+    let out_pipe = vfs::pipe::pipe_of(&out_file).ok_or(Errno::EINVAL)?;
+    let nonblock = (flags & SPLICE_F_NONBLOCK) != 0;
+    let mut total = 0usize;
+    while total < len {
+        match vfs::pipe::Pipe::tee_to(&in_pipe, &out_pipe, len - total) {
+            Ok(0) => {
+                if total > 0 {
+                    return Ok(total);
+                }
+                if in_pipe.writer_count() == 0 {
+                    return Ok(0);
+                }
+                if nonblock || in_file.flags().nonblock || out_file.flags().nonblock {
+                    return Err(Errno::EAGAIN);
+                }
+                // 源有数据但目标满 → 等目标可写；否则等源可读。
+                if in_pipe.available_len() > 0 {
+                    wait_for_file_readiness(&out_file, PollEvents::POLLOUT)?;
+                } else {
+                    wait_for_file_readiness(&in_file, PollEvents::POLLIN)?;
+                }
+            }
+            Ok(n) => total = total.checked_add(n).ok_or(Errno::EINVAL)?,
+            Err(Errno::EPIPE) if total > 0 => return Ok(total),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(total)
 }
 
 pub(super) fn sys_sync_file_range2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -3521,12 +3754,123 @@ pub(super) fn sys_fanotify_mark(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     Ok(0)
 }
 
-pub(super) fn sys_name_to_handle_at(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// 文件句柄编码：`fs_id`(u64) + `ino`(u64)，共 16 字节。
+const FILE_HANDLE_SIZE: usize = 16;
+const FILE_HANDLE_TYPE: i32 = 1;
+
+/// `name_to_handle_at(2)`：把路径解析为 inode，导出 (fs_id, ino) 句柄与挂载 id。
+pub(super) fn sys_name_to_handle_at(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
+    let path = copy_path_from_user(ctx.args[1])?;
+    let handle_user = ctx.args[2];
+    let mount_id_user = ctx.args[3];
+    let flags = ctx.args[4];
+    if (flags & !AT_SYMLINK_NOFOLLOW) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let result = vfs::path::lookup(
+        &vfs_ctx,
+        &dirfd,
+        &path,
+        if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
+            LookupFlags::NO_FOLLOW
+        } else {
+            LookupFlags::default()
+        },
+    )
+    .map_err(|e| e.to_errno())?;
+    let inode = result.dentry.inode().ok_or(Errno::ENOENT)?;
+    let sb_id = inode.superblock().map(|s| s.fs_id.raw()).unwrap_or(0);
+
+    // struct file_handle：handle_bytes(u32) + handle_type(i32) + f_handle[]。
+    if handle_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut hdr = [0u8; 8];
+    copy_from_user(handle_user, &mut hdr).map_err(|e| e.as_errno())?;
+    let capacity = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
+    if capacity < FILE_HANDLE_SIZE {
+        put_u32(&mut hdr, 0, FILE_HANDLE_SIZE as u32);
+        copy_to_user(handle_user, &hdr).map_err(|e| e.as_errno())?;
+        return Err(Errno::EOVERFLOW);
+    }
+    let mut handle = [0u8; FILE_HANDLE_SIZE];
+    put_u64(&mut handle, 0, sb_id);
+    put_u64(&mut handle, 8, inode.ino());
+    copy_to_user(handle_user + 8, &handle).map_err(|e| e.as_errno())?;
+    put_u32(&mut hdr, 0, FILE_HANDLE_SIZE as u32);
+    put_i32(&mut hdr, 4, FILE_HANDLE_TYPE);
+    copy_to_user(handle_user, &hdr).map_err(|e| e.as_errno())?;
+    // mount_id 以 superblock 实例 ID 低 32 位近似（本 VFS 无 per-mount id 注册表）。
+    if mount_id_user != 0 {
+        copy_to_user(mount_id_user, &(sb_id as u32).to_le_bytes()).map_err(|e| e.as_errno())?;
+    }
+    Ok(0)
 }
 
-pub(super) fn sys_open_by_handle_at(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// `open_by_handle_at(2)`：按句柄重开文件。mount_fd 是 open_tree/fsmount 产生的
+/// 挂载 fd，用于定位句柄所属文件系统实例。
+pub(super) fn sys_open_by_handle_at(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let mount_fd = fd_arg(ctx.args[0])?;
+    let handle_user = ctx.args[1];
+    let flags = ctx.args[2];
+
+    if handle_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut hdr = [0u8; 8];
+    copy_from_user(handle_user, &mut hdr).map_err(|e| e.as_errno())?;
+    let handle_bytes = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
+    let handle_type = i32::from_le_bytes(hdr[4..8].try_into().unwrap());
+    if handle_bytes < FILE_HANDLE_SIZE || handle_type != FILE_HANDLE_TYPE {
+        return Err(Errno::EINVAL);
+    }
+    let mut handle = [0u8; FILE_HANDLE_SIZE];
+    copy_from_user(handle_user + 8, &mut handle).map_err(|e| e.as_errno())?;
+    let sb_id = u64::from_le_bytes(handle[0..8].try_into().unwrap());
+    let ino = u64::from_le_bytes(handle[8..16].try_into().unwrap());
+
+    // 从挂载 fd 取出 superblock 并校验句柄所属文件系统实例。
+    let mount_file = fdt.get_file(mount_fd).ok_or(Errno::EBADF)?;
+    let fsc = vfs::fs_context::FsContextFileOps::from_file(&mount_file).ok_or(Errno::EINVAL)?;
+    let sb = fsc.take_superblock().ok_or(Errno::EINVAL)?;
+    if sb.fs_id.raw() != sb_id {
+        return Err(Errno::ESTALE);
+    }
+    let inode = sb.find_inode(ino).ok_or(Errno::ESTALE)?;
+
+    let opts = decode_open_options(flags)?;
+    let cred = vfs_ctx.cred().clone();
+    let ops = inode.open_ops(&opts, &cred).map_err(|e| e.to_errno())?;
+    let mount = fsc
+        .clone_root()
+        .and_then(|root| vfs_ctx.mount_ns.find_mount_for_root(&root))
+        .or_else(|| vfs_ctx.mount_ns.find_mount_for_root(&sb.root_dentry))
+        .ok_or(Errno::ESTALE)?;
+    // 打开句柄不经过路径，用独立 dentry 承载 inode（仅用于 fd 定位语义）。
+    let dentry = vfs::dentry::Dentry::new_positive("", None, Arc::clone(&inode));
+    let file = vfs::file::File::new(
+        Arc::clone(&inode),
+        opts,
+        cred,
+        ops,
+        dentry,
+        Arc::clone(&mount),
+    );
+    mount.inc_open();
+    let fd_flags = if opts.cloexec {
+        FdFlags::CLOEXEC
+    } else {
+        FdFlags::default()
+    };
+    let fd = fdt
+        .alloc_fd(Arc::new(file), fd_flags)
+        .map_err(|e| e.to_errno())?;
+    Ok(fd.as_raw() as usize)
 }
 
 pub(super) fn sys_memfd_create(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -3535,7 +3879,12 @@ pub(super) fn sys_memfd_create(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     if (flags & MFD_UNSUPPORTED) != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
-    if (flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_UNSUPPORTED)) != 0 {
+    if (flags & (MFD_EXEC | MFD_NOEXEC_SEAL)) == (MFD_EXEC | MFD_NOEXEC_SEAL) {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_UNSUPPORTED | MFD_NOEXEC_SEAL | MFD_EXEC))
+        != 0
+    {
         return Err(Errno::EINVAL);
     }
     // memfd 名称只用于调试可见性；当前 anonfs 不暴露 /proc/<pid>/fd 名称，但仍
@@ -3543,11 +3892,12 @@ pub(super) fn sys_memfd_create(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     let _name = copy_cstr_from_user(name_user, 249).map_err(|e| e.as_errno())?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
-    let fd = vfs::memfd::create(
+    let fd = vfs::memfd::create_ext(
         &fdt,
         vfs_ctx.cred(),
         (flags & MFD_ALLOW_SEALING) != 0,
         (flags & MFD_CLOEXEC) != 0,
+        (flags & MFD_NOEXEC_SEAL) != 0,
     )?;
     Ok(fd.as_raw() as usize)
 }
@@ -3565,7 +3915,9 @@ pub(super) fn sys_preadv2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     }
     let offset = split_offset_arg(ctx.args[3], ctx.args[4])?;
     let file = file_for_fd(fd)?;
-    read_iovecs(ctx, &file, iov, iovcnt, offset)
+    // RWF_NOWAIT：遇到会阻塞的 I/O 时返回 EAGAIN 而非睡眠；RWF_HIPRI 在本内核
+    // 无轮询队列，作为性能 hint 接受但无额外效果（Linux 上同为 best-effort）。
+    read_iovecs(ctx, &file, iov, iovcnt, offset, (flags & RWF_NOWAIT) != 0)
 }
 
 pub(super) fn sys_pwritev2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -3585,7 +3937,7 @@ pub(super) fn sys_pwritev2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         split_offset_arg(ctx.args[3], ctx.args[4])?
     };
     let file = file_for_fd(fd)?;
-    let written = write_iovecs(ctx, &file, iov, iovcnt, offset)?;
+    let written = write_iovecs(ctx, &file, iov, iovcnt, offset, (flags & RWF_NOWAIT) != 0)?;
     if (flags & (RWF_DSYNC | RWF_SYNC)) != 0 {
         file.sync().map_err(|e| e.to_errno())?;
     }
@@ -3616,16 +3968,313 @@ pub(super) fn sys_recvmmsg_time64(ctx: &mut SyscallContext<'_>) -> Result<usize,
     sys_recvmmsg(ctx)
 }
 
-pub(super) fn sys_io_uring_setup(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+// ── io_uring 最小同步实现 ────────────────────────────────────────────────────
+//
+// 提供“固定 SQ/CQ 队列 + 同步执行 SQE”的最小闭环：io_uring_setup 分配并映射
+// 一个共享匿名内存对象作为三块 ring（SQ ring + SQE 数组 + CQ ring），io_uring_enter
+// 同步执行 NOP/READ/WRITE/READV/WRITEV/FSYNC，io_uring_register 仅识别清理命令。
+// ring 通过 `SharedAnonObject` 在 setup 时映射进用户地址空间（基址写入
+// `io_uring_params.sq_off.user_addr`），内核侧经 read/write_shared_anon 访问同一
+// 物理页，保证 head/tail 索引相干。这是自洽的最小闭环，但**不兼容标准 liburing**
+// （其自行 mmap(fd, IORING_OFF_*) 会得到写回式文件页而非本共享对象）。
+
+const IORING_SQE_SIZE: usize = 64;
+const IORING_CQE_SIZE: usize = 16;
+const IORING_MAX_ENTRIES: u32 = 4096;
+
+const IORING_OP_NOP: u8 = 0;
+const IORING_OP_READV: u8 = 1;
+const IORING_OP_WRITEV: u8 = 2;
+const IORING_OP_FSYNC: u8 = 3;
+const IORING_OP_READ: u8 = 22;
+const IORING_OP_WRITE: u8 = 23;
+
+const IORING_UNREGISTER_BUFFERS: u32 = 1;
+const IORING_UNREGISTER_FILES: u32 = 3;
+
+struct IoUringState {
+    object: Arc<mm::SharedAnonObject>,
+    sq_entries: u32,
+    cq_entries: u32,
+    sq_ring_size: usize,
+    sqes_size: usize,
+    cq_ring_size: usize,
+    sq_ring_off: u64,
+    sqes_off: u64,
+    cq_ring_off: u64,
 }
 
-pub(super) fn sys_io_uring_enter(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+impl IoUringState {
+    fn new(entries: u32) -> Self {
+        let sq_ring_size = 24 + entries as usize * 4;
+        let sqes_size = entries as usize * IORING_SQE_SIZE;
+        let cq_ring_size = 20 + entries as usize * IORING_CQE_SIZE;
+        let sq_ring_off = 0u64;
+        let sqes_off = sq_ring_size as u64;
+        let cq_ring_off = sqes_off + sqes_size as u64;
+        Self {
+            object: Arc::new(mm::SharedAnonObject::new()),
+            sq_entries: entries,
+            cq_entries: entries,
+            sq_ring_size,
+            sqes_size,
+            cq_ring_size,
+            sq_ring_off,
+            sqes_off,
+            cq_ring_off,
+        }
+    }
+
+    fn total_size(&self) -> usize {
+        self.sq_ring_size + self.sqes_size + self.cq_ring_size
+    }
+
+    fn read_u32(&self, off: u64) -> Result<u32, Errno> {
+        let mut b = [0u8; 4];
+        general::mm::read_shared_anon(&self.object, off, &mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    fn write_u32(&self, off: u64, v: u32) -> Result<(), Errno> {
+        general::mm::write_shared_anon(&self.object, off, &v.to_le_bytes())
+    }
+
+    fn read_bytes(&self, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
+        general::mm::read_shared_anon(&self.object, off, buf)
+    }
+
+    fn write_bytes(&self, off: u64, buf: &[u8]) -> Result<(), Errno> {
+        general::mm::write_shared_anon(&self.object, off, buf)
+    }
+
+    fn init_ring(&self) -> Result<(), Errno> {
+        let mask = self.sq_entries - 1;
+        self.write_u32(self.sq_ring_off, 0)?;
+        self.write_u32(self.sq_ring_off + 4, 0)?;
+        self.write_u32(self.sq_ring_off + 8, mask)?;
+        self.write_u32(self.sq_ring_off + 12, self.sq_entries)?;
+        self.write_u32(self.sq_ring_off + 16, 0)?;
+        self.write_u32(self.sq_ring_off + 20, 0)?;
+        self.write_u32(self.cq_ring_off, 0)?;
+        self.write_u32(self.cq_ring_off + 4, 0)?;
+        self.write_u32(self.cq_ring_off + 8, mask)?;
+        self.write_u32(self.cq_ring_off + 12, self.cq_entries)?;
+        self.write_u32(self.cq_ring_off + 16, 0)?;
+        Ok(())
+    }
 }
 
-pub(super) fn sys_io_uring_register(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+struct IoUringFileOps {
+    state: Arc<IoUringState>,
+}
+
+impl vfs::file::FileOps for IoUringFileOps {
+    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> vfs::error::VfsResult<usize> {
+        Err(VfsError::NotSupported)
+    }
+
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> vfs::error::VfsResult<usize> {
+        Err(VfsError::NotSupported)
+    }
+
+    fn readdir(
+        &self,
+        _pos: u64,
+        _sink: &mut dyn FnMut(vfs::file::DirEntry) -> ControlFlow<()>,
+    ) -> vfs::error::VfsResult<u64> {
+        Err(VfsError::NotADirectory)
+    }
+
+    fn sync(&self) -> vfs::error::VfsResult<()> {
+        Ok(())
+    }
+
+    fn poll(&self, _interest: PollEvents) -> PollEvents {
+        PollEvents::default()
+    }
+
+    fn ioctl(&self, _cmd: IoctlCmd, _arg: usize) -> Result<usize, Errno> {
+        Err(Errno::ENOTTY)
+    }
+
+    fn release(&self) {}
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+/// 同步执行单个 SQE，返回 CQE 的 res 值（错误编码为负 errno）。
+fn execute_uring_sqe(ctx: &mut SyscallContext<'_>, sqe: &[u8]) -> i32 {
+    let opcode = sqe[0];
+    let fd_raw = i32::from_le_bytes(sqe[4..8].try_into().unwrap());
+    let off = u64::from_le_bytes(sqe[8..16].try_into().unwrap());
+    let addr = u64::from_le_bytes(sqe[16..24].try_into().unwrap());
+    let len = u32::from_le_bytes(sqe[24..28].try_into().unwrap());
+    if opcode == IORING_OP_NOP {
+        return 0;
+    }
+    let fd = match fd_arg(fd_raw as usize) {
+        Ok(fd) => fd,
+        Err(e) => return -i32::from(e),
+    };
+    let res: Result<usize, Errno> = match opcode {
+        IORING_OP_READ => {
+            let file = match file_for_fd(fd) {
+                Ok(f) => f,
+                Err(e) => return -i32::from(e),
+            };
+            read_to_user(&file, addr as usize, len as usize, Some(off), false)
+        }
+        IORING_OP_WRITE => {
+            let file = match file_for_fd(fd) {
+                Ok(f) => f,
+                Err(e) => return -i32::from(e),
+            };
+            write_from_user_at(&file, addr as usize, len as usize, Some(off), false)
+        }
+        IORING_OP_READV => {
+            let file = match file_for_fd(fd) {
+                Ok(f) => f,
+                Err(e) => return -i32::from(e),
+            };
+            read_iovecs(ctx, &file, addr as usize, len as usize, Some(off), false)
+        }
+        IORING_OP_WRITEV => {
+            let file = match file_for_fd(fd) {
+                Ok(f) => f,
+                Err(e) => return -i32::from(e),
+            };
+            write_iovecs(ctx, &file, addr as usize, len as usize, Some(off), false)
+        }
+        IORING_OP_FSYNC => {
+            let file = match file_for_fd(fd) {
+                Ok(f) => f,
+                Err(e) => return -i32::from(e),
+            };
+            match file.sync() {
+                Ok(()) => return 0,
+                Err(e) => return -i32::from(e.to_errno()),
+            }
+        }
+        _ => return -i32::from(Errno::EINVAL),
+    };
+    match res {
+        Ok(n) => n as i32,
+        Err(e) => -i32::from(e),
+    }
+}
+
+pub(super) fn sys_io_uring_setup(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let entries = ctx.args[0] as u32;
+    let params_user = ctx.args[1];
+    if entries == 0 || entries > IORING_MAX_ENTRIES || params_user == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let entries = entries.next_power_of_two();
+    let state = Arc::new(IoUringState::new(entries));
+    state.init_ring()?;
+
+    // 将 ring 映射进当前进程地址空间（共享匿名对象，内核/用户相干）。
+    let vm = current_vm_space().ok_or(Errno::ENOMEM)?;
+    let range = vm.alloc_mmap_range(state.total_size())?;
+    let vflags = mm::VmFlags::from_bits(mm::VmFlags::USER | mm::VmFlags::READ | mm::VmFlags::WRITE);
+    vm.map_shared_anon(range.clone(), Arc::clone(&state.object), 0, vflags)?;
+    let user_base = range.start;
+
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let file_flags = OpenOptions {
+        access: AccessMode::ReadWrite,
+        ..OpenOptions::default()
+    };
+    let fd = vfs::anon::create_fd(
+        &fdt,
+        vfs_ctx.cred().clone(),
+        file_flags,
+        FdFlags::default(),
+        alloc::boxed::Box::new(IoUringFileOps {
+            state: Arc::clone(&state),
+        }),
+    )
+    .map_err(|e| e.to_errno())?;
+
+    // struct io_uring_params（128 字节）：sq_off 在偏移 40，cq_off 在偏移 80。
+    let mut params = [0u8; 128];
+    put_u32(&mut params, 0, entries);
+    put_u32(&mut params, 4, entries);
+    // sq_off
+    put_u32(&mut params, 40, 0);
+    put_u32(&mut params, 44, 4);
+    put_u32(&mut params, 48, 8);
+    put_u32(&mut params, 52, 12);
+    put_u32(&mut params, 56, 16);
+    put_u32(&mut params, 60, 20);
+    put_u32(&mut params, 64, 24);
+    put_u64(&mut params, 72, user_base as u64);
+    // cq_off
+    put_u32(&mut params, 80, 0);
+    put_u32(&mut params, 84, 4);
+    put_u32(&mut params, 88, 8);
+    put_u32(&mut params, 92, 12);
+    put_u32(&mut params, 96, 16);
+    put_u32(&mut params, 100, 20);
+    put_u32(&mut params, 104, 24);
+    put_u64(
+        &mut params,
+        112,
+        (user_base + state.cq_ring_off as usize) as u64,
+    );
+    copy_to_user(params_user, &params).map_err(|e| e.as_errno())?;
+    Ok(fd.as_raw() as usize)
+}
+
+pub(super) fn sys_io_uring_enter(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd = fd_arg(ctx.args[0])?;
+    let to_submit = ctx.args[1] as u32;
+    let file = file_for_fd(fd)?;
+    let ring = file.downcast_ops::<IoUringFileOps>().ok_or(Errno::EBADF)?;
+    let st = &ring.state;
+
+    let mask = st.read_u32(st.sq_ring_off + 8)?;
+    let mut sq_head = st.read_u32(st.sq_ring_off)?;
+    let sq_tail = st.read_u32(st.sq_ring_off + 4)?;
+    let mut cq_tail = st.read_u32(st.cq_ring_off + 4)?;
+    let mut completed = 0u32;
+
+    while completed < to_submit && sq_head != sq_tail {
+        let array_off = st.sq_ring_off + 24 + (sq_head & mask) as u64 * 4;
+        let sqe_index = st.read_u32(array_off)?;
+        let sqe_off = st.sqes_off + sqe_index as u64 * IORING_SQE_SIZE as u64;
+        let mut sqe = [0u8; IORING_SQE_SIZE];
+        st.read_bytes(sqe_off, &mut sqe)?;
+        let res = execute_uring_sqe(ctx, &sqe);
+        let user_data = u64::from_le_bytes(sqe[32..40].try_into().unwrap());
+        let mut cqe = [0u8; IORING_CQE_SIZE];
+        put_u64(&mut cqe, 0, user_data);
+        put_i32(&mut cqe, 8, res);
+        let cqe_off = st.cq_ring_off + 20 + (cq_tail & mask) as u64 * IORING_CQE_SIZE as u64;
+        st.write_bytes(cqe_off, &cqe)?;
+        cq_tail = cq_tail.wrapping_add(1);
+        sq_head = sq_head.wrapping_add(1);
+        completed += 1;
+    }
+    st.write_u32(st.sq_ring_off, sq_head)?;
+    st.write_u32(st.cq_ring_off + 4, cq_tail)?;
+    Ok(completed as usize)
+}
+
+pub(super) fn sys_io_uring_register(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd = fd_arg(ctx.args[0])?;
+    let opcode = ctx.args[1] as u32;
+    let file = file_for_fd(fd)?;
+    file.downcast_ops::<IoUringFileOps>().ok_or(Errno::EBADF)?;
+    // 最小语义：固定文件/缓冲注册表未实现；仅接受清理命令为 no-op，便于
+    // 用户态 teardown 路径不因 EOPNOTSUPP 中断。
+    match opcode {
+        IORING_UNREGISTER_BUFFERS | IORING_UNREGISTER_FILES => Ok(0),
+        _ => Err(Errno::EOPNOTSUPP),
+    }
 }
 
 /// `fsopen(2)`：按文件系统类型创建 fs_context 并返回其 fd。
@@ -3670,23 +4319,65 @@ pub(super) fn sys_fsconfig(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
             fsc.create_superblock()?;
         }
         vfs::fs_context::FSCONFIG_CMD_RECONFIGURE => {
-            return Err(Errno::EOPNOTSUPP);
+            // fspick 得到的 fs_context 携带既有 superblock；RECONFIGURE 把累计的
+            // 挂载标志重新应用到该 superblock（Linux remount 语义）。
+            let sb = fsc.take_superblock().ok_or(Errno::EINVAL)?;
+            let flags = fsc.flags();
+            let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+            let mount = fsc
+                .clone_root()
+                .and_then(|root| vfs_ctx.mount_ns.find_mount_for_root(&root));
+            match mount {
+                Some(m) => {
+                    m.superblock.remount(flags).map_err(|e| e.to_errno())?;
+                    m.set_flags(flags);
+                }
+                None => {
+                    sb.remount(flags).map_err(|e| e.to_errno())?;
+                }
+            }
         }
         _ => return Err(Errno::EINVAL),
     }
     Ok(0)
 }
 
-/// `fsmount(2)`：校验 fs_context 已 CREATE，标记挂载就绪并返回挂载 fd。
+/// 把 Linux `MOUNT_ATTR_*` 属性位映射到 fs_context 的 MountFlags（`fsmount` 与
+/// `mount_setattr` 共用）。不支持的位返回 EOPNOTSUPP。
+fn apply_mount_attr_flags(
+    fsc: &vfs::fs_context::FsContext,
+    attr_flags: usize,
+) -> Result<(), Errno> {
+    if attr_flags & !MOUNT_ATTR_SUPPORTED != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    for (bit, key) in [
+        (MOUNT_ATTR_RDONLY, "ro"),
+        (MOUNT_ATTR_NOSUID, "nosuid"),
+        (MOUNT_ATTR_NODEV, "nodev"),
+        (MOUNT_ATTR_NOEXEC, "noexec"),
+        (MOUNT_ATTR_NOATIME, "noatime"),
+        (MOUNT_ATTR_NODIRATIME, "nodiratime"),
+    ] {
+        if attr_flags & bit != 0 {
+            fsc.set_flag(key)?;
+        }
+    }
+    Ok(())
+}
+
+/// `fsmount(2)`：校验 fs_context 已 CREATE，应用 MOUNT_ATTR_* 属性，标记挂载
+/// 就绪并返回挂载 fd。
 pub(super) fn sys_fsmount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fd = fd_arg(ctx.args[0])?;
     let flags = ctx.args[1] as u32;
-    let _mount_flags = ctx.args[2];
+    let attr_flags = ctx.args[2];
     if flags & !vfs::fs_context::FSMOUNT_CLOEXEC != 0 {
         return Err(Errno::EINVAL);
     }
     let file = file_for_fd(fd)?;
     let fsc = vfs::fs_context::FsContextFileOps::from_file(&file).ok_or(Errno::EBADF)?;
+    apply_mount_attr_flags(&fsc, attr_flags)?;
     fsc.mark_mount_ready()?;
     Ok(fd.as_raw() as usize)
 }
@@ -3761,9 +4452,10 @@ pub(super) fn sys_move_mount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
 /// `open_tree(2)`：OPEN_TREE_CLONE 时创建目标挂载的克隆上下文 fd
 /// （move_mount 可将其挂到新位置）。
 pub(super) fn sys_open_tree(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let dirfd = ctx.args[0];
-    let path_user = ctx.args[1];
-    let flags = ctx.args[2] as u32;
+    open_tree_common(ctx.args[0], ctx.args[1], ctx.args[2] as u32)
+}
+
+fn open_tree_common(dirfd_raw: usize, path_user: usize, flags: u32) -> Result<usize, Errno> {
     // asm-generic（LoongArch/RISC-V）O_CLOEXEC=0x80000；x86 为 0o200000。
     const OPEN_TREE_CLOEXEC_ANY: u32 = 0o200000 | 0x80000;
     if flags & !(vfs::fs_context::OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC_ANY) != 0 {
@@ -3773,7 +4465,7 @@ pub(super) fn sys_open_tree(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let path = copy_path_from_user(path_user)?;
-    let dirfd = dirfd_arg(dirfd, &fdt)?;
+    let dirfd = dirfd_arg(dirfd_raw, &fdt)?;
     let result = vfs::path::lookup(&vfs_ctx, &dirfd, &path, LookupFlags::DIRECTORY)
         .map_err(|e| e.to_errno())?;
     // 目标路径所在挂载（若路径本身是挂载点则取覆盖其上的挂载）。
@@ -3822,23 +4514,20 @@ pub(super) fn sys_openat2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(ctx.args[1])?;
     let how = read_open_how(ctx.args[2], ctx.args[3])?;
-    let supported_resolve = RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS;
-    let known_unsupported_resolve = RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_CACHED;
-    if (how.resolve & known_unsupported_resolve) != 0 {
-        return Err(Errno::EOPNOTSUPP);
-    }
-    if (how.resolve & !(supported_resolve | known_unsupported_resolve)) != 0 {
+    const RESOLVE_SUPPORTED: u64 = RESOLVE_NO_MAGICLINKS
+        | RESOLVE_NO_SYMLINKS
+        | RESOLVE_BENEATH
+        | RESOLVE_IN_ROOT
+        | RESOLVE_CACHED;
+    if (how.resolve & !RESOLVE_SUPPORTED) != 0 {
         return Err(Errno::EINVAL);
     }
+    // RESOLVE_BENEATH / RESOLVE_IN_ROOT 要求以 dirfd 为解析边界。
+    let beneath = (how.resolve & RESOLVE_BENEATH) != 0;
+    let in_root = (how.resolve & RESOLVE_IN_ROOT) != 0;
     let raw_flags = usize::try_from(how.flags).map_err(|_| Errno::EINVAL)?;
     validate_openat2_flags(raw_flags)?;
     let flags = decode_open_options(raw_flags)?;
-    let mut lookup_flags = LookupFlags::default();
-    if (how.resolve & RESOLVE_NO_SYMLINKS) != 0 {
-        lookup_flags = lookup_flags
-            .with(LookupFlags::NO_SYMLINKS)
-            .with(LookupFlags::NO_FOLLOW);
-    }
     if how.mode != 0 && (raw_flags & O_CREAT) == 0 {
         return Err(Errno::EINVAL);
     }
@@ -3846,16 +4535,55 @@ pub(super) fn sys_openat2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
         return Err(Errno::EINVAL);
     }
     let mode = FileMode::new((how.mode & 0o7777) as u16);
+    let mut lookup_flags = LookupFlags::default();
+    if (how.resolve & RESOLVE_NO_SYMLINKS) != 0 {
+        lookup_flags = lookup_flags
+            .with(LookupFlags::NO_SYMLINKS)
+            .with(LookupFlags::NO_FOLLOW);
+    }
+    // BENEATH/IN_ROOT 的越界处理：BENEATH 拒绝绝对路径；IN_ROOT 把绝对路径当
+    // 作相对 dirfd 解析。路径解析器对 ".." 的钳制以进程根为界，这里用 Dentry
+    // 祖先校验兜底（越界 → EXDEV，Linux 语义）。
+    let resolved_path = if vfs::path::PathComponents::is_absolute(&path) {
+        if beneath {
+            return Err(Errno::EXDEV);
+        }
+        if in_root {
+            let stripped = path.trim_start_matches('/');
+            if stripped.is_empty() {
+                // "/" 在 IN_ROOT 下等价于 dirfd 本身。
+                "."
+            } else {
+                stripped
+            }
+        } else {
+            path.as_str()
+        }
+    } else {
+        path.as_str()
+    };
     let fd = operation::openat_with_lookup_flags(
         &vfs_ctx,
         &fdt,
         &dirfd,
-        &path,
+        resolved_path,
         flags,
         mode,
         lookup_flags,
     )
     .map_err(|e| e.to_errno())?;
+    // BENEATH/IN_ROOT 的解析后祖先校验（相对路径经 ".."/符号链接可能逃出 dirfd）。
+    if beneath || in_root {
+        let dirfd_root = match &dirfd {
+            Dirfd::Cwd => vfs_ctx.cwd(),
+            Dirfd::Fd(f) => f.dentry().clone(),
+        };
+        let resolved = fdt.get_file(fd).ok_or(Errno::EBADF)?.dentry().clone();
+        if !resolved.is_descendant_of(&dirfd_root) {
+            let _ = operation::close(&fdt, fd);
+            return Err(Errno::EXDEV);
+        }
+    }
     Ok(fd.as_raw() as usize)
 }
 
@@ -3907,8 +4635,121 @@ pub(super) fn sys_epoll_pwait2(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     Ok(ready.len())
 }
 
-pub(super) fn sys_mount_setattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// `mount_setattr(2)`：批量修改挂载属性（只读/访问约束位 + 传播类型）。
+pub(super) fn sys_mount_setattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    if !vfs_ctx.cred().has_cap(vfs::cred::Capability::SysAdmin) {
+        return Err(Errno::EPERM);
+    }
+    let dfd = ctx.args[0];
+    let path = copy_path_from_user(ctx.args[1])?;
+    let flags = ctx.args[2];
+    let attr_user = ctx.args[3];
+    let size = ctx.args[4];
+    const MOUNT_ATTR_SIZE_VER0: usize = 32;
+    if size < MOUNT_ATTR_SIZE_VER0 {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & !(AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW)) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let mut raw = [0u8; 32];
+    copy_from_user(attr_user, &mut raw).map_err(|e| e.as_errno())?;
+    let attr_set = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let attr_clr = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    let propagation = u64::from_le_bytes(raw[16..24].try_into().unwrap());
+    let userns_fd = u64::from_le_bytes(raw[24..32].try_into().unwrap());
+    if userns_fd != 0 {
+        // 无 userns idmap 挂载支持。
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if (attr_set & !MOUNT_ATTR_SUPPORTED as u64) != 0
+        || (attr_clr & !MOUNT_ATTR_SUPPORTED as u64) != 0
+    {
+        return Err(Errno::EOPNOTSUPP);
+    }
+
+    // 定位目标挂载：AT_EMPTY_PATH + 空路径表示 dfd 即 open_tree/fsmount 挂载 fd。
+    let mount = if (flags & AT_EMPTY_PATH) != 0 && path.is_empty() {
+        let file = fdt.get_file(fd_arg(dfd)?).ok_or(Errno::EBADF)?;
+        let fsc = vfs::fs_context::FsContextFileOps::from_file(&file).ok_or(Errno::EINVAL)?;
+        let root = fsc.clone_root().ok_or(Errno::EINVAL)?;
+        vfs_ctx
+            .mount_ns
+            .find_mount_for_root(&root)
+            .ok_or(Errno::EINVAL)?
+    } else {
+        let dirfd = dirfd_arg(dfd, &fdt)?;
+        let r = vfs::path::lookup(&vfs_ctx, &dirfd, &path, LookupFlags::NO_MOUNT_LAST)
+            .map_err(|e| e.to_errno())?;
+        vfs_ctx
+            .mount_ns
+            .lookup_mount(&r.dentry)
+            .ok_or(Errno::EINVAL)?
+    };
+
+    let rec = (flags & AT_RECURSIVE) != 0;
+    apply_mount_setattr_one(&mount, attr_set, attr_clr, propagation)?;
+    if rec {
+        let children: Vec<Arc<vfs::mount::Mount>> = mount.children.lock().clone();
+        for child in children {
+            apply_mount_setattr_recursive(&child, attr_set, attr_clr, propagation)?;
+        }
+    }
+    Ok(0)
+}
+
+fn apply_mount_setattr_one(
+    mount: &Arc<vfs::mount::Mount>,
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+) -> Result<(), Errno> {
+    let mut flags = mount.flags_snapshot();
+    for (bit, flag) in [
+        (MOUNT_ATTR_RDONLY as u64, MountFlags::RDONLY),
+        (MOUNT_ATTR_NOSUID as u64, MountFlags::NOSUID),
+        (MOUNT_ATTR_NODEV as u64, MountFlags::NODEV),
+        (MOUNT_ATTR_NOEXEC as u64, MountFlags::NOEXEC),
+        (MOUNT_ATTR_NOATIME as u64, MountFlags::NOATIME),
+        (MOUNT_ATTR_NODIRATIME as u64, MountFlags::NODIRATIME),
+    ] {
+        if attr_set & bit != 0 {
+            flags = flags.with(flag);
+        }
+        if attr_clr & bit != 0 {
+            flags = flags.without(flag);
+        }
+    }
+    mount.superblock.remount(flags).map_err(|e| e.to_errno())?;
+    mount.set_flags(flags);
+
+    if propagation != 0 {
+        let kind = match propagation as usize {
+            MS_SHARED => vfs::mount::PROP_SHARED,
+            MS_PRIVATE => vfs::mount::PROP_PRIVATE,
+            MS_SLAVE => vfs::mount::PROP_SLAVE,
+            MS_UNBINDABLE => vfs::mount::PROP_UNBINDABLE,
+            _ => return Err(Errno::EINVAL),
+        };
+        vfs::mount::set_mount_propagation(mount, kind);
+    }
+    Ok(())
+}
+
+fn apply_mount_setattr_recursive(
+    mount: &Arc<vfs::mount::Mount>,
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+) -> Result<(), Errno> {
+    apply_mount_setattr_one(mount, attr_set, attr_clr, propagation)?;
+    let children: Vec<Arc<vfs::mount::Mount>> = mount.children.lock().clone();
+    for child in children {
+        apply_mount_setattr_recursive(&child, attr_set, attr_clr, propagation)?;
+    }
+    Ok(())
 }
 
 pub(super) fn sys_quotactl_fd(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -3952,24 +4793,309 @@ pub(super) fn sys_fchmodat2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     Ok(0)
 }
 
-pub(super) fn sys_statmount(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// statmount(2) 的 STATMOUNT_* mask 位（Linux uapi/linux/mount.h）。
+const STATMOUNT_SB_BASIC: u64 = 0x0000_0001;
+const STATMOUNT_MNT_BASIC: u64 = 0x0000_0002;
+const STATMOUNT_MNT_ROOT: u64 = 0x0000_0008;
+const STATMOUNT_MNT_POINT: u64 = 0x0000_0010;
+const STATMOUNT_FS_TYPE: u64 = 0x0000_0020;
+const STATMOUNT_MNT_NS_ID: u64 = 0x0000_0040;
+/// `struct statmount` 固定头大小（字符串区在其后）。
+const STATMOUNT_HEADER_SIZE: usize = 512;
+
+struct MountSnapEntry {
+    mount: Arc<vfs::mount::Mount>,
+    id: u64,
+    parent_id: u64,
 }
 
-pub(super) fn sys_listmount(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// 深度优先（前序）枚举当前命名空间的挂载树，并分配稳定挂载 id（1 起）。
+fn mount_snapshot(vfs_ctx: &Arc<vfs::VfsContext>) -> Vec<MountSnapEntry> {
+    let root = vfs_ctx.mount_ns.root.lock().clone();
+    let mut order: Vec<Arc<vfs::mount::Mount>> = Vec::new();
+    let mut stack = vec![Arc::clone(&root)];
+    while let Some(m) = stack.pop() {
+        order.push(Arc::clone(&m));
+        let children = m.children.lock().clone();
+        for c in children.into_iter().rev() {
+            stack.push(c);
+        }
+    }
+    let mut id_by_ptr: alloc::collections::BTreeMap<usize, u64> =
+        alloc::collections::BTreeMap::new();
+    for (idx, m) in order.iter().enumerate() {
+        id_by_ptr.insert(Arc::as_ptr(m) as usize, idx as u64 + 1);
+    }
+    order
+        .into_iter()
+        .map(|m| {
+            let parent_id = m
+                .location
+                .lock()
+                .parent
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .and_then(|p| id_by_ptr.get(&(Arc::as_ptr(&p) as usize)).copied())
+                .unwrap_or(1);
+            let id = id_by_ptr[&(Arc::as_ptr(&m) as usize)];
+            MountSnapEntry {
+                mount: m,
+                id,
+                parent_id,
+            }
+        })
+        .collect()
 }
 
-pub(super) fn sys_open_tree_attr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+fn mount_flags_to_mount_attr(flags: MountFlags) -> u64 {
+    let mut attr = 0u64;
+    if flags.has(MountFlags::RDONLY) {
+        attr |= MOUNT_ATTR_RDONLY as u64;
+    }
+    if flags.has(MountFlags::NOSUID) {
+        attr |= MOUNT_ATTR_NOSUID as u64;
+    }
+    if flags.has(MountFlags::NODEV) {
+        attr |= MOUNT_ATTR_NODEV as u64;
+    }
+    if flags.has(MountFlags::NOEXEC) {
+        attr |= MOUNT_ATTR_NOEXEC as u64;
+    }
+    if flags.has(MountFlags::NOATIME) {
+        attr |= MOUNT_ATTR_NOATIME as u64;
+    }
+    if flags.has(MountFlags::NODIRATIME) {
+        attr |= MOUNT_ATTR_NODIRATIME as u64;
+    }
+    attr
 }
 
-pub(super) fn sys_file_getattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+fn mount_propagation_to_ms(prop: u32) -> u64 {
+    match prop {
+        vfs::mount::PROP_SHARED => MS_SHARED as u64,
+        vfs::mount::PROP_SLAVE => MS_SLAVE as u64,
+        vfs::mount::PROP_UNBINDABLE => MS_UNBINDABLE as u64,
+        _ => MS_PRIVATE as u64,
+    }
 }
 
-pub(super) fn sys_file_setattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// `statmount(2)`：按挂载 id 查询挂载元数据（最小可用语义）。
+pub(super) fn sys_statmount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let mnt_id = ctx.args[0] as u64;
+    let requested_mask = ctx.args[1] as u64;
+    let buf = ctx.args[2];
+    let bufsize = ctx.args[3];
+    if buf == 0 || bufsize < STATMOUNT_HEADER_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let snapshot = mount_snapshot(&vfs_ctx);
+    let entry = snapshot
+        .iter()
+        .find(|e| e.id == mnt_id)
+        .ok_or(Errno::ENOENT)?;
+    let m = &entry.mount;
+
+    // 字符串区：fs_type 名、挂载根 "/"、挂载点路径。
+    let root_mount = vfs_ctx.mount_ns.root.lock().clone();
+    let visible_root = root_mount.mount_root.clone();
+    let mnt_point = m
+        .mountpoint()
+        .full_path(&visible_root)
+        .unwrap_or_else(|| String::from("?"));
+    let fs_type = m.superblock.fs_type;
+    let mut strs = String::new();
+    let off_fs_type = strs.len();
+    strs.push_str(fs_type);
+    strs.push('\0');
+    let off_point = strs.len();
+    strs.push_str(&mnt_point);
+    strs.push('\0');
+    let total = STATMOUNT_HEADER_SIZE
+        .checked_add(strs.len())
+        .ok_or(Errno::EOVERFLOW)?;
+    if bufsize < total {
+        return Err(Errno::EOVERFLOW);
+    }
+
+    let st = m.superblock.statfs().map_err(|e| e.to_errno())?;
+    let dev = m.superblock.dev_id.unwrap_or_default();
+
+    let mut out = vec![0u8; total];
+    let mask = requested_mask
+        & (STATMOUNT_SB_BASIC
+            | STATMOUNT_MNT_BASIC
+            | STATMOUNT_MNT_ROOT
+            | STATMOUNT_MNT_POINT
+            | STATMOUNT_FS_TYPE
+            | STATMOUNT_MNT_NS_ID);
+    put_u32(&mut out, 0, STATMOUNT_HEADER_SIZE as u32);
+    put_u64(&mut out, 8, mask);
+    put_u32(&mut out, 16, dev.major);
+    put_u32(&mut out, 20, dev.minor);
+    put_u64(&mut out, 24, st.fs_type);
+    put_u64(&mut out, 40, entry.id);
+    put_u64(&mut out, 48, entry.parent_id);
+    put_u64(&mut out, 64, mount_flags_to_mount_attr(m.flags_snapshot()));
+    put_u64(
+        &mut out,
+        72,
+        mount_propagation_to_ms(m.propagation.load(core::sync::atomic::Ordering::Acquire)),
+    );
+    put_u64(
+        &mut out,
+        80,
+        m.peer_group.load(core::sync::atomic::Ordering::Acquire),
+    );
+    put_u64(&mut out, 112, vfs_ctx.mount_ns.id);
+    put_u32(&mut out, 104, off_fs_type as u32);
+    put_u32(&mut out, 108, off_point as u32);
+    put_u32(&mut out, 120, off_fs_type as u32);
+    out[STATMOUNT_HEADER_SIZE..].copy_from_slice(strs.as_bytes());
+    copy_to_user(buf, &out).map_err(|e| e.as_errno())?;
+    Ok(0)
+}
+
+/// `listmount(2)`：枚举命名空间内挂载 id（最小可用语义，忽略筛选参数）。
+pub(super) fn sys_listmount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let last_mnt_id = ctx.args[2] as u64;
+    let list = ctx.args[3];
+    let nr_entries = ctx.args[4];
+    if list == 0 && nr_entries != 0 {
+        return Err(Errno::EFAULT);
+    }
+    let snapshot = mount_snapshot(&vfs_ctx);
+    let ids: Vec<u64> = snapshot
+        .iter()
+        .map(|e| e.id)
+        .filter(|id| *id > last_mnt_id)
+        .take(nr_entries)
+        .collect();
+    let mut raw = vec![0u8; ids.len() * 8];
+    for (i, id) in ids.iter().enumerate() {
+        put_u64(&mut raw, i * 8, *id);
+    }
+    if !raw.is_empty() {
+        copy_to_user(list, &raw).map_err(|e| e.as_errno())?;
+    }
+    Ok(ids.len())
+}
+
+/// `open_tree_attr(2)`：open_tree 的扩展入口。当前内核不处理追加的 mount_attr
+/// 参数，按 open_tree 语义落位（挂载属性通过后续 fsmount/mount_setattr 应用）。
+pub(super) fn sys_open_tree_attr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    open_tree_common(ctx.args[0], ctx.args[1], ctx.args[2] as u32)
+}
+
+// `file_getattr`/`file_setattr`（Linux 6.15+）按 fd 读取/设置扩展文件属性。
+// vendor linux-raw-sys 仅携带 XFS ioctl 的 `struct file_attr`（fa_xflags 等），
+// 未含新 syscall 的 ABI；此处按 Linux 6.15+ 文档的定长头部做 best-effort 映射：
+//   fa_valid(u64) + mode/uid/gid/xflags(u32×4) + size/atime/mtime/ctime(s64+s32)。
+const FILE_ATTR_SIZE: usize = 80;
+const FILE_ATTR_VALID_MODE: u64 = 1 << 0;
+const FILE_ATTR_VALID_UID: u64 = 1 << 1;
+const FILE_ATTR_VALID_GID: u64 = 1 << 2;
+const FILE_ATTR_VALID_XFLAGS: u64 = 1 << 3;
+const FILE_ATTR_VALID_SIZE: u64 = 1 << 4;
+const FILE_ATTR_VALID_ATIME: u64 = 1 << 5;
+const FILE_ATTR_VALID_MTIME: u64 = 1 << 6;
+const FILE_ATTR_VALID_CTIME: u64 = 1 << 7;
+
+pub(super) fn sys_file_getattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let fd = fd_arg(ctx.args[0])?;
+    let fa_user = ctx.args[3];
+    let size = ctx.args[4];
+    if fa_user == 0 || size < FILE_ATTR_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let st = operation::fstat(&fdt, fd).map_err(|e| e.to_errno())?;
+    let mut out = [0u8; FILE_ATTR_SIZE];
+    let valid = FILE_ATTR_VALID_MODE
+        | FILE_ATTR_VALID_UID
+        | FILE_ATTR_VALID_GID
+        | FILE_ATTR_VALID_SIZE
+        | FILE_ATTR_VALID_ATIME
+        | FILE_ATTR_VALID_MTIME
+        | FILE_ATTR_VALID_CTIME;
+    put_u64(&mut out, 0, valid);
+    put_u32(&mut out, 8, st.mode & 0o7777);
+    put_u32(&mut out, 12, st.uid);
+    put_u32(&mut out, 16, st.gid);
+    put_u32(&mut out, 20, 0);
+    put_i64(&mut out, 24, st.size);
+    put_i64(&mut out, 32, st.atime.secs);
+    put_u32(&mut out, 40, st.atime.nsecs);
+    put_i64(&mut out, 48, st.mtime.secs);
+    put_u32(&mut out, 56, st.mtime.nsecs);
+    put_i64(&mut out, 64, st.ctime.secs);
+    put_u32(&mut out, 72, st.ctime.nsecs);
+    copy_to_user(fa_user, &out).map_err(|e| e.as_errno())?;
+    Ok(0)
+}
+
+pub(super) fn sys_file_setattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let fd = fd_arg(ctx.args[0])?;
+    let fa_user = ctx.args[3];
+    let size = ctx.args[4];
+    if fa_user == 0 || size < FILE_ATTR_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let mut raw = [0u8; FILE_ATTR_SIZE];
+    copy_from_user(fa_user, &mut raw).map_err(|e| e.as_errno())?;
+    let valid = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+    if valid
+        & !(FILE_ATTR_VALID_MODE
+            | FILE_ATTR_VALID_UID
+            | FILE_ATTR_VALID_GID
+            | FILE_ATTR_VALID_SIZE
+            | FILE_ATTR_VALID_ATIME
+            | FILE_ATTR_VALID_MTIME)
+        != 0
+    {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if valid & (FILE_ATTR_VALID_MODE | FILE_ATTR_VALID_UID | FILE_ATTR_VALID_GID) != 0 {
+        let mode = FileMode::new(u32::from_le_bytes(raw[8..12].try_into().unwrap()) as u16);
+        let uid = u32::from_le_bytes(raw[12..16].try_into().unwrap());
+        let gid = u32::from_le_bytes(raw[16..20].try_into().unwrap());
+        let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+        if valid & FILE_ATTR_VALID_MODE != 0 {
+            operation::fchmod(&vfs_ctx, &fdt, fd, mode).map_err(|e| e.to_errno())?;
+        }
+        if valid & (FILE_ATTR_VALID_UID | FILE_ATTR_VALID_GID) != 0 {
+            let uid = (valid & FILE_ATTR_VALID_UID != 0).then_some(Uid(uid));
+            let gid = (valid & FILE_ATTR_VALID_GID != 0).then_some(Gid(gid));
+            if uid.is_some() || gid.is_some() {
+                operation::fchown(&vfs_ctx, &fdt, fd, uid, gid).map_err(|e| e.to_errno())?;
+            }
+        }
+        drop(file);
+    }
+    if valid & FILE_ATTR_VALID_SIZE != 0 {
+        let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+        let size = i64::from_le_bytes(raw[24..32].try_into().unwrap());
+        if size < 0 {
+            return Err(Errno::EINVAL);
+        }
+        file.truncate(size as u64).map_err(|e| e.to_errno())?;
+    }
+    if valid & (FILE_ATTR_VALID_ATIME | FILE_ATTR_VALID_MTIME) != 0 {
+        let atime = (valid & FILE_ATTR_VALID_ATIME != 0).then(|| Timespec {
+            secs: i64::from_le_bytes(raw[32..40].try_into().unwrap()),
+            nsecs: u32::from_le_bytes(raw[40..44].try_into().unwrap()),
+        });
+        let mtime = (valid & FILE_ATTR_VALID_MTIME != 0).then(|| Timespec {
+            secs: i64::from_le_bytes(raw[48..56].try_into().unwrap()),
+            nsecs: u32::from_le_bytes(raw[56..60].try_into().unwrap()),
+        });
+        operation::futimens(&vfs_ctx, &fdt, fd, atime, mtime).map_err(|e| e.to_errno())?;
+    }
+    Ok(0)
 }
 
 fn timeout_deadline(timeout_ms: i64) -> Option<u64> {
@@ -4582,7 +5708,7 @@ fn validate_openat2_flags(raw: usize) -> Result<(), Errno> {
 }
 
 fn write_from_user(file: &vfs::file::File, user: usize, len: usize) -> Result<usize, Errno> {
-    write_from_user_at(file, user, len, None)
+    write_from_user_at(file, user, len, None, false)
 }
 
 struct InetStreamWriteBatch<'a> {
@@ -4605,19 +5731,22 @@ fn write_from_user_at(
     user: usize,
     len: usize,
     offset: Option<u64>,
+    nowait: bool,
 ) -> Result<usize, Errno> {
     if len == 0 {
         return Ok(0);
     }
     check_direct_alignment(file, user, offset, len)?;
     let Some(vm) = current_vm_space() else {
-        return write_from_user_at_fallback(file, user, len, offset);
+        return write_from_user_at_fallback(file, user, len, offset, nowait);
     };
     if offset.is_none()
         && let Some(socket) = inet_stream_file(file)
     {
         let _batch = InetStreamWriteBatch { socket };
-        return send_inet_stream_file_from_user(&vm, file, socket, user, len, 0);
+        // RWF_NOWAIT 映射为 MSG_DONTWAIT，让流式 socket 快速路径同样非阻塞。
+        let flags = if nowait { vfs_socket::MSG_DONTWAIT } else { 0 };
+        return send_inet_stream_file_from_user(&vm, file, socket, user, len, flags);
     }
 
     let mut remaining = len;
@@ -4634,7 +5763,9 @@ fn write_from_user_at(
         let (n, window_len) = match result {
             Ok(Ok(pair)) => pair,
             Ok(Err(VfsError::WouldBlock)) if written > 0 => return Ok(written),
-            Ok(Err(VfsError::WouldBlock)) if file.flags().nonblock => return Err(Errno::EAGAIN),
+            Ok(Err(VfsError::WouldBlock)) if nowait || file.flags().nonblock => {
+                return Err(Errno::EAGAIN);
+            }
             Ok(Err(VfsError::WouldBlock)) => {
                 wait_for_file_readiness(file, PollEvents::POLLOUT)?;
                 continue;
@@ -4674,6 +5805,7 @@ fn write_from_user_at_fallback(
     user: usize,
     len: usize,
     offset: Option<u64>,
+    nowait: bool,
 ) -> Result<usize, Errno> {
     check_direct_alignment(file, user, offset, len)?;
     let mut remaining = len;
@@ -4693,7 +5825,9 @@ fn write_from_user_at_fallback(
         let n = match file_write_user_chunk(file, offset, pos, &tmp[..chunk]) {
             Ok(n) => n,
             Err(VfsError::WouldBlock) if written > 0 => return Ok(written),
-            Err(VfsError::WouldBlock) if file.flags().nonblock => return Err(Errno::EAGAIN),
+            Err(VfsError::WouldBlock) if nowait || file.flags().nonblock => {
+                return Err(Errno::EAGAIN);
+            }
             Err(VfsError::WouldBlock) => {
                 wait_for_file_readiness(file, PollEvents::POLLOUT)?;
                 continue;
@@ -4758,20 +5892,23 @@ fn read_to_user(
     user: usize,
     len: usize,
     offset: Option<u64>,
+    nowait: bool,
 ) -> Result<usize, Errno> {
     if len == 0 {
         return Ok(0);
     }
     let Some(vm) = current_vm_space() else {
-        return read_to_user_fallback(file, user, len, offset);
+        return read_to_user_fallback(file, user, len, offset, nowait);
     };
     if offset.is_none()
         && let Some(socket) = inet_stream_file(file)
     {
         let _batch = InetStreamFileReceiveBatch { socket };
-        return recv_inet_stream_file_to_user(&vm, file, socket, user, len, 0);
+        // RWF_NOWAIT 映射为 MSG_DONTWAIT，让流式 socket 快速路径同样非阻塞。
+        let flags = if nowait { vfs_socket::MSG_DONTWAIT } else { 0 };
+        return recv_inet_stream_file_to_user(&vm, file, socket, user, len, flags);
     }
-    read_to_user_windows(&vm, file, user, len, offset)
+    read_to_user_windows(&vm, file, user, len, offset, nowait)
 }
 
 fn read_to_user_windows(
@@ -4780,6 +5917,7 @@ fn read_to_user_windows(
     user: usize,
     len: usize,
     offset: Option<u64>,
+    nowait: bool,
 ) -> Result<usize, Errno> {
     check_direct_alignment(file, user, offset, len)?;
     let mut remaining = len;
@@ -4796,7 +5934,9 @@ fn read_to_user_windows(
         let (n, window_len) = match result {
             Ok(Ok(pair)) => pair,
             Ok(Err(VfsError::WouldBlock)) if read > 0 => return Ok(read),
-            Ok(Err(VfsError::WouldBlock)) if file.flags().nonblock => return Err(Errno::EAGAIN),
+            Ok(Err(VfsError::WouldBlock)) if nowait || file.flags().nonblock => {
+                return Err(Errno::EAGAIN);
+            }
             Ok(Err(VfsError::WouldBlock)) => {
                 wait_for_file_readiness(file, PollEvents::POLLIN)?;
                 continue;
@@ -4825,6 +5965,7 @@ fn read_to_user_fallback(
     user: usize,
     len: usize,
     offset: Option<u64>,
+    nowait: bool,
 ) -> Result<usize, Errno> {
     check_direct_alignment(file, user, offset, len)?;
     let mut remaining = len;
@@ -4841,7 +5982,9 @@ fn read_to_user_fallback(
         } {
             Ok(n) => n,
             Err(VfsError::WouldBlock) if read > 0 => return Ok(read),
-            Err(VfsError::WouldBlock) if file.flags().nonblock => return Err(Errno::EAGAIN),
+            Err(VfsError::WouldBlock) if nowait || file.flags().nonblock => {
+                return Err(Errno::EAGAIN);
+            }
             Err(VfsError::WouldBlock) => {
                 wait_for_file_readiness(file, PollEvents::POLLIN)?;
                 continue;
@@ -5010,6 +6153,7 @@ fn write_iovecs(
     iov: usize,
     iovcnt: usize,
     mut offset: Option<u64>,
+    nowait: bool,
 ) -> Result<usize, Errno> {
     let mut total = 0usize;
     for i in 0..iovcnt {
@@ -5018,7 +6162,7 @@ fn write_iovecs(
         if len != 0 && current_offset.is_none() {
             ensure_network_execution_scope_for_file(ctx, file);
         }
-        match write_from_user_at(file, base, len, current_offset) {
+        match write_from_user_at(file, base, len, current_offset, nowait) {
             Ok(n) => {
                 total = total.checked_add(n).ok_or(Errno::EINVAL)?;
                 if let Some(pos) = offset.as_mut() {
@@ -5041,6 +6185,7 @@ fn read_iovecs(
     iov: usize,
     iovcnt: usize,
     mut offset: Option<u64>,
+    nowait: bool,
 ) -> Result<usize, Errno> {
     let mut total = 0usize;
     for i in 0..iovcnt {
@@ -5049,7 +6194,7 @@ fn read_iovecs(
         if len != 0 && current_offset.is_none() {
             ensure_network_execution_scope_for_file(ctx, file);
         }
-        match read_to_user(file, base, len, current_offset) {
+        match read_to_user(file, base, len, current_offset, nowait) {
             Ok(n) => {
                 total = total.checked_add(n).ok_or(Errno::EINVAL)?;
                 if let Some(pos) = offset.as_mut() {
@@ -5474,12 +6619,32 @@ fn write_linux_stat(user: usize, st: &FileStat) -> Result<(), Errno> {
     copy_to_user(user, &out).map_err(|e| e.as_errno())
 }
 
-fn write_linux_statx(user: usize, st: &FileStat) -> Result<(), Errno> {
+fn write_linux_statx(
+    user: usize,
+    st: &FileStat,
+    mnt_id: u64,
+    dio_mem_align: u32,
+    dio_offset_align: u32,
+    requested_mask: u32,
+) -> Result<(), Errno> {
     let mut out = [0u8; 256];
     let rdev = statx_dev_components(st.rdev);
     let dev = statx_dev_components(st.dev);
-    put_u32(&mut out, 0, STATX_BASIC_STATS);
+    // 可回报字段 = 基本统计 + btime（用 ctime 近似，VFS 无 crtime）+ mnt_id +
+    // DIO 对齐（仅后端支持直接 I/O 时）。mask=0 按 Linux 语义等价 STATX_BASIC_STATS。
+    let mut report_mask = STATX_BASIC_STATS | STATX_BTIME | STATX_MNT_ID;
+    if dio_mem_align != 0 {
+        report_mask |= STATX_DIOALIGN;
+    }
+    let effective_mask = if requested_mask == 0 {
+        STATX_BASIC_STATS
+    } else {
+        requested_mask
+    } & report_mask;
+    put_u32(&mut out, 0, effective_mask);
     put_u32(&mut out, 4, st.blksize);
+    // stx_attributes / stx_attributes_mask：本 VFS 不追踪 inode 属性标志
+    // （IMMUTABLE/APPEND/COMPRESSED 等），按 Linux 语义置 0。
     put_u64(&mut out, 8, 0);
     put_u32(&mut out, 16, st.nlink);
     put_u32(&mut out, 20, st.uid);
@@ -5490,12 +6655,16 @@ fn write_linux_statx(user: usize, st: &FileStat) -> Result<(), Errno> {
     put_u64(&mut out, 48, st.blocks);
     put_u64(&mut out, 56, 0);
     put_statx_timestamp(&mut out, 64, st.atime);
+    put_statx_timestamp(&mut out, 80, st.ctime);
     put_statx_timestamp(&mut out, 96, st.ctime);
     put_statx_timestamp(&mut out, 112, st.mtime);
     put_u32(&mut out, 128, rdev.major);
     put_u32(&mut out, 132, rdev.minor);
     put_u32(&mut out, 136, dev.major);
     put_u32(&mut out, 140, dev.minor);
+    put_u64(&mut out, 144, mnt_id);
+    put_u32(&mut out, 152, dio_mem_align);
+    put_u32(&mut out, 156, dio_offset_align);
     copy_to_user(user, &out).map_err(|e| e.as_errno())
 }
 
@@ -5693,6 +6862,7 @@ fn fcntl_getlk(
     ctx: &SyscallContext<'_>,
     file: &vfs::file::File,
     flock_user: usize,
+    ofd: bool,
 ) -> Result<usize, Errno> {
     let raw = LinuxFlock::read(flock_user)?;
     let lock_type = linux_flock_type(raw.lock_type)?;
@@ -5702,19 +6872,25 @@ fn fcntl_getlk(
     let mut raw = raw;
     let req =
         vfs::record_lock::request_from_parts(file, lock_type, raw.whence, raw.start, raw.len)?;
-    let owner_pid = record_lock_owner_pid(ctx);
     if req.lock_type == vfs::record_lock::RecordLockType::Unlock {
         raw.lock_type = F_UNLCK;
         raw.write(flock_user)?;
         return Ok(0);
     }
-    if let Some(conflict) = vfs::record_lock::getlk(file, owner_pid, req) {
+    let conflict = if ofd {
+        // OFD owner 用打开文件描述的地址标识；`&File` 地址与 `Arc::as_ptr` 一致。
+        vfs::record_lock::getlk_ofd(file, file as *const _ as usize, req)
+    } else {
+        vfs::record_lock::getlk(file, record_lock_owner_pid(ctx), req)
+    };
+    if let Some(conflict) = conflict {
         let conflict = vfs::record_lock::clipped_conflict(conflict, &req);
         raw.lock_type = linux_flock_type_raw(conflict.lock_type);
         raw.whence = 0;
         raw.start = conflict.start as i64;
         raw.len = vfs::record_lock::len_from_range(conflict.start, conflict.end) as i64;
-        raw.pid = conflict.owner_pid;
+        // F_OFD_GETLK 恒返回 l_pid = -1（owner 为打开文件描述而非进程）。
+        raw.pid = if ofd { -1 } else { conflict.owner_pid };
     } else {
         raw.lock_type = F_UNLCK;
     }
@@ -5727,6 +6903,7 @@ fn fcntl_setlk(
     file: &vfs::file::File,
     flock_user: usize,
     wait: bool,
+    ofd: bool,
 ) -> Result<usize, Errno> {
     let raw = LinuxFlock::read(flock_user)?;
     let lock_type = linux_flock_type(raw.lock_type)?;
@@ -5736,7 +6913,11 @@ fn fcntl_setlk(
     let req =
         vfs::record_lock::request_from_parts(file, lock_type, raw.whence, raw.start, raw.len)?;
     validate_record_lock_access(file, &req)?;
-    vfs::record_lock::setlk(file, record_lock_owner_pid(ctx), req, wait)?;
+    if ofd {
+        vfs::record_lock::setlk_ofd(file, file as *const _ as usize, req, wait)?;
+    } else {
+        vfs::record_lock::setlk(file, record_lock_owner_pid(ctx), req, wait)?;
+    }
     Ok(0)
 }
 

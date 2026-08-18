@@ -73,6 +73,9 @@ impl RawInode {
     pub fn set_mtime(&mut self, value: Timespec) {
         self.set_time(16, 0x88, value);
     }
+    pub fn set_crtime(&mut self, value: Timespec) {
+        self.set_time(0x90, 0x94, value);
+    }
     pub fn nlink(&self) -> u16 {
         u16::from_le_bytes([self.bytes[26], self.bytes[27]])
     }

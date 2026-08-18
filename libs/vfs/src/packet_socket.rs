@@ -110,9 +110,7 @@ struct FanoutRegistry {
     groups: Vec<FanoutGroupRef>,
 }
 
-static FANOUT_REGISTRY: Mutex<FanoutRegistry> = Mutex::new(FanoutRegistry {
-    groups: Vec::new(),
-});
+static FANOUT_REGISTRY: Mutex<FanoutRegistry> = Mutex::new(FanoutRegistry { groups: Vec::new() });
 
 // ── socket 注册表（接收投递用）─────────────────────────────────────────────
 //
@@ -231,7 +229,11 @@ impl PacketSocketFileOps {
     }
 
     fn set_protocol(&self, protocol: u16) {
-        unsafe { core::ptr::addr_of!(self.protocol).cast_mut().write(protocol) };
+        unsafe {
+            core::ptr::addr_of!(self.protocol)
+                .cast_mut()
+                .write(protocol)
+        };
     }
 
     fn set_bound_ifindex(&self, interface: Option<net::InterfaceId>) {
@@ -253,9 +255,7 @@ impl PacketSocketFileOps {
 
     /// 发送一帧。SOCK_RAW 期望完整以太网帧；SOCK_DGRAM 期望 IP 报文（内核补头）。
     pub fn sendto(&self, data: &[u8], dest: &[u8]) -> Result<usize, Errno> {
-        let handler = PACKET_TX_HANDLER
-            .lock()
-            .ok_or(Errno::EOPNOTSUPP)?;
+        let handler = PACKET_TX_HANDLER.lock().ok_or(Errno::EOPNOTSUPP)?;
         let interface = self.bound_ifindex.ok_or(Errno::EDESTADDRREQ)?;
         let frame = if self.sock_raw {
             if data.len() < 14 {
@@ -456,7 +456,11 @@ impl PacketSocketFileOps {
     }
 
     fn set_promiscuous(&self, enabled: bool) {
-        unsafe { core::ptr::addr_of!(self.promiscuous).cast_mut().write(enabled) };
+        unsafe {
+            core::ptr::addr_of!(self.promiscuous)
+                .cast_mut()
+                .write(enabled)
+        };
     }
 
     fn set_allmulti(&self, enabled: bool) {
@@ -482,12 +486,20 @@ impl PacketSocketFileOps {
         {
             {
                 let mut group = group.lock();
-                if !group.members.iter().any(|member| member.0 == self as *const _) {
-                    group.members.push(NetlinkSocketPtr(self as *const PacketSocketFileOps));
+                if !group
+                    .members
+                    .iter()
+                    .any(|member| member.0 == self as *const _)
+                {
+                    group
+                        .members
+                        .push(NetlinkSocketPtr(self as *const PacketSocketFileOps));
                 }
             }
             unsafe {
-                core::ptr::addr_of!(self.fanout).cast_mut().write(Some((group_id, group)));
+                core::ptr::addr_of!(self.fanout)
+                    .cast_mut()
+                    .write(Some((group_id, group)));
             }
             return Ok(());
         }
@@ -594,7 +606,10 @@ impl FileOps for PacketSocketFileOps {
             .lock()
             .retain(|entry| entry.0 != self as *const PacketSocketFileOps);
         if let Some((_, group)) = self.fanout.as_ref().cloned() {
-            group.lock().members.retain(|member| member.0 != self as *const _);
+            group
+                .lock()
+                .members
+                .retain(|member| member.0 != self as *const _);
         }
     }
 
@@ -610,7 +625,10 @@ impl Drop for PacketSocketFileOps {
             .lock()
             .retain(|entry| entry.0 != self as *const PacketSocketFileOps);
         if let Some((_, group)) = self.fanout.as_ref().cloned() {
-            group.lock().members.retain(|member| member.0 != self as *const _);
+            group
+                .lock()
+                .members
+                .retain(|member| member.0 != self as *const _);
         }
     }
 }
@@ -678,9 +696,8 @@ pub fn packet_socket_deliver(
     for entry in registry.iter() {
         // Safety: 表锁持有期间没有并发 release 出表（release 也持同一把锁）。
         let socket = unsafe { &*entry.0 };
-        let protocol_matches = socket.protocol == ETH_P_ALL
-            || socket.protocol == 0
-            || socket.protocol == ethertype;
+        let protocol_matches =
+            socket.protocol == ETH_P_ALL || socket.protocol == 0 || socket.protocol == ethertype;
         if !protocol_matches {
             continue;
         }
@@ -730,11 +747,17 @@ mod tests {
             PACKET_MULTICAST
         );
         assert_eq!(
-            frame_pkttype(&frame([0x02, 0, 0, 0, 0, 1], ETH_P_IP), [0x02, 0, 0, 0, 0, 1]),
+            frame_pkttype(
+                &frame([0x02, 0, 0, 0, 0, 1], ETH_P_IP),
+                [0x02, 0, 0, 0, 0, 1]
+            ),
             PACKET_HOST
         );
         assert_eq!(
-            frame_pkttype(&frame([0x02, 0, 0, 0, 0, 2], ETH_P_IP), [0x02, 0, 0, 0, 0, 1]),
+            frame_pkttype(
+                &frame([0x02, 0, 0, 0, 0, 2], ETH_P_IP),
+                [0x02, 0, 0, 0, 0, 1]
+            ),
             PACKET_OTHERHOST
         );
     }
@@ -744,12 +767,7 @@ mod tests {
         let socket = create_packet_socket(ETH_P_IP, true, true);
         socket.set_bound_ifindex(Some(net::InterfaceId(2)));
         let ip_frame = frame(LOCAL_MAC, ETH_P_IP);
-        let delivered = packet_socket_deliver(
-            net::InterfaceId(2),
-            ETH_P_IP,
-            &ip_frame,
-            LOCAL_MAC,
-        );
+        let delivered = packet_socket_deliver(net::InterfaceId(2), ETH_P_IP, &ip_frame, LOCAL_MAC);
         // 并行测试可能命中其他 socket；断言自身收到帧即可。
         assert!(delivered >= 1);
         let mut buf = [0u8; 64];
@@ -761,12 +779,7 @@ mod tests {
     fn deliver_rejects_other_ethertype() {
         let socket = create_packet_socket(ETH_P_IP, true, true);
         let arp_frame = frame(LOCAL_MAC, ETH_P_ARP);
-        let _ = packet_socket_deliver(
-            net::InterfaceId(1),
-            ETH_P_ARP,
-            &arp_frame,
-            LOCAL_MAC,
-        );
+        let _ = packet_socket_deliver(net::InterfaceId(1), ETH_P_ARP, &arp_frame, LOCAL_MAC);
         // 本 socket 绑定 ETH_P_IP，不应收到 ARP 帧（并行测试的
         // ETH_P_ALL socket 可能命中，但与本 socket 无关）。
         let mut buf = [0u8; 64];
@@ -780,20 +793,10 @@ mod tests {
     fn otherhost_requires_promiscuous() {
         let socket = create_packet_socket(ETH_P_ALL, true, true);
         let foreign = frame([0x02, 0, 0, 0, 0, 2], ETH_P_IP);
-        let delivered = packet_socket_deliver(
-            net::InterfaceId(1),
-            ETH_P_IP,
-            &foreign,
-            LOCAL_MAC,
-        );
+        let delivered = packet_socket_deliver(net::InterfaceId(1), ETH_P_IP, &foreign, LOCAL_MAC);
         assert_eq!(delivered, 0);
         socket.set_promiscuous(true);
-        let delivered = packet_socket_deliver(
-            net::InterfaceId(1),
-            ETH_P_IP,
-            &foreign,
-            LOCAL_MAC,
-        );
+        let delivered = packet_socket_deliver(net::InterfaceId(1), ETH_P_IP, &foreign, LOCAL_MAC);
         assert_eq!(delivered, 1);
     }
 
@@ -825,21 +828,36 @@ mod tests {
     fn filter_attached_drops_matching_frames() {
         // 过滤器：拒绝 type == 0x0800 的帧。
         let program = net::bpf::CbpfProgram::compile(vec![
-            net::bpf::CbpfInsn { code: 0x28, jt: 0, jf: 0, k: 12 },
-            net::bpf::CbpfInsn { code: 0x15, jt: 0, jf: 1, k: 0x0800 },
-            net::bpf::CbpfInsn { code: 0x06, jt: 0, jf: 0, k: 0 },
-            net::bpf::CbpfInsn { code: 0x06, jt: 0, jf: 0, k: 0xffff },
+            net::bpf::CbpfInsn {
+                code: 0x28,
+                jt: 0,
+                jf: 0,
+                k: 12,
+            },
+            net::bpf::CbpfInsn {
+                code: 0x15,
+                jt: 0,
+                jf: 1,
+                k: 0x0800,
+            },
+            net::bpf::CbpfInsn {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            net::bpf::CbpfInsn {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: 0xffff,
+            },
         ])
         .unwrap();
         let socket = create_packet_socket(ETH_P_IP, true, true);
         socket.attach_filter(program).unwrap();
         let ip_frame = frame(LOCAL_MAC, ETH_P_IP);
-        let delivered = packet_socket_deliver(
-            net::InterfaceId(1),
-            ETH_P_IP,
-            &ip_frame,
-            LOCAL_MAC,
-        );
+        let delivered = packet_socket_deliver(net::InterfaceId(1), ETH_P_IP, &ip_frame, LOCAL_MAC);
         // 帧被 filter 丢弃：即使有投递命中，本 socket 也收不到。
         let _ = delivered;
         let mut buf = [0u8; 64];
@@ -851,9 +869,12 @@ mod tests {
 
     #[test]
     fn detach_filter_restores_delivery() {
-        let program = net::bpf::CbpfProgram::compile(vec![
-            net::bpf::CbpfInsn { code: 0x06, jt: 0, jf: 0, k: 0 },
-        ])
+        let program = net::bpf::CbpfProgram::compile(vec![net::bpf::CbpfInsn {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        }])
         .unwrap();
         let socket = create_packet_socket(ETH_P_ALL, true, true);
         socket.attach_filter(program).unwrap();
@@ -871,17 +892,17 @@ mod tests {
 
     #[test]
     fn lock_filter_blocks_reattach() {
-        let program = net::bpf::CbpfProgram::compile(vec![
-            net::bpf::CbpfInsn { code: 0x06, jt: 0, jf: 0, k: 0xffff },
-        ])
+        let program = net::bpf::CbpfProgram::compile(vec![net::bpf::CbpfInsn {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: 0xffff,
+        }])
         .unwrap();
         let socket = create_packet_socket(ETH_P_ALL, true, true);
         socket.attach_filter(program.clone()).unwrap();
         socket.lock_filter().unwrap();
-        assert_eq!(
-            socket.attach_filter(program.clone()),
-            Err(Errno::EPERM)
-        );
+        assert_eq!(socket.attach_filter(program.clone()), Err(Errno::EPERM));
         assert_eq!(socket.detach_filter(), Err(Errno::EPERM));
     }
 }

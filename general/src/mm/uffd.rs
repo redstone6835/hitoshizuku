@@ -8,8 +8,10 @@
 //! - 用户态 `read()` 事件、执行 `UFFDIO_COPY` / `UFFDIO_ZEROPAGE` /
 //!   `UFFDIO_WRITEPROTECT` 解决缺页后，被挂起的任务被唤醒并重试访问。
 //!
-//! 本实现覆盖匿名私有映射的 MISSING 与 WP 两种模式；shmem/hugetlb/file 区域
-//! 在 `UFFDIO_REGISTER` 时返回 `EINVAL`（与不支持这些后端的 Linux 行为一致）。
+//! 本实现覆盖匿名私有映射的 MISSING、WP 与 MINOR 三种模式；shmem/hugetlb/file
+//! 区域在 `UFFDIO_REGISTER` 时返回 `EINVAL`（与不支持这些后端的 Linux 行为一致）。
+//! MINOR 模式的 `UFFDIO_CONTINUE` 因无共享页缓存而退化为对非驻留页安装零页
+//! （见 [`crate::mm::vm_space::VmSpace::uffd_continue`] 的说明）。
 //! 挂起采用 [`WaitQueue::wait_event`]，语义上近似 Linux 的 TASK_KILLABLE：
 //! 普通信号不打断等待，但 fd 关闭/注销会唤醒等待者并让其退回普通缺页路径。
 //!
@@ -51,6 +53,7 @@ const NR_WAKE: u64 = 0x02;
 const NR_COPY: u64 = 0x03;
 const NR_ZEROPAGE: u64 = 0x04;
 const NR_WRITEPROTECT: u64 = 0x05;
+const NR_CONTINUE: u64 = 0x06;
 const NR_API: u64 = 0x3F;
 
 /// 组装 Linux `_IOWR(type, nr, size)` ioctl 命令字。
@@ -70,6 +73,7 @@ pub const UFFDIO_WAKE: usize = iow(NR_WAKE, 16);
 pub const UFFDIO_COPY: usize = iowr(NR_COPY, 40);
 pub const UFFDIO_ZEROPAGE: usize = iowr(NR_ZEROPAGE, 32);
 pub const UFFDIO_WRITEPROTECT: usize = iowr(NR_WRITEPROTECT, 24);
+pub const UFFDIO_CONTINUE: usize = iowr(NR_CONTINUE, 32);
 
 /// ioctls 位掩码（按 nr 位）。
 const BIT_REGISTER: u64 = 1 << NR_REGISTER;
@@ -78,8 +82,10 @@ const BIT_WAKE: u64 = 1 << NR_WAKE;
 const BIT_COPY: u64 = 1 << NR_COPY;
 const BIT_ZEROPAGE: u64 = 1 << NR_ZEROPAGE;
 const BIT_WRITEPROTECT: u64 = 1 << NR_WRITEPROTECT;
+const BIT_CONTINUE: u64 = 1 << NR_CONTINUE;
 
-pub const UFFD_API_RANGE_IOCTLS: u64 = BIT_WAKE | BIT_COPY | BIT_ZEROPAGE | BIT_WRITEPROTECT;
+pub const UFFD_API_RANGE_IOCTLS: u64 =
+    BIT_WAKE | BIT_COPY | BIT_ZEROPAGE | BIT_WRITEPROTECT | BIT_CONTINUE;
 pub const UFFD_API_REGISTER_IOCTLS: u64 = UFFD_API_RANGE_IOCTLS | BIT_UNREGISTER;
 pub const UFFD_API_IOCTLS: u64 = UFFD_API_REGISTER_IOCTLS | BIT_REGISTER;
 
@@ -87,7 +93,8 @@ pub const UFFD_API_IOCTLS: u64 = UFFD_API_REGISTER_IOCTLS | BIT_REGISTER;
 pub(crate) const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
 pub(crate) const UFFDIO_REGISTER_MODE_WP: u64 = 1 << 1;
 pub const UFFDIO_REGISTER_MODE_MINOR: u64 = 1 << 2;
-const REGISTER_MODES_SUPPORTED: u64 = UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP;
+const REGISTER_MODES_SUPPORTED: u64 =
+    UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP | UFFDIO_REGISTER_MODE_MINOR;
 
 /// `UFFDIO_COPY` 模式位。
 const UFFDIO_COPY_MODE_DONTWAKE: u64 = 1 << 0;
@@ -103,7 +110,7 @@ const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 /// `uffd_msg.pagefault.flags` 取值。
 pub(crate) const UFFD_PAGEFAULT_FLAG_WRITE: u64 = 1;
 pub(crate) const UFFD_PAGEFAULT_FLAG_WP: u64 = 1 << 1;
-const UFFD_PAGEFAULT_FLAG_MINOR: u64 = 1 << 2;
+pub(crate) const UFFD_PAGEFAULT_FLAG_MINOR: u64 = 1 << 2;
 
 /// 缺页事件消息（Linux `struct uffd_msg`，32 字节）。
 #[derive(Debug, Clone, Copy)]
@@ -402,6 +409,25 @@ impl UffdFileOps {
         Ok(0)
     }
 
+    fn ioctl_continue(&self, vm: &Arc<VmSpace>, arg: usize) -> Result<usize, Errno> {
+        // struct uffdio_continue { range {start,len}, mode, mapped } —— 32 字节。
+        let mut raw = [0u8; 32];
+        crate::mm::copy_from_user(arg, &mut raw).map_err(|e| e.as_errno())?;
+        let start = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+        let len = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        let mode = u64::from_le_bytes(raw[16..24].try_into().unwrap());
+        if mode != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let start_usize = usize::try_from(start).map_err(|_| Errno::EINVAL)?;
+        let len_usize = usize::try_from(len).map_err(|_| Errno::EINVAL)?;
+        let installed = vm.uffd_continue(start_usize, len_usize)?;
+        raw[24..32].copy_from_slice(&(installed as i64).to_le_bytes());
+        crate::mm::copy_to_user(arg, &raw).map_err(|e| e.as_errno())?;
+        self.state.wake_all();
+        Ok(0)
+    }
+
     fn ioctl_writeprotect(&self, vm: &Arc<VmSpace>, arg: usize) -> Result<usize, Errno> {
         // struct uffdio_writeprotect { range {start,len}, mode } —— 24 字节。
         let mut raw = [0u8; 24];
@@ -437,8 +463,8 @@ impl UffdFileOps {
     ) -> Result<Arc<VmSpace>, Errno> {
         match cmd {
             UFFDIO_REGISTER | UFFDIO_UNREGISTER => Ok(Arc::clone(caller)),
-            UFFDIO_COPY | UFFDIO_ZEROPAGE | UFFDIO_WRITEPROTECT => {
-                // 三种结构体的首 8 字节都是目标地址（dst / range.start）。
+            UFFDIO_COPY | UFFDIO_ZEROPAGE | UFFDIO_WRITEPROTECT | UFFDIO_CONTINUE => {
+                // 这些结构体的首 8 字节都是目标地址（dst / range.start）。
                 let mut raw = [0u8; 8];
                 crate::mm::copy_from_user(arg, &mut raw).map_err(|e| e.as_errno())?;
                 let start = u64::from_le_bytes(raw);
@@ -517,7 +543,7 @@ impl FileOps for UffdFileOps {
         match raw_cmd {
             UFFDIO_API => self.ioctl_api(arg),
             UFFDIO_REGISTER | UFFDIO_UNREGISTER | UFFDIO_COPY | UFFDIO_ZEROPAGE
-            | UFFDIO_WRITEPROTECT | UFFDIO_WAKE => {
+            | UFFDIO_WRITEPROTECT | UFFDIO_CONTINUE | UFFDIO_WAKE => {
                 // Linux：未完成 API 握手前其它 ioctl 一律 EINVAL。
                 if !self.state.api_handshake_done() {
                     return Err(Errno::EINVAL);
@@ -533,6 +559,7 @@ impl FileOps for UffdFileOps {
                     UFFDIO_COPY => self.ioctl_copy(&vm, arg),
                     UFFDIO_ZEROPAGE => self.ioctl_zeropage(&vm, arg),
                     UFFDIO_WRITEPROTECT => self.ioctl_writeprotect(&vm, arg),
+                    UFFDIO_CONTINUE => self.ioctl_continue(&vm, arg),
                     _ => unreachable!(),
                 }
             }
@@ -590,13 +617,14 @@ mod tests {
         assert_eq!(UFFDIO_COPY, 0xC028_AA03);
         assert_eq!(UFFDIO_ZEROPAGE, 0xC020_AA04);
         assert_eq!(UFFDIO_WRITEPROTECT, 0xC018_AA05);
+        assert_eq!(UFFDIO_CONTINUE, 0xC020_AA06);
     }
 
     #[test]
     fn ioctl_masks_match_linux_uapi() {
-        assert_eq!(UFFD_API_RANGE_IOCTLS, 0x3C); // (1<<2)|(1<<3)|(1<<4)|(1<<5)
-        assert_eq!(UFFD_API_REGISTER_IOCTLS, 0x3E); // | (1<<1) UNREGISTER
-        assert_eq!(UFFD_API_IOCTLS, 0x3F); // | (1<<0) REGISTER
+        assert_eq!(UFFD_API_RANGE_IOCTLS, 0x7C); // (1<<2..=6)
+        assert_eq!(UFFD_API_REGISTER_IOCTLS, 0x7E); // | (1<<1) UNREGISTER
+        assert_eq!(UFFD_API_IOCTLS, 0x7F); // | (1<<0) REGISTER
     }
 
     #[test]

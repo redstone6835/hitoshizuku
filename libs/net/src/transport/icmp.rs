@@ -358,13 +358,7 @@ fn handle_icmpv6(
     // 用于解析待发送队列（ping6 等目标在链路本地时依赖 NS/NA 交换）。
     if icmp[0] == 136 {
         return handle_neighbor_advertisement(
-            packet,
-            offset,
-            len,
-            interface,
-            config,
-            neighbors,
-            now_ns,
+            packet, offset, len, interface, config, neighbors, now_ns,
         );
     }
     if icmp[0] != 128 {
@@ -816,14 +810,16 @@ mod tests {
             1_000_000,
         );
         assert!(matches!(result, ControlPacketResult::Consumed(_)));
-        assert!(neighbors
-            .lookup(
-                NeighborKey {
-                    interface: InterfaceId(1),
-                    address: IpAddr::V6(local),
-                },
-                1_100_000,
-            )
-            .is_none());
+        assert!(
+            neighbors
+                .lookup(
+                    NeighborKey {
+                        interface: InterfaceId(1),
+                        address: IpAddr::V6(local),
+                    },
+                    1_100_000,
+                )
+                .is_none()
+        );
     }
 }

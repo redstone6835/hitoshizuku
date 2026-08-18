@@ -181,7 +181,8 @@ pub fn setxattr(
             if let Ok(acl) = crate::acl::parse(&bytes) {
                 if let Some(mask_perm) = crate::acl::mask_to_mode_group(&acl) {
                     let meta = inode.meta_snapshot();
-                    let new_mode = crate::vfs::stat::FileMode((meta.mode.0 & !0o070) | (mask_perm << 3));
+                    let new_mode =
+                        crate::vfs::stat::FileMode((meta.mode.0 & !0o070) | (mask_perm << 3));
                     let _ = inode.ops.chmod(inode, new_mode);
                 }
             }

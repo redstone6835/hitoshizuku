@@ -24,6 +24,7 @@ use crate::dir::{self, ATTR_ARCHIVE, ATTR_DIRECTORY, DirBacking, DirEntryView};
 use crate::file::{DirFileOps, RegFileOps};
 use crate::state::FsState;
 use crate::sync_layer::backend_to_vfs;
+use crate::time::{FatTimestamp, fat_to_timespec};
 
 /// 目录 inode 在父目录里的"位置"信息(允许后续修改其大小/簇等)。
 #[derive(Debug, Clone, Copy)]
@@ -78,7 +79,12 @@ fn build_inode_for_entry(
     sb: &Arc<vfs::superblock::Superblock>,
     entry: &DirEntryView,
 ) -> Arc<Inode> {
-    let now = Timespec::ZERO;
+    // FAT 目录项只有创建/修改/访问三组时间,没有独立的 Unix ctime。按 Linux vfat
+    // 语义:atime ← 访问日期(时分秒为 0),mtime ← 修改日期+时间,ctime ← 创建
+    // 日期+时间(即把 FAT 的"创建时间"映射到 stat 的 ctime 槽位)。
+    let atime = fat_to_timespec(0, entry.times.adate, 0);
+    let mtime = fat_to_timespec(entry.times.mtime, entry.times.mdate, 0);
+    let ctime = fat_to_timespec(entry.times.time, entry.times.date, entry.times.tenths);
     let parent = ParentSlot {
         backing: parent_backing,
         sfn_slot: entry.slot_sfn,
@@ -95,9 +101,9 @@ fn build_inode_for_entry(
             },
             uid: Uid::ROOT,
             gid: Gid::ROOT,
-            atime: now,
-            mtime: now,
-            ctime: now,
+            atime,
+            mtime,
+            ctime,
             blocks: 0,
         };
         let ops = DirInodeOps::new_sub(Arc::clone(state), entry.first_cluster, parent);
@@ -126,9 +132,9 @@ fn build_inode_for_entry(
             },
             uid: Uid::ROOT,
             gid: Gid::ROOT,
-            atime: now,
-            mtime: now,
-            ctime: now,
+            atime,
+            mtime,
+            ctime,
             blocks: ((entry.size as u64 + 511) / 512),
         };
         let ino = if entry.first_cluster >= 2 {
@@ -197,7 +203,8 @@ impl InodeOps for DirInodeOps {
                 return Err(VfsError::AlreadyExists);
             }
             let (sfn, lfn_entries) = dir::build_entries_for_name(name, &used);
-            let entry = dir::build_sfn_entry(sfn, ATTR_ARCHIVE, 0, 0);
+            let times = FatTimestamp::now();
+            let entry = dir::build_sfn_entry(sfn, ATTR_ARCHIVE, 0, 0, &times);
             let sfn_slot = dir::insert_new_entry_with_scratch(
                 &self.state,
                 self.backing,
@@ -213,6 +220,7 @@ impl InodeOps for DirInodeOps {
                 attr: ATTR_ARCHIVE,
                 first_cluster: 0,
                 size: 0,
+                times,
                 slot_start: sfn_slot - lfn_entries.len() as u32,
                 slot_sfn: sfn_slot,
             };
@@ -261,9 +269,10 @@ impl InodeOps for DirInodeOps {
                     DirBacking::ChainFromCluster(c) => c,
                     DirBacking::FixedRange { .. } => 0,
                 };
-                let dot_entry = dir::build_sfn_entry(dot_sfn, ATTR_DIRECTORY, new_c, 0);
+                let times = FatTimestamp::now();
+                let dot_entry = dir::build_sfn_entry(dot_sfn, ATTR_DIRECTORY, new_c, 0, &times);
                 let dotdot_entry =
-                    dir::build_sfn_entry(dotdot_sfn, ATTR_DIRECTORY, parent_first, 0);
+                    dir::build_sfn_entry(dotdot_sfn, ATTR_DIRECTORY, parent_first, 0, &times);
                 // 新分配目录簇本应全零；直接在零缓冲中放入 `.`/`..`,避免两次读改写。
                 dir_scratch.resize(self.state.cluster_size as usize, 0);
                 dir_scratch.fill(0);
@@ -280,7 +289,7 @@ impl InodeOps for DirInodeOps {
                     .map_err(backend_to_vfs)?;
 
                 let (sfn, lfn_entries) = dir::build_entries_for_name(name, &used);
-                let entry = dir::build_sfn_entry(sfn, ATTR_DIRECTORY, new_c, 0);
+                let entry = dir::build_sfn_entry(sfn, ATTR_DIRECTORY, new_c, 0, &times);
                 let sfn_slot = dir::insert_new_entry_with_scratch(
                     &self.state,
                     self.backing,
@@ -296,6 +305,7 @@ impl InodeOps for DirInodeOps {
                     attr: ATTR_DIRECTORY,
                     first_cluster: new_c,
                     size: 0,
+                    times,
                     slot_start: sfn_slot - lfn_entries.len() as u32,
                     slot_sfn: sfn_slot,
                 };
@@ -432,7 +442,11 @@ impl InodeOps for DirInodeOps {
             }
             let (sfn, lfn_entries) = dir::build_entries_for_name(new_name, &used);
             let attr = entry.attr;
-            let new_entry = dir::build_sfn_entry(sfn, attr, entry.first_cluster, entry.size);
+            // rename 是纯元数据操作,不触碰文件内容;沿用源条目时间戳,避免丢失原始的
+            // 创建/修改时间(Linux vfat 会把新条目创建时间设为 now,此处选择保留,属
+            // 有意取舍,见提交说明)。
+            let new_entry =
+                dir::build_sfn_entry(sfn, attr, entry.first_cluster, entry.size, &entry.times);
             dir::insert_new_entry_with_scratch(
                 &self.state,
                 new_dir_ops.backing,

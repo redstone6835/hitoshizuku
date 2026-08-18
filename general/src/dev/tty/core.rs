@@ -13,7 +13,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use errno::Errno;
 use sched::operation;
@@ -21,7 +21,7 @@ use vfs::sync::Spinlock;
 
 use crate::dev::char::{CharDevice, CharIoError};
 use crate::dev::control::{CharControlRequest, CharControlResponse, ControlError};
-use crate::vfs::user_api::tty::{UserTermios, UserWinSize};
+use crate::vfs::user_api::tty::{TCIOFF, TCION, TCOOFF, TCOON, UserTermios, UserWinSize};
 
 /// TTY 数据路径错误。
 ///
@@ -173,6 +173,14 @@ pub struct TtyCore {
     foreground_pgrp: Spinlock<i32>,
     line_state: Spinlock<TtyLineState>,
     hung_up: AtomicBool,
+    /// TIOCEXCL/TIOCNXCL 独占打开标志。
+    exclusive: AtomicBool,
+    /// 当前打开该终端的文件描述计数(独占语义判断用)。
+    open_count: AtomicU32,
+    /// TIOCMGET/MSET/MBIS/MBIC 的 modem 控制线状态位图。
+    modem_lines: Spinlock<u32>,
+    /// TCXONC(TCOOFF/TCOON)的本地输出流控制状态。
+    output_stopped: AtomicBool,
 }
 
 /// 异步输入泵的单次 drain 上限。
@@ -197,6 +205,10 @@ impl TtyCore {
             foreground_pgrp: Spinlock::new(0),
             line_state: Spinlock::new(TtyLineState::default()),
             hung_up: AtomicBool::new(false),
+            exclusive: AtomicBool::new(false),
+            open_count: AtomicU32::new(0),
+            modem_lines: Spinlock::new(0),
+            output_stopped: AtomicBool::new(false),
         });
         TTY_CORES_BY_COOKIE
             .lock()
@@ -274,12 +286,105 @@ impl TtyCore {
         operation::getsid(0)
     }
 
+    /// 独占打开语义:TIOCEXCL 置位后,已有打开者存在时再 open 返回 EBUSY。
+    ///
+    /// 由 devtmpfs 的字符设备打开路径在构造 FileOps 前调用。
+    pub fn try_open(&self) -> Result<(), Errno> {
+        if self.exclusive.load(Ordering::Acquire) && self.open_count.load(Ordering::Acquire) != 0 {
+            return Err(Errno::EBUSY);
+        }
+        self.open_count.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// 与 [`Self::try_open`] 配对的释放回调。
+    pub fn release_open(&self) {
+        self.open_count.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// TIOCEXCL/TIOCNXCL 设置/清除独占打开标志。
+    pub fn set_exclusive(&self, exclusive: bool) {
+        self.exclusive.store(exclusive, Ordering::Release);
+    }
+
+    /// TIOCSTI:向行规程注入一个输入字节(如同用户键入)。
+    pub fn inject_input(&self, byte: u8) -> TtyIoResult<()> {
+        let termios = *self.termios.lock();
+        let result = if termios.canonical() {
+            self.feed_canonical_byte(byte, termios)
+        } else {
+            let mut buf = [byte];
+            match self.process_raw_input_bytes(termios, &mut buf, false) {
+                Ok(produced) => {
+                    if produced != 0 {
+                        let mut state = self.line_state.lock();
+                        state
+                            .ready
+                            .try_reserve(produced)
+                            .map_err(|_| TtyIoError::NoSpace)?;
+                        for &byte in &buf[..produced] {
+                            state.ready.push_back(byte);
+                        }
+                    }
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            }
+        };
+        // 注入的字节若触发 VINTR/VQUIT/VSUSP,信号已投递,ioctl 本身成功。
+        match result {
+            Ok(()) | Err(TtyIoError::Interrupted) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// TIOCMGET:读取 modem 控制线状态位图。
+    pub fn modem_lines(&self) -> u32 {
+        *self.modem_lines.lock()
+    }
+
+    /// TIOCMSET/TIOCMBIS/TIOCMBIC:更新 modem 控制线状态位图。
+    ///
+    /// 状态保存在行规程层;真实硬件 RTS/CTS 等线翻转需要串口驱动支持,当前驱动
+    /// 未实现时按 ABI 层语义记账(与 Linux 无硬件 modem 线的 pty 行为一致)。
+    pub fn set_modem_lines(&self, lines: u32) {
+        *self.modem_lines.lock() = lines;
+    }
+
+    /// TCXONC:流控动作。
+    pub fn transmit_control(&self, action: u32) -> Result<(), Errno> {
+        match action {
+            TCOOFF => {
+                self.output_stopped.store(true, Ordering::Release);
+                Ok(())
+            }
+            TCOON => {
+                self.output_stopped.store(false, Ordering::Release);
+                Ok(())
+            }
+            TCIOFF => self
+                .driver
+                .write_all_output(&[0x13])
+                .map_err(map_tty_io_errno),
+            TCION => self
+                .driver
+                .write_all_output(&[0x11])
+                .map_err(map_tty_io_errno),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
     pub(crate) fn write_tty_bytes(&self, buf: &[u8], termios: UserTermios) -> TtyIoResult<()> {
         if self.hung_up.load(Ordering::Acquire) {
             return Err(TtyIoError::NoDevice);
         }
         if buf.is_empty() {
             return Ok(());
+        }
+        // TCXONC(TCOOFF)后本地输出暂停,写路径(含回显)返回 WouldBlock,由
+        // 上层按 O_NONBLOCK 决定 EAGAIN 还是阻塞等待。
+        if self.output_stopped.load(Ordering::Acquire) {
+            return Err(TtyIoError::WouldBlock);
         }
         if !termios.opost_onlcr() {
             return self.driver.write_all_output(buf);
@@ -413,13 +518,18 @@ impl TtyCore {
         if n == 0 {
             return Ok(false);
         }
+        self.feed_canonical_byte(byte[0], termios)?;
+        Ok(true)
+    }
 
-        let mut ch = byte[0];
+    /// 把一个字节送入规范模式行规程(信号/编辑/回显)。
+    fn feed_canonical_byte(&self, ch: u8, termios: UserTermios) -> TtyIoResult<()> {
+        let mut ch = ch;
         if termios.icrnl() && ch == b'\r' {
             ch = b'\n';
         }
         if termios.ixon() && (ch == 17 || ch == 19) {
-            return Ok(true);
+            return Ok(());
         }
         self.handle_input_signal(ch, termios)?;
 
@@ -478,7 +588,7 @@ impl TtyCore {
         if let Some(bytes) = echo_bytes.as_deref() {
             let _ = self.write_tty_bytes(bytes, termios);
         }
-        Ok(true)
+        Ok(())
     }
 
     fn process_raw_input_bytes(
@@ -676,6 +786,27 @@ impl crate::vfs::user_api::tty::TtyIoctlState for TtyCore {
             TtyIoError::Invalid => Errno::EINVAL,
         })
     }
+
+    fn inject_input(&self, byte: u8) -> Result<(), Errno> {
+        self.inject_input(byte).map_err(map_tty_io_errno)
+    }
+
+    fn modem_lines(&self) -> u32 {
+        self.modem_lines()
+    }
+
+    fn set_modem_lines(&self, lines: u32) -> Result<(), Errno> {
+        self.set_modem_lines(lines);
+        Ok(())
+    }
+
+    fn transmit_control(&self, action: u32) -> Result<(), Errno> {
+        self.transmit_control(action)
+    }
+
+    fn set_exclusive(&self, exclusive: bool) {
+        self.set_exclusive(exclusive);
+    }
 }
 
 // ── CharDevice 后端适配 ───────────────────────────────────────────────────────
@@ -770,6 +901,19 @@ fn map_char_err(e: CharIoError) -> TtyIoError {
         CharIoError::Unavailable => TtyIoError::NoDevice,
         CharIoError::Interrupted => TtyIoError::Interrupted,
         CharIoError::Timeout => TtyIoError::TimedOut,
+    }
+}
+
+fn map_tty_io_errno(err: TtyIoError) -> Errno {
+    match err {
+        TtyIoError::WouldBlock | TtyIoError::TimedOut => Errno::EAGAIN,
+        TtyIoError::Interrupted => Errno::EINTR,
+        TtyIoError::NoSpace => Errno::ENOMEM,
+        TtyIoError::Io => Errno::EIO,
+        TtyIoError::NoDevice => Errno::ENODEV,
+        TtyIoError::Unsupported => Errno::ENOTTY,
+        TtyIoError::Busy => Errno::EBUSY,
+        TtyIoError::Invalid => Errno::EINVAL,
     }
 }
 

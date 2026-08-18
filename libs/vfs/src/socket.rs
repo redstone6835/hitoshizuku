@@ -526,14 +526,7 @@ fn new_packet_socket_file(
         nonblock,
         ..Default::default()
     };
-    let file = File::new(
-        inode,
-        flags,
-        cred,
-        ops,
-        dentry,
-        Arc::clone(&mount),
-    );
+    let file = File::new(inode, flags, cred, ops, dentry, Arc::clone(&mount));
     mount.inc_open();
     Arc::new(file)
 }
@@ -549,14 +542,7 @@ fn new_netlink_socket_file(
         nonblock,
         ..Default::default()
     };
-    let file = File::new(
-        inode,
-        flags,
-        cred,
-        ops,
-        dentry,
-        Arc::clone(&mount),
-    );
+    let file = File::new(inode, flags, cred, ops, dentry, Arc::clone(&mount));
     mount.inc_open();
     Arc::new(file)
 }
@@ -916,9 +902,8 @@ pub fn send(
     validate_send_flags(flags)?;
     let file = file_from_fd(fdt, fd)?;
     if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
-        if !control.is_empty() {
-            return Err(Errno::ENOPROTOOPT);
-        }
+        // sendmsg 辅助数据：IP_PKTINFO/IP_TTL/IPV6_PKTINFO/IPV6_HOPLIMIT 逐包生效。
+        let send = parse_inet_send_cmsgs(net_ops.family(), control)?;
         if (flags & MSG_FASTOPEN) != 0 {
             // Linux：MSG_FASTOPEN 仅 TCP；未连接时需要目标地址（SYN 携带数据），
             // 已连接时退化为普通发送（地址忽略）。
@@ -951,7 +936,7 @@ pub fn send(
             let nonblocking = file.flags().nonblock || (flags & MSG_DONTWAIT) != 0;
             return net_ops.send_oob(byte, nonblocking);
         }
-        let result = net_ops.sendto(
+        let result = net_ops.sendto_ctl(
             data,
             raw_addr,
             InetSendOptions {
@@ -961,6 +946,7 @@ pub fn send(
                 confirm: (flags & MSG_CONFIRM) != 0,
                 deadline_ns: None,
             },
+            send,
         );
         if result == Err(Errno::EPIPE) && (flags & MSG_NOSIGNAL) == 0 {
             deliver_inet_sigpipe();
@@ -1097,11 +1083,7 @@ fn recv_inner(
             file.flags().nonblock || (flags & MSG_DONTWAIT) != 0,
             deadline_ns,
         )?;
-        let address = if want_addr {
-            Some(sll.to_vec())
-        } else {
-            None
-        };
+        let address = if want_addr { Some(sll.to_vec()) } else { None };
         return Ok(RecvOutput {
             len,
             address,
@@ -1189,7 +1171,13 @@ fn recv_inner(
         let address = if want_addr {
             result.remote.and_then(|ep| {
                 let mut buf = vec![0u8; 28];
-                crate::addr::encode_inet_sockaddr(&ep, net_ops.family(), &mut buf)
+                // 链路本地对端回填 sin6_scope_id = 入接口索引（Linux ifindex）。
+                let scope = if matches!(ep.addr, net::IpAddr::V6(addr) if addr.is_link_local()) {
+                    result.interface_id.map_or(0, net::NetDeviceId::raw)
+                } else {
+                    0
+                };
+                crate::addr::encode_inet_sockaddr_scoped(&ep, net_ops.family(), scope, &mut buf)
                     .ok()
                     .map(|sz| {
                         buf.truncate(sz);
@@ -1407,8 +1395,12 @@ const IP_MULTICAST_TTL: i32 = 33;
 const IP_MULTICAST_LOOP: i32 = 34;
 const IP_ADD_MEMBERSHIP: i32 = 35;
 const IP_DROP_MEMBERSHIP: i32 = 36;
+const IP_ADD_SOURCE_MEMBERSHIP: i32 = 39;
+const IP_DROP_SOURCE_MEMBERSHIP: i32 = 40;
 const MCAST_JOIN_GROUP: i32 = 42;
 const MCAST_LEAVE_GROUP: i32 = 45;
+const MCAST_JOIN_SOURCE_GROUP: i32 = 46;
+const MCAST_LEAVE_SOURCE_GROUP: i32 = 47;
 
 const IPV6_RECVERR: i32 = 25;
 const IPV6_V6ONLY: i32 = 26;
@@ -1425,6 +1417,8 @@ const IPV6_ADD_MEMBERSHIP: i32 = 20;
 const IPV6_DROP_MEMBERSHIP: i32 = 21;
 
 const SO_TIMESTAMP: i32 = 29;
+const SO_TIMESTAMPNS: i32 = 35;
+const SO_TIMESTAMPING: i32 = 37;
 const SO_OOBINLINE: i32 = 10;
 
 // ── 选项值解析辅助 ──────────────────────────────────────────────────────────
@@ -1483,6 +1477,20 @@ fn parse_ipv4_membership(value: &[u8]) -> Result<net::MulticastMembership, Errno
     } else {
         return Err(Errno::EADDRNOTAVAIL);
     };
+    Ok(net::MulticastMembership { group, interface })
+}
+
+/// 解析 `struct ip_mreq_source`（12 字节：imr_multiaddr + imr_interface + imr_sourceaddr）。
+///
+/// SSM 最小语义：源地址被丢弃（本内核不实现 IGMPv3/MLDv2 源过滤），仅按组加入/离开。
+fn parse_ipv4_source_membership(value: &[u8]) -> Result<net::MulticastMembership, Errno> {
+    if value.len() < 12 {
+        return Err(Errno::EINVAL);
+    }
+    let group = net::IpAddr::V4(net::Ipv4Addr(value[..4].try_into().unwrap()));
+    // imr_interface 为 in_addr（0.0.0.0 = 默认接口），与 IP_ADD_MEMBERSHIP 的 ip_mreqn
+    // 不同，不带 ifindex；按默认接口处理。
+    let interface = None;
     Ok(net::MulticastMembership { group, interface })
 }
 
@@ -1564,6 +1572,16 @@ fn timeval_from_ns(ns: u64) -> [u8; 16] {
     buf
 }
 
+/// `struct timespec { tv_sec: i64; tv_nsec: i64 }`（LP64 ABI，16 字节）。
+fn timespec_from_ns(ns: u64) -> [u8; 16] {
+    let secs = (ns / 1_000_000_000) as i64;
+    let nsecs = (ns % 1_000_000_000) as i64;
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&secs.to_ne_bytes());
+    buf[8..16].copy_from_slice(&nsecs.to_ne_bytes());
+    buf
+}
+
 fn encode_tcp_info(info: net::TcpInfoSnapshot) -> Vec<u8> {
     let mut output = vec![0u8; 136];
     output[0] = info.state;
@@ -1631,6 +1649,8 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
                 Ok(timeval_from_ns(ns).to_vec())
             }
             SO_TIMESTAMP => Ok((opts.timestamp as i32).to_ne_bytes().to_vec()),
+            SO_TIMESTAMPNS => Ok((opts.timestampns as i32).to_ne_bytes().to_vec()),
+            SO_TIMESTAMPING => Ok((opts.timestamping as i32).to_ne_bytes().to_vec()),
             SO_KEEPALIVE if net_ops.sock_type() == SOCK_STREAM as u16 => {
                 Ok((net_ops.proxy().tcp_keepalive_enabled() as i32)
                     .to_ne_bytes()
@@ -1674,11 +1694,14 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
         },
         SOL_RAW if net_ops.family() == crate::addr::AF_INET6 => match optname {
             // Linux 语义：默认 -1（关闭），启用时为 ICMPv6 校验和字段偏移。
-            IPV6_CHECKSUM => Ok(
-                (i32::from(net_ops.proxy().ipv6_checksum_offset().map_or(-1, |offset| i32::from(offset))))
-                    .to_ne_bytes()
-                    .to_vec(),
-            ),
+            IPV6_CHECKSUM => Ok((i32::from(
+                net_ops
+                    .proxy()
+                    .ipv6_checksum_offset()
+                    .map_or(-1, |offset| i32::from(offset)),
+            ))
+            .to_ne_bytes()
+            .to_vec()),
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_IPV6 => match optname {
@@ -1844,6 +1867,16 @@ fn inet_setsockopt(
                 opts.timestamp = parse_int_opt(value)? != 0;
                 Ok(())
             }
+            SO_TIMESTAMPNS => {
+                opts.timestampns = parse_int_opt(value)? != 0;
+                Ok(())
+            }
+            // SO_TIMESTAMPING 最小语义：接受开关位图，接收时按 SCM_TIMESTAMPING 上报
+            // 软件时间戳（硬件发送/接收时间戳不实现，始终为 0）。
+            SO_TIMESTAMPING => {
+                opts.timestamping = parse_int_opt(value)? != 0;
+                Ok(())
+            }
             SO_KEEPALIVE if net_ops.sock_type() == SOCK_STREAM as u16 => {
                 net_ops
                     .proxy()
@@ -1945,9 +1978,24 @@ fn inet_setsockopt(
                 }
                 .map_err(crate::net_socket::map_socket_error_public)
             }
-            MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP => {
+            // SSM（IGMPv3 源过滤）最小语义：解析 ip_mreq_source 的组地址并按普通组加入/
+            // 离开；源地址不参与过滤（本内核无 IGMPv3/MLDv2 源列表，取舍见提交说明）。
+            IP_ADD_SOURCE_MEMBERSHIP | IP_DROP_SOURCE_MEMBERSHIP => {
+                let membership = parse_ipv4_source_membership(value)?;
+                if optname == IP_ADD_SOURCE_MEMBERSHIP {
+                    net_ops.proxy().add_multicast_membership(membership)
+                } else {
+                    net_ops.proxy().drop_multicast_membership(membership)
+                }
+                .map_err(crate::net_socket::map_socket_error_public)
+            }
+            MCAST_JOIN_GROUP
+            | MCAST_LEAVE_GROUP
+            | MCAST_JOIN_SOURCE_GROUP
+            | MCAST_LEAVE_SOURCE_GROUP => {
                 let membership = parse_multicast_group_req(value, crate::addr::AF_INET)?;
-                if optname == MCAST_JOIN_GROUP {
+                let join = matches!(optname, MCAST_JOIN_GROUP | MCAST_JOIN_SOURCE_GROUP);
+                if join {
                     net_ops.proxy().add_multicast_membership(membership)
                 } else {
                     net_ops.proxy().drop_multicast_membership(membership)
@@ -2035,9 +2083,13 @@ fn inet_setsockopt(
                 }
                 .map_err(crate::net_socket::map_socket_error_public)
             }
-            MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP => {
+            MCAST_JOIN_GROUP
+            | MCAST_LEAVE_GROUP
+            | MCAST_JOIN_SOURCE_GROUP
+            | MCAST_LEAVE_SOURCE_GROUP => {
                 let membership = parse_multicast_group_req(value, crate::addr::AF_INET6)?;
-                if optname == MCAST_JOIN_GROUP {
+                let join = matches!(optname, MCAST_JOIN_GROUP | MCAST_JOIN_SOURCE_GROUP);
+                if join {
                     net_ops.proxy().add_multicast_membership(membership)
                 } else {
                     net_ops.proxy().drop_multicast_membership(membership)
@@ -2057,8 +2109,7 @@ fn inet_setsockopt(
                 }
                 let mut filter = [0u32; 8];
                 for (index, word) in filter.iter_mut().enumerate() {
-                    *word =
-                        u32::from_ne_bytes(value[index * 4..index * 4 + 4].try_into().unwrap());
+                    *word = u32::from_ne_bytes(value[index * 4..index * 4 + 4].try_into().unwrap());
                 }
                 net_ops.proxy().set_icmp6_filter(filter);
                 Ok(())
@@ -2072,13 +2123,11 @@ fn inet_setsockopt(
                 if offset < -1 {
                     return Err(Errno::EINVAL);
                 }
-                net_ops
-                    .proxy()
-                    .set_ipv6_checksum_offset(if offset < 0 {
-                        None
-                    } else {
-                        Some(offset as u16)
-                    });
+                net_ops.proxy().set_ipv6_checksum_offset(if offset < 0 {
+                    None
+                } else {
+                    Some(offset as u16)
+                });
                 Ok(())
             }
             _ => Err(Errno::ENOPROTOOPT),
@@ -2384,7 +2433,11 @@ fn resolve_connect_address(ctx: &VfsContext, raw: &[u8]) -> Result<UnixAddress, 
             if inode.kind() != FileType::Socket {
                 return Err(Errno::ENOTSOCK);
             }
-            if !crate::acl::check_access(ctx.cred().as_ref(), inode.as_ref(), crate::acl::AclCheckKind::Write) {
+            if !crate::acl::check_access(
+                ctx.cred().as_ref(),
+                inode.as_ref(),
+                crate::acl::AclCheckKind::Write,
+            ) {
                 return Err(Errno::EACCES);
             }
             Ok(UnixAddress::Path {
@@ -2663,6 +2716,70 @@ fn encode_cmsg(level: i32, kind: i32, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// 解析 INET 发送路径的辅助数据（sendmsg cmsg）。
+///
+/// 支持 IP_PKTINFO（ipi_ifindex → 出接口、ipi_spec_dst → 源地址）、IP_TTL、
+/// IPV6_PKTINFO（ipi6_ifindex/ipi6_addr）、IPV6_HOPLIMIT。未知 cmsg 忽略（与 Linux
+/// 对多数未知类型的行为一致）。返回逐包发送覆盖项。
+fn parse_inet_send_cmsgs(family: u16, control: &[u8]) -> Result<net::DatagramSendOptions, Errno> {
+    let mut send = net::DatagramSendOptions::default();
+    let mut offset = 0usize;
+    while offset + CMSG_HEADER_LEN <= control.len() {
+        let len = usize::from_ne_bytes(control[offset..offset + 8].try_into().expect("cmsg len"));
+        if len < CMSG_HEADER_LEN || offset + len > control.len() {
+            break;
+        }
+        let level = i32::from_ne_bytes(control[offset + 8..offset + 12].try_into().unwrap());
+        let kind = i32::from_ne_bytes(control[offset + 12..offset + 16].try_into().unwrap());
+        let payload = &control[offset + CMSG_HEADER_LEN..offset + len];
+        match (level, kind) {
+            (SOL_IP, IP_PKTINFO) if family == crate::addr::AF_INET => {
+                if payload.len() >= 12 {
+                    let ifindex = i32::from_ne_bytes(payload[0..4].try_into().unwrap());
+                    if ifindex > 0 {
+                        send.interface = Some(net::InterfaceId(ifindex as u32));
+                    }
+                    let spec_dst = net::Ipv4Addr(payload[4..8].try_into().unwrap());
+                    if spec_dst != net::Ipv4Addr::UNSPECIFIED {
+                        send.source = Some(net::IpAddr::V4(spec_dst));
+                    }
+                }
+            }
+            (SOL_IP, IP_TTL) if family == crate::addr::AF_INET => {
+                if payload.len() >= 4 {
+                    let ttl = i32::from_ne_bytes(payload[0..4].try_into().unwrap());
+                    if (1..=255).contains(&ttl) {
+                        send.hop_limit = Some(ttl as u8);
+                    }
+                }
+            }
+            (SOL_IPV6, IPV6_PKTINFO) if family == crate::addr::AF_INET6 => {
+                if payload.len() >= 20 {
+                    let addr = net::Ipv6Addr(payload[0..16].try_into().unwrap());
+                    if !addr.is_unspecified() {
+                        send.source = Some(net::IpAddr::V6(addr));
+                    }
+                    let ifindex = u32::from_ne_bytes(payload[16..20].try_into().unwrap());
+                    if ifindex != 0 {
+                        send.interface = Some(net::InterfaceId(ifindex));
+                    }
+                }
+            }
+            (SOL_IPV6, IPV6_HOPLIMIT) if family == crate::addr::AF_INET6 => {
+                if payload.len() >= 4 {
+                    let hops = i32::from_ne_bytes(payload[0..4].try_into().unwrap());
+                    if (1..=255).contains(&hops) {
+                        send.hop_limit = Some(hops as u8);
+                    }
+                }
+            }
+            _ => {}
+        }
+        offset = align_cmsg(offset + len);
+    }
+    Ok(send)
+}
+
 fn encode_inet_pktinfo(result: &InetRecvResult) -> Option<Vec<u8>> {
     let local = result.local?;
     let net::IpAddr::V4(addr) = local.addr else {
@@ -2729,6 +2846,20 @@ fn encode_inet6_hoplimit(result: &InetRecvResult) -> Option<Vec<u8>> {
 fn encode_inet_timestamp(result: &InetRecvResult) -> Vec<u8> {
     let realtime = crate::net_socket::packet_realtime_ns(result.rx_timestamp_ns);
     encode_cmsg(SOL_SOCKET, SO_TIMESTAMP, &timeval_from_ns(realtime))
+}
+
+fn encode_inet_timestampns(result: &InetRecvResult) -> Vec<u8> {
+    let realtime = crate::net_socket::packet_realtime_ns(result.rx_timestamp_ns);
+    encode_cmsg(SOL_SOCKET, SO_TIMESTAMPNS, &timespec_from_ns(realtime))
+}
+
+/// SCM_TIMESTAMPING 最小语义：`scm_timestamping` 的 ts[0]（软件时间戳）填真实值，
+/// ts[1]/ts[2]（硬件收发时间戳）不实现，保持 0。
+fn encode_inet_timestamping(result: &InetRecvResult) -> Vec<u8> {
+    let realtime = crate::net_socket::packet_realtime_ns(result.rx_timestamp_ns);
+    let mut payload = [0u8; 48];
+    payload[0..16].copy_from_slice(&timespec_from_ns(realtime));
+    encode_cmsg(SOL_SOCKET, SO_TIMESTAMPING, &payload)
 }
 
 fn append_receive_cmsg(out: &mut Vec<u8>, control_len: usize, cmsg: Vec<u8>) -> bool {
@@ -2807,6 +2938,12 @@ fn encode_inet_receive_control_with_options(
     let mut truncated = false;
     if opts.timestamp {
         truncated |= append_receive_cmsg(&mut out, control_len, encode_inet_timestamp(result));
+    }
+    if !truncated && opts.timestampns {
+        truncated |= append_receive_cmsg(&mut out, control_len, encode_inet_timestampns(result));
+    }
+    if !truncated && opts.timestamping {
+        truncated |= append_receive_cmsg(&mut out, control_len, encode_inet_timestamping(result));
     }
     if !truncated && opts.pktinfo {
         if let Some(cmsg) = encode_inet_pktinfo(result) {
@@ -3070,6 +3207,71 @@ mod tests {
         let cmsgs = parse_cmsgs(&control);
         assert_eq!(cmsgs.len(), 1);
         assert_eq!(cmsgs[0].1, IP_PKTINFO);
+    }
+
+    #[test]
+    fn inet_receive_control_encodes_timestampns() {
+        let mut opts = SocketOptions::default();
+        opts.timestampns = true;
+        let result = InetRecvResult {
+            len: 4,
+            remote: None,
+            local: Some(net::Endpoint {
+                addr: net::IpAddr::V4(net::Ipv4Addr::new(10, 1, 2, 3)),
+                port: 7783,
+            }),
+            interface_id: Some(NetDeviceId(4)),
+            hop_limit: Some(37),
+            traffic_class: Some(0),
+            rx_timestamp_ns: 1_500_000_000,
+            msg_flags: 0,
+        };
+
+        let (control, truncated) = encode_inet_receive_control_with_options(&opts, &result, 128);
+        assert!(!truncated);
+        let cmsgs = parse_cmsgs(&control);
+        assert_eq!(cmsgs.len(), 1);
+        assert_eq!(cmsgs[0].0, SOL_SOCKET);
+        assert_eq!(cmsgs[0].1, SO_TIMESTAMPNS);
+        assert_eq!(cmsgs[0].2.len(), 16);
+        assert_eq!(i64::from_ne_bytes(cmsgs[0].2[0..8].try_into().unwrap()), 1);
+        assert_eq!(
+            i64::from_ne_bytes(cmsgs[0].2[8..16].try_into().unwrap()),
+            500_000_000
+        );
+    }
+
+    #[test]
+    fn inet_send_cmsgs_parses_pktinfo_and_ttl() {
+        let mut control = Vec::new();
+        // IP_PKTINFO：ipi_ifindex=3、ipi_spec_dst=10.9.8.7。
+        let mut pktinfo = encode_cmsg(SOL_IP, IP_PKTINFO, &[0u8; 12]);
+        pktinfo[16..20].copy_from_slice(&3i32.to_ne_bytes());
+        pktinfo[20..24].copy_from_slice(&[10, 9, 8, 7]);
+        control.extend_from_slice(&pktinfo);
+        // IP_TTL：TTL=42。
+        control.extend_from_slice(&encode_cmsg(SOL_IP, IP_TTL, &42i32.to_ne_bytes()));
+
+        let send = parse_inet_send_cmsgs(crate::addr::AF_INET, &control).unwrap();
+        assert_eq!(send.interface, Some(net::InterfaceId(3)));
+        assert_eq!(
+            send.source,
+            Some(net::IpAddr::V4(net::Ipv4Addr::new(10, 9, 8, 7)))
+        );
+        assert_eq!(send.hop_limit, Some(42));
+    }
+
+    #[test]
+    fn inet_send_cmsgs_ignores_foreign_family_and_unknown() {
+        // IPv6 cmsg 作用于 AF_INET socket 时应被忽略；未知 cmsg 类型也被跳过。
+        let mut control = Vec::new();
+        let mut pktinfo6 = encode_cmsg(SOL_IPV6, IPV6_PKTINFO, &[0u8; 20]);
+        pktinfo6[16..20].copy_from_slice(&5u32.to_ne_bytes());
+        control.extend_from_slice(&pktinfo6);
+        control.extend_from_slice(&encode_cmsg(SOL_IP, 9999, &[1u8; 4]));
+
+        let send = parse_inet_send_cmsgs(crate::addr::AF_INET, &control).unwrap();
+        assert_eq!(send, net::DatagramSendOptions::default());
     }
 
     #[test]

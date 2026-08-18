@@ -169,11 +169,12 @@ impl TaskExtCloneHook for KernelExtCloneHook {
                     .expect("[sched][ext] prctl misc state type mismatch");
                 // Linux：TSC 模式与 THP 开关随 fork 继承（exec 保留）。
                 let child = crate::syscalls::process::PrctlMiscState::new();
-                child.tsc_mode.store(state.tsc_mode.load(Ordering::Acquire), Ordering::Release);
-                child.thp_disable.store(
-                    state.thp_disable.load(Ordering::Acquire),
-                    Ordering::Release,
-                );
+                child
+                    .tsc_mode
+                    .store(state.tsc_mode.load(Ordering::Acquire), Ordering::Release);
+                child
+                    .thp_disable
+                    .store(state.thp_disable.load(Ordering::Acquire), Ordering::Release);
                 Arc::new(child)
             }
             crate::syscalls::ipc::TASKEXT_KEYRINGS => {

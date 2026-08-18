@@ -34,12 +34,13 @@ pub use flow::{
 };
 pub use id::{FlowId, InterfaceId, ListenGroupId, NetDeviceId, QueuePairId, ShardId, SocketId};
 pub use socket::{
-    DatagramCopyError, InetSocketSnapshot, InstallSocketRuntimeError, ListenGroup,
-    MulticastMembership, NetSocketProxy, OwnerRef, Readiness, ReadinessObserver, SocketCommand,
-    SocketError, SocketErrorOrigin, SocketErrorRecord, SocketFacade, SocketKind, SocketRuntime,
-    SocketTxCause, TcpInfoSnapshot, TcpTxLease, UdpReceive, UdpTxLease, detach_proxy_stack,
-    detach_socket_generation, install_socket_runtime, interface_by_name, new_raw_socket_facade,
-    new_socket_facade, new_tcp_socket_facade, snapshot_inet_sockets, track_socket_facade,
+    DatagramCopyError, DatagramSendOptions, InetSocketSnapshot, InstallSocketRuntimeError,
+    ListenGroup, MulticastMembership, NetSocketProxy, OwnerRef, Readiness, ReadinessObserver,
+    SocketCommand, SocketError, SocketErrorOrigin, SocketErrorRecord, SocketFacade, SocketKind,
+    SocketRuntime, SocketTxCause, TcpInfoSnapshot, TcpTxLease, UdpReceive, UdpTxLease,
+    detach_proxy_stack, detach_socket_generation, install_socket_runtime, interface_by_name,
+    new_raw_socket_facade, new_socket_facade, new_tcp_socket_facade, snapshot_inet_sockets,
+    track_socket_facade,
 };
 
 /// 保留网络子系统的 ELM provider 规格代码生成单元。

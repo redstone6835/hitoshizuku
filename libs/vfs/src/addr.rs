@@ -39,6 +39,17 @@ pub fn sockaddr_family(data: &[u8]) -> Result<u16, Errno> {
     Ok(u16::from_ne_bytes([data[0], data[1]]))
 }
 
+/// 提取 sockaddr_in6 的 `sin6_scope_id`（sockaddr_in 或长度不足返回 0）。
+///
+/// 仅链路本地地址（fe80::/10）在 Linux 中携带非零 scope_id，用于标识接口。
+pub fn sockaddr_scope_id(data: &[u8]) -> u32 {
+    if data.len() >= SOCKADDR_IN6_SIZE && sockaddr_family(data) == Ok(AF_INET6) {
+        u32::from_ne_bytes(data[24..28].try_into().unwrap())
+    } else {
+        0
+    }
+}
+
 fn parse_inet_sockaddr_with_family(data: &[u8], family: u16) -> Result<Endpoint, Errno> {
     match family {
         AF_INET => parse_sockaddr_in(data),
@@ -47,13 +58,26 @@ fn parse_inet_sockaddr_with_family(data: &[u8], family: u16) -> Result<Endpoint,
     }
 }
 
-/// 序列化 `net::Endpoint` 为 sockaddr 二进制格式。
+/// 序列化 `net::Endpoint` 为 sockaddr 二进制格式（scope_id 置 0）。
 ///
 /// 返回实际写入的字节数。
 pub fn encode_inet_sockaddr(ep: &Endpoint, family: u16, buf: &mut [u8]) -> Result<usize, Errno> {
+    encode_inet_sockaddr_scoped(ep, family, 0, buf)
+}
+
+/// 序列化 `net::Endpoint` 为 sockaddr 二进制格式，并写入 `sin6_scope_id`。
+///
+/// scope_id 仅在地址为链路本地（fe80::/10）时才有意义；调用方负责传入
+/// 与地址关联的接口索引。返回实际写入的字节数。
+pub fn encode_inet_sockaddr_scoped(
+    ep: &Endpoint,
+    family: u16,
+    scope_id: u32,
+    buf: &mut [u8],
+) -> Result<usize, Errno> {
     match family {
         AF_INET => encode_sockaddr_in(ep, buf),
-        AF_INET6 => encode_sockaddr_in6(ep, buf),
+        AF_INET6 => encode_sockaddr_in6(ep, scope_id, buf),
         _ => Err(Errno::EAFNOSUPPORT),
     }
 }
@@ -107,7 +131,7 @@ fn encode_sockaddr_in(ep: &Endpoint, buf: &mut [u8]) -> Result<usize, Errno> {
     Ok(SOCKADDR_IN_SIZE)
 }
 
-fn encode_sockaddr_in6(ep: &Endpoint, buf: &mut [u8]) -> Result<usize, Errno> {
+fn encode_sockaddr_in6(ep: &Endpoint, scope_id: u32, buf: &mut [u8]) -> Result<usize, Errno> {
     if buf.len() < SOCKADDR_IN6_SIZE {
         return Err(Errno::EINVAL);
     }
@@ -129,6 +153,8 @@ fn encode_sockaddr_in6(ep: &Endpoint, buf: &mut [u8]) -> Result<usize, Errno> {
     buf[2..4].copy_from_slice(&ep.port.to_be_bytes());
     // flowinfo = 0 (bytes 4..8 already zeroed)
     buf[8..24].copy_from_slice(&octets);
-    // scope_id = 0 (bytes 24..28 already zeroed)
+    // 仅链路本地地址写入 scope_id（非链路本地语义上应为 0）。
+    let scoped = matches!(ep.addr, IpAddr::V6(addr) if addr.is_link_local());
+    buf[24..28].copy_from_slice(&(if scoped { scope_id } else { 0 }).to_ne_bytes());
     Ok(SOCKADDR_IN6_SIZE)
 }

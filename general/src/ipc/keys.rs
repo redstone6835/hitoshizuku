@@ -77,6 +77,16 @@ pub const KEY_MAXBYTES_PER_UID: usize = 20_000;
 /// 搜索深度上限（Linux `KEYRING_SEARCH_MAX_DEPTH`）。
 pub const KEYRING_SEARCH_MAX_DEPTH: usize = 4;
 
+/// `KEYCTL_SET_REQKEY_KEYRING` 的默认请求 keyring 偏好（Linux `keyctl.h`）。
+pub const KEY_REQKEY_DEFL_DEFAULT: i32 = 0;
+pub const KEY_REQKEY_DEFL_THREAD_KEYRING: i32 = 1;
+pub const KEY_REQKEY_DEFL_PROCESS_KEYRING: i32 = 2;
+pub const KEY_REQKEY_DEFL_SESSION_KEYRING: i32 = 3;
+pub const KEY_REQKEY_DEFL_USER_KEYRING: i32 = 4;
+pub const KEY_REQKEY_DEFL_USER_SESSION_KEYRING: i32 = 5;
+pub const KEY_REQKEY_DEFL_REQUESTOR_KEYRING: i32 = 7;
+pub const KEY_REQKEY_DEFL_NO_CHANGE: i32 = -1;
+
 /// key 状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyState {
@@ -146,6 +156,9 @@ struct KeyInner {
     expiry: Option<u64>,
     /// keyring 类型的成员（按 (type, desc) 有序）。
     members: Vec<(String, KeyId)>,
+    /// `KEYCTL_RESTRICT_KEYRING` 施加的 key 类型限制（仅 keyring 有效）。
+    /// `None` 表示不限制。
+    restriction: Option<KeyType>,
 }
 
 /// 一个 key 对象。keyring 与普通 key 统一表示（`members` 仅 keyring 使用）。
@@ -227,6 +240,15 @@ impl Key {
         self.inner.lock().perm = perm & KEY_ALL;
     }
 
+    /// 读取当前限制（仅 keyring 有意义）。
+    fn restriction(&self) -> Option<KeyType> {
+        self.inner.lock().restriction
+    }
+
+    fn set_restriction(&self, restriction: Option<KeyType>) {
+        self.inner.lock().restriction = restriction;
+    }
+
     fn payload(&self) -> Vec<u8> {
         self.inner.lock().payload.clone()
     }
@@ -259,7 +281,12 @@ impl Key {
 
     /// 迭代成员（供递归搜索；不可在遍历中修改）。
     fn member_ids(&self) -> Vec<KeyId> {
-        self.inner.lock().members.iter().map(|(_, id)| *id).collect()
+        self.inner
+            .lock()
+            .members
+            .iter()
+            .map(|(_, id)| *id)
+            .collect()
     }
 }
 
@@ -267,12 +294,26 @@ impl Key {
 ///
 /// kernel 层把它作为任务扩展挂载；`fork` 共享 process/session 引用，
 /// thread keyring 不继承（`CLONE_THREAD` 除外）。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ProcessKeyrings {
     pub thread: Mutex<Option<KeyId>>,
     pub process: Mutex<Option<KeyId>>,
     pub session: Mutex<Option<KeyId>>,
     pub reqkey_auth: Mutex<Option<KeyId>>,
+    /// `KEYCTL_SET_REQKEY_KEYRING` 的默认请求 keyring 偏好（`jit_keyring`）。
+    pub reqkey_default: Mutex<i32>,
+}
+
+impl Default for ProcessKeyrings {
+    fn default() -> Self {
+        Self {
+            thread: Mutex::new(None),
+            process: Mutex::new(None),
+            session: Mutex::new(None),
+            reqkey_auth: Mutex::new(None),
+            reqkey_default: Mutex::new(KEY_REQKEY_DEFL_DEFAULT),
+        }
+    }
 }
 
 impl ProcessKeyrings {
@@ -424,6 +465,7 @@ impl KeyManager {
                     None
                 },
                 members: Vec::new(),
+                restriction: None,
             }),
         });
         guard.keys.insert(id, Arc::clone(&key));
@@ -434,7 +476,12 @@ impl KeyManager {
 
     /// 按序列号取 key（校验存在性，不校验权限）。
     pub fn key(&self, id: KeyId) -> Result<Arc<Key>, Errno> {
-        self.state.lock().keys.get(&id).cloned().ok_or(Errno::ENOKEY)
+        self.state
+            .lock()
+            .keys
+            .get(&id)
+            .cloned()
+            .ok_or(Errno::ENOKEY)
     }
 
     /// 销毁 key（引用为 0 时由 `drop` 自然回收；此处移除注册与配额）。
@@ -504,14 +551,9 @@ impl KeyManager {
         for member_id in keyring.member_ids() {
             let member = self.key(member_id).ok()?;
             if member.is_keyring() && member.is_live(now_sec) {
-                if let Some(found) = self.search_inner(
-                    member_id,
-                    key_type,
-                    description,
-                    cred,
-                    now_sec,
-                    depth + 1,
-                ) {
+                if let Some(found) =
+                    self.search_inner(member_id, key_type, description, cred, now_sec, depth + 1)
+                {
                     return Some(found);
                 }
             }
@@ -569,9 +611,7 @@ impl KeyManager {
                 }
             }
             KEY_SPEC_USER_KEYRING => self.user_keyring(cred.euid.0, cred)?,
-            KEY_SPEC_USER_SESSION_KEYRING => {
-                self.user_session(cred.euid.0, cred, now_sec)?
-            }
+            KEY_SPEC_USER_SESSION_KEYRING => self.user_session(cred.euid.0, cred, now_sec)?,
             KEY_SPEC_REQKEY_AUTH_KEY => process.reqkey_auth.lock().ok_or(Errno::ENOKEY)?,
             spec if spec > 0 => KeyId(spec),
             _ => return Err(Errno::ENOKEY),
@@ -672,12 +712,7 @@ impl KeyManager {
     }
 
     /// `keyctl(KEYCTL_LINK)`。
-    pub fn link(
-        &self,
-        keyring_id: KeyId,
-        key_id: KeyId,
-        cred: &Credentials,
-    ) -> Result<(), Errno> {
+    pub fn link(&self, keyring_id: KeyId, key_id: KeyId, cred: &Credentials) -> Result<(), Errno> {
         let keyring = self.key(keyring_id)?;
         if !keyring.is_keyring() {
             return Err(Errno::ENOTDIR);
@@ -689,6 +724,11 @@ impl KeyManager {
         if !permission_ok(&key, cred, KEY_POS_LINK) {
             return Err(Errno::EACCES);
         }
+        if let Some(restriction) = keyring.restriction() {
+            if key.key_type() != restriction {
+                return Err(Errno::EACCES);
+            }
+        }
         let (type_name, desc) = {
             let inner = key.inner.lock();
             (inner.key_type.name(), inner.description.clone())
@@ -698,7 +738,12 @@ impl KeyManager {
     }
 
     /// `keyctl(KEYCTL_UNLINK)`。
-    pub fn unlink(&self, keyring_id: KeyId, key_id: KeyId, cred: &Credentials) -> Result<(), Errno> {
+    pub fn unlink(
+        &self,
+        keyring_id: KeyId,
+        key_id: KeyId,
+        cred: &Credentials,
+    ) -> Result<(), Errno> {
         let keyring = self.key(keyring_id)?;
         if !keyring.is_keyring() {
             return Err(Errno::ENOTDIR);
@@ -715,12 +760,7 @@ impl KeyManager {
     }
 
     /// `keyctl(KEYCTL_UPDATE)`：仅 user/logon 可更新；keyring 报 `EOPNOTSUPP`。
-    pub fn update(
-        &self,
-        key_id: KeyId,
-        payload: Vec<u8>,
-        cred: &Credentials,
-    ) -> Result<(), Errno> {
+    pub fn update(&self, key_id: KeyId, payload: Vec<u8>, cred: &Credentials) -> Result<(), Errno> {
         let key = self.key(key_id)?;
         if !permission_ok(&key, cred, KEY_POS_WRITE) {
             return Err(Errno::EACCES);
@@ -755,7 +795,13 @@ impl KeyManager {
 
     /// `keyctl(KEYCTL_CHOWN)`：改 uid/gid 需 `CAP_SYS_ADMIN`（简化：owner 或
     /// 相同 uid）；`KEY_USR_SETATTR` 权限。
-    pub fn chown(&self, key_id: KeyId, uid: Option<u32>, gid: Option<u32>, cred: &Credentials) -> Result<(), Errno> {
+    pub fn chown(
+        &self,
+        key_id: KeyId,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        cred: &Credentials,
+    ) -> Result<(), Errno> {
         let key = self.key(key_id)?;
         if !permission_ok(&key, cred, KEY_POS_SETATTR) {
             return Err(Errno::EACCES);
@@ -783,6 +829,28 @@ impl KeyManager {
         Ok(())
     }
 
+    /// `keyctl(KEYCTL_RESTRICT_KEYRING)`：限制 keyring 只接受指定类型的 key。
+    ///
+    /// `restriction == None` 表示不限制类型（Linux 允许只给 restriction 字符串
+    /// 而不给 type）。本内核的 key 类型固定为 user/keyring/logon，因此只实现
+    /// type 级限制；restriction 字符串（LSM 风格）在 syscall 层校验后可安全忽略。
+    pub fn restrict_keyring(
+        &self,
+        keyring_id: KeyId,
+        restriction: Option<KeyType>,
+        cred: &Credentials,
+    ) -> Result<(), Errno> {
+        let keyring = self.key(keyring_id)?;
+        if !keyring.is_keyring() {
+            return Err(Errno::ENOTDIR);
+        }
+        if !permission_ok(&keyring, cred, KEY_POS_SETATTR) {
+            return Err(Errno::EACCES);
+        }
+        keyring.set_restriction(restriction);
+        Ok(())
+    }
+
     /// `keyctl(KEYCTL_CLEAR)`。
     pub fn clear(&self, keyring_id: KeyId, cred: &Credentials) -> Result<(), Errno> {
         let keyring = self.key(keyring_id)?;
@@ -800,7 +868,13 @@ impl KeyManager {
     }
 
     /// `keyctl(KEYCTL_SET_TIMEOUT)`：设置到期时间（相对秒）。
-    pub fn set_timeout(&self, key_id: KeyId, seconds: u64, cred: &Credentials, now_sec: u64) -> Result<(), Errno> {
+    pub fn set_timeout(
+        &self,
+        key_id: KeyId,
+        seconds: u64,
+        cred: &Credentials,
+        now_sec: u64,
+    ) -> Result<(), Errno> {
         let key = self.key(key_id)?;
         if !permission_ok(&key, cred, KEY_POS_SETATTR) {
             return Err(Errno::EACCES);
@@ -827,7 +901,10 @@ impl KeyManager {
     /// （4 字节每个）。logon 类型不可读（`EACCES`，Linux 语义）。
     pub fn read(&self, key_id: KeyId, cred: &Credentials) -> Result<Vec<u8>, Errno> {
         let key = self.key(key_id)?;
-        if !permission_ok(&key, cred, KEY_USR_READ) {
+        // `permission_ok` 的 mask 约定是 possessor 位（`KEY_POS_*`），内部按
+        // possessor/user/group/other 逐级左移 8 位检查；传 `KEY_USR_READ` 会让
+        // group/other 档位失效。
+        if !permission_ok(&key, cred, KEY_POS_READ) {
             return Err(Errno::EACCES);
         }
         let inner = key.inner.lock();
@@ -846,7 +923,7 @@ impl KeyManager {
     /// `keyctl(KEYCTL_DESCRIBE)`：`type;uid;gid;perm;desc`。
     pub fn describe(&self, key_id: KeyId, cred: &Credentials) -> Result<String, Errno> {
         let key = self.key(key_id)?;
-        if !permission_ok(&key, cred, KEY_USR_VIEW) {
+        if !permission_ok(&key, cred, KEY_POS_VIEW) {
             return Err(Errno::EACCES);
         }
         let inner = key.inner.lock();
@@ -887,11 +964,7 @@ impl KeyManager {
     /// 全部 key 快照（`/proc/keys`）。
     pub fn snapshot_all(&self) -> Vec<KeySnapshot> {
         let guard = self.state.lock();
-        guard
-            .keys
-            .values()
-            .map(|key| key.snapshot())
-            .collect()
+        guard.keys.values().map(|key| key.snapshot()).collect()
     }
 
     /// 每 uid 配额快照（`/proc/key-users`）。
@@ -943,8 +1016,35 @@ pub fn default_keyring_chain(
     manager: &KeyManager,
     now_sec: u64,
 ) -> KeyId {
+    // `KEYCTL_SET_REQKEY_KEYRING` 设置的具体 keyring 优先；否则走
     // Linux `KEY_SPEC_REQKEY_AUTH_KEY` 未设置时的默认链：
     // thread → process → session → user-session。
+    match *process.reqkey_default.lock() {
+        KEY_REQKEY_DEFL_THREAD_KEYRING => {
+            if let Some(id) = *process.thread.lock() {
+                return id;
+            }
+        }
+        KEY_REQKEY_DEFL_PROCESS_KEYRING => {
+            if let Some(id) = *process.process.lock() {
+                return id;
+            }
+        }
+        KEY_REQKEY_DEFL_SESSION_KEYRING => {
+            if let Some(id) = *process.session.lock() {
+                return id;
+            }
+        }
+        KEY_REQKEY_DEFL_USER_KEYRING => {
+            return manager.user_keyring(cred.euid.0, cred).unwrap_or(KeyId(0));
+        }
+        KEY_REQKEY_DEFL_USER_SESSION_KEYRING => {
+            return manager
+                .user_session(cred.euid.0, cred, now_sec)
+                .unwrap_or(KeyId(0));
+        }
+        _ => {}
+    }
     if let Some(id) = *process.thread.lock() {
         return id;
     }

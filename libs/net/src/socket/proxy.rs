@@ -8,9 +8,9 @@ use sched::{Task, WaitQueue};
 use spin::RwLock;
 
 use super::{
-    MulticastMembership, OwnerRef, Readiness, ReadinessObserver, SocketError, SocketErrorRecord,
-    SocketFacade, SocketKind, TcpInfoSnapshot, UdpReceive, new_raw_socket_facade,
-    new_socket_facade, new_tcp_socket_facade, track_socket_facade,
+    DatagramSendOptions, MulticastMembership, OwnerRef, Readiness, ReadinessObserver, SocketError,
+    SocketErrorRecord, SocketFacade, SocketKind, TcpInfoSnapshot, UdpReceive,
+    new_raw_socket_facade, new_socket_facade, new_tcp_socket_facade, track_socket_facade,
 };
 use crate::control::BindOptions;
 use crate::{AddressFamily, Endpoint, InterfaceId, SocketId};
@@ -188,7 +188,7 @@ impl NetSocketProxy {
         let facade = match (kind, protocol) {
             (SocketKind::Datagram, 0 | 17) => new_socket_facade(family),
             (SocketKind::Stream, 0 | 6) => new_tcp_socket_facade(family),
-            (SocketKind::Raw, 1..=u8::MAX) => new_raw_socket_facade(family, protocol),
+            (SocketKind::Raw, 0..=u8::MAX) => new_raw_socket_facade(family, protocol),
             _ => return Err(SocketError::InvalidState),
         }?;
         track_socket_facade(&facade, stack_generation);
@@ -210,7 +210,12 @@ impl NetSocketProxy {
             facade.close();
             return Err(SocketError::Buffer);
         }
-        if facade.family() != family || facade.kind() != kind || facade.protocol() == 0 {
+        // protocol == 0 仅对 SOCK_RAW（「全协议」原始套接字）合法；数据报/流套接字
+        // 的 facade 协议号必须非零（UDP=17 / TCP=6）。
+        if facade.family() != family
+            || facade.kind() != kind
+            || (facade.protocol() == 0 && kind != SocketKind::Raw)
+        {
             facade.close();
             return Err(SocketError::RuntimeBusy);
         }
@@ -350,6 +355,7 @@ impl NetSocketProxy {
         deadline_ns: Option<u64>,
         dont_route: bool,
         confirm: bool,
+        send: DatagramSendOptions,
     ) -> Result<usize, SocketError> {
         self.ensure_backend()?;
         self.facade.send_datagram(
@@ -359,6 +365,7 @@ impl NetSocketProxy {
             deadline_ns,
             dont_route,
             confirm,
+            send,
         )
     }
 
@@ -370,6 +377,7 @@ impl NetSocketProxy {
         deadline_ns: Option<u64>,
         dont_route: bool,
         confirm: bool,
+        send: DatagramSendOptions,
         copy: impl FnMut(usize, &mut [u8]) -> Result<(), E>,
     ) -> Result<usize, super::DatagramCopyError<E>> {
         self.ensure_backend()
@@ -381,6 +389,7 @@ impl NetSocketProxy {
             deadline_ns,
             dont_route,
             confirm,
+            send,
             copy,
         )
     }

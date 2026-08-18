@@ -126,8 +126,7 @@ static ADDRESS_SNAPSHOT_PROVIDER: Mutex<Option<fn() -> Vec<net::control::Address
     Mutex::new(None);
 static ROUTE_SNAPSHOT_PROVIDER: Mutex<Option<fn() -> Vec<net::control::RouteEntry>>> =
     Mutex::new(None);
-static NEIGHBOR_SNAPSHOT_PROVIDER: Mutex<Option<fn() -> Vec<NeighborSnapshot>>> =
-    Mutex::new(None);
+static NEIGHBOR_SNAPSHOT_PROVIDER: Mutex<Option<fn() -> Vec<NeighborSnapshot>>> = Mutex::new(None);
 
 pub fn install_address_snapshot_provider(provider: fn() -> Vec<net::control::AddressEntry>) {
     *ADDRESS_SNAPSHOT_PROVIDER.lock() = Some(provider);
@@ -217,9 +216,7 @@ static NETLINK_SOCKETS: Mutex<Vec<NetlinkSocketPtr>> = Mutex::new(Vec::new());
 /// 向订阅了对应组播组的所有 netlink socket 推送事件消息。
 pub fn netlink_event_broadcast(msg_type: u16, message: Vec<u8>) {
     let groups = match msg_type {
-        RTM_NEWLINK | RTM_DELLINK | RTM_SETLINK => {
-            RTMGRP_LINK | RTMGRP_IPV6_IFINFO | RTMGRP_NOTIFY
-        }
+        RTM_NEWLINK | RTM_DELLINK | RTM_SETLINK => RTMGRP_LINK | RTMGRP_IPV6_IFINFO | RTMGRP_NOTIFY,
         RTM_NEWADDR | RTM_DELADDR => RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR,
         RTM_NEWROUTE | RTM_DELROUTE => RTMGRP_IPV4_ROUTE | RTMGRP_IPV6_ROUTE,
         RTM_NEWNEIGH | RTM_DELNEIGH => RTMGRP_NEIGH,
@@ -575,7 +572,11 @@ fn dispatch_message(
             let result = handle_link_change(msg_type, payload);
             vec![nlmsg_ack_or_error(result, seq, local_pid)]
         }
-        _ => vec![build_nlmsg_error(seq, local_pid, -i32::from(Errno::EOPNOTSUPP))],
+        _ => vec![build_nlmsg_error(
+            seq,
+            local_pid,
+            -i32::from(Errno::EOPNOTSUPP),
+        )],
     }
 }
 
@@ -711,7 +712,9 @@ fn handle_route_change(msg_type: u16, payload: &[u8]) -> Result<(), i32> {
             if data.len() < 4 {
                 return Err(-i32::from(Errno::EINVAL));
             }
-            Ok(net::InterfaceId(u32::from_ne_bytes(data[..4].try_into().unwrap())))
+            Ok(net::InterfaceId(u32::from_ne_bytes(
+                data[..4].try_into().unwrap(),
+            )))
         })
         .transpose()?
         .unwrap_or(net::InterfaceId(0));
@@ -733,8 +736,10 @@ fn handle_route_change(msg_type: u16, payload: &[u8]) -> Result<(), i32> {
             if data.len() < 4 {
                 return Err(-i32::from(Errno::EINVAL));
             }
-            Ok(u8::try_from(u32::from_ne_bytes(data[..4].try_into().unwrap()))
-                .map_err(|_| -i32::from(Errno::EINVAL))?)
+            Ok(
+                u8::try_from(u32::from_ne_bytes(data[..4].try_into().unwrap()))
+                    .map_err(|_| -i32::from(Errno::EINVAL))?,
+            )
         })
         .transpose()?
         .unwrap_or(table);
@@ -797,13 +802,17 @@ fn decode_address(family: u8, data: &[u8]) -> Result<net::IpAddr, i32> {
             if data.len() < 4 {
                 return Err(-i32::from(Errno::EINVAL));
             }
-            Ok(net::IpAddr::V4(net::Ipv4Addr(data[..4].try_into().unwrap())))
+            Ok(net::IpAddr::V4(net::Ipv4Addr(
+                data[..4].try_into().unwrap(),
+            )))
         }
         AF_INET6 => {
             if data.len() < 16 {
                 return Err(-i32::from(Errno::EINVAL));
             }
-            Ok(net::IpAddr::V6(net::Ipv6Addr(data[..16].try_into().unwrap())))
+            Ok(net::IpAddr::V6(net::Ipv6Addr(
+                data[..16].try_into().unwrap(),
+            )))
         }
         _ => Err(-i32::from(Errno::EAFNOSUPPORT)),
     }
@@ -982,9 +991,9 @@ pub fn netlink_getsockopt(
                 .to_ne_bytes()
                 .to_vec()),
             crate::socket::SO_ERROR => Ok(0i32.to_ne_bytes().to_vec()),
-            crate::socket::SO_PASSCRED => {
-                Ok((i32::from(ops.passcred.load(Ordering::Acquire))).to_ne_bytes().to_vec())
-            }
+            crate::socket::SO_PASSCRED => Ok((i32::from(ops.passcred.load(Ordering::Acquire)))
+                .to_ne_bytes()
+                .to_vec()),
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_NETLINK => match optname {

@@ -97,6 +97,8 @@ pub struct SocketOptions {
     pub sndbuf: i32,
     pub rcvbuf: i32,
     pub timestamp: bool,
+    pub timestampns: bool,
+    pub timestamping: bool,
     pub recvttl: bool,
     pub recvtos: bool,
     pub pktinfo: bool,
@@ -133,6 +135,8 @@ impl Default for SocketOptions {
             sndbuf: 212_992,
             rcvbuf: 212_992,
             timestamp: false,
+            timestampns: false,
+            timestamping: false,
             recvttl: false,
             recvtos: false,
             pktinfo: false,
@@ -271,7 +275,7 @@ impl NetSocketFileOps {
         let local = crate::addr::parse_inet_sockaddr_for_socket(sockaddr, self.family())?;
         validate_bind_permission(&local, allow_privileged_port)?;
         let options = self.bind_options_for(local.addr);
-        let interface = self.options.lock().bind_interface;
+        let interface = self.interface_for(local.addr, sockaddr);
         self.proxy
             .bind(local, interface, options)
             .map_err(map_socket_error)
@@ -311,7 +315,7 @@ impl NetSocketFileOps {
             sockaddr,
             self.family(),
         )?);
-        let interface = self.options.lock().bind_interface;
+        let interface = self.interface_for(peer.addr, sockaddr);
         let options = self.bind_options();
         self.proxy
             .connect_with_mode(peer, interface, options, nonblocking)
@@ -335,6 +339,21 @@ impl NetSocketFileOps {
         sockaddr: Option<&[u8]>,
         opts: InetSendOptions,
     ) -> Result<usize, Errno> {
+        self.sendto_ctl(data, sockaddr, opts, net::DatagramSendOptions::default())
+    }
+
+    /// 带逐包辅助数据（sendmsg cmsg / sockaddr scope_id）的数据报发送。
+    ///
+    /// `send` 中的 hop_limit / interface / source 分别对应 IP_TTL（IPV6_HOPLIMIT）、
+    /// IP_PKTINFO ipi_ifindex（IPV6_PKTINFO ipi6_ifindex）与 ipi_spec_dst（源地址）。
+    /// None 表示沿用 socket 级设置。
+    pub fn sendto_ctl(
+        &self,
+        data: &[u8],
+        sockaddr: Option<&[u8]>,
+        opts: InetSendOptions,
+        send: net::DatagramSendOptions,
+    ) -> Result<usize, Errno> {
         self.ensure_backend()?;
         if self.sock_type() == SOCK_STREAM {
             if sockaddr.is_some() {
@@ -353,6 +372,8 @@ impl NetSocketFileOps {
         let destination = sockaddr
             .map(|raw| crate::addr::parse_inet_sockaddr_for_socket(raw, self.family()))
             .transpose()?;
+        // sockaddr_in6 的 sin6_scope_id 仅对链路本地地址有出接口语义，逐包覆盖。
+        let send = merge_scope_id(send, sockaddr);
         let socket_options = self.options.lock().clone();
         if destination.is_some_and(
             |endpoint| matches!(endpoint.addr, net::IpAddr::V4(address) if address.is_broadcast()),
@@ -369,6 +390,7 @@ impl NetSocketFileOps {
                 deadline,
                 opts.dont_route || socket_options.dont_route,
                 opts.confirm,
+                send,
             )
             .map_err(map_socket_error)
     }
@@ -408,6 +430,7 @@ impl NetSocketFileOps {
                 deadline,
                 opts.dont_route || socket_options.dont_route,
                 opts.confirm,
+                net::DatagramSendOptions::default(),
                 copy,
             )
             .map_err(|error| match error {
@@ -610,13 +633,15 @@ impl NetSocketFileOps {
             addr: unspecified(self.family()),
             port: 0,
         });
-        crate::addr::encode_inet_sockaddr(&endpoint, self.family(), buf)
+        let scope = self.scope_id_for(endpoint.addr);
+        crate::addr::encode_inet_sockaddr_scoped(&endpoint, self.family(), scope, buf)
     }
 
     pub fn getpeername(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         self.ensure_backend()?;
         let endpoint = self.proxy.peer_endpoint().ok_or(Errno::ENOTCONN)?;
-        crate::addr::encode_inet_sockaddr(&endpoint, self.family(), buf)
+        let scope = self.scope_id_for(endpoint.addr);
+        crate::addr::encode_inet_sockaddr_scoped(&endpoint, self.family(), scope, buf)
     }
 
     pub fn protocol(&self) -> u16 {
@@ -672,6 +697,27 @@ impl NetSocketFileOps {
         options.multicast_or_broadcast |= address.is_multicast()
             || matches!(address, net::IpAddr::V4(address) if address.is_broadcast());
         options
+    }
+
+    /// 解析 bind/connect 目标地址的出接口：sockaddr_in6 的 sin6_scope_id（链路本地）
+    /// 优先于 SO_BINDTODEVICE。
+    fn interface_for(&self, address: net::IpAddr, sockaddr: &[u8]) -> Option<net::InterfaceId> {
+        if matches!(address, net::IpAddr::V6(addr) if addr.is_link_local()) {
+            let scope = crate::addr::sockaddr_scope_id(sockaddr);
+            if scope != 0 {
+                return Some(net::InterfaceId(scope));
+            }
+        }
+        self.options.lock().bind_interface
+    }
+
+    /// 链路本地地址回填 sin6_scope_id = 绑定接口索引（非链路本地返回 0）。
+    fn scope_id_for(&self, address: net::IpAddr) -> u32 {
+        if matches!(address, net::IpAddr::V6(addr) if addr.is_link_local()) {
+            self.options.lock().bind_interface.map_or(0, |id| id.0)
+        } else {
+            0
+        }
     }
 
     fn recv_deadline(&self) -> Option<u64> {
@@ -763,6 +809,21 @@ pub(crate) fn validate_bind_permission(
         return Err(Errno::EACCES);
     }
     Ok(())
+}
+
+/// 将 sockaddr_in6 的 `sin6_scope_id` 合并为逐包出接口覆盖（仅链路本地地址语义）。
+fn merge_scope_id(
+    mut send: net::DatagramSendOptions,
+    sockaddr: Option<&[u8]>,
+) -> net::DatagramSendOptions {
+    if send.interface.is_none()
+        && let Some(raw) = sockaddr
+        && let scope = crate::addr::sockaddr_scope_id(raw)
+        && scope != 0
+    {
+        send.interface = Some(net::InterfaceId(scope));
+    }
+    send
 }
 
 impl FileOps for NetSocketFileOps {
@@ -941,6 +1002,32 @@ pub fn create_net_socket(
         _ => return Err(Errno::EAFNOSUPPORT),
     };
     match sock_type {
+        // ICMP ping 套接字（SOCK_DGRAM + IPPROTO_ICMP/IPPROTO_ICMPV6）。
+        //
+        // 最小实现取舍：映射为对应协议号的原始套接字（SOCK_RAW），因此 SO_TYPE 报告
+        // SOCK_RAW 而非 Linux 的 SOCK_DGRAM，且发送时用户须提供完整 ICMP 头（而非仅
+        // payload）。本内核的 SOCK_RAW 无特权门槛，busybox/iputils 的 ping 均可用此路径
+        // 收发 echo request/reply；完整 ping_sock 语义（内核自动补 ICMP 头/剥头）暂不实现。
+        SOCK_DGRAM if matches!(protocol, 1 | 58) => {
+            let proxy = net::NetSocketProxy::create(
+                address_family,
+                net::SocketKind::Raw,
+                protocol as u8,
+                stack.generation,
+                stack_instance,
+            )
+            .map_err(map_socket_error)?;
+            proxy.set_buffer_limits(Some(64 * 1024), Some(64 * 1024));
+            Ok(NetSocketFileOps::from_proxy(
+                proxy,
+                nonblock,
+                SocketOptions {
+                    sndbuf: 64 * 1024,
+                    rcvbuf: 64 * 1024,
+                    ..SocketOptions::default()
+                },
+            ))
+        }
         SOCK_DGRAM if matches!(protocol, 0 | 17) => {
             let proxy = net::NetSocketProxy::create(
                 address_family,
@@ -981,7 +1068,9 @@ pub fn create_net_socket(
                 },
             ))
         }
-        SOCK_RAW if (1..=u8::MAX as u16).contains(&protocol) => {
+        // protocol == 0（IPPROTO_IP/IPPROTO_IPV6）是「全协议」原始套接字，接收所有
+        // IP 协议报文（tcpdump 式抓包）；发送时 IP 头协议字段为 0。
+        SOCK_RAW if (0..=u8::MAX as u16).contains(&protocol) => {
             let proxy = net::NetSocketProxy::create(
                 address_family,
                 net::SocketKind::Raw,

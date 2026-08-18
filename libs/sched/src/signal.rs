@@ -430,6 +430,11 @@ impl SignalState {
         SigSet(self.pending_bits.load(Ordering::Acquire))
     }
 
+    /// 排队 siginfo 的非破坏性快照（`PTRACE_PEEKSIGINFO` 用）。
+    pub fn pending_infos_snapshot(&self) -> Vec<SigInfo> {
+        self.pending_infos.lock().clone()
+    }
+
     /// blocked 位图快照。
     pub fn blocked_snapshot(&self) -> SigSet {
         SigSet(self.blocked.load(Ordering::Acquire))
@@ -727,6 +732,11 @@ impl SharedSignal {
 
     pub fn pending_len_hint(&self) -> usize {
         self.shared_pending_infos.lock().len()
+    }
+
+    /// 进程级排队 siginfo 的非破坏性快照（`PTRACE_PEEKSIGINFO` SHARED 用）。
+    pub fn shared_pending_infos_snapshot(&self) -> Vec<SigInfo> {
+        self.shared_pending_infos.lock().clone()
     }
 }
 

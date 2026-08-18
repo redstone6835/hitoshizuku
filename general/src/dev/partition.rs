@@ -323,3 +323,85 @@ fn scan(disk: &Arc<BlockDevice>) -> Vec<PartitionInfo> {
         Vec::new()
     }
 }
+
+// ── /dev 投影查询接口 ─────────────────────────────────────────────────────
+//
+// 合并自审计整改(devtmpfs 块):投影层需要按父整盘查询已注册分区设备,以生成
+// /dev/<disk><part> 节点。分区设备由 `scan_and_register_all` 注册进全局表,
+// 这里从注册表按 parent 过滤,避免重复扫描磁盘。
+
+/// 已注册的分区设备快照(供 `/dev` 投影层查询)。
+#[derive(Clone)]
+pub struct PartitionDevice {
+    dev: Arc<BlockDevice>,
+    number: u32,
+}
+
+impl PartitionDevice {
+    pub fn dev(&self) -> Arc<BlockDevice> {
+        Arc::clone(&self.dev)
+    }
+
+    /// 分区序号(1-based,MBR 主分区槽位或 GPT 条目槽位)。
+    pub fn number(&self) -> u32 {
+        self.number
+    }
+}
+
+/// 磁盘名 -> 分区节点名(`vd0` -> `vd0p1`,`sda` -> `sda1`)。
+///
+/// 与 Linux 命名规则一致:盘名以数字结尾时插入 `p` 再拼序号,否则直接拼序号。
+pub fn partition_disk_name(disk_name: &str, number: u32) -> String {
+    let mut name = String::new();
+    // 命名分配失败时返回空串;调用方(VFS 投影层)会跳过该分区,避免 panic。
+    if name.try_reserve(disk_name.len() + 16).is_err() {
+        return String::new();
+    }
+    name.push_str(disk_name);
+    if disk_name.bytes().last().is_some_and(|b| b.is_ascii_digit()) {
+        name.push('p');
+    }
+    let _ = core::fmt::write(&mut name, format_args!("{}", number));
+    name
+}
+
+/// 返回一个整盘块设备当前已注册的分区设备(按 parent 过滤全局注册表)。
+pub fn partitions_of(parent: &Arc<BlockDevice>) -> Vec<PartitionDevice> {
+    if parent.class() != BlockClass::Whole || !parent.is_active() {
+        return Vec::new();
+    }
+    let Some(functions) = DEVICES.functions.try_list() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for func in functions {
+        let Some(block) = crate::dev::function::function_as::<BlockFunction>(&*func) else {
+            continue;
+        };
+        let dev = block.dev();
+        if dev.class() != BlockClass::Partition || !dev.is_active() {
+            continue;
+        }
+        let Some(disk) = dev.parent() else {
+            continue;
+        };
+        if !core::ptr::eq(Arc::as_ptr(&disk), Arc::as_ptr(parent)) {
+            continue;
+        }
+        // 分区号由名字尾部数字提取(注册名 `<disk>[p]<n>`)。
+        let name = dev.name();
+        let number = name
+            .rsplit(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        if number == 0 {
+            continue;
+        }
+        if out.try_reserve(1).is_err() {
+            return out;
+        }
+        out.push(PartitionDevice { dev, number });
+    }
+    out
+}

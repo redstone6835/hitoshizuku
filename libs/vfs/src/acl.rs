@@ -60,7 +60,9 @@ pub enum AclCheckKind {
     Write,
     /// 执行/搜索。`is_dir` 决定 `DAC_OVERRIDE` 能力是否可直接放行
     /// （与 `Credentials::check_permission` 的 `Exec { is_dir }` 一致）。
-    Exec { is_dir: bool },
+    Exec {
+        is_dir: bool,
+    },
 }
 
 impl AclCheckKind {
@@ -271,9 +273,7 @@ fn acl_check(
     let mut group_hit = false;
     for e in &acl.entries {
         let matches = match e.tag {
-            ACL_GROUP_OBJ => {
-                cred.fsgid == *inode_gid || cred.groups.contains(inode_gid)
-            }
+            ACL_GROUP_OBJ => cred.fsgid == *inode_gid || cred.groups.contains(inode_gid),
             ACL_GROUP => {
                 cred.fsgid == crate::vfs::cred::Gid(e.id)
                     || cred.groups.contains(&crate::vfs::cred::Gid(e.id))

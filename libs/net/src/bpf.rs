@@ -487,8 +487,7 @@ mod tests {
     #[test]
     fn filter_runs_on_malformed_program_safely() {
         // 无 RET 的程序：pc 越界后返回 0。
-        let program =
-            CbpfProgram::compile(vec![insn(0x00, 0, 0, 1), insn(0x00, 0, 0, 2)]).unwrap();
+        let program = CbpfProgram::compile(vec![insn(0x00, 0, 0, 1), insn(0x00, 0, 0, 2)]).unwrap();
         assert_eq!(program.run(&[]), 0);
     }
 

@@ -6,8 +6,11 @@
 //! （误差 ≤ 500ppm × 10ms ≈ 5us/tick），且不触碰调度器依赖的单调时钟域。
 //!
 //! `ADJ_OFFSET` 立即应用（Linux 默认在 1 秒内缓变；立即应用对外可观测语义
-//! 等价，`ADJ_OFFSET_SS_READ` 因此恒返回 0 剩余量）。`CLOCK_TAI` 未实现，
-//! `ADJ_TAI` 返回 `EINVAL`（Linux 对不支持 TAI 的时钟同样拒绝）。
+//! 等价，`ADJ_OFFSET_SS_READ` 因此恒返回 0 剩余量）。`CLOCK_TAI = CLOCK_REALTIME
+//! + TAI_OFFSET_NS`，`ADJ_TAI` 通过 `timex.constant`（秒）设置偏移。取舍：
+//! TAI 偏移由本模块维护、clock_gettime 在 syscall 层叠加，vDSO 不导出 TAI。
+
+use core::sync::atomic::{AtomicI64, Ordering};
 
 use errno::Errno;
 use sched::sync::Spinlock;
@@ -123,6 +126,14 @@ static STATE: Spinlock<TimexState> = Spinlock::new(TimexState {
     last_fold_mono: 0,
 });
 
+/// `CLOCK_TAI` 相对 `CLOCK_REALTIME` 的偏移（ns）。`ADJ_TAI` 以秒为单位写入。
+static TAI_OFFSET_NS: AtomicI64 = AtomicI64::new(0);
+
+/// 读取当前 TAI 偏移（ns）。`CLOCK_TAI = CLOCK_REALTIME + tai_offset_ns()`。
+pub fn tai_offset_ns() -> i64 {
+    TAI_OFFSET_NS.load(Ordering::Relaxed)
+}
+
 /// 把自上次折叠以来的频率误差累加进 `REALTIME_OFFSET_NS`。
 ///
 /// `drift_ns = elapsed_ns × freq_ppm / 1e6 = elapsed × freq_scaled / 65536 / 1e6`。
@@ -183,8 +194,15 @@ pub fn do_adjtimex(mut txc: TimexFields) -> Result<TimexFields, Errno> {
             return Err(Errno::EINVAL);
         }
         if modes & ADJ_TAI != 0 {
-            // 本内核未实现 CLOCK_TAI。
-            return Err(Errno::EINVAL);
+            // Linux：ADJ_TAI 用 timex.constant 携带 TAI 偏移（秒）。范围上限
+            // 取 Linux 的 CLOCK_TAI 合理域（±2^32 秒）防止 ns 溢出。
+            let seconds = txc.constant;
+            if !(-(1i64 << 32)..=(1i64 << 32)).contains(&seconds) {
+                return Err(Errno::EINVAL);
+            }
+            let delta_ns = seconds.checked_mul(1_000_000_000).ok_or(Errno::EINVAL)?;
+            TAI_OFFSET_NS.store(delta_ns, Ordering::Relaxed);
+            txc.constant = seconds;
         }
         if modes & ADJ_FREQUENCY != 0 && !(-MAXFREQ_SCALED..=MAXFREQ_SCALED).contains(&txc.freq) {
             return Err(Errno::EINVAL);
@@ -277,7 +295,12 @@ pub fn do_adjtimex(mut txc: TimexFields) -> Result<TimexFields, Errno> {
     txc.maxerror = state.maxerror;
     txc.esterror = state.esterror;
     txc.status = state.status;
-    txc.constant = state.constant;
+    // ADJ_TAI 复用 constant 字段返回 TAI 偏移（秒），否则返回 PLL 时间常数。
+    txc.constant = if modes & ADJ_TAI != 0 {
+        TAI_OFFSET_NS.load(Ordering::Relaxed) / 1_000_000_000
+    } else {
+        state.constant
+    };
     txc.tick = state.tick_usec;
     txc.precision = PRECISION_NS;
     txc.tolerance = MAXFREQ_SCALED;

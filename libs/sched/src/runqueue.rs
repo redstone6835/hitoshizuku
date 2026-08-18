@@ -475,7 +475,8 @@ impl Runqueue {
         let _ = update_curr_locked(&mut inner, now_ns);
         task.set_state(TaskState::Runnable);
         task.sched.set_on_rq(true);
-        let preferred_fair = preferred && task.sched.policy() == SchedPolicy::Fair;
+        let preferred_fair = preferred
+            && matches!(task.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch);
         let preferred_task = preferred_fair.then(|| Arc::clone(&task));
         enqueue_queued_locked_at(&mut inner, task, now_ns, "enqueue");
         if let Some(task) = preferred_task {
@@ -606,7 +607,7 @@ impl Runqueue {
                             && has_rt_peer_locked(&inner, curr.sched.rt_priority()))
                 }
                 SchedPolicy::RtFifo => inner.rt_throttled && !curr.pi_is_boosted(),
-                SchedPolicy::Fair | SchedPolicy::Idle => {
+                SchedPolicy::Fair | SchedPolicy::Batch | SchedPolicy::Idle => {
                     has_runnable_peer && curr.sched.vruntime() >= curr.sched.deadline()
                 }
             }
@@ -642,7 +643,7 @@ impl Runqueue {
                 && (prev.state() == TaskState::Running || prev.state() == TaskState::Runnable)
             {
                 prev.set_state(TaskState::Runnable);
-                if prev.sched.policy() == SchedPolicy::Fair {
+                if matches!(prev.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch) {
                     fair_prev_task = Some(Arc::clone(&prev));
                 }
                 enqueue_queued_locked_at(&mut inner, prev, now_ns, "pick_next_requeue_prev");
@@ -707,7 +708,7 @@ impl Runqueue {
         let mut inner = self.inner.lock();
         let _ = update_curr_locked(&mut inner, now_ns);
 
-        if target.sched.policy() != SchedPolicy::Fair
+        if !matches!(target.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch)
             || !task_can_run_on(target, cpu_mask)
             // 精确交接目标不可能是 current（下一项已显式排除），因此只要仍有
             // CPU 执行所有权，就尚未完成上下文保存。调用方的无锁预检与这里拿
@@ -1022,7 +1023,7 @@ fn enqueue_queued_locked_at(inner: &mut RqInner, task: Arc<Task>, now_ns: u64, s
             let seq = next_seq(inner);
             inner.rt_tree.insert(RtKey::of(&task, seq), task);
         }
-        SchedPolicy::Fair => enqueue_fair_locked(inner, task),
+        SchedPolicy::Fair | SchedPolicy::Batch => enqueue_fair_locked(inner, task),
         SchedPolicy::Idle => {
             let seq = next_seq(inner);
             inner.idle_tree.insert(RtKey::idle(&task, seq), task);
@@ -1242,7 +1243,7 @@ fn prepare_running_locked(inner: &mut RqInner, task: &Arc<Task>, now_ns: u64) {
     task.set_state(TaskState::Running);
     task.sched.set_on_rq(true);
     match task.sched.policy() {
-        SchedPolicy::Fair | SchedPolicy::Idle => {
+        SchedPolicy::Fair | SchedPolicy::Batch | SchedPolicy::Idle => {
             let new_vr = task.sched.vruntime().max(inner.min_vruntime);
             task.sched.store_vruntime(new_vr);
             task.sched.store_lag(0);
@@ -1269,7 +1270,7 @@ fn prepare_running_locked(inner: &mut RqInner, task: &Arc<Task>, now_ns: u64) {
 }
 
 fn prepare_sleeping_locked(inner: &mut RqInner, task: &Arc<Task>, _now_ns: u64) {
-    if task.sched.policy() == SchedPolicy::Fair {
+    if matches!(task.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch) {
         let new_dl = task.sched.recalc_deadline();
         task.sched.store_deadline(new_dl);
     } else if task.sched.policy() == SchedPolicy::RtRoundRobin && task.sched.rr_remaining_ns() == 0
@@ -1287,7 +1288,7 @@ fn prepare_sleeping_locked(inner: &mut RqInner, task: &Arc<Task>, _now_ns: u64) 
 fn dequeue_locked(inner: &mut RqInner, task: &Arc<Task>) -> bool {
     if let Some(curr) = inner.current.as_ref() {
         if Arc::ptr_eq(curr, task) {
-            if task.sched.policy() == SchedPolicy::Fair {
+            if matches!(task.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch) {
                 store_fair_lag_locked(inner, task);
             }
             release_rq_ownership(task);
@@ -1470,7 +1471,7 @@ fn update_curr_locked(inner: &mut RqInner, now_ns: u64) -> bool {
         if let Some(curr) = inner.current.as_ref().map(Arc::clone) {
             curr.account_cpu_runtime(delta, now_ns);
             match curr.sched.policy() {
-                SchedPolicy::Fair | SchedPolicy::Idle => {
+                SchedPolicy::Fair | SchedPolicy::Batch | SchedPolicy::Idle => {
                     update_fair_curr_locked(inner, &curr, delta)
                 }
                 SchedPolicy::RtRoundRobin => {
@@ -1565,7 +1566,7 @@ fn update_fair_curr_locked(inner: &mut RqInner, curr: &Arc<Task>, delta_ns: u64)
 
 fn avg_vruntime_locked(inner: &RqInner) -> u64 {
     let (w_sum, vw_sum) = match inner.current.as_ref() {
-        Some(curr) if curr.sched.policy() == SchedPolicy::Fair => {
+        Some(curr) if matches!(curr.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch) => {
             let w = curr.sched.weight() as u128;
             let vr = curr.sched.vruntime() as u128;
             (inner.total_weight + w, inner.weighted_vruntime_sum + vr * w)

@@ -1137,7 +1137,9 @@ impl InodeOps for TmpfsInodeOps {
             4096,
             sb.dev_id,
             meta,
-            Arc::new(TmpfsInodeOps::new(TmpfsInodeData::File(TmpfsFileData::new()))),
+            Arc::new(TmpfsInodeOps::new(TmpfsInodeData::File(
+                TmpfsFileData::new(),
+            ))),
             sb.self_weak.clone(),
         );
 
@@ -1201,7 +1203,9 @@ impl InodeOps for TmpfsInodeOps {
             4096,
             sb.dev_id,
             meta,
-            Arc::new(TmpfsInodeOps::new(TmpfsInodeData::Directory(BTreeMap::new()))),
+            Arc::new(TmpfsInodeOps::new(TmpfsInodeData::Directory(
+                BTreeMap::new(),
+            ))),
             sb.self_weak.clone(),
         );
 
@@ -1334,7 +1338,9 @@ impl InodeOps for TmpfsInodeOps {
             4096,
             sb.dev_id,
             meta,
-            Arc::new(TmpfsInodeOps::new(TmpfsInodeData::Symlink(target.to_string()))),
+            Arc::new(TmpfsInodeOps::new(TmpfsInodeData::Symlink(
+                target.to_string(),
+            ))),
             sb.self_weak.clone(),
         );
 

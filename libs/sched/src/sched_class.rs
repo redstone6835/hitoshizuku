@@ -27,6 +27,9 @@ pub enum SchedPolicy {
     RtRoundRobin = 2,
     Deadline = 3,
     Idle = 4,
+    /// Linux `SCHED_BATCH`：nice 权重调度，但唤醒抢占更保守。本内核按 Fair
+    /// 类等价实现（EEVDF），不单独建模批处理唤醒语义。
+    Batch = 5,
 }
 
 impl SchedPolicy {
@@ -37,6 +40,7 @@ impl SchedPolicy {
             2 => Some(Self::RtRoundRobin),
             3 => Some(Self::Deadline),
             4 => Some(Self::Idle),
+            5 => Some(Self::Batch),
             _ => None,
         }
     }
@@ -45,7 +49,7 @@ impl SchedPolicy {
         match self {
             Self::Deadline => SchedClass::Deadline,
             Self::RtFifo | Self::RtRoundRobin => SchedClass::Realtime,
-            Self::Fair => SchedClass::Fair,
+            Self::Fair | Self::Batch => SchedClass::Fair,
             Self::Idle => SchedClass::Idle,
         }
     }
@@ -144,7 +148,8 @@ impl SchedAttr {
     pub fn normalized(mut self) -> Self {
         self.nice = self.nice.clamp(NICE_MIN, NICE_MAX);
         match self.policy {
-            SchedPolicy::Fair => {
+            // Batch 与 Fair 同走 EEVDF 权重调度；仅保留 nice 差异。
+            SchedPolicy::Fair | SchedPolicy::Batch => {
                 if self.slice_ns == 0 {
                     self.slice_ns = DEFAULT_BASE_SLICE_NS;
                 }
@@ -199,7 +204,7 @@ impl SchedAttr {
         let raw = self;
         let attr = self.normalized();
         match attr.policy {
-            SchedPolicy::Fair | SchedPolicy::Idle => Ok(attr),
+            SchedPolicy::Fair | SchedPolicy::Batch | SchedPolicy::Idle => Ok(attr),
             SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => {
                 if raw.priority < RT_PRIO_MIN || raw.priority > RT_PRIO_MAX {
                     Err(Errno::EINVAL)
