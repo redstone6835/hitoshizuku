@@ -195,7 +195,8 @@ pub fn do_adjtimex(mut txc: TimexFields) -> Result<TimexFields, Errno> {
         }
         if modes & ADJ_TAI != 0 {
             // Linux：ADJ_TAI 用 timex.constant 携带 TAI 偏移（秒）。范围上限
-            // 取 Linux 的 CLOCK_TAI 合理域（±2^32 秒）防止 ns 溢出。
+            // 取 Linux 的 CLOCK_TAI 合理域（±2^32 秒）防止 ns 溢出；负值
+            // 合法并被接受（TAI 允许落后于 realtime）。
             let seconds = txc.constant;
             if !(-(1i64 << 32)..=(1i64 << 32)).contains(&seconds) {
                 return Err(Errno::EINVAL);
@@ -308,6 +309,11 @@ pub fn do_adjtimex(mut txc: TimexFields) -> Result<TimexFields, Errno> {
 }
 
 /// `adjtimex`/`clock_adjtime` 的系统调用返回值：时钟状态（`TIME_OK` 等）。
+///
+/// 取舍：本实现不调度闰秒插入/删除（STA_INS/STA_DEL 只作标志位直接映射），
+/// 也没有“进行中/已完成”的跃变阶段，因此不会返回 `TIME_OOP(3)`/`TIME_WAIT(4)`；
+/// 返回值集合收敛为 `TIME_OK/TIME_ERROR/TIME_INS/TIME_DEL`。这是无闰秒状态机
+/// 下的可接受简化。
 pub fn clock_state(status: i32) -> i32 {
     // Linux kernel/time/time.c 的映射：UNSYNC/CLOCKERR → TIME_ERROR(5)，
     // INS → TIME_INS(1)，DEL → TIME_DEL(2)，否则 TIME_OK(0)。
