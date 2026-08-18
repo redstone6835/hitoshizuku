@@ -1836,6 +1836,10 @@ fn inet_setsockopt(
                 if priority < 0 {
                     return Err(Errno::EINVAL);
                 }
+                // Linux：`SO_PRIORITY` 大于 TC_PRIO_BESTEFFORT(6) 需要 CAP_NET_ADMIN。
+                if priority > 6 && !cred.has_cap(crate::vfs::cred::Capability::NetAdmin) {
+                    return Err(Errno::EPERM);
+                }
                 opts.priority = priority;
                 net_ops.proxy().set_socket_priority(priority);
                 Ok(())
