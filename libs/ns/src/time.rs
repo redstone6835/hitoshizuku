@@ -3,7 +3,7 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI64, Ordering};
 
-use crate::{NsType, Namespace, allocate_ns_inum};
+use crate::{Namespace, NsType, allocate_ns_inum};
 
 /// 时间命名空间。
 pub struct TimeNamespace {

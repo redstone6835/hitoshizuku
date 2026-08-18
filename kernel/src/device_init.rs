@@ -564,12 +564,7 @@ fn mount_mqueue_on_dev_mqueue(tag: &str, ctx: &VfsContext) -> Arc<Mount> {
         .find("mqueue")
         .expect("[kernel-start] mqueue driver not found")
         .mount(None, "")
-        .unwrap_or_else(|err| {
-            panic!(
-                "[kernel-start][{}] failed to mount mqueue: {:?}",
-                tag, err
-            )
-        });
+        .unwrap_or_else(|err| panic!("[kernel-start][{}] failed to mount mqueue: {:?}", tag, err));
     let mount = ctx.mount_ns.mount_at(
         Arc::clone(&mountpoint.dentry),
         Arc::clone(&mountpoint.mount),

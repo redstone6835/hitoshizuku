@@ -1635,12 +1635,7 @@ fn build_raw_tx_plan(work: PreparedRawTx) -> Result<TxPlan, SocketError> {
                             protocol: work.protocol,
                         })
                 });
-                (
-                    54,
-                    0,
-                    payload_len as u32,
-                    checksum_fixup,
-                )
+                (54, 0, payload_len as u32, checksum_fixup)
             }
             _ => return Err(SocketError::InvalidState),
         }
@@ -7525,8 +7520,12 @@ mod tests {
         frame[18..20].copy_from_slice(&8u16.to_be_bytes());
         frame[20] = 58;
         frame[21] = 64;
-        let IpAddr::V6(source_v6) = source else { unreachable!() };
-        let IpAddr::V6(destination_v6) = destination else { unreachable!() };
+        let IpAddr::V6(source_v6) = source else {
+            unreachable!()
+        };
+        let IpAddr::V6(destination_v6) = destination else {
+            unreachable!()
+        };
         frame[22..38].copy_from_slice(&source_v6.0);
         frame[38..54].copy_from_slice(&destination_v6.0);
         frame[54] = kind;
@@ -7613,7 +7612,9 @@ mod tests {
             completion: CompletionToken(1),
         })
         .expect("IPv6 raw plan 应构建成功");
-        let fixup = plan.checksum_fixup.expect("启用 IPV6_CHECKSUM 应带回填参数");
+        let fixup = plan
+            .checksum_fixup
+            .expect("启用 IPV6_CHECKSUM 应带回填参数");
         assert_eq!(fixup.payload_offset, 2);
         assert_eq!(fixup.source, source);
         assert_eq!(fixup.destination, destination);

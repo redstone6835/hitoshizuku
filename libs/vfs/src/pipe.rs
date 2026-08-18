@@ -173,6 +173,69 @@ impl Pipe {
         self.inner.lock().data.len()
     }
 
+    /// 已缓冲且可读的字节数。
+    pub fn available_len(&self) -> usize {
+        let inner = self.inner.lock();
+        self.available(&inner)
+    }
+
+    /// 当前写端数量（0 表示读端应看到 EOF）。
+    pub fn writer_count(&self) -> u32 {
+        self.inner.lock().writer_count
+    }
+
+    /// 把源 pipe 已缓冲数据复制到目标 pipe，但不消费源数据（`tee(2)` 语义）。
+    ///
+    /// 单次非阻塞尝试，最多复制 `max` 字节（内部按 `PIPE_BUF` 分块）；源无数据
+    /// 或目标无空间时返回 0，目标无读者时返回 `EPIPE`。
+    pub fn tee_to(src: &Pipe, dst: &Pipe, max: usize) -> Result<usize, Errno> {
+        if max == 0 {
+            return Ok(0);
+        }
+        let mut tmp = [0u8; PIPE_BUF];
+        let chunk = max.min(tmp.len());
+        let n = {
+            let inner = src.inner.lock();
+            let avail = src.available(&inner);
+            let n = chunk.min(avail);
+            if n == 0 {
+                return Ok(0);
+            }
+            src.peek_data(&inner, &mut tmp[..n]);
+            n
+        };
+        let written = {
+            let mut inner = dst.inner.lock();
+            if inner.reader_count == 0 {
+                return Err(Errno::EPIPE);
+            }
+            dst.write_data(&mut inner, &tmp[..n])
+        };
+        if written > 0 {
+            dst.publish_readiness();
+            dst.read_wait.wake_one_default();
+        }
+        Ok(written)
+    }
+
+    /// 从 `inner` 读取数据到 `dst`，但不推进 `read_pos`（窥视语义）。
+    fn peek_data(&self, inner: &PipeInner, dst: &mut [u8]) -> usize {
+        let avail = self.available(inner);
+        let n = dst.len().min(avail);
+        if n == 0 {
+            return 0;
+        }
+        let cap = inner.data.len();
+        let start = inner.read_pos % cap;
+        let first = (cap - start).min(n);
+        dst[..first].copy_from_slice(&inner.data[start..start + first]);
+        if first < n {
+            let second = n - first;
+            dst[first..n].copy_from_slice(&inner.data[..second]);
+        }
+        n
+    }
+
     fn set_capacity(&self, requested: usize, privileged: bool) -> Result<usize, Errno> {
         let capacity = normalize_pipe_capacity(requested)?;
         if !privileged && capacity > pipe_max_size() {
@@ -775,6 +838,20 @@ pub fn new_pipe(cred: Arc<Credentials>, nonblock: bool) -> VfsResult<(Arc<File>,
     mount.inc_open();
 
     Ok((Arc::new(read_end), Arc::new(write_end)))
+}
+
+/// 若 `file` 是 pipe 端点（读/写/读写），返回其底层共享管道状态。
+pub fn pipe_of(file: &File) -> Option<Arc<Pipe>> {
+    if let Some(r) = file.downcast_ops::<PipeReadEnd>() {
+        return Some(Arc::clone(&r.pipe));
+    }
+    if let Some(w) = file.downcast_ops::<PipeWriteEnd>() {
+        return Some(Arc::clone(&w.pipe));
+    }
+    if let Some(rw) = file.downcast_ops::<PipeReadWriteEnd>() {
+        return Some(Arc::clone(&rw.pipe));
+    }
+    None
 }
 
 #[cfg(test)]

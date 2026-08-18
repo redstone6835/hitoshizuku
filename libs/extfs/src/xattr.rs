@@ -121,7 +121,9 @@ fn build_block(entries: &[(u8, Vec<u8>, Vec<u8>)], block_size: usize) -> Result<
         let value_len = value.len();
         if value_len > 0 {
             let aligned = (value_len + 3) & !3;
-            if value_cursor < aligned || entry_start + XATTR_ENTRY_SIZE + name_len > value_cursor - aligned {
+            if value_cursor < aligned
+                || entry_start + XATTR_ENTRY_SIZE + name_len > value_cursor - aligned
+            {
                 return Err(VfsError::FileTooLarge);
             }
             value_cursor -= aligned;
@@ -131,8 +133,7 @@ fn build_block(entries: &[(u8, Vec<u8>, Vec<u8>)], block_size: usize) -> Result<
         block[entry_start + 2..entry_start + 4]
             .copy_from_slice(&(value_cursor as u16).to_le_bytes());
         // e_value_block @+4 = 0（内联）
-        block[entry_start + 8..entry_start + 12]
-            .copy_from_slice(&(value_len as u32).to_le_bytes());
+        block[entry_start + 8..entry_start + 12].copy_from_slice(&(value_len as u32).to_le_bytes());
         // e_hash @+12 = 0（本内核不校验哈希；e2fsck 不强制）
         block[entry_start + 16..entry_start + 16 + name_len].copy_from_slice(name);
         if value_len > 0 {
@@ -206,11 +207,7 @@ pub(crate) fn set(
 
 /// 在块上执行 removexattr；返回 `(新的 i_file_acl, 重建后的块字节)`。
 /// 属性列表清空时返回 `(0, 空)`（调用方释放块并清 i_file_acl）。
-pub(crate) fn remove(
-    state: &FsState,
-    acl_block: u64,
-    name: &[u8],
-) -> VfsResult<(u64, Vec<u8>)> {
+pub(crate) fn remove(state: &FsState, acl_block: u64, name: &[u8]) -> VfsResult<(u64, Vec<u8>)> {
     let (index, short) = name_index(name)?;
     if acl_block == 0 {
         return Err(VfsError::NoData);
@@ -248,7 +245,10 @@ pub(crate) fn list(state: &FsState, acl_block: u64) -> VfsResult<Vec<Vec<u8>>> {
 mod tests {
     use super::*;
 
-    fn build_and_parse(entries: &[(u8, Vec<u8>, Vec<u8>)], block_size: usize) -> Vec<(u8, Vec<u8>, Vec<u8>)> {
+    fn build_and_parse(
+        entries: &[(u8, Vec<u8>, Vec<u8>)],
+        block_size: usize,
+    ) -> Vec<(u8, Vec<u8>, Vec<u8>)> {
         let block = build_block(entries, block_size).unwrap();
         assert_eq!(block.len(), block_size);
         parse_block(&block)
@@ -275,7 +275,11 @@ mod tests {
         // 按 (index, name) 排序后与原始内容一致（无序比较）。
         assert_eq!(parsed.len(), entries.len());
         for (i, n, v) in &parsed {
-            assert!(entries.iter().any(|(ei, en, ev)| ei == i && en == n && ev == v));
+            assert!(
+                entries
+                    .iter()
+                    .any(|(ei, en, ev)| ei == i && en == n && ev == v)
+            );
         }
     }
 
@@ -300,8 +304,14 @@ mod tests {
     #[test]
     fn name_index_mapping() {
         assert_eq!(name_index(b"user.foo").unwrap(), (1, b"foo".as_slice()));
-        assert_eq!(name_index(b"system.posix_acl_access").unwrap(), (2, b"".as_slice()));
-        assert_eq!(name_index(b"system.posix_acl_default").unwrap(), (3, b"".as_slice()));
+        assert_eq!(
+            name_index(b"system.posix_acl_access").unwrap(),
+            (2, b"".as_slice())
+        );
+        assert_eq!(
+            name_index(b"system.posix_acl_default").unwrap(),
+            (3, b"".as_slice())
+        );
         assert_eq!(name_index(b"trusted.t").unwrap(), (4, b"t".as_slice()));
         assert_eq!(name_index(b"security.s").unwrap(), (6, b"s".as_slice()));
         assert_eq!(name_index(b"system.other"), Err(VfsError::NotSupported));

@@ -105,12 +105,14 @@ impl SeccompState {
     /// 安装一个过滤器。
     pub fn push_filter(&self, filter: Arc<SeccompFilter>) {
         self.filters.lock().push(filter);
-        self.mode.store(SECCOMP_MODE_FILTER as u32, Ordering::Release);
+        self.mode
+            .store(SECCOMP_MODE_FILTER as u32, Ordering::Release);
     }
 
     pub fn set_strict(&self) {
         self.filters.lock().clear();
-        self.mode.store(SECCOMP_MODE_STRICT as u32, Ordering::Release);
+        self.mode
+            .store(SECCOMP_MODE_STRICT as u32, Ordering::Release);
     }
 
     /// 在 syscall 入口运行过滤器链，返回最终动作（含 data）。
@@ -367,10 +369,22 @@ pub fn run_bpf(insns: &[SockFilter], data: &[u8; SECCOMP_DATA_SIZE]) -> u32 {
             BPF_JMP => {
                 let (condition, _offset) = match op {
                     BPF_JA => (true, insn.k as i32),
-                    BPF_JEQ => (a == if insn.code & 0x08 != 0 { x } else { insn.k }, insn.jt as i32 - insn.jf as i32),
-                    BPF_JGT => (a > if insn.code & 0x08 != 0 { x } else { insn.k }, insn.jt as i32 - insn.jf as i32),
-                    BPF_JGE => (a >= if insn.code & 0x08 != 0 { x } else { insn.k }, insn.jt as i32 - insn.jf as i32),
-                    BPF_JSET => (a & if insn.code & 0x08 != 0 { x } else { insn.k } != 0, insn.jt as i32 - insn.jf as i32),
+                    BPF_JEQ => (
+                        a == if insn.code & 0x08 != 0 { x } else { insn.k },
+                        insn.jt as i32 - insn.jf as i32,
+                    ),
+                    BPF_JGT => (
+                        a > if insn.code & 0x08 != 0 { x } else { insn.k },
+                        insn.jt as i32 - insn.jf as i32,
+                    ),
+                    BPF_JGE => (
+                        a >= if insn.code & 0x08 != 0 { x } else { insn.k },
+                        insn.jt as i32 - insn.jf as i32,
+                    ),
+                    BPF_JSET => (
+                        a & if insn.code & 0x08 != 0 { x } else { insn.k } != 0,
+                        insn.jt as i32 - insn.jf as i32,
+                    ),
                     _ => return SECCOMP_RET_KILL_THREAD,
                 };
                 // 跳转语义：JA 相对 +k；条件跳转真分支 +jt、假分支 +jf

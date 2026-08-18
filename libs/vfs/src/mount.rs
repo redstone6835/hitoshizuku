@@ -31,12 +31,12 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use ns::Namespace as _;
 use crate::vfs::DCACHE;
 use crate::vfs::dentry::Dentry;
 use crate::vfs::error::{VfsError, VfsResult};
 use crate::vfs::superblock::Superblock;
 use crate::vfs::sync::Spinlock;
+use ns::Namespace as _;
 
 /// 同一 Superblock 可以同时出现在多个挂载点和多个 mount namespace 中。
 /// 这里按 Superblock 身份记录仍存活的 Mount 对象，避免卸载其中一个实例时破坏

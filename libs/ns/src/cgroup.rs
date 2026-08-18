@@ -2,7 +2,7 @@
 //! 视图；对象仍然存在，保证 `unshare(CLONE_NEWCGROUP)`/`setns` 与
 //! `/proc/self/cgroup` 语义成立。
 
-use crate::{NsType, Namespace, allocate_ns_inum};
+use crate::{Namespace, NsType, allocate_ns_inum};
 
 /// cgroup 命名空间（恒为根层级）。
 pub struct CgroupNamespace {

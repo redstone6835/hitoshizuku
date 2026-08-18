@@ -10,5 +10,7 @@ pub use config::{
     AddressEntry, ConfigError, ConfigSnapshot, ConfigStore, InterfaceSnapshot, PolicyRule,
     RouteDecision, RouteEntry, RouteSnapshot,
 };
-pub use neighbor::{NeighborError, NeighborKey, NeighborSnapshotEntry, NeighborTable, neighbor_snapshot};
+pub use neighbor::{
+    NeighborError, NeighborKey, NeighborSnapshotEntry, NeighborTable, neighbor_snapshot,
+};
 pub use pmtu::{PmtuCache, PmtuKey};

@@ -9002,9 +9002,7 @@ impl WorkerContext {
         }
 
         // IPV6_CHECKSUM 回填需要可变字节，强制走连续拷贝路径。
-        if !self.queue.as_ref().unwrap().caps().scatter_gather
-            || plan.checksum_fixup.is_some()
-        {
+        if !self.queue.as_ref().unwrap().caps().scatter_gather || plan.checksum_fixup.is_some() {
             let frame_len = usize::from(plan.header_len).saturating_add(payload_len);
             let Ok(frame_len) = u16::try_from(frame_len) else {
                 plan.facade.set_pending_error(SocketError::MessageTooLarge);
@@ -9046,8 +9044,7 @@ impl WorkerContext {
                         fixup.destination,
                         fixup.protocol,
                     ) {
-                        bytes[position..position + 2]
-                            .copy_from_slice(&checksum.to_be_bytes());
+                        bytes[position..position + 2].copy_from_slice(&checksum.to_be_bytes());
                     }
                 }
             }

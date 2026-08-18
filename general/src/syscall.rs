@@ -586,10 +586,8 @@ fn seccomp_filter_syscall(ctx: &mut SyscallContext<'_>) -> bool {
     const AUDIT_ARCH: u32 = 0xc000_003e;
 
     let mut data = [0u8; crate::seccomp::SECCOMP_DATA_SIZE];
-    data[SECCOMP_DATA_NR..SECCOMP_DATA_NR + 8]
-        .copy_from_slice(&(ctx.nr as i64).to_le_bytes());
-    data[SECCOMP_DATA_ARCH..SECCOMP_DATA_ARCH + 4]
-        .copy_from_slice(&AUDIT_ARCH.to_le_bytes());
+    data[SECCOMP_DATA_NR..SECCOMP_DATA_NR + 8].copy_from_slice(&(ctx.nr as i64).to_le_bytes());
+    data[SECCOMP_DATA_ARCH..SECCOMP_DATA_ARCH + 4].copy_from_slice(&AUDIT_ARCH.to_le_bytes());
     data[SECCOMP_DATA_IP..SECCOMP_DATA_IP + 8].copy_from_slice(&0u64.to_le_bytes());
     for (index, arg) in ctx.args.iter().enumerate() {
         let offset = SECCOMP_DATA_ARGS + index * 8;
@@ -656,7 +654,6 @@ fn seccomp_filter_syscall(ctx: &mut SyscallContext<'_>) -> bool {
         _ => false,
     }
 }
-
 
 fn dispatch_tomori_for_task(
     tf: TrapFramePtr,

@@ -8,7 +8,7 @@ use crate::fsnotify::{self, IN_DELETE, IN_MODIFY, IN_MOVED_FROM, IN_MOVED_TO, IN
 use crate::inode::{Inode, InodeId, InodeMeta, InodeOps};
 use crate::inotify::InotifyInstance;
 use crate::stat::{FileMode, FileType, Timespec};
-use crate::vfs::cred::{Credentials, Uid, Gid};
+use crate::vfs::cred::{Credentials, Gid, Uid};
 use crate::vfs::error::{VfsError, VfsResult};
 use crate::vfs::file::OpenOptions;
 
@@ -116,7 +116,8 @@ fn mask_add_merges_replaces() {
     fsnotify::emit(&file, IN_OPEN, 0);
     assert!(read_all(&inst).is_empty());
     // 合并
-    inst.add_watch(&file, IN_OPEN, fsnotify::IN_MASK_ADD).unwrap();
+    inst.add_watch(&file, IN_OPEN, fsnotify::IN_MASK_ADD)
+        .unwrap();
     fsnotify::emit(&file, IN_OPEN, 0);
     fsnotify::emit(&file, IN_MODIFY, 0);
     let events = read_all(&inst);
@@ -128,7 +129,8 @@ fn mask_add_merges_replaces() {
 fn oneshot_delivers_once_then_ignored() {
     let inst = InotifyInstance::new_for_test();
     let file = make_inode(4, FileType::Regular);
-    inst.add_watch(&file, IN_MODIFY, fsnotify::IN_ONESHOT).unwrap();
+    inst.add_watch(&file, IN_MODIFY, fsnotify::IN_ONESHOT)
+        .unwrap();
     fsnotify::emit(&file, IN_MODIFY, 0);
     fsnotify::emit(&file, IN_MODIFY, 0);
     let events = read_all(&inst);
@@ -158,10 +160,16 @@ fn read_buffer_semantics() {
     inst.add_watch(&file, IN_MODIFY, 0).unwrap();
     fsnotify::emit(&file, IN_MODIFY, 0);
     let mut small = [0u8; 8];
-    assert_eq!(inst.read_events_for_test(&mut small), Err(VfsError::InvalidArgument));
+    assert_eq!(
+        inst.read_events_for_test(&mut small),
+        Err(VfsError::InvalidArgument)
+    );
     let mut buf = [0u8; 16];
     assert_eq!(inst.read_events_for_test(&mut buf), Ok(16));
-    assert_eq!(inst.read_events_for_test(&mut buf), Err(VfsError::WouldBlock));
+    assert_eq!(
+        inst.read_events_for_test(&mut buf),
+        Err(VfsError::WouldBlock)
+    );
 }
 
 /// 队列溢出：溢出标志 → 读取时合成 Q_OVERFLOW。
@@ -185,7 +193,9 @@ fn named_events_and_delete_self() {
     let inst = InotifyInstance::new_for_test();
     let dir = make_inode(10, FileType::Directory);
     let child = make_inode(11, FileType::Regular);
-    let wd_dir = inst.add_watch(&dir, fsnotify::IN_CREATE | fsnotify::IN_DELETE, 0).unwrap();
+    let wd_dir = inst
+        .add_watch(&dir, fsnotify::IN_CREATE | fsnotify::IN_DELETE, 0)
+        .unwrap();
     let wd_child = inst.add_watch(&child, fsnotify::IN_DELETE_SELF, 0).unwrap();
     fsnotify::emit_named(&dir, &child, IN_DELETE, b"kid", 0);
     let events = read_all(&inst);
@@ -203,7 +213,9 @@ fn named_events_and_delete_self() {
     // EXCL_UNLINK：不投递 DELETE_SELF，监视保留（无 IGNORED）。
     let inst2 = InotifyInstance::new_for_test();
     let child2 = make_inode(12, FileType::Regular);
-    inst2.add_watch(&child2, fsnotify::IN_DELETE_SELF, fsnotify::IN_EXCL_UNLINK).unwrap();
+    inst2
+        .add_watch(&child2, fsnotify::IN_DELETE_SELF, fsnotify::IN_EXCL_UNLINK)
+        .unwrap();
     fsnotify::emit_named(&dir, &child2, IN_DELETE, b"kid2", 0);
     assert!(read_all(&inst2).is_empty());
     // 重新 link 后恢复。
@@ -241,5 +253,8 @@ fn rename_events_share_cookie() {
 fn onlydir_rejects_regular_file() {
     let inst = InotifyInstance::new_for_test();
     let file = make_inode(30, FileType::Regular);
-    assert!(inst.add_watch(&file, IN_MODIFY, fsnotify::IN_ONLYDIR).is_err());
+    assert!(
+        inst.add_watch(&file, IN_MODIFY, fsnotify::IN_ONLYDIR)
+            .is_err()
+    );
 }
