@@ -339,16 +339,18 @@ impl UserTrapFrame {
 
         #[cfg(target_arch = "riscv64")]
         {
+            // riscv 的 sigcontext.sc_regs 本身即 `struct user_regs_struct`
+            // （pc + 31 个通用寄存器，无 x0），共 256 字节。这里严格按该布局：
+            // pc@0、ra..t6 依次落在 REGS_OFF 起的 31 个槽位。
             const PC_OFF: usize = 0;
             const REGS_OFF: usize = 8;
-            const MCONTEXT_LEN: usize = REGS_OFF + 32 * 8;
+            const MCONTEXT_LEN: usize = REGS_OFF + 31 * 8;
             if out.len() < MCONTEXT_LEN {
                 return false;
             }
             out[..MCONTEXT_LEN].fill(0);
             write_u64(out, PC_OFF, self.inner.sepc as u64);
             let regs = [
-                0usize,
                 self.inner.ra,
                 self.inner.sp,
                 self.inner.gp,
@@ -435,45 +437,47 @@ impl UserTrapFrame {
 
         #[cfg(target_arch = "riscv64")]
         {
+            // 与 write_linux_mcontext 的 riscv 分支对称：pc@0 后紧跟 31 个
+            // 通用寄存器（ra..t6），无 x0 槽位。
             const PC_OFF: usize = 0;
             const REGS_OFF: usize = 8;
-            const MCONTEXT_LEN: usize = REGS_OFF + 32 * 8;
+            const MCONTEXT_LEN: usize = REGS_OFF + 31 * 8;
             if input.len() < MCONTEXT_LEN {
                 return false;
             }
             let reg = |idx: usize| -> usize { read_u64(input, REGS_OFF + idx * 8) as usize };
             self.inner.sepc = read_u64(input, PC_OFF) as usize;
-            self.inner.ra = reg(1);
-            self.inner.sp = reg(2);
-            self.inner.gp = reg(3);
-            self.inner.tp = reg(4);
-            self.inner.t0 = reg(5);
-            self.inner.t1 = reg(6);
-            self.inner.t2 = reg(7);
-            self.inner.s0 = reg(8);
-            self.inner.s1 = reg(9);
-            self.inner.a0 = reg(10);
-            self.inner.a1 = reg(11);
-            self.inner.a2 = reg(12);
-            self.inner.a3 = reg(13);
-            self.inner.a4 = reg(14);
-            self.inner.a5 = reg(15);
-            self.inner.a6 = reg(16);
-            self.inner.a7 = reg(17);
-            self.inner.s2 = reg(18);
-            self.inner.s3 = reg(19);
-            self.inner.s4 = reg(20);
-            self.inner.s5 = reg(21);
-            self.inner.s6 = reg(22);
-            self.inner.s7 = reg(23);
-            self.inner.s8 = reg(24);
-            self.inner.s9 = reg(25);
-            self.inner.s10 = reg(26);
-            self.inner.s11 = reg(27);
-            self.inner.t3 = reg(28);
-            self.inner.t4 = reg(29);
-            self.inner.t5 = reg(30);
-            self.inner.t6 = reg(31);
+            self.inner.ra = reg(0);
+            self.inner.sp = reg(1);
+            self.inner.gp = reg(2);
+            self.inner.tp = reg(3);
+            self.inner.t0 = reg(4);
+            self.inner.t1 = reg(5);
+            self.inner.t2 = reg(6);
+            self.inner.s0 = reg(7);
+            self.inner.s1 = reg(8);
+            self.inner.a0 = reg(9);
+            self.inner.a1 = reg(10);
+            self.inner.a2 = reg(11);
+            self.inner.a3 = reg(12);
+            self.inner.a4 = reg(13);
+            self.inner.a5 = reg(14);
+            self.inner.a6 = reg(15);
+            self.inner.a7 = reg(16);
+            self.inner.s2 = reg(17);
+            self.inner.s3 = reg(18);
+            self.inner.s4 = reg(19);
+            self.inner.s5 = reg(20);
+            self.inner.s6 = reg(21);
+            self.inner.s7 = reg(22);
+            self.inner.s8 = reg(23);
+            self.inner.s9 = reg(24);
+            self.inner.s10 = reg(25);
+            self.inner.s11 = reg(26);
+            self.inner.t3 = reg(27);
+            self.inner.t4 = reg(28);
+            self.inner.t5 = reg(29);
+            self.inner.t6 = reg(30);
             true
         }
     }
