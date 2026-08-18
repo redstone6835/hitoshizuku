@@ -423,9 +423,7 @@ impl Runqueue {
         let _ = update_curr_locked(&mut inner, now_ns);
         task.set_state(TaskState::Runnable);
         task.sched.set_on_rq(true);
-        if preferred
-            && matches!(task.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch)
-        {
+        if preferred && matches!(task.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch) {
             // futex 唤醒是短等待热路径。只记录一次性候选，
             // 真正 pick 时仍会复查状态、亲和性和 class，避免破坏长期公平性。
             inner.preferred_fair_addr = Some(task_addr(&task));
@@ -1449,9 +1447,7 @@ fn update_fair_curr_locked(inner: &mut RqInner, curr: &Arc<Task>, delta_ns: u64)
 
 fn avg_vruntime_locked(inner: &RqInner) -> u64 {
     let (w_sum, vw_sum) = match inner.current.as_ref() {
-        Some(curr)
-            if matches!(curr.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch) =>
-        {
+        Some(curr) if matches!(curr.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch) => {
             let w = curr.sched.weight() as u128;
             let vr = curr.sched.vruntime() as u128;
             (inner.total_weight + w, inner.weighted_vruntime_sum + vr * w)
