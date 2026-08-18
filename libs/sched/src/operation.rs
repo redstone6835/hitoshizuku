@@ -2062,6 +2062,7 @@ fn rlimit_err_to_errno(e: RlimitError) -> Errno {
     match e {
         RlimitError::InvalidResource => Errno::EINVAL,
         RlimitError::ExceedsHard => Errno::EINVAL,
+        RlimitError::PermissionDenied => Errno::EPERM,
     }
 }
 
@@ -2076,16 +2077,17 @@ pub fn get_rlimit(resource: Resource) -> Result<RlimitPair, Errno> {
 /// `setrlimit(resource, new)` 写调用者 tg 的 rlimit。
 ///
 /// 校验规则照搬 Linux 6.x `kernel/sys.c::do_prlimit`：
-///   1. `new.soft ≤ new.hard`（基础不变量）
-///   2. `new.hard ≤ cur.hard`（无 CAP_SYS_RESOURCE 时硬限制不可逆降不到
-///      "原值以下"——但硬限制是允许降到任何更小的值，包括小于当前 soft）
-///   3. `new.soft ≤ cur.hard`（软限制不能超过当前硬限制）
+///   1. `new.soft ≤ new.hard`（基础不变量，违反 → EINVAL）
+///   2. `new.hard ≤ cur.hard`（无 CAP_SYS_RESOURCE 时不可提升硬限制，
+///      违反 → EPERM；持 CAP_SYS_RESOURCE 时可任意调整 hard）
 ///
 /// 关键点：**不检查** `new.hard < cur.soft`。POSIX 允许"硬限制降到
 /// ≥ 0 的任意值"，glibc 旧 ABI setrlimit 也支持；libctest 的
 /// `setrlim.c:21` 典型用法 `setrlimit(RLIMIT_STACK, 102400)` 会把
 /// `rlim_max = 102400`，当前 soft 可能是 8MB，老式"hard 不能降到
-/// 软以下"校验会误返 EINVAL。
+/// 软以下"校验会误返 EINVAL。规则 1 已蕴含"软限制不能超过当前硬限制"
+/// （无特权时 hard ≤ cur.hard 且 soft ≤ hard），故不单独校验
+/// `new.soft ≤ cur.hard`，以免特权路径错误拒绝"同时提升 soft+hard"。
 #[kernel_symbols::export(name = "sched.operation.set_rlimit", contract = "kernel.sched.rlimit@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn set_rlimit(resource: Resource, new: RlimitPair) -> Result<RlimitPair, Errno> {
     let me = current_task();
@@ -2093,17 +2095,13 @@ pub fn set_rlimit(resource: Resource, new: RlimitPair) -> Result<RlimitPair, Err
     let mut guard = tg.rlimits().lock();
     let cur = guard.get(resource);
 
-    // (1) 软限制必须 ≤ 硬限制。
+    // (1) 软限制必须 ≤ 硬限制 → EINVAL
     if new.soft.0 > new.hard.0 {
         return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
     }
-    // (2) 无 CAP 时硬限制不可调高（只能降或保留）。
-    if new.hard.0 > cur.hard.0 {
-        return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
-    }
-    // (3) 软限制不能超当前硬限制。
-    if new.soft.0 > cur.hard.0 {
-        return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
+    // (2) 无 CAP_SYS_RESOURCE 时不可提升硬限制 → EPERM
+    if new.hard.0 > cur.hard.0 && !me.credentials().has_cap(Capability::SysResource) {
+        return Err(rlimit_err_to_errno(RlimitError::PermissionDenied));
     }
     let old = cur;
     guard.set(resource, new);
@@ -2112,7 +2110,9 @@ pub fn set_rlimit(resource: Resource, new: RlimitPair) -> Result<RlimitPair, Err
 
 /// `prlimit64(pid, resource, new, old)`：
 /// - `pid == 0`：当前进程；
-/// - `pid > 0`：指定 TGID。
+/// - `pid > 0`：指定 TGID（调用者须持 CAP_SYS_RESOURCE 或与目标同 uid，
+///   否则返回 EPERM）；
+/// - `pid < 0`：无对应进程 → ESRCH。
 /// `new == None` 表示只读；`old != None` 写到该地址（call-site 决定）。
 pub fn prlimit64(
     pid: i32,
@@ -2120,8 +2120,9 @@ pub fn prlimit64(
     new: Option<RlimitPair>,
 ) -> Result<RlimitPair, Errno> {
     let me = current_task();
-    let target_tg = if pid == 0 {
-        me.thread_group()
+    // 解析目标 task：pid == 0 走当前进程，pid > 0 查注册表，pid < 0 → ESRCH。
+    let target = if pid == 0 {
+        None
     } else if pid > 0 {
         let root = root_pid_ns();
         let Some(weak) = root.registry().lookup(pid) else {
@@ -2130,23 +2131,39 @@ pub fn prlimit64(
         let Some(task) = weak.upgrade() else {
             return Err(Errno::ESRCH);
         };
-        task.thread_group()
+        Some(task)
     } else {
-        return Err(Errno::EINVAL);
+        return Err(Errno::ESRCH);
     };
-    // 权限：调用方需是同 uid 或具 CAP_SYS_RESOURCE。本仓库尚未实现
-    // capability 模型，按"同进程/同 uid 直通"处理。
+    // F1：pid > 0 时，读写目标 rlimit 前都必须校验权限。这里的"同 uid"判定
+    // 采用 Linux `ptrace_may_access(PTRACE_MODE_READ_REALCREDS)` 的 uid 语义
+    // （对 READ_REALCREDS 的近似）：调用者 euid 与目标的 uid、euid、suid 三者
+    // 全等。本仓库凭据模型刻意用 euid 而非 real uid，且不校验 gid。
+    if let Some(task) = &target {
+        let me_creds = me.credentials();
+        let t_creds = task.credentials();
+        if !me_creds.has_cap(Capability::SysResource)
+            && !(me_creds.euid == t_creds.uid
+                && me_creds.euid == t_creds.euid
+                && me_creds.euid == t_creds.suid)
+        {
+            return Err(Errno::EPERM);
+        }
+    }
+    let target_tg = match &target {
+        Some(task) => task.thread_group(),
+        None => me.thread_group(),
+    };
     if let Some(n) = new {
         let mut guard = target_tg.rlimits().lock();
         let cur = guard.get(resource);
+        // (1) 软限制必须 ≤ 硬限制 → EINVAL
         if n.soft.0 > n.hard.0 {
             return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
         }
-        if n.hard.0 > cur.hard.0 {
-            return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
-        }
-        if n.soft.0 > cur.hard.0 {
-            return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
+        // (2) 无 CAP_SYS_RESOURCE 时不可提升硬限制 → EPERM
+        if n.hard.0 > cur.hard.0 && !me.credentials().has_cap(Capability::SysResource) {
+            return Err(rlimit_err_to_errno(RlimitError::PermissionDenied));
         }
         let old = cur;
         guard.set(resource, n);
