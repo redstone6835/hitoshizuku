@@ -190,10 +190,11 @@ fn parse(sb: &[u8]) -> Result<Superblock, BlockBackendError> {
     // 支持位白名单:任何超出的位一律拒绝。
     //
     // - RECOVER:挂载时回放日志(见 [`crate::journal`]);
-    // - MMP:挂载时做 CLEAN 序列检查(见 state 模块);
-    // - ENCRYPT:可挂载,访问加密 inode 时再报错(与无密钥 Linux 一致);
-    // - CASEFOLD:可挂载,带 CASEFOLD 标志目录按 ASCII 大小写不敏感匹配
-    //   (完整 Unicode casefold 未实现);
+    // - MMP:挂载时做序列检查 + 运行期活动心跳(见 [`crate::mmp`]);
+    // - ENCRYPT:可挂载,访问加密 inode 时 read/write/truncate 返回 ENOKEY(与
+    //   Linux 无密钥一致,经 VfsError::Enokey 映射);
+    // - CASEFOLD:可挂载,带 CASEFOLD 标志目录按 Unicode 简单小写折叠匹配
+    //   (完整 casefold/NFKD 未实现);
     // - LARGEDIR:读路径为线性扫描,天然兼容。
     const SUPPORTED_INCOMPAT: u32 = INCOMPAT_FILETYPE
         | INCOMPAT_RECOVER

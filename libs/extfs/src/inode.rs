@@ -38,6 +38,10 @@ fn inode_has_extra_time_field(raw: &[u8], extra_offset: usize) -> bool {
 }
 
 fn parse_inode_time(raw: &[u8], base_offset: usize, extra_offset: usize) -> Timespec {
+    // 字段完全不存在时(如 128 字节 inode 无 crtime 区)返回零时间戳。
+    if raw.len() < base_offset + 4 {
+        return Timespec::ZERO;
+    }
     let base = i32::from_le_bytes(raw[base_offset..base_offset + 4].try_into().unwrap()) as i64;
     if !inode_has_extra_time_field(raw, extra_offset) {
         return Timespec {
@@ -64,6 +68,7 @@ pub(crate) struct InodeMetaDisk {
     pub atime: Timespec,
     pub mtime: Timespec,
     pub ctime: Timespec,
+    pub crtime: Timespec,
     pub flags: u32,
     pub blocks_512: u64,
     pub file_acl_hi: u32,
@@ -152,6 +157,7 @@ fn parse_inode_meta(raw: &[u8], huge_file: bool, block_size: u32) -> InodeMetaDi
         atime: parse_inode_time(raw, 8, 0x8c),
         mtime: parse_inode_time(raw, 16, 0x88),
         ctime: parse_inode_time(raw, 12, 0x84),
+        crtime: parse_inode_time(raw, 0x90, 0x94),
         flags,
         blocks_512,
         file_acl_hi,
@@ -463,6 +469,7 @@ fn create_disk_inode(
         raw.set_flags(0);
     }
     let now = Timespec::now();
+    raw.set_crtime(now);
     raw.set_atime(now);
     raw.set_mtime(now);
     raw.set_ctime(now);
@@ -564,8 +571,7 @@ impl InodeOps for ExtInodeOps {
         let (new_block, block) = crate::xattr::set(&self.state, acl_block, name, value, flags)?;
         if new_block == 0 {
             // 首个属性：分配 xattr 块。
-            let block_no = crate::alloc_mod::alloc_block(&self.state)
-                .map_err(|_| VfsError::Io)?;
+            let block_no = crate::alloc_mod::alloc_block(&self.state).map_err(|_| VfsError::Io)?;
             raw.set_file_acl(block_no);
             self.state
                 .write_data_blocks(block_no, 1, &block)
@@ -575,7 +581,9 @@ impl InodeOps for ExtInodeOps {
                 .write_data_blocks(new_block, 1, &block)
                 .map_err(|_| VfsError::Io)?;
         }
-        self.state.publish_inode_write(&raw).map_err(|_| VfsError::Io)?;
+        self.state
+            .publish_inode_write(&raw)
+            .map_err(|_| VfsError::Io)?;
         Ok(())
     }
 
@@ -591,11 +599,12 @@ impl InodeOps for ExtInodeOps {
         if new_block == 0 {
             // 最后一个属性被删除：释放 xattr 块并清 i_file_acl。
             if acl_block != 0 {
-                crate::alloc_mod::free_block(&self.state, acl_block)
-                    .map_err(|_| VfsError::Io)?;
+                crate::alloc_mod::free_block(&self.state, acl_block).map_err(|_| VfsError::Io)?;
             }
             raw.set_file_acl(0);
-            self.state.publish_inode_write(&raw).map_err(|_| VfsError::Io)?;
+            self.state
+                .publish_inode_write(&raw)
+                .map_err(|_| VfsError::Io)?;
         } else {
             self.state
                 .write_data_blocks(new_block, 1, &block)
@@ -1242,9 +1251,9 @@ impl InodeOps for ExtInodeOps {
         if file_type_from_mode(meta.mode) != FileType::Regular {
             return Err(VfsError::InvalidArgument);
         }
-        // fscrypt 无密钥不可写;fs-verity 已启用校验的文件不可变。
+        // fscrypt 无密钥不可写(ENOKEY);fs-verity 已启用校验的文件不可变。
         if meta.flags & EXT4_ENCRYPT_FL != 0 {
-            return Err(VfsError::NotSupported);
+            return Err(VfsError::Enokey);
         }
         if meta.flags & EXT4_VERITY_FL != 0 {
             return Err(VfsError::ReadOnlyFilesystem);
@@ -1473,13 +1482,19 @@ mod tests {
             secs: 2_000_000_000,
             nsecs: 42,
         };
+        let crtime = Timespec {
+            secs: (2i64 << 32) + 999,
+            nsecs: 555_555_555,
+        };
         raw.set_atime(atime);
         raw.set_mtime(mtime);
         raw.set_ctime(ctime);
+        raw.set_crtime(crtime);
 
         let parsed = parse_inode_meta(&raw.bytes, false, 4096);
         assert_eq!(parsed.atime, atime);
         assert_eq!(parsed.mtime, mtime);
         assert_eq!(parsed.ctime, ctime);
+        assert_eq!(parsed.crtime, crtime);
     }
 }

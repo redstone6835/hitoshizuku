@@ -119,6 +119,12 @@ pub enum VfsError {
     /// 当前文件系统或驱动不支持该操作（ENOSYS / EOPNOTSUPP）。
     NotSupported,
 
+    /// 访问加密文件但缺少解密密钥（ENOKEY）。
+    ///
+    /// 与 Linux fscrypt 无密钥访问语义一致：ext4/f2fs 等加密 inode 在未加载
+    /// 密钥时 read/write/truncate 返回 `ENOKEY`，而非 `EOPNOTSUPP`。
+    Enokey,
+
     /// 文件类型不支持按偏移定位的 I/O（ESPIPE）。
     IllegalSeek,
 
@@ -179,6 +185,7 @@ impl VfsError {
             VfsError::TextFileBusy => Errno::ETXTBSY,
             VfsError::InvalidArgument => Errno::EINVAL,
             VfsError::NotSupported => Errno::EOPNOTSUPP,
+            VfsError::Enokey => Errno::ENOKEY,
             VfsError::IllegalSeek => Errno::ESPIPE,
             VfsError::Interrupted => Errno::EINTR,
             VfsError::WouldBlock => Errno::EAGAIN,
