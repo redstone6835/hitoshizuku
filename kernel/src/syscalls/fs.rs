@@ -3387,6 +3387,9 @@ fn dirfd_as_fd(dirfd: &Dirfd, fdt: &vfs::fdtable::FdTable) -> Option<Fd> {
 }
 
 pub(super) fn sys_lookup_dcookie(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // lookup_dcookie(2) 把 perf/oprofile 的 64-bit cookie 反查为文件路径。本内核
+    // 没有 perf 子系统产生 cookie，维护一个 cookie→路径注册表只会留下无生产者
+    // 的死状态；因此保持 ENOSYS（Linux 在无 CONFIG_PROFILING 时同样不可用）。
     Err(Errno::ENOSYS)
 }
 
@@ -3505,8 +3508,19 @@ pub(super) fn sys_nfsservctl(_ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_vhangup(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_vhangup(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // Linux 要求 CAP_SYS_TTY_CONFIG；本内核能力集以 SysAdmin 近似该管理能力。
+    if !ctx.task().credentials().has_cap(Capability::SysAdmin) {
+        return Err(Errno::EPERM);
+    }
+    // 对当前会话的控制终端执行挂起（SIGHUP 到前台进程组 + 撤销后续访问）。
+    // 无控制终端时按 Linux 语义视为 no-op 成功。
+    if let Some(cookie) = sched::operation::current_session_ctty()
+        && let Some(core) = general::dev::tty::resolve_ctty_cookie(cookie)
+    {
+        core.hangup();
+    }
+    Ok(0)
 }
 
 pub(super) fn sys_quotactl(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
