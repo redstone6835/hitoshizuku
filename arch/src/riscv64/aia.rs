@@ -16,7 +16,6 @@ const IMSIC_EIE0: usize = 0xc0;
 const IMSIC_ISELECT_STRIDE: usize = 2;
 const IMSIC_TOPEI_ID_SHIFT: usize = 16;
 const IMSIC_TOPEI_ID_MASK: usize = 0x7ff;
-const SIE_SEIE: usize = 1 << 9;
 const SSTATUS_SIE: usize = 1 << 1;
 const INSTALLING_HANDLE: u64 = u64::MAX;
 
@@ -230,7 +229,6 @@ unsafe fn program_local_file(cpu: usize, handle: u64, num_ids: u32) {
         }
         write_indirect(IMSIC_EITHRESHOLD, 0);
         write_indirect(IMSIC_EIDELIVERY, 1);
-        core::arch::asm!("csrs sie, {mask}", mask = in(reg) SIE_SEIE, options(nostack));
     }
     APPLIED_NUM_IDS[cpu].store(num_ids, Ordering::Release);
     APPLIED_HANDLE[cpu].store(handle, Ordering::Release);
