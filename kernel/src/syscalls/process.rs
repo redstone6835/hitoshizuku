@@ -62,6 +62,10 @@ const PTRACE_POKEUSR: usize = 6;
 const PTRACE_CONT: usize = 7;
 const PTRACE_KILL: usize = 8;
 const PTRACE_SINGLESTEP: usize = 9;
+const PTRACE_GETREGS: usize = 12;
+const PTRACE_SETREGS: usize = 13;
+const PTRACE_GETFPREGS: usize = 14;
+const PTRACE_SETFPREGS: usize = 15;
 const PTRACE_ATTACH: usize = 16;
 const PTRACE_DETACH: usize = 17;
 const PTRACE_OLDSETOPTIONS: usize = 21;
@@ -5650,6 +5654,44 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             let note_type = addr;
             let iov_user = data;
             ptrace_regset(&target, note_type, request == PTRACE_SETREGSET, iov_user)?;
+            Ok(0)
+        }
+        PTRACE_GETREGS | PTRACE_SETREGS => {
+            // GETREGS/SETREGS 的第 4 个参数 data 直接指向原始寄存器组缓冲区
+            // （riscv64 `user_regs_struct` / loongarch64 `user_pt_regs`），
+            // 不带 iovec 包装、不带 elf_prstatus 头。
+            let target = ptrace_target_task(pid)?;
+            let size = linux_user_regs_size();
+            let mut buf = [0u8; 360]; // 覆盖 riscv 256 / loongarch 360
+            if request == PTRACE_SETREGS {
+                copy_from_user(data, &mut buf[..size]).map_err(|e| e.as_errno())?;
+                let mut frame = ptrace_target_frame(&target)?;
+                if !frame.apply_linux_user_regs(&buf[..size]) {
+                    return Err(Errno::EIO);
+                }
+                ptrace_store_frame(&target, frame);
+            } else {
+                let frame = ptrace_target_frame(&target)?;
+                if !frame.write_linux_user_regs(&mut buf[..size]) {
+                    return Err(Errno::EIO);
+                }
+                copy_to_user(data, &buf[..size]).map_err(|e| e.as_errno())?;
+            }
+            Ok(0)
+        }
+        PTRACE_GETFPREGS | PTRACE_SETFPREGS => {
+            // GETFPREGS/SETFPREGS 的第 4 个参数 data 直接指向浮点寄存器组缓冲区
+            // （`struct user_fpregs_struct` / loongarch `user_fp_state`）。
+            let target = ptrace_target_task(pid)?;
+            let size = linux_fpregset_size();
+            if request == PTRACE_SETFPREGS {
+                let mut buf = [0u8; 272]; // 覆盖 riscv 264 / loongarch 272
+                copy_from_user(data, &mut buf[..size]).map_err(|e| e.as_errno())?;
+                ptrace_write_arch_fpregs(&target, &buf[..size])?;
+            } else {
+                let out = ptrace_read_arch_fpregs(&target)?;
+                copy_to_user(data, &out).map_err(|e| e.as_errno())?;
+            }
             Ok(0)
         }
         PTRACE_GETSIGINFO => {
