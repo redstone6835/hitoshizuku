@@ -1295,15 +1295,18 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
     if flags & !TIMER_ABSTIME != 0 {
         return Err(Errno::EINVAL);
     }
-    if clock_id == CLOCK_THREAD_CPUTIME_ID as i32 {
-        return Err(Errno::EOPNOTSUPP);
-    }
-    if clock_id != crate::vdso::CLOCK_REALTIME as i32
-        && clock_id != crate::vdso::CLOCK_MONOTONIC as i32
-        && clock_id != crate::vdso::CLOCK_MONOTONIC_RAW as i32
+    // Linux 语义：clock_nanosleep 接受 CLOCK_REALTIME、CLOCK_MONOTONIC、
+    // CLOCK_PROCESS_CPUTIME_ID；其余 clockid（含 CLOCK_MONOTONIC_RAW、
+    // CLOCK_THREAD_CPUTIME_ID）一律返回 EINVAL。
+    let is_cpu_clock = if clock_id == crate::vdso::CLOCK_REALTIME as i32
+        || clock_id == crate::vdso::CLOCK_MONOTONIC as i32
     {
+        false
+    } else if clock_id == CLOCK_PROCESS_CPUTIME_ID as i32 {
+        true
+    } else {
         return Err(Errno::EINVAL);
-    }
+    };
     if req_user == 0 {
         // 空指针是用户内存访问失败；只有读取到的 timespec 内容非法才返回 EINVAL。
         return Err(Errno::EFAULT);
@@ -1318,6 +1321,13 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
     let absolute = (flags & TIMER_ABSTIME) != 0;
     let deadline = if absolute {
         sec.saturating_mul(1_000_000_000i64).saturating_add(nsec) as u64
+    } else if is_cpu_clock {
+        // CPU 时间域：相对模式以“进程累计 CPU 时间”作为现在，deadline 落在
+        // 进程 CPU 时间轴上（而非单调时钟）。
+        let now_cpu =
+            clock_time_ns_for_task(ctx.task(), CLOCK_PROCESS_CPUTIME_ID).ok_or(Errno::EINVAL)?;
+        let ns_total = sec.saturating_mul(1_000_000_000i64).saturating_add(nsec);
+        now_cpu.saturating_add(ns_total as u64)
     } else {
         let ns_total = sec.saturating_mul(1_000_000_000i64).saturating_add(nsec);
         sched::now_ns_direct().saturating_add(ns_total as u64)
@@ -1325,8 +1335,13 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
     if !absolute && sec == 0 && nsec == 0 {
         return Ok(0);
     }
-    let now_fn = || {
-        if absolute {
+    let task = Arc::clone(ctx.task());
+    let now_fn = move || {
+        if is_cpu_clock {
+            // 睡眠判定同样使用进程 CPU 时间，否则相对/绝对 deadline 的语义域
+            // 不一致。
+            clock_time_ns_for_task(&task, CLOCK_PROCESS_CPUTIME_ID).ok_or(Errno::EINVAL)
+        } else if absolute {
             crate::vdso::clock_time_ns(clock_id as usize).ok_or(Errno::EINVAL)
         } else {
             Ok(sched::now_ns_direct())
@@ -1336,10 +1351,14 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
         Ok(()) => Ok(0),
         Err(Errno::EINTR) => {
             if !absolute {
-                write_remaining_timespec(
-                    rem_user,
-                    deadline.saturating_sub(sched::now_ns_direct()),
-                )?;
+                let remaining = if is_cpu_clock {
+                    let now_cpu = clock_time_ns_for_task(ctx.task(), CLOCK_PROCESS_CPUTIME_ID)
+                        .unwrap_or(deadline);
+                    deadline.saturating_sub(now_cpu)
+                } else {
+                    deadline.saturating_sub(sched::now_ns_direct())
+                };
+                write_remaining_timespec(rem_user, remaining)?;
             }
             Err(Errno::EINTR)
         }
