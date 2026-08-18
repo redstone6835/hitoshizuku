@@ -46,7 +46,7 @@ use general::vfs::current_fdtable;
 use general::vfs::mqueue::{MqFileOps, dispatch_mq_notification, mq_registry, open_mq_fd};
 use mm::{FileLike, VmFlags};
 use sched::sync::Spinlock;
-use vfs::cred::{Gid as VfsGid, Uid as VfsUid};
+use vfs::cred::{Credentials as VfsCredentials, Gid as VfsGid, Uid as VfsUid};
 use vfs::fdtable::FdFlags;
 use vfs::file::{AccessMode, OpenOptions};
 use vfs::stat::FileMode;
@@ -1232,6 +1232,149 @@ pub(super) fn sys_semop(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 /// 注册 mqueue 通知分发器（`SIGEV_SIGNAL`/`SIGEV_THREAD` 触发动作）。
 pub(super) fn register_mq_notify_dispatcher_once() {
     general::vfs::register_mq_notify_dispatcher(mq_notify_dispatcher);
+}
+
+/// 启动期把 SysV shm/sem/msg 与 key 的快照接入 /proc 渲染（安装一次）。
+///
+/// 与 [`register_mq_notify_dispatcher_once`] 一样由 `syscalls::register_all`
+/// 在启动期调用。provider 无任务上下文，读取 /proc 的进程即"当前任务"，因此
+/// SysV 快照按当前任务所在 IPC 命名空间返回（与 Linux /proc/sysvipc 的命名
+/// 空间语义一致）；key 非命名空间隔离，走全局 [`keys_manager`]。
+pub(super) fn register_proc_ipc_providers_once() {
+    general::vfs::procfs::install_proc_sysvipc_shm_provider(proc_sysvipc_shm_snapshot);
+    general::vfs::procfs::install_proc_sysvipc_sem_provider(proc_sysvipc_sem_snapshot);
+    general::vfs::procfs::install_proc_sysvipc_msg_provider(proc_sysvipc_msg_snapshot);
+    general::vfs::procfs::install_proc_keys_provider(proc_keys_snapshot);
+    general::vfs::procfs::install_proc_key_users_provider(proc_key_users_snapshot);
+}
+
+/// `/proc/sysvipc/shm`：当前 IPC 命名空间内全部 shm 段的快照。
+fn proc_sysvipc_shm_snapshot() -> Vec<general::vfs::procfs::ProcSysvShmEntry> {
+    let manager = Arc::clone(&crate::ns::current_ns().ipc.shm);
+    let used = manager.info().used_segments;
+    let page = general::mm::page_size() as u64;
+    let mut out = Vec::with_capacity(used);
+    for index in 0..used {
+        let Ok((_id, meta)) = manager.stat_by_index(index as i32, &VfsCredentials::root(), false)
+        else {
+            continue;
+        };
+        out.push(general::vfs::procfs::ProcSysvShmEntry {
+            id: meta.id.0,
+            key: meta.key.0,
+            size_bytes: meta.size,
+            nattch: meta.nattch as u32,
+            uid: meta.perm.uid.0,
+            gid: meta.perm.gid.0,
+            cuid: meta.perm.cuid.0,
+            cgid: meta.perm.cgid.0,
+            mode: meta.perm.mode.bits(),
+            cpid: meta.cpid,
+            lpid: meta.lpid,
+            pages: meta.size.div_ceil(page),
+            locked: meta.locked,
+            marked_for_removal: meta.marked_for_removal,
+            atime: meta.atime,
+            dtime: meta.dtime,
+            ctime: meta.ctime,
+        });
+    }
+    out
+}
+
+/// `/proc/sysvipc/sem`：当前 IPC 命名空间内全部 semaphore 集合的快照。
+fn proc_sysvipc_sem_snapshot() -> Vec<general::vfs::procfs::ProcSysvSemEntry> {
+    let manager = Arc::clone(&crate::ns::current_ns().ipc.sem);
+    let used = manager.info().sets;
+    let mut out = Vec::with_capacity(used);
+    for index in 0..used {
+        let Ok((id, set)) = manager.set_by_index(index as i32) else {
+            continue;
+        };
+        let Ok(meta) = set.stat_any() else {
+            continue;
+        };
+        out.push(general::vfs::procfs::ProcSysvSemEntry {
+            id: id.0,
+            key: meta.key().0,
+            nsems: meta.nsems as u32,
+            uid: meta.uid().0,
+            gid: meta.gid().0,
+            cuid: meta.cuid().0,
+            cgid: meta.cgid().0,
+            mode: meta.mode().bits(),
+            otime: meta.otime,
+            ctime: meta.ctime,
+        });
+    }
+    out
+}
+
+/// `/proc/sysvipc/msg`：当前 IPC 命名空间内全部消息队列的快照。
+fn proc_sysvipc_msg_snapshot() -> Vec<general::vfs::procfs::ProcSysvMsgEntry> {
+    let manager = Arc::clone(&crate::ns::current_ns().ipc.msg);
+    let used = manager.info().queues;
+    let mut out = Vec::with_capacity(used);
+    for index in 0..used {
+        let Ok((id, queue)) = manager.queue_by_index(index as i32) else {
+            continue;
+        };
+        let Ok(meta) = queue.stat_any() else {
+            continue;
+        };
+        out.push(general::vfs::procfs::ProcSysvMsgEntry {
+            id: id.0,
+            key: meta.key().0,
+            qbytes: meta.qbytes as u64,
+            qnum: meta.qnum as u64,
+            uid: meta.uid().0,
+            gid: meta.gid().0,
+            cuid: meta.cuid().0,
+            cgid: meta.cgid().0,
+            mode: meta.mode().bits(),
+            lspid: meta.lspid,
+            lrpid: meta.lrpid,
+            stime: meta.stime,
+            rtime: meta.rtime,
+            ctime: meta.ctime,
+        });
+    }
+    out
+}
+
+/// `/proc/keys`：全局 keyring 系统的 key 快照。
+fn proc_keys_snapshot() -> Vec<general::vfs::procfs::ProcKeyEntry> {
+    keys_manager()
+        .snapshot_all()
+        .into_iter()
+        .map(|snapshot| general::vfs::procfs::ProcKeyEntry {
+            id: snapshot.id.0,
+            type_name: snapshot.key_type.name(),
+            description: snapshot.description,
+            uid: snapshot.uid,
+            gid: snapshot.gid,
+            perm: snapshot.perm,
+            state: key_state_flag(snapshot.state),
+            expiry: snapshot.expiry,
+            payload_len: snapshot.payload_len,
+            nkeys: snapshot.nkeys,
+        })
+        .collect()
+}
+
+/// `/proc/key-users`：每 uid 的 key 配额快照。
+fn proc_key_users_snapshot() -> Vec<(u32, usize, usize)> {
+    keys_manager().quota_snapshot()
+}
+
+/// `/proc/keys` flags 列的 key 状态编码（简化自 Linux `KEY_FLAG_*`）。
+fn key_state_flag(state: KeyState) -> &'static str {
+    match state {
+        KeyState::Instantiated => "I",
+        KeyState::Uninstantiated => "U",
+        KeyState::Negative => "N",
+        KeyState::Revoked => "R",
+    }
 }
 
 /// `SIGEV_SIGNAL`：向注册者投递信号（`si_code = SI_MESGQ`，携带 `si_value`）；
