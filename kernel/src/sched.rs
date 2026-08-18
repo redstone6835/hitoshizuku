@@ -527,7 +527,7 @@ fn process_spawn_user_process(
     #[cfg(feature = "performance-profile")]
     install_profile_images(child, &loaded);
     if let Some(fdt) = task_fdtable(child) {
-        fdt.close_on_exec();
+        fdt.close_on_exec(child.pid_root().unwrap_or(0));
     }
     child
         .thread_group()
@@ -1633,7 +1633,7 @@ fn enter_loaded_user_image(
     #[cfg(feature = "performance-profile")]
     install_profile_images(task, &loaded);
     if let Some(fdt) = task_fdtable(task) {
-        fdt.close_on_exec();
+        fdt.close_on_exec(task.pid_root().unwrap_or(0));
     }
 
     let kstack_top = task.ensure_kernel_stack();

@@ -680,7 +680,7 @@ impl FdTable {
     /// 通过位图遍历就地提取，**不在锁内做任何堆分配**。
     /// 提取出的 `FdEntry` 在锁外统一 drop，避免 `File::drop` → `FileOps::release`
     /// 在持锁状态下执行。
-    pub fn close_on_exec(&self) {
+    pub fn close_on_exec(&self, owner_pid: i32) {
         // 栈上固定大小缓冲区，避免按硬限制做线性堆分配。
         // 无论进程硬限制多大，每轮都只在锁外批量 drop 最多 64 个条目。
         const BATCH: usize = 64;
@@ -717,6 +717,7 @@ impl FdTable {
             // 锁已释放，安全 drop
             for entry in batch_buf[..batch_count].iter_mut() {
                 if let Some(removed) = entry.take() {
+                    Self::release_record_locks_for_removed(&removed, owner_pid);
                     self.notify_fd_closed(&removed);
                     drop(removed);
                 }
