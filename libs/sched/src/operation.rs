@@ -1738,9 +1738,16 @@ pub fn ptrace_seize(pid: PidT) -> Result<(), Errno> {
     Ok(())
 }
 
+/// `PTRACE_INTERRUPT` 产生的 group-stop 事件号（`PTRACE_EVENT_STOP`）。
+const PTRACE_EVENT_STOP: u16 = 128;
+
 pub fn ptrace_interrupt(pid: PidT) -> Result<(), Errno> {
     let target = ptrace_target(pid)?;
-    target.set_ptrace_stop_event(0);
+    // PTRACE_INTERRUPT 仅对 PTRACE_SEIZE 附着的目标有效（Linux 返回 EIO）。
+    if !target.is_ptrace_seized() {
+        return Err(Errno::EIO);
+    }
+    target.set_ptrace_stop_event(PTRACE_EVENT_STOP);
     let _ = mark_task_stopped(&target, SignalNumber::SIGTRAP);
     Ok(())
 }
