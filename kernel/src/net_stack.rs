@@ -811,6 +811,7 @@ impl NetStackRegistrar for KernelNetStackRegistrar {
         }
         let detached_proxies = net::detach_proxy_stack(handle.0);
         let detached_socket_facades = net::detach_socket_generation(generation);
+        let cleared_neighbors = net::control::clear_neighbor_snapshot();
         let mut broker = BROKER.lock();
         broker.record = None;
         if !broker.lifecycle.finish_remove(handle) {
@@ -822,12 +823,13 @@ impl NetStackRegistrar for KernelNetStackRegistrar {
             generation,
             handle.0
         );
-        if detached_proxies != 0 || detached_socket_facades != 0 {
+        if detached_proxies != 0 || detached_socket_facades != 0 || cleared_neighbors != 0 {
             log::info!(
-                "[net-stack] detached sockets: generation={} proxies={} socket_facades={}",
+                "[net-stack] detached generation state: generation={} proxies={} socket_facades={} neighbors={}",
                 generation,
                 detached_proxies,
-                detached_socket_facades
+                detached_socket_facades,
+                cleared_neighbors,
             );
         }
         Ok(())

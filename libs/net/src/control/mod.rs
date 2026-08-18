@@ -11,6 +11,7 @@ pub use config::{
     RouteDecision, RouteEntry, RouteSnapshot,
 };
 pub use neighbor::{
-    NeighborError, NeighborKey, NeighborSnapshotEntry, NeighborTable, neighbor_snapshot,
+    NeighborError, NeighborKey, NeighborSnapshotEntry, NeighborTable, clear_neighbor_snapshot,
+    neighbor_snapshot,
 };
 pub use pmtu::{PmtuCache, PmtuKey};
