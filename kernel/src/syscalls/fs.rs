@@ -4495,12 +4495,190 @@ pub(super) fn sys_fchmodat2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     Ok(0)
 }
 
-pub(super) fn sys_statmount(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// statmount(2) 的 STATMOUNT_* mask 位（Linux uapi/linux/mount.h）。
+const STATMOUNT_SB_BASIC: u64 = 0x0000_0001;
+const STATMOUNT_MNT_BASIC: u64 = 0x0000_0002;
+const STATMOUNT_MNT_ROOT: u64 = 0x0000_0008;
+const STATMOUNT_MNT_POINT: u64 = 0x0000_0010;
+const STATMOUNT_FS_TYPE: u64 = 0x0000_0020;
+const STATMOUNT_MNT_NS_ID: u64 = 0x0000_0040;
+/// `struct statmount` 固定头大小（字符串区在其后）。
+const STATMOUNT_HEADER_SIZE: usize = 512;
+
+struct MountSnapEntry {
+    mount: Arc<vfs::mount::Mount>,
+    id: u64,
+    parent_id: u64,
 }
 
-pub(super) fn sys_listmount(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// 深度优先（前序）枚举当前命名空间的挂载树，并分配稳定挂载 id（1 起）。
+fn mount_snapshot(vfs_ctx: &Arc<vfs::VfsContext>) -> Vec<MountSnapEntry> {
+    let root = vfs_ctx.mount_ns.root.lock().clone();
+    let mut order: Vec<Arc<vfs::mount::Mount>> = Vec::new();
+    let mut stack = vec![Arc::clone(&root)];
+    while let Some(m) = stack.pop() {
+        order.push(Arc::clone(&m));
+        let children = m.children.lock().clone();
+        for c in children.into_iter().rev() {
+            stack.push(c);
+        }
+    }
+    let mut id_by_ptr: alloc::collections::BTreeMap<usize, u64> =
+        alloc::collections::BTreeMap::new();
+    for (idx, m) in order.iter().enumerate() {
+        id_by_ptr.insert(Arc::as_ptr(m) as usize, idx as u64 + 1);
+    }
+    order
+        .into_iter()
+        .map(|m| {
+            let parent_id = m
+                .location
+                .lock()
+                .parent
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .and_then(|p| id_by_ptr.get(&(Arc::as_ptr(&p) as usize)).copied())
+                .unwrap_or(1);
+            let id = id_by_ptr[&(Arc::as_ptr(&m) as usize)];
+            MountSnapEntry {
+                mount: m,
+                id,
+                parent_id,
+            }
+        })
+        .collect()
+}
+
+fn mount_flags_to_mount_attr(flags: MountFlags) -> u64 {
+    let mut attr = 0u64;
+    if flags.has(MountFlags::RDONLY) {
+        attr |= MOUNT_ATTR_RDONLY as u64;
+    }
+    if flags.has(MountFlags::NOSUID) {
+        attr |= MOUNT_ATTR_NOSUID as u64;
+    }
+    if flags.has(MountFlags::NODEV) {
+        attr |= MOUNT_ATTR_NODEV as u64;
+    }
+    if flags.has(MountFlags::NOEXEC) {
+        attr |= MOUNT_ATTR_NOEXEC as u64;
+    }
+    if flags.has(MountFlags::NOATIME) {
+        attr |= MOUNT_ATTR_NOATIME as u64;
+    }
+    if flags.has(MountFlags::NODIRATIME) {
+        attr |= MOUNT_ATTR_NODIRATIME as u64;
+    }
+    attr
+}
+
+fn mount_propagation_to_ms(prop: u32) -> u64 {
+    match prop {
+        vfs::mount::PROP_SHARED => MS_SHARED as u64,
+        vfs::mount::PROP_SLAVE => MS_SLAVE as u64,
+        vfs::mount::PROP_UNBINDABLE => MS_UNBINDABLE as u64,
+        _ => MS_PRIVATE as u64,
+    }
+}
+
+/// `statmount(2)`：按挂载 id 查询挂载元数据（最小可用语义）。
+pub(super) fn sys_statmount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let mnt_id = ctx.args[0] as u64;
+    let requested_mask = ctx.args[1] as u64;
+    let buf = ctx.args[2];
+    let bufsize = ctx.args[3];
+    if buf == 0 || bufsize < STATMOUNT_HEADER_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let snapshot = mount_snapshot(&vfs_ctx);
+    let entry = snapshot.iter().find(|e| e.id == mnt_id).ok_or(Errno::ENOENT)?;
+    let m = &entry.mount;
+
+    // 字符串区：fs_type 名、挂载根 "/"、挂载点路径。
+    let root_mount = vfs_ctx.mount_ns.root.lock().clone();
+    let visible_root = root_mount.mount_root.clone();
+    let mnt_point = m
+        .mountpoint()
+        .full_path(&visible_root)
+        .unwrap_or_else(|| String::from("?"));
+    let fs_type = m.superblock.fs_type;
+    let mut strs = String::new();
+    let off_fs_type = strs.len();
+    strs.push_str(fs_type);
+    strs.push('\0');
+    let off_point = strs.len();
+    strs.push_str(&mnt_point);
+    strs.push('\0');
+    let total = STATMOUNT_HEADER_SIZE
+        .checked_add(strs.len())
+        .ok_or(Errno::EOVERFLOW)?;
+    if bufsize < total {
+        return Err(Errno::EOVERFLOW);
+    }
+
+    let st = m.superblock.statfs().map_err(|e| e.to_errno())?;
+    let dev = m.superblock.dev_id.unwrap_or_default();
+
+    let mut out = vec![0u8; total];
+    let mask = requested_mask
+        & (STATMOUNT_SB_BASIC
+            | STATMOUNT_MNT_BASIC
+            | STATMOUNT_MNT_ROOT
+            | STATMOUNT_MNT_POINT
+            | STATMOUNT_FS_TYPE
+            | STATMOUNT_MNT_NS_ID);
+    put_u32(&mut out, 0, STATMOUNT_HEADER_SIZE as u32);
+    put_u64(&mut out, 8, mask);
+    put_u32(&mut out, 16, dev.major);
+    put_u32(&mut out, 20, dev.minor);
+    put_u64(&mut out, 24, st.fs_type);
+    put_u64(&mut out, 40, entry.id);
+    put_u64(&mut out, 48, entry.parent_id);
+    put_u64(&mut out, 64, mount_flags_to_mount_attr(m.flags_snapshot()));
+    put_u64(
+        &mut out,
+        72,
+        mount_propagation_to_ms(m.propagation.load(core::sync::atomic::Ordering::Acquire)),
+    );
+    put_u64(
+        &mut out,
+        80,
+        m.peer_group.load(core::sync::atomic::Ordering::Acquire),
+    );
+    put_u64(&mut out, 112, vfs_ctx.mount_ns.id);
+    put_u32(&mut out, 104, off_fs_type as u32);
+    put_u32(&mut out, 108, off_point as u32);
+    put_u32(&mut out, 120, off_fs_type as u32);
+    out[STATMOUNT_HEADER_SIZE..].copy_from_slice(strs.as_bytes());
+    copy_to_user(buf, &out).map_err(|e| e.as_errno())?;
+    Ok(0)
+}
+
+/// `listmount(2)`：枚举命名空间内挂载 id（最小可用语义，忽略筛选参数）。
+pub(super) fn sys_listmount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let last_mnt_id = ctx.args[2] as u64;
+    let list = ctx.args[3];
+    let nr_entries = ctx.args[4];
+    if list == 0 && nr_entries != 0 {
+        return Err(Errno::EFAULT);
+    }
+    let snapshot = mount_snapshot(&vfs_ctx);
+    let ids: Vec<u64> = snapshot
+        .iter()
+        .map(|e| e.id)
+        .filter(|id| *id > last_mnt_id)
+        .take(nr_entries)
+        .collect();
+    let mut raw = vec![0u8; ids.len() * 8];
+    for (i, id) in ids.iter().enumerate() {
+        put_u64(&mut raw, i * 8, *id);
+    }
+    if !raw.is_empty() {
+        copy_to_user(list, &raw).map_err(|e| e.as_errno())?;
+    }
+    Ok(ids.len())
 }
 
 pub(super) fn sys_open_tree_attr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
