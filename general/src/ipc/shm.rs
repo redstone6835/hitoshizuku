@@ -372,6 +372,9 @@ struct ShmState {
     by_key: BTreeMap<ShmKey, ShmId>,
     next_id: i32,
     total_pages: usize,
+    /// 经 `SHM_LOCK` 锁定的段页数之和（`RLIMIT_MEMLOCK` 记账，对应 Linux
+    /// `user->locked_shm`）。
+    locked_pages: usize,
 }
 
 impl ShmState {
@@ -381,6 +384,7 @@ impl ShmState {
             by_key: BTreeMap::new(),
             next_id: FIRST_SHM_ID,
             total_pages: 0,
+            locked_pages: 0,
         }
     }
 }
@@ -580,22 +584,50 @@ impl ShmManager {
         Ok(())
     }
 
-    /// `SHM_LOCK`/`SHM_UNLOCK`：设置/清除段的锁定标志。
-    ///
-    /// Linux 语义：需要 `CAP_IPC_LOCK`（由 syscall 层校验）；本内核没有页换出，
-    /// 因此"锁定"的完整语义是权限校验 + `SHM_LOCKED` 状态记账（`ipcs` 可见）。
-    /// 返回是否处于锁定状态。
-    #[kernel_symbols::export(name = "general.ipc.ShmManager.lock", contract = "kernel.ipc.sysv-shm@1", version = 1, capabilities = kernel_symbols::capability::IPC, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
-    pub fn lock(&self, id: ShmId, locked: bool, cred: &Credentials) -> Result<bool, Errno> {
-        let mut state = self.state.lock();
-        let entry = state.by_id.get_mut(&id).ok_or(Errno::EINVAL)?;
+    /// 若锁定 `id` 会新增的锁页数（已锁定返回 0）。供 syscall 层在调用
+    /// [`Self::lock`] 前做 `RLIMIT_MEMLOCK` 检查。
+    pub fn would_lock_pages(&self, id: ShmId) -> Result<usize, Errno> {
+        let state = self.state.lock();
+        let entry = state.by_id.get(&id).ok_or(Errno::EINVAL)?;
         if entry.marked_for_removal {
             return Err(Errno::EIDRM);
         }
-        if !cred.has_cap(Capability::IpcLock) {
-            return Err(Errno::EPERM);
+        Ok(if entry.locked { 0 } else { entry.pages })
+    }
+
+    /// 当前经 `SHM_LOCK` 锁定的段页数之和（`RLIMIT_MEMLOCK` 记账用）。
+    pub fn locked_pages(&self) -> usize {
+        self.state.lock().locked_pages
+    }
+
+    /// `SHM_LOCK`/`SHM_UNLOCK`：设置/清除段的锁定标志并做锁页记账。
+    ///
+    /// Linux 语义：需要 `CAP_IPC_LOCK`；本内核没有页换出，因此"锁定"的可观测
+    /// 部分是 `SHM_LOCKED` 状态记账（`ipcs` 可见）与 `RLIMIT_MEMLOCK` 记账
+    /// （锁定过多段时由 syscall 层返回 `ENOMEM`）。返回是否处于锁定状态。
+    #[kernel_symbols::export(name = "general.ipc.ShmManager.lock", contract = "kernel.ipc.sysv-shm@1", version = 1, capabilities = kernel_symbols::capability::IPC, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
+    pub fn lock(&self, id: ShmId, locked: bool, cred: &Credentials) -> Result<bool, Errno> {
+        let mut state = self.state.lock();
+        let pages = {
+            let entry = state.by_id.get_mut(&id).ok_or(Errno::EINVAL)?;
+            if entry.marked_for_removal {
+                return Err(Errno::EIDRM);
+            }
+            if !cred.has_cap(Capability::IpcLock) {
+                return Err(Errno::EPERM);
+            }
+            if locked == entry.locked {
+                // 幂等：重复 lock/unlock 不重复记账。
+                return Ok(locked);
+            }
+            entry.locked = locked;
+            entry.pages
+        };
+        if locked {
+            state.locked_pages = state.locked_pages.saturating_add(pages);
+        } else {
+            state.locked_pages = state.locked_pages.saturating_sub(pages);
         }
-        entry.locked = locked;
         Ok(locked)
     }
 
