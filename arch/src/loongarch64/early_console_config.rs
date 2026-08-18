@@ -14,9 +14,25 @@ const UART_LSR_REGISTER: usize = 5;
 const UART_DIVISOR_OVERSAMPLE: u32 = 16;
 
 /// 没有可用 DT 控制台时保留的传统 LoongArch QEMU 安全配置。
+#[cfg(not(mygo_la_board_ls2k1000))]
 pub(crate) const FALLBACK_EARLY_UART_CONFIG: EarlyUartConfig = EarlyUartConfig {
     phys_base: 0x1fe0_01e0,
     clock_hz: 100_000_000,
+    baud: 115_200,
+    reg_offset: 0,
+    reg_shift: 0,
+    io_width: RegisterIoWidth::U8,
+    endian: RegisterEndian::Little,
+};
+
+/// 2K1000LA 板（LS2K1000-DP-FACTORY / BPI1001）兜底：板载 UART0。
+///
+/// fork U-Boot 直启时不提供 DTB/EFI 配置表，命令行也没有 earlycon，
+/// 必须在这里指向板载 UART0（0x1fe20000，APB 125MHz）。
+#[cfg(mygo_la_board_ls2k1000)]
+pub(crate) const FALLBACK_EARLY_UART_CONFIG: EarlyUartConfig = EarlyUartConfig {
+    phys_base: 0x1fe2_0000,
+    clock_hz: 125_000_000,
     baud: 115_200,
     reg_offset: 0,
     reg_shift: 0,

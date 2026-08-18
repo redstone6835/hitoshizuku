@@ -6,7 +6,8 @@ ENTRY(_start)
    QEMU loongarch64 virt 的默认内核装载地址为 0x90000000；
    2K1000LA 开发板 fork U-Boot 装载于物理 0x200000（见 ls2k1000.ld）。 */
 BASE_ADDRESS = 0x90000000;
-VIRTUAL_BASE_ADDRESS = 0x9000000090000000;
+DMW1_BASE_ADDRESS = 0x9000000000000000;
+VIRTUAL_BASE_ADDRESS = DMW1_BASE_ADDRESS + BASE_ADDRESS;
 LOAD_OFFSET = VIRTUAL_BASE_ADDRESS - BASE_ADDRESS;
 
 SECTIONS
@@ -69,6 +70,12 @@ SECTIONS
     . = ALIGN(4K);
     erodata = .;
     . = ALIGN(8);
+
+    /* 板级内置设备树（ls2k1000 板 fork U-Boot 不传 DTB，厂内核以
+       CONFIG_BUILTIN_DTB 处理同一局面）。8 字节对齐以满足 DTB 内 u64 单元。 */
+    .builtin_dtb ALIGN(8) : AT(ADDR(.builtin_dtb) - LOAD_OFFSET) {
+        KEEP(*(.builtin_dtb .builtin_dtb.*))
+    }
 
     sdata = .;
     .data ALIGN(4K) : AT(ADDR(.data) - LOAD_OFFSET) {

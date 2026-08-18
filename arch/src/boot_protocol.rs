@@ -3,12 +3,13 @@
 //! 本模块把"识别固件启动方式 + 执行固件快照"从 loader 的硬编码逻辑中抽出。
 //! MyGO 的 LoongArch64 目标只支持 **U-Boot / 传统引导器直启**（无 EFI）：
 //!
-//! - 启动参数遵循 LoongArch Linux 协议：`$a0/$a1/$a2` 分别为 `efi_boot`
-//!   标志（U-Boot 直启为 0）、命令行或 DTB 物理地址、EFI system table
-//!   或 DTB 物理地址（U-Boot 直启通常为 0）。
+//! - 主线 LoongArch Linux 协议用 `$a0/$a1/$a2` 传 `efi_boot`、命令行和
+//!   EFI system table；UHI 直启用 `$a0=-2/$a1=FDT`。
+//! - 2K1000 板载 Loongson U-Boot 还保留厂商 legacy ABI：`$a0=argc`、
+//!   `$a1=argv`、`$a2=bootparam`、`$a3=FDT`。loader 会自动识别这些通道。
 //! - 固件来源只有 DTB：QEMU `-kernel` 直启会经伪 EFI 配置表暴露 FDT；
-//!   板载 fork U-Boot 的 `bootm` 显式传 fdt 时，DTB 经 `$a1`/`$a2` 直传，
-//!   由 loader 用 FDT magic 探测识别（不硬编码任何板级数据）。
+//!   U-Boot 交接中的 `$a3`（Loongson legacy）或 `$a1/$a2`（其它直启形式）
+//!   由 loader 用 FDT magic 探测识别。
 //!
 //! 原 EFI 适配器（真 UEFI / QEMU EFI 兼容交接）与 efi_stub 已随 U-Boot 直启
 //! 改造删除：内核镜像不再携带 PE 头，EFI Boot Services / ACPI 路径不再支持。
@@ -30,15 +31,19 @@ pub(crate) struct BootRegisters {
     /// `$a2`：EFI system table 或 DTB 物理地址（0 表示无；QEMU 伪 EFI 交接会提供）。
     #[allow(dead_code)]
     pub(crate) system_table_ptr: usize,
+    /// `$a3`：Loongson U-Boot legacy ABI 的 DTB 地址；主线协议未定义。
+    #[allow(dead_code)]
+    pub(crate) extension_ptr: usize,
 }
 
 impl BootRegisters {
-    /// 从 `_start` 传入的三个寄存器参数构造。
-    pub(crate) const fn new(a0: usize, a1: usize, a2: usize) -> Self {
+    /// 从 `_start` 传入的四个寄存器参数构造。
+    pub(crate) const fn new(a0: usize, a1: usize, a2: usize, a3: usize) -> Self {
         Self {
             efi_boot_flag: a0,
             cmdline_ptr: a1,
             system_table_ptr: a2,
+            extension_ptr: a3,
         }
     }
 }
@@ -156,7 +161,7 @@ mod tests {
     #[test]
     fn linux_boot_uses_config_table_fdt_when_present() {
         // QEMU `-kernel` 直启：a0=1 + 伪 EFI 配置表暴露 FDT。
-        let regs = BootRegisters::new(1, 0, 0x200);
+        let regs = BootRegisters::new(1, 0, 0x200, 0);
         let mut engine = engine_with(Some(0x9000_0000));
         let handoff = BootProtocolDispatcher::new(regs)
             .dispatch(&mut engine)
@@ -170,7 +175,7 @@ mod tests {
     #[test]
     fn linux_boot_without_fdt_is_ok() {
         // 板载 U-Boot 直启：无 EFI 配置表，DTB 由 loader 从交接探测。
-        let regs = BootRegisters::new(0, 0, 0);
+        let regs = BootRegisters::new(0, 0, 0, 0);
         let mut engine = engine_with(None);
         let handoff = BootProtocolDispatcher::new(regs)
             .dispatch(&mut engine)
@@ -183,9 +188,10 @@ mod tests {
 
     #[test]
     fn regs_keep_raw_view() {
-        let regs = BootRegisters::new(0, 0, 0);
+        let regs = BootRegisters::new(0, 0, 0, 0x300);
         assert_eq!(regs.cmdline_ptr, 0);
         assert_eq!(regs.system_table_ptr, 0);
         assert_eq!(regs.efi_boot_flag, 0);
+        assert_eq!(regs.extension_ptr, 0x300);
     }
 }

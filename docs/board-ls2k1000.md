@@ -7,7 +7,8 @@ U-Boot，以及逐驱动核对启动日志。
 ## 1. 构建
 
 ```sh
-# 板级二进制（fork U-Boot bootm 传统镜像用，装载于物理 0x200000）
+# 板级二进制（fork U-Boot bootm 传统镜像用，装载于物理 0x00200000，
+# 对应 DMW1 地址 0x9000000000200000）
 make ARCH=loongarch64 MYGO_LA_BOARD=ls2k1000
 # 产物：build/loongarch64/kernel
 
@@ -22,7 +23,7 @@ qemu-system-loongarch64 -machine virt -cpu la464 -m 1G -nographic \
   -kernel target/loongarch64-unknown-none/release/kernel -no-reboot
 ```
 
-预期：`handoff probe` 两条探测日志 → `DTB describes /memory` →
+预期：`handoff probe` 显示 EFI 配置表中的 DTB → `DTB describes /memory` →
 `total_ram=1024 MiB`；裸内核最后在 boot_root 因无根文件系统 panic
 属预期终态。
 
@@ -45,9 +46,9 @@ cp /tmp/board-fdt.dtb /srv/tftp/mygo.dtb
 板侧 U-Boot（进入 U-Boot 后）：
 
 ```
-# 一次性配置：bootm 必须显式传 fdt 参数（无参 bootm 会传 bd_info，
-# 内核会因 "no device tree in handoff" panic 并提示）
-setenv bootcmd 'dhcp; tftp ${loadaddr} uImage; tftp ${fdt_addr} mygo.dtb; bootm ${loadaddr} - ${fdt_addr}'
+# 厂商 U-Boot 从环境变量 fdt_addr 取得内核 DTB。先把 DTB 加载到该地址，
+# 再执行普通 bootm；该版本的 `bootm kernel - fdt` 交接不可靠。
+setenv bootcmd 'dhcp; tftp ${loadaddr} uImage; tftp ${fdt_addr} mygo.dtb; bootm ${loadaddr}'
 saveenv
 boot
 ```
@@ -55,11 +56,24 @@ boot
 `fdt_addr`/`loadaddr` 使用板子既有环境值（实测
 fdt_addr=0x900000000a000000，loadaddr=0x9000000098000000）。
 
+若从 SPI flash 启动，等价的关键顺序是：
+
+```
+sf probe
+sf read ${fdt_addr} dtb
+bootm ${loadaddr}
+```
+
+loader 会自动识别固件交接，优先级为 EFI 配置表、Loongson legacy `$a3`、
+UHI `$a1`、兼容 `$a2`，都无有效 FDT 时才使用内置板级 DTB。厂商 U-Boot 的
+`fdtcontroladdr` 是它自身使用的控制设备树，不保证适合作为内核设备树，因此
+内核不会扫描任意物理内存或自动采用该地址。
+
 ## 3. 预期启动日志（逐驱动核对）
 
 | 驱动 | 期望日志（前缀） | 说明 |
 | --- | --- | --- |
-| loader/DTB | `[loader] handoff probe ... a1_is_fdt=true`；`[loader][dtb] DTB copied ...`；`DTB has no /memory; using 2K1000 board memory: 2 regions (2048 MiB)` | 工厂 DTB 无 /memory，走板级内存回退，`total_ram` 应 ≈1885 MiB |
+| loader/DTB | 新 ABI：`EFI system table address accepted ... via=a2`；legacy ABI：`bpi_handoff=true ... a3_is_fdt=true`；随后出现 `[loader][dtb] DTB copied ...`，且不出现 `builtin board DTB copied` | 工厂 DTB 无 /memory，随后走板级内存回退，`total_ram` 应 ≈1885 MiB |
 | loongson-irq/clk/pinctrl | `[loongson-*]` 绑定 2k1000-icu、ls2x-clk、pinctrl/gpio | |
 | uart16550 | `[platform-uart16550] bound ... serial@1fe20000 ... -> /dev/uart0` ×12 | ttyS0 alias |
 | ls2k-rtc | `[platform-ls2k-rtc] installed realtime source ... phys=0x1fe27800 unix_ns=...` | TOY 时间 |

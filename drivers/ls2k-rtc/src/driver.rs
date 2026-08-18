@@ -1,13 +1,15 @@
 //! Loongson LS2K RTC platform ELM 驱动。
 //!
 //! 匹配 `loongson,ls2k-rtc`（2K1000LA 板工厂 DTB）与主线命名的
-//! `loongson,ls2k1000-rtc`。寄存器布局与 Linux drivers/rtc/rtc-loongson.c
-//! 一致：TOY 计数器 + TOY_MATCH0 闹钟；PM 域位于 RTC 基址下方 0x800 处
-//! （ls2k1000_rtc_config.pm_offset），用于闹钟中断/唤醒使能。
+//! `loongson,ls2k1000-rtc`。两个 compatible 在 LS2K1000LA 上使用同一套
+//! 寄存器语义，与 Linux drivers/rtc/rtc-loongson.c/rtc-ls2x.c 一致：TOY
+//! 计数器 + TOY_MATCH0 闹钟；PM 域位于 RTC 基址下方 0x800 处，用于闹钟
+//! 中断/唤醒使能。
 //! 固件层只负责把 `compatible` 与 MMIO resource 注册成 platform 设备；
 //! 本模块负责匹配、访问寄存器，并把读到的硬件时间交给内核 realtime 时钟。
 
 use alloc::sync::{Arc, Weak};
+use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use crate::dev::irq::{self, IrqHandle, IrqHandler, IrqLine, IrqStatus};
@@ -25,7 +27,7 @@ use vfs::sync::Spinlock;
 const COMPAT_LOONGSON_LS2K_RTC: &str = "loongson,ls2k-rtc";
 const COMPAT_LOONGSON_LS2K1000_RTC: &str = "loongson,ls2k1000-rtc";
 
-// Linux drivers/rtc/rtc-loongson.c 的 TOY 域寄存器偏移。
+// Linux drivers/rtc/rtc-loongson.c 与厂商 rtc-ls2x.c 的 TOY/RTC 域寄存器偏移。
 const TOY_WRITE0_REG: usize = 0x24;
 const TOY_WRITE1_REG: usize = 0x28;
 const TOY_READ0_REG: usize = 0x2c;
@@ -87,12 +89,12 @@ fn realtime_source_id(phys: usize) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ls2kRtcError {
     RegisterWindowTooSmall,
-    CounterDisabled,
     UnstableRead,
     InvalidDate,
     Overflow,
 }
 
+#[repr(C)]
 pub struct Ls2kRtc {
     base: usize,
     size: usize,
@@ -115,6 +117,28 @@ impl Ls2kRtc {
             alarm_match: AtomicU32::new(0),
             fix_year_offset: AtomicU32::new(0),
             pm_lock: Spinlock::new(()),
+        }
+    }
+
+    /// 在已经分配但尚未初始化的 Arc 存储中逐字段构造 RTC 对象。
+    ///
+    /// 这里不能把整个 `Ls2kRtc` 当作一个普通聚合值复制：结构体中包含
+    /// `AtomicBool` 和低对齐的 `Spinlock<()>`，LLVM 可能为了合并零写入而
+    /// 生成从非对齐地址开始的 `st.w`。LA264 不保证该访存可用，因此每个
+    /// 字段都必须保持自己的对齐和独立的 volatile 写语义。
+    unsafe fn write_in_place(dst: *mut Self, base: usize, size: usize, pm_base: Option<usize>) {
+        // Safety: 调用者传入的是 `Arc::new_uninit` 为唯一 owner 分配的、
+        // 满足 `Self` 对齐要求的存储；每个字段只写入一次，随后才转换为
+        // 已初始化的 Arc。
+        unsafe {
+            ptr::addr_of_mut!((*dst).base).write_volatile(base);
+            ptr::addr_of_mut!((*dst).size).write_volatile(size);
+            ptr::addr_of_mut!((*dst).pm_base).write_volatile(pm_base);
+            ptr::addr_of_mut!((*dst).alarm_irq_available).write_volatile(AtomicBool::new(false));
+            ptr::addr_of_mut!((*dst).alarm_enabled).write_volatile(AtomicBool::new(false));
+            ptr::addr_of_mut!((*dst).alarm_match).write_volatile(AtomicU32::new(0));
+            ptr::addr_of_mut!((*dst).fix_year_offset).write_volatile(AtomicU32::new(0));
+            ptr::addr_of_mut!((*dst).pm_lock).write_volatile(Spinlock::new(()));
         }
     }
 
@@ -319,6 +343,10 @@ impl Ls2kRtc {
     }
 
     fn enable_counter(&self) -> Result<(), Ls2kRtcError> {
+        // 厂商 `rtc-ls2x.c` 对 `loongson,ls2k-rtc` 也会执行这次
+        // RTC_CTRL read-modify-write；legacy compatible 并不表示这是 LS1C
+        // 那类没有 RTC_CTRL 的硬件。LS1C 应使用独立的 board-compatible，
+        // 不能在这里按字符串名称跳过寄存器访问。
         let mut ctrl = self.read32(RTC_CTRL_REG)?;
         if ctrl & CTRL_REQUIRED == CTRL_REQUIRED {
             return Ok(());
@@ -326,12 +354,9 @@ impl Ls2kRtc {
 
         ctrl |= CTRL_REQUIRED;
         self.write32(RTC_CTRL_REG, ctrl)?;
-        let ctrl = self.read32(RTC_CTRL_REG)?;
-        if ctrl & CTRL_REQUIRED == CTRL_REQUIRED {
-            Ok(())
-        } else {
-            Err(Ls2kRtcError::CounterDisabled)
-        }
+        // 与厂商 rtc-ls2x.c 的 probe 保持一致：一次 read-modify-write 后不再
+        // 读取 RTC_CTRL。后续直接读取 TOY 计数器。
+        Ok(())
     }
 
     fn read32(&self, offset: usize) -> Result<u32, Ls2kRtcError> {
@@ -341,7 +366,10 @@ impl Ls2kRtc {
             .ok_or(Ls2kRtcError::Overflow)?;
         // Safety: `ensure_register_window` 在访问前验证主 RTC 窗口，所有偏移均为对齐的
         // 固定寄存器偏移，且基址由 platform probe 完成映射。
-        Ok(unsafe { core::ptr::read_volatile(addr as *const u32) })
+        hal::memory::device_io_barrier();
+        let value = unsafe { core::ptr::read_volatile(addr as *const u32) };
+        hal::memory::device_io_barrier();
+        Ok(value)
     }
 
     fn write32(&self, offset: usize, value: u32) -> Result<(), Ls2kRtcError> {
@@ -350,21 +378,28 @@ impl Ls2kRtc {
             .checked_add(offset)
             .ok_or(Ls2kRtcError::Overflow)?;
         // Safety: 安全条件与 `read32` 相同，目标 RTC 寄存器允许 32 位易失写入。
+        hal::memory::device_io_barrier();
         unsafe { core::ptr::write_volatile(addr as *mut u32, value) };
+        hal::memory::device_io_barrier();
         Ok(())
     }
 
     fn pm_read32(&self, pm_base: usize, offset: usize) -> Result<u32, Ls2kRtcError> {
         let addr = pm_base.checked_add(offset).ok_or(Ls2kRtcError::Overflow)?;
-        // Safety: `pm_base` 是 RTC 基址下方的固定 PM 窗口（LS2K_PM_OFFSET），
-        // 由 probe 校验基址后映射，调用方只传入该窗口内的对齐固定偏移。
-        Ok(unsafe { core::ptr::read_volatile(addr as *const u32) })
+        // Safety: `pm_base` 是 LS2K 固件约定的 RTC 基址下方 PM 窗口
+        // （LS2K_PM_OFFSET），调用方只传入该窗口内的对齐固定偏移。
+        hal::memory::device_io_barrier();
+        let value = unsafe { core::ptr::read_volatile(addr as *const u32) };
+        hal::memory::device_io_barrier();
+        Ok(value)
     }
 
     fn pm_write32(&self, pm_base: usize, offset: usize, value: u32) -> Result<(), Ls2kRtcError> {
         let addr = pm_base.checked_add(offset).ok_or(Ls2kRtcError::Overflow)?;
         // Safety: 安全条件与 `pm_read32` 相同，目标 PM 寄存器允许 32 位易失写入。
+        hal::memory::device_io_barrier();
         unsafe { core::ptr::write_volatile(addr as *mut u32, value) };
+        hal::memory::device_io_barrier();
         Ok(())
     }
 }
@@ -417,7 +452,6 @@ fn map_ls2k_rtc_error(err: Ls2kRtcError) -> RtcError {
         Ls2kRtcError::RegisterWindowTooSmall
         | Ls2kRtcError::InvalidDate
         | Ls2kRtcError::Overflow => RtcError::Invalid,
-        Ls2kRtcError::CounterDisabled => RtcError::Io,
         Ls2kRtcError::UnstableRead => RtcError::Busy,
     }
 }
@@ -642,30 +676,65 @@ impl PnpDriver for Ls2kRtcPlatformDriver {
         let Some((phys, size)) = info.first_mmio() else {
             return Err(PnpError::missing(PnpResourceKind::Mmio, "rtc reg missing"));
         };
-        // PM 域位于 RTC 基址下方 0x800（Linux ls2k1000_rtc_config.pm_offset），
-        // 在固件声明的 reg 窗口之外，因此这里单独用地址换算映射。
+        // 两个 LS2K compatible 都对应同一块 LS2K1000 PM 域。工厂 DT 没有
+        // 在 RTC 节点上重复声明 PM resource（Linux 厂商驱动同样在缺少
+        // regmap phandle 时使用 rtc_base - 0x800），因此只在算术安全时
+        // 建立该固定窗口；地址不足时保留无 PM alarm 的降级行为。
         let pm_base = phys
             .checked_sub(LS2K_PM_OFFSET)
             .map(|pm_phys| (self.device_mmio_to_virt)(pm_phys));
-        let rtc = Arc::new(Ls2kRtc::new(
-            (self.device_mmio_to_virt)(phys),
-            size,
-            pm_base,
-        ));
-        let realtime_ns = rtc.read_unix_time_ns().map_err(|err| {
-            log::printk!(
-                "[platform-ls2k-rtc] probe failed for {} phys={:#x}: {:?}",
-                dev.id,
-                phys,
-                err
-            );
-            PnpError::hardware_failure("rtc initial time read failed")
-        })?;
+        log::printk!(
+            "[platform-ls2k-rtc] initializing {} phys={:#x} size={:#x}",
+            dev.id,
+            phys,
+            size
+        );
+        let rtc_base = (self.device_mmio_to_virt)(phys);
+        let rtc = Arc::<Ls2kRtc>::new_uninit();
+        // `new_uninit` 刚返回时只有这个局部变量持有 Arc。不要调用
+        // `Arc::get_mut`：它会为唯一性检查执行一次 LL/SC，而这里既没有
+        // 其它 strong/weak 引用，也不需要在早期平台 probe 中引入该原子路径。
+        let rtc_ptr = Arc::as_ptr(&rtc).cast_mut().cast::<Ls2kRtc>();
+        // Safety: `rtc_ptr` 指向当前唯一持有的、尚未初始化的 Arc 数据区；
+        // 在没有创建任何别的 Arc/Weak 引用期间，逐字段写入是独占的。
+        unsafe { Ls2kRtc::write_in_place(rtc_ptr, rtc_base, size, pm_base) };
+        // `Arc::assume_init` 会先调用 `into_inner_with_allocator` 验证唯一
+        // strong 引用；该验证在 LA264 上会生成 LL/SC，而平台 probe 此时
+        // 不需要也不应引入这条原子路径。这里没有创建任何别的引用，直接
+        // 消费未初始化 Arc 的裸指针，再以已初始化类型重建同一个 Arc。
+        // Safety: `rtc_ptr` 的完整对象已经由 `write_in_place` 初始化，且
+        // `into_raw` 保证原 Arc 不会再执行 drop；`from_raw` 接收的地址正是
+        // 同一分配及其原始 Arc header。
+        let rtc = unsafe {
+            let raw = Arc::into_raw(rtc).cast::<Ls2kRtc>();
+            Arc::<Ls2kRtc>::from_raw(raw)
+        };
+        let realtime_ns = match rtc.read_unix_time_ns() {
+            Ok(realtime_ns) => Some(realtime_ns),
+            Err(err) => {
+                // RTC 电池耗尽或固件留下非法日期时仍保留设备节点，允许用户态校时。
+                log::printk!(
+                    "[platform-ls2k-rtc] initial time from {} phys={:#x} is invalid: {:?}",
+                    dev.id,
+                    phys,
+                    err
+                );
+                None
+            }
+        };
+        log::printk!(
+            "[platform-ls2k-rtc] resources mapped {} phys={:#x} size={:#x}",
+            dev.id,
+            phys,
+            size
+        );
 
         let rtc_driver: Arc<dyn RtcDriver> = rtc.clone();
         let rtc_projection_name = RtcDevice::alloc_stable_projection_name(&dev.name)?;
         let rtc_dev = Arc::new(RtcDevice::new(rtc_projection_name, rtc_driver));
         dev.register_function(RtcFunction::new_arc(Arc::clone(&rtc_dev)))?;
+        // 厂商 legacy 驱动和主线驱动都会申请 DT 中声明的 alarm IRQ。处理器
+        // 先清 TOY_MATCH0，再向 RTC class 投递事件，避免匹配条件持续触发。
         let irq_handle = self.register_alarm_irq_handler(&rtc, &rtc_dev, info)?;
         if let Some(handle) = irq_handle
             && let Err(err) = dev.own_resource(irq::irq_handler_pnp_resource(
@@ -678,7 +747,9 @@ impl PnpDriver for Ls2kRtcPlatformDriver {
             return Err(err);
         }
 
-        self.install_realtime_clock(dev, phys, realtime_ns);
+        if let Some(realtime_ns) = realtime_ns {
+            self.install_realtime_clock(dev, phys, realtime_ns);
+        }
 
         dev.set_driver_data(Arc::new(Ls2kRtcBinding { rtc, rtc_dev }));
         Ok(())

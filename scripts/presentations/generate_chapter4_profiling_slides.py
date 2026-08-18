@@ -474,14 +474,14 @@ def enforce_font_floor(slide) -> None:
 
 def draw_01(slide) -> None:
     set_title(slide, CHAPTER4_TITLES[0])
-    lead(slide, "性能结论沿五层证据逐步收敛：先确认工作负载可比，再还原动态路径，最后把指令工作量换算为带不确定性的成本。")
+    lead(slide, "性能结论沿五层证据收敛：固定负载、还原路径、统计工作量、估计成本，并把结果归因到责任阶段。")
 
     labels = (
-        ("固定负载", "同一镜像、CPU、内存与窗口", PALE_BLUE, BLUE),
-        ("动态路径", "marker 内完整指令顺序", PALE_TEAL, TEAL),
-        ("执行计数", "用户态 / 内核态及语义分类", PALE_PURPLE, PURPLE),
-        ("成本估计", "成对差分、区间与质量标签", PALE_BLUE, BLUE),
-        ("热点归因", "函数、阶段与源码责任", PALE_GRAY, MUTED),
+        ("固定负载", "保持比较条件一致", PALE_BLUE, BLUE),
+        ("动态路径", "还原真实执行顺序", PALE_TEAL, TEAL),
+        ("执行计数", "统计实际工作量", PALE_PURPLE, PURPLE),
+        ("成本估计", "给出中心值与区间", PALE_BLUE, BLUE),
+        ("热点归因", "对应函数与责任阶段", PALE_GRAY, MUTED),
     )
     x = 3.00
     for index, (title, detail, fill, accent) in enumerate(labels):
@@ -490,21 +490,21 @@ def draw_01(slide) -> None:
             arrow(slide, x + 1.67, 3.30, x + 1.88, color=accent)
         x += 1.96
 
-    compact_row(slide, 4.36, "宏观比较", "BuildStorm 的时间与进度回答“整体是否变快”；QEMU CPU、指令数和函数热点回答“工作量发生了什么变化”。", fill=PALE_BLUE, accent=BLUE, h=0.68, title_w=1.76)
-    compact_row(slide, 5.18, "微观比较", "单次 syscall 或缺页探针固定输入与边界，逐条对照 MyGO / Linux 动态指令，定位首个结构分歧。", fill=PALE_TEAL, accent=TEAL, h=0.68, title_w=1.76)
-    boundary(slide, "统计模型负责量化成本及不确定性；机器学习从残差和时间留出中寻找新的结构，并反馈下一轮实验设计。", label="建模分工")
+    compact_row(slide, 4.36, "宏观比较", "整体时间与进度回答“是否变快”，指令工作量和热点回答“变化来自哪里”。", fill=PALE_BLUE, accent=BLUE, h=0.68, title_w=1.76)
+    compact_row(slide, 5.18, "微观比较", "固定同一类操作，对照两条动态路径并定位结构差异。", fill=PALE_TEAL, accent=TEAL, h=0.68, title_w=1.76)
+    boundary(slide, "统计模型量化成本与不确定性，机器学习检查剩余结构并反馈实验设计。", label="建模分工")
 
 
 def draw_02(slide) -> None:
-    set_title(slide, CHAPTER4_TITLES[1])
-    lead(slide, "固定逻辑探针给出唯一开始和结束边界；QEMU 插件只记录边界内真实执行的 RISC-V 指令，再由同次镜像的 ELF 与 map 还原函数身份。")
+    set_title(slide, METHOD_TITLES[1])
+    lead(slide, "制作 C/ASM 探针并在 MyGO 与 Linux 中运行；QEMU-TCG 识别探针头、限定窗口并记录两条动态内核路径。")
 
     steps = (
-        ("固定探针", "单一算法或 syscall", PALE_BLUE, BLUE),
-        ("START marker", "窗口恰好开启一次", PALE_PURPLE, PURPLE),
-        ("TCG 指令流", "sequence · PC · bytes · disassembly", PALE_TEAL, TEAL),
-        ("STOP marker", "窗口恰好闭合一次", PALE_PURPLE, PURPLE),
-        ("符号化", "ELF / map · function + offset", PALE_GRAY, MUTED),
+        ("编写探针", "C / ASM 固定操作", PALE_BLUE, BLUE),
+        ("双系统运行", "MyGO / Linux", PALE_PURPLE, PURPLE),
+        ("识别探针头", "限定采集窗口", PALE_TEAL, TEAL),
+        ("记录指令", "指令 / PC", PALE_PURPLE, PURPLE),
+        ("过滤并查表", "PC → 函数", PALE_GRAY, MUTED),
     )
     x = 3.00
     for index, (title, detail, fill, accent) in enumerate(steps):
@@ -513,22 +513,22 @@ def draw_02(slide) -> None:
             arrow(slide, x + 1.68, 3.09, x + 1.90, color=accent)
         x += 1.96
 
-    panel(slide, 3.00, 4.08, 4.55, 1.62, "完整性门禁", "单 vCPU；轨迹为 user → kernel → user；sequence 连续；dropped=0；translation_failures=0；窗口退出时 inactive。", fill=PALE_BLUE, accent=BLUE, title_size=18, detail_size=15)
-    panel(slide, 7.86, 4.08, 4.74, 1.62, "镜像一致性", "动态字节必须与静态反汇编一致；Linux alternative 仅在元数据与替换字节精确闭合时接受；kernel、map 与 manifest 绑定哈希。", fill=PALE_TEAL, accent=TEAL, title_size=18, detail_size=15)
-    boundary(slide, "最终 TSV 保存 sequence、权限态、PC、编码、函数、函数内偏移和动态汇编，形成可逐条复核的执行证据。", label="跟踪产物")
+    panel(slide, 3.00, 4.08, 4.55, 1.62, "动态路径分析", "按责任阶段和函数语义对齐两条路径，定位结构差异来自哪个内核责任。", fill=PALE_BLUE, accent=BLUE, title_size=18, detail_size=15)
+    panel(slide, 7.86, 4.08, 4.74, 1.62, "具体优化内容", "结合函数内指令数量和汇编差异，定位额外搬运、检查、分支或慢路径。", fill=PALE_TEAL, accent=TEAL, title_size=18, detail_size=15)
+    boundary(slide, "探针法观察一次固定操作，是同一指令归因思路的微观形态。", label="微观输出")
 
 
 def draw_03(slide) -> None:
     set_title(slide, CHAPTER4_TITLES[2])
-    lead(slide, "以 getpid 为例：同一用户探针在 MyGO 与 Linux 中各执行一次，比较对象不是同名函数，而是从 ecall 到 sret 的同一组责任阶段。")
+    lead(slide, "单次系统调用按责任阶段对齐：比较入口、分发、业务处理和返回，而不是机械比较同名函数。")
 
     stages = (
         ("ecall", "用户边界"),
-        ("trap 入口", "寄存器与 CSR"),
-        ("syscall 分发", "编号与目标选择"),
-        ("getpid", "当前任务读取"),
-        ("返回检查", "信号与调度标志"),
-        ("sret", "用户现场恢复"),
+        ("trap 入口", "进入内核"),
+        ("syscall 分发", "选择责任阶段"),
+        ("业务处理", "完成目标操作"),
+        ("返回检查", "准备返回用户态"),
+        ("返回用户态", "恢复执行"),
     )
     x = 3.00
     for index, (title, detail) in enumerate(stages):
@@ -540,88 +540,88 @@ def draw_03(slide) -> None:
             arrow(slide, x + 1.37, 2.94, x + 1.55, color=accent)
         x += 1.60
 
-    compact_row(slide, 3.84, "阶段指令数", "分别统计入口、分发、业务实现和返回路径，避免总数差异掩盖具体责任。", fill=PALE_BLUE, accent=BLUE, h=0.58, title_w=1.82)
-    compact_row(slide, 4.54, "首个动态分歧", "从两条顺序流的第一个不同位置开始回看函数与汇编，识别额外搬运、状态检查、原子操作或慢路径进入。", fill=PALE_PURPLE, accent=PURPLE, h=0.68, title_w=1.82)
-    compact_row(slide, 5.34, "源码责任对齐", "再将差异映射到 Linux entry、syscall dispatch 与 ret-to-user 的对应责任，而非按函数名机械匹配。", fill=PALE_TEAL, accent=TEAL, h=0.58, title_w=1.82)
-    boundary(slide, "单次轨迹解释路径结构；同一结构在长负载中出现多少次，由 BuildStorm 动态计数补足。", label="两类尺度")
+    compact_row(slide, 3.84, "阶段指令数", "分别统计入口、分发、业务和返回，保留责任结构。", fill=PALE_BLUE, accent=BLUE, h=0.58, title_w=1.82)
+    compact_row(slide, 4.54, "首个动态分歧", "从两条路径的第一个不同位置开始定位结构差异。", fill=PALE_PURPLE, accent=PURPLE, h=0.68, title_w=1.82)
+    compact_row(slide, 5.34, "责任对齐", "把差异归入对应阶段，避免只按函数名称下结论。", fill=PALE_TEAL, accent=TEAL, h=0.58, title_w=1.82)
+    boundary(slide, "单次轨迹解释路径结构，长负载计数补足其出现频率。", label="两类尺度")
 
 
 def draw_04(slide) -> None:
     set_title(slide, CHAPTER4_TITLES[3])
-    lead(slide, "内核动态指令总数描述工作量，却不能直接代表时间；成本归因需要同时保留每类指令的执行次数、语义上下文和成本区间。")
+    lead(slide, "动态指令数描述工作量；将其与语义成本结合，才能得到可解释的相对性能估计。")
 
     add_rect(slide, 3.00, 2.48, 9.60, 1.06, NAVY)
     body(slide, "T_kernel  ≈  Σₖ  Nₖ · θₖ", 3.20, 2.64, 9.20, 0.68, size=28, color=WHITE, bold=True, align=PP_ALIGN.CENTER, valign=MSO_ANCHOR.MIDDLE)
 
-    panel(slide, 3.00, 3.82, 2.92, 1.74, "Nₖ · 动态次数", "QEMU TCG 在固定窗口内统计真实执行次数，并区分用户态、内核态、指令编码和执行阶段。", fill=PALE_BLUE, accent=BLUE, title_size=19, detail_size=15)
-    panel(slide, 6.24, 3.82, 2.92, 1.74, "θₖ · 上下文成本", "同一助记符按依赖关系、分支方向、访存模式和控制流形态分别估计中心值与区间。", fill=PALE_PURPLE, accent=PURPLE, title_size=19, detail_size=15)
-    panel(slide, 9.48, 3.82, 3.12, 1.74, "函数与阶段归因", "将动态 PC 映射到 ELF 函数，再按指令成本分配到 trap、MM、VFS、调度等责任阶段。", fill=PALE_TEAL, accent=TEAL, title_size=19, detail_size=15)
-    boundary(slide, "该模型用于比较同一 QEMU TCG 环境中的相对成本构成；中心估计与上下界同时进入函数归因。", label="归因输出")
+    panel(slide, 3.00, 3.82, 2.92, 1.74, "Nₖ · 动态次数", "在固定窗口中统计每类指令的真实执行次数。", fill=PALE_BLUE, accent=BLUE, title_size=19, detail_size=15)
+    panel(slide, 6.24, 3.82, 2.92, 1.74, "θₖ · 上下文成本", "按执行语义估计中心成本与不确定性区间。", fill=PALE_PURPLE, accent=PURPLE, title_size=19, detail_size=15)
+    panel(slide, 9.48, 3.82, 3.12, 1.74, "函数与阶段归因", "将成本汇总到函数和系统责任阶段。", fill=PALE_TEAL, accent=TEAL, title_size=19, detail_size=15)
+    boundary(slide, "模型输出相对成本构成，并把中心值和区间同时用于归因。", label="归因输出")
 
 
 def draw_05(slide) -> None:
     set_title(slide, CHAPTER4_TITLES[4])
-    lead(slide, "每个目标指令上下文都配有同形态 baseline；二者共享序言、循环、调用、返回与 marker，差分后保留目标指令带来的增量。")
+    lead(slide, "成对差分让目标路径与同形态基线共享公共成本，差值用于估计目标操作的增量。")
 
-    panel(slide, 3.00, 2.36, 4.16, 1.78, "Probe 窗口", "START → 公共准备 → 目标指令 × N → 公共收束 → STOP", fill=PALE_BLUE, accent=BLUE, title_size=20, detail_size=16, center=True)
-    panel(slide, 8.44, 2.36, 4.16, 1.78, "Baseline 窗口", "START → 相同准备 → 同形态基线 × N → 相同收束 → STOP", fill=PALE_TEAL, accent=TEAL, title_size=20, detail_size=16, center=True)
+    panel(slide, 3.00, 2.36, 4.16, 1.78, "目标窗口", "公共准备 → 目标操作 → 公共收束", fill=PALE_BLUE, accent=BLUE, title_size=20, detail_size=16, center=True)
+    panel(slide, 8.44, 2.36, 4.16, 1.78, "基线窗口", "相同准备 → 对照操作 → 相同收束", fill=PALE_TEAL, accent=TEAL, title_size=20, detail_size=16, center=True)
     body(slide, "−", 7.36, 2.86, 0.88, 0.48, size=28, color=PURPLE, bold=True, align=PP_ALIGN.CENTER, valign=MSO_ANCHOR.MIDDLE)
 
     add_rect(slide, 3.00, 4.39, 9.60, 0.76, PALE_PURPLE)
     add_rect(slide, 3.00, 4.39, 0.08, 0.76, PURPLE)
     body(slide, "dᵢ = (T_probe,i − T_baseline,i) / (N_probe,i − N_baseline,i)", 3.24, 4.49, 9.12, 0.52, size=21, color=NAVY, bold=True, align=PP_ALIGN.CENTER, valign=MSO_ANCHOR.MIDDLE)
 
-    metric(slide, 3.00, 5.34, 2.90, "4K / 16K / 64K", "三档 batch", fill=PALE_BLUE, accent=BLUE)
-    metric(slide, 6.23, 5.34, 2.92, "AB / BA", "执行顺序交错", fill=PALE_TEAL, accent=TEAL)
-    metric(slide, 9.48, 5.34, 3.12, "相同路径", "预热与固定操作数", fill=PALE_GRAY, accent=MUTED)
+    metric(slide, 3.00, 5.34, 2.90, "成对窗口", "共享公共成本", fill=PALE_BLUE, accent=BLUE)
+    metric(slide, 6.23, 5.34, 2.92, "交错顺序", "降低顺序影响", fill=PALE_TEAL, accent=TEAL)
+    metric(slide, 9.48, 5.34, 3.12, "固定规模", "保证可比性", fill=PALE_GRAY, accent=MUTED)
 
 
 def draw_06(slide) -> None:
     set_title(slide, CHAPTER4_TITLES[5])
-    lead(slide, "成本键由“指令身份 + 原始编码 + 执行模式”共同确定；同一 mnemonic 的不同数据流和控制流不被静默平均。")
+    lead(slide, "成本按指令身份和执行语义分层；不同数据流、控制流和访存情境分别估计，避免平均掉关键差异。")
 
     rows = (
-        ("整数算术", "dependency-chain · independent/reset", PALE_BLUE, BLUE),
-        ("条件分支", "taken · not-taken · 不同分支历史", PALE_TEAL, TEAL),
-        ("访存与栈", "hot-load · hot-store · stack-load/store", PALE_PURPLE, PURPLE),
-        ("跳转与调用", "direct · indirect · call · return", PALE_BLUE, BLUE),
-        ("原子操作", "reservation-pair · SC 成功/失败 · aq/rl", PALE_TEAL, TEAL),
-        ("浮点与系统指令", "dependency · convert · compare · CSR 编号 · fence immediate", PALE_GRAY, MUTED),
+        ("整数算术", "依赖与独立数据流", PALE_BLUE, BLUE),
+        ("条件分支", "方向与历史", PALE_TEAL, TEAL),
+        ("访存与栈", "缓存与地址形态", PALE_PURPLE, PURPLE),
+        ("跳转与调用", "控制流类别", PALE_BLUE, BLUE),
+        ("原子操作", "成功与失败语义", PALE_TEAL, TEAL),
+        ("浮点与系统指令", "操作语义与上下文", PALE_GRAY, MUTED),
     )
     y = 2.42
     for title, detail, fill, accent in rows:
         compact_row(slide, y, title, detail, fill=fill, accent=accent, h=0.52, title_w=1.76, detail_size=15)
         y += 0.61
 
-    boundary(slide, "60-run 差分实验中 8 个 div/rem 数据流效应均成立，幅度为 2.780–5.075 ns/instruction；两个 mixed-TB 效应仅为 0.038–0.041 ns。", label="数据流证据")
+    boundary(slide, "数据流和控制流差异在成本估计中保持可见，模型不会把不同语义静默合并。", label="数据流结论")
 
 
 def draw_07(slide) -> None:
     set_title(slide, CHAPTER4_TITLES[6])
-    lead(slide, "成对差分仍会受到 QEMU 进程差异、执行顺序、时间漂移和 batch 的影响；稳健回归把这些量显式纳入模型。")
+    lead(slide, "成对差分之后，仍需用稳健模型吸收运行差异、顺序影响、时间漂移和规模效应。")
 
     add_rect(slide, 3.00, 2.39, 9.60, 0.76, NAVY)
     body(slide, "dᵢ = θ + α_run(i) + βₒOᵢ + β_dDᵢ + β_bBᵢ + εᵢ", 3.16, 2.50, 9.28, 0.52, size=22, color=WHITE, bold=True, align=PP_ALIGN.CENTER, valign=MSO_ANCHOR.MIDDLE)
 
     panels = (
         (3.00, "目标量 θ", "目标指令相对 baseline 的中心成本。", PALE_BLUE, BLUE),
-        (5.45, "run 效应 α", "吸收不同 QEMU 进程的整体快慢差异。", PALE_TEAL, TEAL),
-        (7.90, "顺序与漂移", "Oᵢ 表示 AB/BA；Dᵢ 表示 run 内时间位置。", PALE_PURPLE, PURPLE),
-        (10.35, "batch 档位", "Bᵢ 检查计数规模与成本是否保持稳定。", PALE_GRAY, MUTED),
+        (5.45, "运行效应 α", "吸收不同运行的整体差异。", PALE_TEAL, TEAL),
+        (7.90, "顺序与漂移", "表示实验顺序和时间位置。", PALE_PURPLE, PURPLE),
+        (10.35, "规模效应", "检查成本随工作量的变化。", PALE_GRAY, MUTED),
     )
     for x, title, detail, fill, accent in panels:
         panel(slide, x, 3.43, 2.25, 1.56, title, detail, fill=fill, accent=accent, title_size=17, detail_size=14)
 
-    compact_row(slide, 5.24, "Huber IRLS", "δ=1.345；主体残差采用二次损失，长尾残差逐步降权，不同 batch 的 MAD 方差形成异方差权重。", fill=PALE_BLUE, accent=BLUE, h=0.58, title_w=1.74)
-    boundary(slide, "60-run 实验每个上下文含 1,800 pair，ESS 为 653.44–1039.95；target → nop → empty-call 控制图继续传播 reference 不确定性。", label="样本与控制")
+    compact_row(slide, 5.24, "稳健拟合", "主体样本保持高权重，异常和长尾样本降低影响，输出中心成本及区间。", fill=PALE_BLUE, accent=BLUE, h=0.58, title_w=1.74)
+    boundary(slide, "回归结果同时保留运行效应和目标成本，便于比较并归因。", label="模型输出")
 
 
 def draw_08(slide) -> None:
     set_title(slide, CHAPTER4_TITLES[7])
-    lead(slide, "独立样本以完整启动组合定义，而不是以窗口数量定义；时间相关性由 super-run 顶层和 run 内连续块共同保留。")
+    lead(slide, "Bootstrap 以完整运行组合为独立样本，并在运行内部保持时间块结构，得到更稳健的不确定性区间。")
 
-    body(slide, "一个独立 super-run", 3.00, 2.36, 2.16, 0.34, size=16, color=NAVY, bold=True, valign=MSO_ANCHOR.MIDDLE)
-    sequence = (("A", "timing", BLUE), ("B", "plugin-off", TEAL), ("B", "plugin-off", TEAL), ("A", "timing", BLUE))
+    body(slide, "一个独立运行组合", 3.00, 2.36, 2.16, 0.34, size=16, color=NAVY, bold=True, valign=MSO_ANCHOR.MIDDLE)
+    sequence = (("A", "测量", BLUE), ("B", "对照", TEAL), ("B", "对照", TEAL), ("A", "测量", BLUE))
     x = 5.05
     for index, (letter, detail, accent) in enumerate(sequence):
         add_rect(slide, x, 2.28, 1.46, 0.78, PALE_BLUE if letter == "A" else PALE_TEAL)
@@ -631,48 +631,48 @@ def draw_08(slide) -> None:
             arrow(slide, x + 1.47, 2.67, x + 1.67, color=accent)
         x += 1.82
 
-    compact_row(slide, 3.40, "顶层重采样", "对完整 ABBA / BAAB super-run 有放回抽样；四次启动保持在同一独立簇内。", fill=PALE_PURPLE, accent=PURPLE, h=0.68, title_w=1.86)
-    compact_row(slide, 4.22, "时间块重采样", "在每个 run 内按连续 probe-round block 重采样，保留相邻窗口的自相关和慢漂移。", fill=PALE_TEAL, accent=TEAL, h=0.68, title_w=1.86)
-    compact_row(slide, 5.04, "全量重新拟合", "每个 replicate 重新执行 Huber 拟合、控制图解析、锚点尺度和全部上下文联合估计。", fill=PALE_BLUE, accent=BLUE, h=0.68, title_w=1.86)
-    boundary(slide, "60-run 结构实验完成 4,999/4,999 个有效 replicate；复制同一次 QEMU 启动内的 pair 只增加组内重复。", label="重采样闭合")
+    compact_row(slide, 3.40, "顶层重采样", "以完整运行组合为单位抽样，保留独立性。", fill=PALE_PURPLE, accent=PURPLE, h=0.68, title_w=1.86)
+    compact_row(slide, 4.22, "时间块重采样", "保留相邻窗口的相关结构和慢漂移。", fill=PALE_TEAL, accent=TEAL, h=0.68, title_w=1.86)
+    compact_row(slide, 5.04, "全量重新拟合", "每次重采样都重新估计中心值和区间。", fill=PALE_BLUE, accent=BLUE, h=0.68, title_w=1.86)
+    boundary(slide, "分层 Bootstrap 输出稳定的成本区间，并把运行结构纳入不确定性。", label="重采样结论")
 
 
 def draw_09(slide) -> None:
     set_title(slide, CHAPTER4_TITLES[8])
-    lead(slide, "模型同时评价点估计精度、跨运行稳定性和采集有效性；质量标签来自整套门禁，而不是单个窄区间。")
+    lead(slide, "质量评价同时关注点估计、跨运行稳定性和采集完整性，最终输出中心值、区间和质量等级。")
 
     add_rect(slide, 3.00, 2.40, 4.44, 1.18, NAVY)
     body(slide, "M_b = maxₖ |(θ̂ₖ⁽ᵇ⁾ − θ̂ₖ) / sₖ|", 3.16, 2.55, 4.12, 0.40, size=20, color=WHITE, bold=True, align=PP_ALIGN.CENTER, valign=MSO_ANCHOR.MIDDLE)
-    body(slide, "全族同时区间控制多上下文比较中的整体误报", 3.18, 2.99, 4.08, 0.30, size=14, color=WHITE, bold=True, align=PP_ALIGN.CENTER, valign=MSO_ANCHOR.MIDDLE)
+    body(slide, "同时区间控制多上下文比较的整体误报", 3.18, 2.99, 4.08, 0.30, size=14, color=WHITE, bold=True, align=PP_ALIGN.CENTER, valign=MSO_ANCHOR.MIDDLE)
 
-    panel(slide, 7.76, 2.40, 4.84, 1.18, "正成本锚点", "dependency-chain div 在 head / body / tail 与不同 batch 重复；每个 bootstrap replicate 内重新估计 plugin-off 到 primary 的尺度。", fill=PALE_TEAL, accent=TEAL, title_size=18, detail_size=14)
+    panel(slide, 7.76, 2.40, 4.84, 1.18, "正成本锚点", "用稳定的正成本参照校准相对指令成本。", fill=PALE_TEAL, accent=TEAL, title_size=18, detail_size=14)
 
     left = (
-        ("样本闭合", "编码纯度 · pair 数 · ESS · bootstrap 有效率"),
-        ("模型稳定", "Huber 收敛 · batch · 顺序 · run 内漂移"),
+        ("样本闭合", "样本完整、区间可复现"),
+        ("模型稳定", "估计对运行条件不敏感"),
     )
     right = (
-        ("跨运行一致性", "plugin-off · cross-clock · future-run interval"),
-        ("宿主审计", "CPU 绑定 · SMT sibling · 频率 · PSI · 温度"),
+        ("跨运行一致性", "不同运行得到相近结论"),
+        ("环境记录", "保留必要的主机与时间上下文"),
     )
     for index, (title, detail) in enumerate(left):
         panel(slide, 3.00, 3.86 + index * 1.02, 4.44, 0.88, title, detail, fill=PALE_BLUE, accent=BLUE, title_size=17, detail_size=14)
     for index, (title, detail) in enumerate(right):
         panel(slide, 7.76, 3.86 + index * 1.02, 4.84, 0.88, title, detail, fill=PALE_PURPLE if index == 0 else PALE_GRAY, accent=PURPLE if index == 0 else MUTED, title_size=17, detail_size=14)
 
-    boundary(slide, "输出保留中心值、同时区间、质量标签和具名失败项；下游函数归因可以区分严格成本、有限区间与探索估计。", label="分级产物")
+    boundary(slide, "输出保留中心值、同时区间和质量标签；下游归因据此区分稳定结论与探索估计。", label="分级产物")
 
 
 def draw_10(slide) -> None:
     set_title(slide, CHAPTER4_TITLES[9])
-    lead(slide, "机器学习读取同一批成对差分样本，从指令身份、执行模式和实验位置中寻找稳健回归尚未显式表达的结构。")
+    lead(slide, "机器学习作为结构发现工具，读取差分样本并寻找稳健统计模型尚未表达的非线性关系。")
 
     stages = (
-        ("差分样本", "ns / target-instruction", PALE_BLUE, BLUE),
-        ("特征展开", "语义 · 编码 · pattern · batch · order · drift", PALE_TEAL, TEAL),
-        ("HGB", "absolute-error loss", PALE_PURPLE, PURPLE),
-        ("残差结构", "非线性关联与上下文交互", PALE_BLUE, BLUE),
-        ("实验反馈", "新探针 · 新分层 · 采样优先级", PALE_GRAY, MUTED),
+        ("差分样本", "目标成本与上下文", PALE_BLUE, BLUE),
+        ("特征展开", "语义、执行模式和位置", PALE_TEAL, TEAL),
+        ("结构模型", "学习非线性关系", PALE_PURPLE, PURPLE),
+        ("残差结构", "发现剩余交互", PALE_BLUE, BLUE),
+        ("实验反馈", "更新探针与采样", PALE_GRAY, MUTED),
     )
     x = 3.00
     for index, (title, detail, fill, accent) in enumerate(stages):
@@ -681,29 +681,29 @@ def draw_10(slide) -> None:
             arrow(slide, x + 1.68, 3.10, x + 1.90, color=accent)
         x += 1.96
 
-    panel(slide, 3.00, 4.12, 4.55, 1.60, "结构发现", "识别 dependency/reset、mixed-TB、batch、AB/BA 与 run 内位置之间的复杂关联，筛选需要建立专用差分窗口的上下文。", fill=PALE_BLUE, accent=BLUE, title_size=19, detail_size=15)
-    panel(slide, 7.86, 4.12, 4.74, 1.60, "采样配置", "依据残差幅度、区间宽度和时间稳定性分配后续 run；把模型发现转化为可预注册、可独立复核的实验条件。", fill=PALE_TEAL, accent=TEAL, title_size=19, detail_size=15)
-    boundary(slide, "60-run 数据：HGB OOF MAE 0.119238 ns，context+batch 基线 0.120531 ns；增量改善 0.001292 ns，约为 0.15 ns 实用尺度的 0.86%。", label="结构增量")
+    panel(slide, 3.00, 4.12, 4.55, 1.60, "结构发现", "识别上下文之间的非线性关联，找出需要进一步解释的成本差异。", fill=PALE_BLUE, accent=BLUE, title_size=19, detail_size=15)
+    panel(slide, 7.86, 4.12, 4.74, 1.60, "采样反馈", "依据残差、区间和稳定性调整下一轮实验重点。", fill=PALE_TEAL, accent=TEAL, title_size=19, detail_size=15)
+    boundary(slide, "机器学习带来小幅但稳定的结构增量，价值在于发现方向并改善实验设计。", label="结构结论")
 
 
 def draw_11(slide) -> None:
     set_title(slide, CHAPTER4_TITLES[10])
-    lead(slide, "完整 super-run 分组避免同源数据泄漏；随机留出衡量独立重复的一致性，时间前向留出检验早期模型对后期运行的解释能力。")
+    lead(slide, "留出评估用独立运行组合划分训练、校准和测试，并同时检验随机重复与时间前向稳定性。")
 
-    panel(slide, 3.00, 2.36, 4.55, 1.62, "随机完整组留出", "20 train → 20 calibration → 80 test\nGroupKFold 与 split conformal 都以完整 super-run 为最小分组。", fill=PALE_BLUE, accent=BLUE, title_size=19, detail_size=15, center=True)
-    panel(slide, 7.86, 2.36, 4.74, 1.62, "时间前向留出", "早期 train → 中期 calibration → 后期 test\n采集顺序固定保留，用于识别共同慢漂移与时间外推风险。", fill=PALE_TEAL, accent=TEAL, title_size=19, detail_size=15, center=True)
+    panel(slide, 3.00, 2.36, 4.55, 1.62, "随机完整组留出", "以独立运行组合划分训练、校准和测试，评价重复性。", fill=PALE_BLUE, accent=BLUE, title_size=19, detail_size=15, center=True)
+    panel(slide, 7.86, 2.36, 4.74, 1.62, "时间前向留出", "按采集顺序前向测试，评价跨时间的稳定性。", fill=PALE_TEAL, accent=TEAL, title_size=19, detail_size=15, center=True)
 
     metric(slide, 3.00, 4.26, 2.90, "0.12258 ns", "HGB OOF MAE", fill=PALE_PURPLE, accent=PURPLE)
     metric(slide, 6.23, 4.26, 2.92, "0.12392 ns", "context+batch 基线", fill=PALE_BLUE, accent=BLUE)
     metric(slide, 9.48, 4.26, 3.12, "0.00134 ns", "增量改善", fill=PALE_TEAL, accent=TEAL)
 
-    compact_row(slide, 5.40, "时间结构发现", "120-run 复核测得 lag-1 相关 0.36–0.61、早晚成本上升 2.3%–3.9%；前向 test 的 800/800 个差分分类保持一致。", fill=PALE_GRAY, accent=MUTED, h=0.58, title_w=1.92, detail_size=14)
-    boundary(slide, "前向验证推动 CPU 亲和性、governor、温度遥测、QEMU 预热和 run-block Bootstrap 进入正式采集协议。", label="协议反馈")
+    compact_row(slide, 5.40, "时间结构发现", "前向测试显示结论具有时间稳定性，同时暴露出可继续优化的慢漂移。", fill=PALE_GRAY, accent=MUTED, h=0.58, title_w=1.92, detail_size=14)
+    boundary(slide, "随机与时间前向留出共同支持模型的泛化结论，并反馈后续采集协议。", label="协议反馈")
 
 
 def draw_12(slide) -> None:
     set_title(slide, CHAPTER4_TITLES[11])
-    lead(slide, "统计估计与机器学习形成闭环：前者给出可解释的成本及区间，后者发现剩余结构并把它转化为下一轮受控实验。")
+    lead(slide, "统计估计给出可解释的成本和区间，机器学习发现剩余结构，二者共同反馈下一轮受控实验。")
 
     stages = (
         ("受控微基准", "固定上下文", PALE_BLUE, BLUE),
@@ -719,30 +719,124 @@ def draw_12(slide) -> None:
             arrow(slide, x + 1.68, 3.07, x + 1.90, color=accent)
         x += 1.96
 
-    compact_row(slide, 4.10, "指令层产物", "每个语义上下文的动态次数、中心成本、同时区间、稳定性标签与实验身份。", fill=PALE_BLUE, accent=BLUE, h=0.64, title_w=1.82)
-    compact_row(slide, 4.88, "函数层产物", "结合动态 PC 与 ELF/map，将成本区间汇总到函数、trap/MM/VFS 等责任阶段。", fill=PALE_TEAL, accent=TEAL, h=0.64, title_w=1.82)
-    compact_row(slide, 5.66, "现行实验设计", "205 个独立 super-run = 20 train + 39 calibration + 146 honest test；随机与时间前向两组共同复核。", fill=PALE_PURPLE, accent=PURPLE, h=0.40, title_w=1.82, detail_size=14)
-    boundary(slide, "动态指令流从“调试日志”转化为可计数、可定价、可归因的证据；模型发现继续反馈新探针与独立 BuildStorm 验证。", label="方法收束")
+    compact_row(slide, 4.10, "指令层产物", "动态次数、中心成本、区间和稳定性标签。", fill=PALE_BLUE, accent=BLUE, h=0.64, title_w=1.82)
+    compact_row(slide, 4.88, "函数层产物", "把成本区间汇总到函数和系统责任阶段。", fill=PALE_TEAL, accent=TEAL, h=0.64, title_w=1.82)
+    compact_row(slide, 5.66, "现行实验设计", "以独立运行组合进行随机与时间前向留出。", fill=PALE_PURPLE, accent=PURPLE, h=0.40, title_w=1.82, detail_size=14)
+    boundary(slide, "动态指令流从调试日志转化为可计数、可定价、可归因的证据，并持续反馈新的实验方向。", label="方法收束")
 
 
-DRAWERS = (
-    draw_01,
-    draw_02,
-    draw_03,
-    draw_04,
-    draw_05,
-    draw_06,
-    draw_07,
-    draw_08,
-    draw_09,
-    draw_10,
-    draw_11,
-    draw_12,
+METHOD_TITLES = (
+    "三种调试方法与演进关系",
+    "调试探针法：微观调用路径",
+    "整体测量法：1200 秒宏观窗口",
+    "统计分析法：构建可信指令权重",
+    "加权归因与优化优先级",
 )
 
 
+def draw_method_01(slide) -> None:
+    set_title(slide, METHOD_TITLES[0])
+    lead(slide, "三种方法共享“动态指令 → 内核地址 → 函数归属”的证据链，并依次完成微观定位、宏观筛选与加权定序。")
+
+    panel(slide, 3.00, 2.38, 2.92, 2.02, "调试探针法 · 微观", "C/ASM 固定操作；对齐 MyGO 与 Linux 的单次内核路径，定位动态函数序列与函数内差异。", fill=PALE_BLUE, accent=BLUE, title_size=18, detail_size=15)
+    panel(slide, 6.24, 2.38, 2.92, 2.02, "整体测量法 · 宏观", "同一负载运行 1200 秒；按函数汇总内核动态指令，筛选长期累计热点。", fill=PALE_TEAL, accent=TEAL, title_size=18, detail_size=15)
+    panel(slide, 9.48, 2.38, 3.12, 2.02, "统计分析法 · 加权", "测量指令在特定上下文中的相对时间，隔离环境噪声并建立可信权重表。", fill=PALE_PURPLE, accent=PURPLE, title_size=18, detail_size=15)
+
+    compact_row(slide, 4.72, "统一思路", "TCG 记录指令及其 PC，过滤内核地址，再由当次构建的符号表映射到函数。", fill=PALE_BLUE, accent=BLUE, h=0.62, title_w=1.76)
+    compact_row(slide, 5.48, "演进原因", "指令数只能产生候选热点，不能直接代表时间；最终必须引入指令权重。", fill=PALE_PURPLE, accent=PURPLE, h=0.62, title_w=1.76)
+    boundary(slide, "探针与整体测量分别观察微观路径和宏观累计量，统计分析为二者提供统一成本尺度。", label="方法关系")
+
+
+def draw_method_03(slide) -> None:
+    set_title(slide, METHOD_TITLES[2])
+    lead(slide, "在固定资源与同一负载定义下，各运行 1200 秒并记录动态指令，从全局视角筛选内核函数热点。")
+
+    steps = (
+        ("固定条件", "资源与负载一致", PALE_BLUE, BLUE),
+        ("1200 秒", "覆盖长期行为", PALE_PURPLE, PURPLE),
+        ("记录指令", "TCG 指令与 PC", PALE_TEAL, TEAL),
+        ("过滤内核", "保留内核 PC", PALE_PURPLE, PURPLE),
+        ("函数聚合", "符号表 → 指令构成", PALE_GRAY, MUTED),
+    )
+    x = 3.00
+    for index, (title, detail, fill, accent) in enumerate(steps):
+        stage_box(slide, x, 2.38, 1.66, 1.42, title, detail, fill=fill, accent=accent)
+        if index != len(steps) - 1:
+            arrow(slide, x + 1.68, 3.09, x + 1.90, color=accent)
+        x += 1.96
+
+    panel(slide, 3.00, 4.08, 4.55, 1.62, "宏观输出", "按函数汇总动态指令总量与构成，识别长窗口中累计工作量高的候选热点。", fill=PALE_BLUE, accent=BLUE, title_size=18, detail_size=15)
+    panel(slide, 7.86, 4.08, 4.74, 1.62, "与探针法的关系", "符号归因链相同；探针法解释单次路径，整体法衡量长负载中的累计工作量。", fill=PALE_TEAL, accent=TEAL, title_size=18, detail_size=15)
+    boundary(slide, "跨系统比较须按完成操作数或有效进度归一化；原始数量只用于筛选候选热点。", label="宏观边界")
+
+
+def draw_method_04(slide) -> None:
+    set_title(slide, METHOD_TITLES[3])
+    lead(slide, "统计分析为指令及其执行上下文建立可信权重：先测量初始时间增量，再隔离环境噪声与时间漂移。")
+
+    steps = (
+        ("改造探针", "加入固定指令段", PALE_BLUE, BLUE),
+        ("前后对比", "时间差 / 指令增量", PALE_TEAL, TEAL),
+        ("噪声隔离", "差分、稳健拟合", PALE_PURPLE, PURPLE),
+        ("Bootstrap", "复核区间与稳定性", PALE_BLUE, BLUE),
+        ("ML 检查", "比较残差与方案", PALE_GRAY, MUTED),
+    )
+    x = 3.00
+    for index, (title, detail, fill, accent) in enumerate(steps):
+        stage_box(slide, x, 2.30, 1.66, 1.48, title, detail, fill=fill, accent=accent, title_size=16, detail_size=14)
+        if index != len(steps) - 1:
+            arrow(slide, x + 1.68, 3.04, x + 1.90, color=accent)
+        x += 1.96
+
+    add_rect(slide, 3.00, 4.10, 4.55, 0.78, NAVY)
+    body(slide, "wₖ⁽⁰⁾  ≈  ΔT / ΔNₖ", 3.20, 4.15, 4.15, 0.34, size=22, color=WHITE, bold=True, align=PP_ALIGN.CENTER, valign=MSO_ANCHOR.MIDDLE)
+    body(slide, "单一指令类 · 固定执行上下文", 3.20, 4.51, 4.15, 0.24, size=14, color=WHITE, bold=True, align=PP_ALIGN.CENTER, valign=MSO_ANCHOR.MIDDLE)
+
+    add_rect(slide, 7.86, 4.10, 4.74, 0.78, PALE_TEAL)
+    add_rect(slide, 7.86, 4.10, 0.08, 0.78, TEAL)
+    heading(slide, "可信权重表", 8.08, 4.28, 1.48, 0.34, size=17, color=NAVY)
+    body(slide, "中心权重 · 区间 · 稳定性标签", 9.66, 4.19, 2.70, 0.48, size=14, color=BODY, bold=True, valign=MSO_ANCHOR.MIDDLE)
+    compact_row(slide, 5.18, "统计方法", "成对差分吸收公共成本，稳健回归处理漂移，分层 Bootstrap 保留运行结构。", fill=PALE_PURPLE, accent=PURPLE, h=0.62, title_w=1.72)
+    boundary(slide, "Bootstrap 评估不确定性；独立留出与机器学习检查残差结构，辅助筛选可信方案。", label="筛选原则")
+
+
+def draw_method_05(slide) -> None:
+    set_title(slide, METHOD_TITLES[4])
+    lead(slide, "将微观动态路径、宏观累计指令和可信上下文权重合并，才能得到可解释的性能开销与优化优先级。")
+
+    stages = (
+        ("探针路径", "具体调用与指令差异", PALE_BLUE, BLUE),
+        ("累计指令", "函数内总量与构成", PALE_TEAL, TEAL),
+        ("上下文权重", "相对时间与区间", PALE_PURPLE, PURPLE),
+        ("加权成本", "数量 × 权重", PALE_BLUE, BLUE),
+        ("优化定位", "优先级与具体内容", PALE_GRAY, MUTED),
+    )
+    x = 3.00
+    for index, (title, detail, fill, accent) in enumerate(stages):
+        stage_box(slide, x, 2.34, 1.66, 1.42, title, detail, fill=fill, accent=accent, title_size=16, detail_size=14)
+        if index != len(stages) - 1:
+            arrow(slide, x + 1.68, 3.05, x + 1.90, color=accent)
+        x += 1.96
+
+    add_rect(slide, 3.00, 4.08, 9.60, 0.78, NAVY)
+    body(slide, "C(f)  ≈  ∑  N(f, k, c) · w(k, c)", 3.18, 4.19, 9.24, 0.52, size=23, color=WHITE, bold=True, align=PP_ALIGN.CENTER, valign=MSO_ANCHOR.MIDDLE)
+    compact_row(slide, 5.14, "工程结果", "优先优化“累计加权成本高”的函数，再回到探针动态路径确定具体修改内容。", fill=PALE_TEAL, accent=TEAL, h=0.64, title_w=1.72)
+    boundary(slide, "权重和成本只用于同一 QEMU 环境中的相对比较；详细统计参数与验证结果保存在补充文档。", label="结论边界")
+
+
+DRAWERS = (
+    draw_method_01,
+    draw_02,
+    draw_method_03,
+    draw_method_04,
+    draw_method_05,
+)
+
+ACTIVE_CHAPTER4_TITLES = METHOD_TITLES
+
+
 def update_transition(slide) -> None:
-    replacement = "从动态指令出发，建立可归因、可复核的成本模型。"
+    replacement = "从微观探针到长窗口测量，再以可信指令权重确定优化优先级。"
     candidates = [
         shape
         for shape in slide.shapes
@@ -824,11 +918,11 @@ def atomic_save(prs: Presentation, output: Path) -> None:
 
 def build_topic(full_output: Path, topic_output: Path) -> None:
     prs = Presentation(full_output)
-    keep_titles = set(CHAPTER4_TITLES)
+    keep_titles = set(ACTIVE_CHAPTER4_TITLES)
     for slide in list(prs.slides):
         if not (slide_texts(slide) & keep_titles):
             remove_slide(prs, slide)
-    if len(prs.slides) != len(CHAPTER4_TITLES):
+    if len(prs.slides) != len(ACTIVE_CHAPTER4_TITLES):
         raise RuntimeError(f"第四章专题页数错误：{len(prs.slides)}")
     atomic_save(prs, topic_output)
 
@@ -840,7 +934,7 @@ def validate(path: Path, *, expected_slides: int | None = None) -> None:
     titles_found = []
     for slide_number, slide in enumerate(prs.slides, 1):
         texts = slide_texts(slide)
-        titles_found.extend(title for title in CHAPTER4_TITLES if title in texts)
+        titles_found.extend(title for title in ACTIVE_CHAPTER4_TITLES if title in texts)
         for shape in slide.shapes:
             if not getattr(shape, "has_text_frame", False) or not shape.text.strip():
                 continue
@@ -848,11 +942,11 @@ def validate(path: Path, *, expected_slides: int | None = None) -> None:
                 for run in paragraph.runs:
                     if not run.text.strip() or run.font.size is None:
                         continue
-                    if any(title in texts for title in CHAPTER4_TITLES) and run.font.size.pt < MIN_FONT_PT:
+                    if any(title in texts for title in ACTIVE_CHAPTER4_TITLES) and run.font.size.pt < MIN_FONT_PT:
                         raise RuntimeError(
                             f"第 {slide_number} 页文字小于 {MIN_FONT_PT:g} pt：{run.text!r}"
                         )
-    if sorted(titles_found) != sorted(CHAPTER4_TITLES):
+    if sorted(titles_found) != sorted(ACTIVE_CHAPTER4_TITLES):
         raise RuntimeError("第四章标题集合不完整或重复")
 
 
@@ -872,7 +966,7 @@ def main() -> int:
     parser.add_argument(
         "--topic-output",
         type=Path,
-        default=root / "output/presentations/mygo-defense-chapter4-profiling-12pages.pptx",
+        default=root / "output/presentations/mygo-defense-chapter4-profiling-5pages.pptx",
     )
     args = parser.parse_args()
 
@@ -884,7 +978,7 @@ def main() -> int:
     atomic_save(prs, full_output)
     validate(full_output)
     build_topic(full_output, topic_output)
-    validate(topic_output, expected_slides=len(CHAPTER4_TITLES))
+    validate(topic_output, expected_slides=len(ACTIVE_CHAPTER4_TITLES))
     print(full_output)
     print(topic_output)
     return 0

@@ -3,13 +3,14 @@
 //! 匹配工厂 DTB 的三个 USB 节点：otg@40000000（loongson,loongson2-dwc2，
 //! dr_mode="host"）、ehci@40060000（loongson,ls2k-ehci）、
 //! ohci@40070000（loongson,ls2k-ohci）。每个控制器绑定后创建
-//! [`UsbBus`]（HCD 实现 + 枚举），上电端口并做首次扫描；IRQ（端口变化）
-//! 触发后续扫描。EHCI 端口复位后把 FS/LS 设备移交给伴生 OHCI。
+//! [`UsbBus`]（HCD 实现 + 枚举），上电端口并做首次扫描。当前三个 HCD 的传输
+//! 都采用同步轮询；热插拔扫描必须由可睡眠 worker 承担，不能放进硬中断上下文。
+//! EHCI 端口复位后把 FS/LS 设备移交给伴生 OHCI。
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 
-use general::dev::irq::{self, IrqHandle, IrqHandler, IrqLine, IrqStatus};
-use general::dev::platform::{PlatformDeviceInfo, PlatformIrqRegistrationError};
+use general::dev::dt_provider::{self, DtbProviderError, DtbResourceRequest};
+use general::dev::platform::PlatformDeviceInfo;
 use general::dev::pnp::{
     BusType, DevInitContext, DriverFactory, DriverHandle, PnpBusInfo, PnpDevice, PnpDriver,
     PnpError, PnpId, PnpResourceKind, register_driver_factory,
@@ -19,18 +20,16 @@ use crate::core::{UsbBus, UsbHcd};
 use crate::dwc2::Dwc2Hcd;
 use crate::ehci::EhciHcd;
 use crate::ohci::OhciHcd;
-use crate::regs::*;
-
 const COMPAT_DWC2: &str = "loongson,loongson2-dwc2";
 const COMPAT_EHCI: &str = "loongson,ls2k-ehci";
 const COMPAT_OHCI: &str = "loongson,ls2k-ohci";
+const PROP_PINCTRL_DEFAULT: &str = "pinctrl-0";
+const PROP_GPIOS: &str = "gpios";
 
-/// IRQ 端口变化 → 清除变化位并触发总线扫描。
-struct UsbScanHandler {
-    bus: Weak<UsbBus>,
-    kind: ScanKind,
-    base: usize,
-}
+// 2K1000 板级代码在任何 USB 控制器启动前都会关闭硬件预取。该位不属于
+// EHCI 标准寄存器窗口，不能由通用 EHCI 初始化流程代替。
+const LS2K1000_GENERAL_CFG1_PHYS: usize = 0x1fe0_0428;
+const LS2K1000_USB_PREFETCH: u32 = 1 << 19;
 
 #[derive(Clone, Copy, Debug)]
 enum ScanKind {
@@ -39,70 +38,8 @@ enum ScanKind {
     Dwc2,
 }
 
-impl UsbScanHandler {
-    fn acknowledge(&self) {
-        match self.kind {
-            ScanKind::Ehci => {
-                // 清除全部端口连接/使能变化位（PORTSC 变化位写 1 清除）。
-                // Safety: base 由 platform probe 映射，窗口已校验。
-                for port in 0..8 {
-                    let reg = self.base + EHCI_PORTSC + port * 4;
-                    let value = unsafe { core::ptr::read_volatile(reg as *const u32) };
-                    if value & (EHCI_PORTSC_CSC | EHCI_PORTSC_OCC | (1 << 16) | (1 << 17) | (1 << 19) | (1 << 20)) != 0 {
-                        unsafe {
-                            core::ptr::write_volatile(reg as *mut u32, value)
-                        };
-                    }
-                }
-            }
-            ScanKind::Ohci => {
-                // Safety: 同 Ehci。
-                let status = unsafe {
-                    core::ptr::read_volatile((self.base + OHCI_HcInterruptStatus) as *const u32)
-                };
-                if status & OHCI_INTR_RHSC != 0 {
-                    unsafe {
-                        core::ptr::write_volatile(
-                            (self.base + OHCI_HcInterruptStatus) as *mut u32,
-                            OHCI_INTR_RHSC,
-                        )
-                    };
-                }
-            }
-            ScanKind::Dwc2 => {
-                // Safety: 同 Ehci。
-                let hprt = unsafe { core::ptr::read_volatile((self.base + DWC2_HPRT) as *const u32) };
-                if hprt & (DWC2_HPRT_PRTCONNDET | DWC2_HPRT_PRTENCHNG | DWC2_HPRT_PRTOVRCURRCHNG) != 0 {
-                    unsafe {
-                        core::ptr::write_volatile(
-                            (self.base + DWC2_HPRT) as *mut u32,
-                            hprt
-                                | DWC2_HPRT_PRTCONNDET
-                                | DWC2_HPRT_PRTENCHNG
-                                | DWC2_HPRT_PRTOVRCURRCHNG,
-                        )
-                    };
-                }
-            }
-        }
-    }
-}
-
-impl IrqHandler for UsbScanHandler {
-    fn handle_irq(&self, _line: IrqLine) -> IrqStatus {
-        self.acknowledge();
-        if let Some(bus) = self.bus.upgrade() {
-            bus.scan_ports();
-            IrqStatus::Handled
-        } else {
-            IrqStatus::Unhandled
-        }
-    }
-}
-
 struct UsbBinding {
     bus: Arc<UsbBus>,
-    irq_handle: Option<IrqHandle>,
 }
 
 pub struct Ls2kUsbDriver {
@@ -111,7 +48,9 @@ pub struct Ls2kUsbDriver {
 
 impl Ls2kUsbDriver {
     pub const fn new(device_mmio_to_virt: fn(usize) -> usize) -> Self {
-        Self { device_mmio_to_virt }
+        Self {
+            device_mmio_to_virt,
+        }
     }
 
     fn kind_of(info: &PlatformDeviceInfo) -> Option<ScanKind> {
@@ -126,26 +65,78 @@ impl Ls2kUsbDriver {
         }
     }
 
-    fn register_scan_irq(
+    fn acquire_optional_resource(
         &self,
-        bus: &Arc<UsbBus>,
-        kind: ScanKind,
-        base: usize,
+        dev: &Arc<PnpDevice>,
         info: &PlatformDeviceInfo,
-    ) -> Result<Option<IrqHandle>, PnpError> {
-        let handler: Arc<dyn IrqHandler> = Arc::new(UsbScanHandler {
-            bus: Arc::downgrade(bus),
-            kind,
-            base,
-        });
-        match info.register_first_irq_handler(handler) {
-            Ok(handle) => Ok(Some(handle)),
-            Err(PlatformIrqRegistrationError::NoResource) => Ok(None),
-            Err(PlatformIrqRegistrationError::Unresolved) => {
-                Ok(None) // 端口变化走首次扫描 + 未来轮询，IRQ 缺失不致命
-            }
-            Err(PlatformIrqRegistrationError::RegistrationFailed { .. }) => Ok(None),
+        property: &str,
+        request: DtbResourceRequest<'_>,
+        label: &'static str,
+    ) -> Result<(), PnpError> {
+        let lease = match info.acquire_dtb_resource_at(property, 0) {
+            Ok(lease) => lease,
+            Err(DtbProviderError::Disabled | DtbProviderError::Invalid) => return Ok(()),
+            Err(error) => return Err(error.into_pnp_error()),
+        };
+        lease
+            .control(request)
+            .map_err(DtbProviderError::into_pnp_error)?;
+        dev.own_resource(dt_provider::lease_pnp_resource(lease, label))
+    }
+
+    /// 应用 2K1000-DP 板级 EHCI 引脚复用，并拉高外部 VBUS 使能。
+    ///
+    /// 两项资源均由 DT 描述；其它板型没有对应属性时保持现有固件状态。
+    fn prepare_ehci_board_resources(
+        &self,
+        dev: &Arc<PnpDevice>,
+        info: &PlatformDeviceInfo,
+    ) -> Result<(), PnpError> {
+        dev.reserve_owned_resources(2)?;
+        self.acquire_optional_resource(
+            dev,
+            info,
+            PROP_PINCTRL_DEFAULT,
+            DtbResourceRequest::Enable,
+            "ls2k-ehci-pinctrl",
+        )?;
+        self.acquire_optional_resource(
+            dev,
+            info,
+            PROP_GPIOS,
+            DtbResourceRequest::Assert,
+            "ls2k-ehci-vbus",
+        )
+    }
+
+    /// 应用厂商 2K1000 U-Boot `dev_fixup()` 中的 USB 预取修正。
+    fn disable_ehci_prefetch(&self, dev: &PnpDevice) -> Result<(), PnpError> {
+        let register = (self.device_mmio_to_virt)(LS2K1000_GENERAL_CFG1_PHYS);
+        hal::memory::device_io_barrier();
+        // Safety: `register` 是 2K1000 GENERAL_CFG1 的非缓存设备映射，寄存器
+        // 宽度为 32 位；probe 在单核启动阶段以读改写方式保留其它功能位。
+        let before = unsafe { core::ptr::read_volatile(register as *const u32) };
+        let expected = before & !LS2K1000_USB_PREFETCH;
+        if expected != before {
+            // Safety: 地址与访问宽度同上，写入值仅清除厂商指定的 bit 19。
+            unsafe { core::ptr::write_volatile(register as *mut u32, expected) };
         }
+        hal::memory::device_io_barrier();
+        // Safety: 回读同一有效 MMIO 寄存器，用于确认 posted write 已经生效。
+        let after = unsafe { core::ptr::read_volatile(register as *const u32) };
+        hal::memory::device_io_barrier();
+        log::printk!(
+            "[ls2k-usb] EHCI platform fixup for {} GENERAL_CFG1={:#010x}->{:#010x}",
+            dev.id,
+            before,
+            after
+        );
+        if after & LS2K1000_USB_PREFETCH != 0 {
+            return Err(PnpError::hardware_failure(
+                "ls2k1000 usb prefetch disable did not latch",
+            ));
+        }
+        Ok(())
     }
 
     fn probe_hcd(
@@ -162,23 +153,47 @@ impl Ls2kUsbDriver {
         let context = info.dma_context();
         let hcd: Arc<dyn UsbHcd> = match kind {
             ScanKind::Ehci => {
+                self.prepare_ehci_board_resources(dev, info)?;
+                self.disable_ehci_prefetch(dev)?;
                 if size < 0x100 {
-                    return Err(PnpError::malformed(PnpResourceKind::Mmio, "ehci window too small"));
+                    return Err(PnpError::malformed(
+                        PnpResourceKind::Mmio,
+                        "ehci window too small",
+                    ));
                 }
                 // EHCI 能力寄存器在基址，操作寄存器在 CAPLENGTH 偏移。
                 // Safety: 窗口由 platform probe 校验。
-                let caplength =
-                    unsafe { core::ptr::read_volatile(base as *const u32) } & 0xff;
-                Arc::new(
-                    EhciHcd::new(base + caplength as usize, base, context)
-                        .map_err(|_| PnpError::hardware_failure("ehci init failed"))?,
-                )
+                let capability = unsafe { core::ptr::read_volatile(base as *const u32) };
+                let caplength = capability & 0xff;
+                if capability == u32::MAX || caplength < 0x10 || caplength as usize >= size {
+                    log::printk!(
+                        "[ls2k-usb] EHCI capability invalid for {} phys={:#x}: {:#010x}; check BAR0 and PCI memory decode",
+                        dev.id,
+                        phys,
+                        capability
+                    );
+                    return Err(PnpError::hardware_failure("ehci capability header invalid"));
+                }
+                let op_base = base + caplength as usize;
+                let hcd: Arc<dyn UsbHcd> =
+                    Arc::new(EhciHcd::new(op_base, base, context).map_err(|error| {
+                        log::printk!(
+                            "[ls2k-usb] EHCI init failed for {} phys={:#x}: {}",
+                            dev.id,
+                            phys,
+                            error
+                        );
+                        PnpError::hardware_failure("ehci init failed")
+                    })?);
+                hcd
             }
             ScanKind::Ohci => Arc::new(
-                OhciHcd::new(base, context).map_err(|_| PnpError::hardware_failure("ohci init failed"))?,
+                OhciHcd::new(base, context)
+                    .map_err(|_| PnpError::hardware_failure("ohci init failed"))?,
             ),
             ScanKind::Dwc2 => Arc::new(
-                Dwc2Hcd::new(base, context).map_err(|_| PnpError::hardware_failure("dwc2 init failed"))?,
+                Dwc2Hcd::new(base, context)
+                    .map_err(|_| PnpError::hardware_failure("dwc2 init failed"))?,
             ),
         };
         let bus = UsbBus::new(bus_id, hcd);
@@ -187,8 +202,8 @@ impl Ls2kUsbDriver {
                 .port_power_on(port)
                 .map_err(|_| PnpError::hardware_failure("usb port power failed"))?;
         }
-        let irq_handle = self.register_scan_irq(&bus, kind, base, info)?;
-        // 首次扫描（枚举可能耗时，只记录结果）。
+        // 枚举包含端口复位、同步传输和 PnP probe，只能在进程上下文执行。
+        // 当前 HCD 使用轮询完成，不注册 IRQ；运行期热插拔后续由专用 worker 接入。
         bus.scan_ports();
         log::printk!(
             "[ls2k-usb] bound {} phys={:#x} size={:#x} kind={:?} ports={}",
@@ -198,7 +213,7 @@ impl Ls2kUsbDriver {
             kind,
             bus.hcd().port_count(),
         );
-        dev.set_driver_data(Arc::new(UsbBinding { bus, irq_handle }));
+        dev.set_driver_data(Arc::new(UsbBinding { bus }));
         Ok(())
     }
 }
@@ -237,9 +252,16 @@ impl PnpDriver for Ls2kUsbDriver {
     fn remove(&self, dev: &Arc<PnpDevice>) {
         if let Some(data) = dev.take_driver_data()
             && let Ok(binding) = data.downcast::<UsbBinding>()
-            && let Some(handle) = binding.irq_handle
+            && let Err(error) = binding.bus.hcd().shutdown()
         {
-            let _ = irq::unregister_irq_handler(handle);
+            log::error!(
+                "[ls2k-usb] cannot stop {} safely: {}; retaining DMA objects",
+                dev.id,
+                error,
+            );
+            // 控制器可能仍持有 DMA 地址。此时泄漏整个 binding 比释放后形成
+            // DMA use-after-free 更安全，后续板级复位才能重新接管设备。
+            core::mem::forget(binding);
         }
         log::printk!("[ls2k-usb] removed {}", dev.id);
     }

@@ -414,7 +414,7 @@ impl SdioHost {
     }
 
     fn wait_card_ready(&mut self) -> Result<(), SdioError> {
-        let deadline = sched::now_ns_public().saturating_add(COMMAND_TIMEOUT_NS);
+        let deadline = hal::time::monotonic_ns().saturating_add(COMMAND_TIMEOUT_NS);
         loop {
             let status = self.send_command(
                 Command::new(13, u32::from(self.card.rca) << 16, ResponseType::R1, None),
@@ -424,7 +424,7 @@ impl SdioHost {
             if status & (1 << 8) != 0 && state == 4 {
                 return Ok(());
             }
-            if sched::now_ns_public() >= deadline {
+            if hal::time::monotonic_ns() >= deadline {
                 return Err(SdioError::Timeout);
             }
             core::hint::spin_loop();
@@ -467,7 +467,7 @@ impl SdioHost {
         } else {
             DATA_TIMEOUT_NS
         };
-        let deadline = sched::now_ns_public().saturating_add(timeout);
+        let deadline = hal::time::monotonic_ns().saturating_add(timeout);
         let mut response_done = false;
         let mut transferred = 0usize;
         loop {
@@ -513,7 +513,7 @@ impl SdioHost {
             } else if response_done {
                 break;
             }
-            if sched::now_ns_public() >= deadline {
+            if hal::time::monotonic_ns() >= deadline {
                 self.stop_dma();
                 return Err(SdioError::Timeout);
             }
@@ -878,8 +878,8 @@ fn write32(address: usize, value: u32) {
 }
 
 fn delay_ns(duration: u64) {
-    let deadline = sched::now_ns_public().saturating_add(duration);
-    while sched::now_ns_public() < deadline {
+    let deadline = hal::time::monotonic_ns().saturating_add(duration);
+    while hal::time::monotonic_ns() < deadline {
         core::hint::spin_loop();
     }
 }

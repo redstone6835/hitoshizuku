@@ -814,6 +814,8 @@ pub fn cargo_build(project: &Path, target: &str, cargo_name: &str) -> Result<Pat
     let (api_profiles, profile_hashes) = kernel_profile_cfg_values(&project_manifest, target)?;
     append_kernel_profile_flags(&mut rustflags, &interface, &api_profiles, &profile_hashes);
     if target == "loongarch64-unknown-none" {
+        rustflags.push("-Ctarget-feature=-ual".to_string());
+        rustflags.push("-Ctarget-feature=-lsx,-lasx".to_string());
         rustflags.push("-Anamed_asm_labels".to_string());
     }
     let mut command = Command::new("cargo");
@@ -860,6 +862,10 @@ pub fn cargo_build_integrated(
     append_kernel_metadata_flags(&mut rustflags, &metadata, &interface)?;
     let (api_profiles, profile_hashes) = kernel_profile_cfg_values(&project_manifest, target)?;
     append_kernel_profile_flags(&mut rustflags, &interface, &api_profiles, &profile_hashes);
+    if target == "loongarch64-unknown-none" {
+        rustflags.push("-Ctarget-feature=-ual".to_string());
+        rustflags.push("-Ctarget-feature=-lsx,-lasx".to_string());
+    }
     rustflags.push(format!(
         "--cfg=elm_integrated_phase=\"{}\"",
         project_manifest.integrated_phase.as_str()
@@ -908,10 +914,25 @@ pub fn cargo_build_integrated(
     remove_if_exists(&temporary)?;
     fs::create_dir_all(&temporary)
         .map_err(|err| format!("创建 {} 失败: {err}", temporary.display()))?;
+    // 同一 build-set 中的多个 integrated consumer 可能依赖同一个本地 API crate。
+    // kernel 最终会对每个组件归档使用 --whole-archive，因此共享 API 只能由首个
+    // consumer 带入一次；provider 自己的 API 仍始终保留在 provider 归档中。
+    let shared_api_crates = std::env::var("ELM_INTEGRATED_SHARED_API_CRATES")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
     let mut archives = vec![rlib];
     let mut local_api_crates = project_manifest
         .dependencies
         .iter()
+        .filter(|dependency| {
+            dependency.crate_name.as_ref().map_or(true, |crate_name| {
+                !shared_api_crates.contains(crate_name)
+            })
+        })
         .filter_map(|dependency| dependency.crate_name.clone())
         .collect::<Vec<_>>();
     if let Some(api) = &project_manifest.api {
@@ -2590,6 +2611,10 @@ fn elm_link_flags(loongarch: bool) -> Vec<String> {
         "link-arg=--build-id=none".to_string(),
     ];
     if loongarch {
+        flags.push("-C".to_string());
+        flags.push("target-feature=-ual".to_string());
+        flags.push("-C".to_string());
+        flags.push("target-feature=-lsx,-lasx".to_string());
         flags.push("-A".to_string());
         flags.push("named_asm_labels".to_string());
     }

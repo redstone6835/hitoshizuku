@@ -25,52 +25,69 @@ pub const EHCI_PORTSC: usize = 0x44;
 
 pub const EHCI_CMD_RUN: u32 = 1 << 0;
 pub const EHCI_CMD_HCRESET: u32 = 1 << 1;
-pub const EHCI_CMD_ASE: u32 = 1 << 6;
-pub const EHCI_CMD_PSE: u32 = 1 << 7;
-pub const EHCI_CMD_IAA: u32 = 1 << 5;
+pub const EHCI_CMD_PSE: u32 = 1 << 4;
+pub const EHCI_CMD_ASE: u32 = 1 << 5;
+pub const EHCI_CMD_IAAD: u32 = 1 << 6;
+pub const EHCI_CMD_LRESET: u32 = 1 << 7;
 
-pub const EHCI_STS_HCHALTED: u32 = 1 << 12;
-pub const EHCI_STS_IAA: u32 = 1 << 6;
-pub const EHCI_STS_PORTCHANGE: u32 = 1 << 3;
-pub const EHCI_STS_FLR: u32 = 1 << 4;
+pub const EHCI_STS_USBINT: u32 = 1 << 0;
 pub const EHCI_STS_ERRINT: u32 = 1 << 1;
+pub const EHCI_STS_PORTCHANGE: u32 = 1 << 2;
+pub const EHCI_STS_FLR: u32 = 1 << 3;
+pub const EHCI_STS_FATAL: u32 = 1 << 4;
+pub const EHCI_STS_IAA: u32 = 1 << 5;
+pub const EHCI_STS_HCHALTED: u32 = 1 << 12;
+pub const EHCI_STS_PSS: u32 = 1 << 14;
+pub const EHCI_STS_ASS: u32 = 1 << 15;
+pub const EHCI_STS_W1C_MASK: u32 = EHCI_STS_USBINT
+    | EHCI_STS_ERRINT
+    | EHCI_STS_PORTCHANGE
+    | EHCI_STS_FLR
+    | EHCI_STS_FATAL
+    | EHCI_STS_IAA;
 
-pub const EHCI_INTR_IAA: u32 = 1 << 6;
-pub const EHCI_INTR_PORTCHANGE: u32 = 1 << 3;
-pub const EHCI_INTR_FLR: u32 = 1 << 4;
-pub const EHCI_INTR_ERRINT: u32 = 1 << 1;
-pub const EHCI_INTR_USBINT: u32 = 1 << 0;
+// USBINTR 与 USBSTS 的中断源位号相同，直接复用状态位，避免两组定义漂移。
+pub const EHCI_INTR_IAA: u32 = EHCI_STS_IAA;
+pub const EHCI_INTR_PORTCHANGE: u32 = EHCI_STS_PORTCHANGE;
+pub const EHCI_INTR_FLR: u32 = EHCI_STS_FLR;
+pub const EHCI_INTR_FATAL: u32 = EHCI_STS_FATAL;
+pub const EHCI_INTR_ERRINT: u32 = EHCI_STS_ERRINT;
+pub const EHCI_INTR_USBINT: u32 = EHCI_STS_USBINT;
 
 pub const EHCI_PORTSC_CCS: u32 = 1 << 0;
-pub const EHCI_PORTSC_PED: u32 = 1 << 1;
-pub const EHCI_PORTSC_CSC: u32 = 1 << 2;
-pub const EHCI_PORTSC_OCC: u32 = 1 << 4;
-pub const EHCI_PORTSC_FPR: u32 = 1 << 5;
-pub const EHCI_PORTSC_SUSP: u32 = 1 << 6;
-pub const EHCI_PORTSC_PR: u32 = 1 << 7;
-pub const EHCI_PORTSC_PP: u32 = 1 << 10;
+pub const EHCI_PORTSC_CSC: u32 = 1 << 1;
+pub const EHCI_PORTSC_PED: u32 = 1 << 2;
+pub const EHCI_PORTSC_PEC: u32 = 1 << 3;
+pub const EHCI_PORTSC_OCC: u32 = 1 << 5;
+pub const EHCI_PORTSC_FPR: u32 = 1 << 6;
+pub const EHCI_PORTSC_SUSP: u32 = 1 << 7;
+pub const EHCI_PORTSC_PR: u32 = 1 << 8;
+pub const EHCI_PORTSC_PP: u32 = 1 << 12;
 pub const EHCI_PORTSC_PORT_OWNER: u32 = 1 << 13;
 pub const EHCI_PORTSC_WKCNNT_E: u32 = 1 << 20;
-pub const EHCI_PORTSC_DEVSPD_SHIFT: u32 = 26;
-pub const EHCI_PORTSC_DEVSPD_MASK: u32 = 3 << 26;
-pub const EHCI_PORTSC_CHANGE_MASK: u32 =
-    EHCI_PORTSC_CSC | EHCI_PORTSC_OCC | (1 << 16) | (1 << 17) | (1 << 19) | (1 << 20);
+/// PORTSC 中写 1 清除的状态变化位。修改其它字段前必须先清掉这些位，
+/// 否则“读-改-写”会意外确认尚未处理的端口事件。
+pub const EHCI_PORTSC_CHANGE_MASK: u32 = EHCI_PORTSC_CSC | EHCI_PORTSC_PEC | EHCI_PORTSC_OCC;
 
-/// QH（48 字节，32 位地址模式）。
-#[repr(C)]
+/// QH 硬件区（48 字节，32 位地址模式）。
+///
+/// EHCI 要求每个 QH 按 32 字节对齐；`align(32)` 同时把数组槽距补齐到
+/// 64 字节，避免连续池中第二个 QH 落在未对齐地址。
+#[repr(C, align(32))]
 #[derive(Clone, Copy, Default)]
 pub struct EhciQhHw {
-    pub next: u32,        // dword0: 链接指针（bit0=T）
-    pub info1: u32,       // dword1: 端点特性
-    pub info2: u32,       // dword2: 端点能力
-    pub current: u32,     // dword3: 当前 qTD
-    pub qtd_next: u32,    // dword4: 下一个 qTD（overlay）
-    pub token: u32,       // dword5: token（overlay）
-    pub buf0: u32,        // dword6
-    pub buf1: u32,        // dword7
-    pub buf2: u32,        // dword8
-    pub buf3: u32,        // dword9
-    pub buf4: u32,        // dword10
+    pub next: u32,         // dword0: 链接指针（bit0=T，bits2:1=类型）
+    pub info1: u32,        // dword1: 端点特性
+    pub info2: u32,        // dword2: 端点能力
+    pub current: u32,      // dword3: 当前 qTD
+    pub qtd_next: u32,     // dword4: 下一个 qTD（overlay）
+    pub qtd_alt_next: u32, // dword5: 备选 qTD（overlay）
+    pub token: u32,        // dword6: token（overlay）
+    pub buf0: u32,         // dword7
+    pub buf1: u32,         // dword8
+    pub buf2: u32,         // dword9
+    pub buf3: u32,         // dword10
+    pub buf4: u32,         // dword11
 }
 
 pub const QH_CONTROL_EP: u32 = 1 << 27;
@@ -80,6 +97,22 @@ pub const QH_HIGH_SPEED: u32 = 2 << 12;
 pub const QH_FULL_SPEED: u32 = 0 << 12;
 pub const QH_LOW_SPEED: u32 = 1 << 12;
 pub const QH_NEXT_TERMINATE: u32 = 1 << 0;
+pub const QH_NEXT_TYPE_QH: u32 = 1 << 1;
+pub const QH_NEXT_TYPE_MASK: u32 = 3 << 1;
+pub const QH_NEXT_POINTER_MASK: u32 = !0x1f;
+
+/// 编码 QH horizontal link pointer（EHCI 1.0 3.6.1）。
+pub const fn qh_next(dma: u32) -> u32 {
+    (dma & QH_NEXT_POINTER_MASK) | QH_NEXT_TYPE_QH
+}
+
+/// 从 horizontal link pointer 中提取 32 字节对齐的 DMA 地址。
+pub const fn qh_next_pointer(link: u32) -> u32 {
+    link & QH_NEXT_POINTER_MASK
+}
+
+const _: () = assert!(core::mem::size_of::<EhciQhHw>() == 64);
+const _: () = assert!(core::mem::align_of::<EhciQhHw>() == 32);
 
 /// qTD（32 字节）。
 #[repr(C)]

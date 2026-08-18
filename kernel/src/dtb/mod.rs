@@ -6,6 +6,51 @@
 //! 固件解析结果拥有路径与属性数据；设备模型在注册时接管或复制这些值，
 //! 不通过泄漏分配伪造静态生命周期。
 
+/// 板级调试：绕过 printk 直接向 UART0 输出一个字符（arch::dbg_char 裸汇编）。
+///
+/// 用于 printk/分配器疑似死锁时的启动路径定位；非调试构建中 dbg_char 为空操作，
+/// 因此本函数可在任何构建中无条件调用。
+#[cfg(target_arch = "loongarch64")]
+fn raw_mark(byte: u8) {
+    unsafe extern "C" {
+        fn dbg_char();
+    }
+    unsafe {
+        core::arch::asm!(
+            "move $a3, {c}",
+            "bl {dbg_char}",
+            c = in(reg) byte as u64,
+            dbg_char = sym dbg_char,
+            options(nostack),
+            clobber_abi("C"),
+        );
+    }
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn raw_mark(_byte: u8) {}
+
+/// 板级调试：绕过 printk 直接向 UART0 输出一个 16 位十六进制值。
+#[cfg(target_arch = "loongarch64")]
+fn raw_hex16(value: usize) {
+    unsafe extern "C" {
+        fn dbg_hex16();
+    }
+    unsafe {
+        core::arch::asm!(
+            "move $a0, {v}",
+            "bl {dbg_hex16}",
+            v = in(reg) value as u64,
+            dbg_hex16 = sym dbg_hex16,
+            options(nostack),
+            clobber_abi("C"),
+        );
+    }
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn raw_hex16(_value: usize) {}
+
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -326,6 +371,9 @@ pub fn kernel_start_init(context: &StartContext) {
         memory_segments.len()
     );
 
+    printk!("[dbg] T-a: collecting cpu topology");
+    raw_mark(b'U');
+    raw_mark(b'1');
     let cpu_numa_topology: Vec<general::dev::cpu::CpuNumaEntry> = cpus
         .iter()
         .filter_map(|cpu| {
@@ -340,6 +388,7 @@ pub fn kernel_start_init(context: &StartContext) {
         .iter()
         .map(|entry: &general::dev::cpu::CpuNumaEntry| entry.node_id)
         .collect();
+    raw_mark(b'2');
     let cpu_topology: Vec<_> = cpus
         .into_iter()
         .map(|cpu| general::dev::cpu::CpuTopologyEntry {
@@ -359,9 +408,16 @@ pub fn kernel_start_init(context: &StartContext) {
             capacity_dmips_mhz: cpu.capacity_dmips_mhz,
         })
         .collect();
+    raw_mark(b'3');
+    raw_mark(b'V');
     let cpu_topology_count = cpu_topology.len();
+    printk!("[dbg] T-b: installing cpu topology ({} entries)", cpu_topology_count);
     general::dev::cpu::install_topology(cpu_topology);
+    raw_mark(b'W');
+    printk!("[dbg] T-c: cpu topology installed");
     general::dev::cpu::install_numa_topology(cpu_numa_topology);
+    raw_mark(b'P');
+    printk!("[dbg] T-d: cpu numa topology installed");
     general::dev::numa::install_topology(
         cpu_numa_nodes,
         numa.distances
@@ -381,6 +437,8 @@ pub fn kernel_start_init(context: &StartContext) {
             })
             .collect(),
     );
+    raw_mark(b'Q');
+    printk!("[dbg] T-e: numa topology installed");
     printk!(
         "[kernel-start][dtb] installed CPU topology: {} CPU node(s)",
         cpu_topology_count
@@ -451,7 +509,11 @@ pub fn kernel_start_init(context: &StartContext) {
             let before = pending.len();
             let mut retry = Vec::new();
             for index in pending {
+                raw_mark(b'R');
+                raw_hex16(index);
+                raw_mark(b':');
                 let device = &platform_devices[index];
+                printk!("[dbg] probing device {}: {}", index, device.path);
                 let pcie_host = pcie_hosts
                     .iter()
                     .find(|host| host.path.as_ref() == device.path.as_ref());
@@ -462,7 +524,10 @@ pub fn kernel_start_init(context: &StartContext) {
                     &nodes,
                     &platform_devices,
                 );
+                raw_mark(b'I');
+                raw_mark(b'P');
                 let outcome = register_platform_device_status(info, "dtb", priority == 2);
+                raw_mark(b'p');
                 if let Some(pnp_device) = outcome.device {
                     remember_registered_platform_node(
                         &mut registered_platform_nodes,

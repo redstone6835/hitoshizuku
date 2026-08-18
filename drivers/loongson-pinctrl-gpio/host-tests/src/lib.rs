@@ -2,10 +2,10 @@
 
 extern crate alloc;
 
-#[path = "../../src/pinctrl.rs"]
-mod pinctrl;
 #[path = "../../src/gpio.rs"]
 mod gpio;
+#[path = "../../src/pinctrl.rs"]
+mod pinctrl;
 
 #[cfg(test)]
 mod tests {
@@ -14,8 +14,8 @@ mod tests {
         RegisterUpdate,
     };
     use super::pinctrl::{
-        MuxUpdate, PinFunction, PinGroup, PinctrlError, PinctrlMmioLayout, decode_state,
-        decode_named_state, merge_states,
+        MuxUpdate, PinFunction, PinGroup, PinctrlError, PinctrlMmioLayout, decode_named_state,
+        decode_state, merge_states,
     };
 
     const PINCTRL_BASE: usize = 0x1fe0_0420;
@@ -388,12 +388,56 @@ mod tests {
         assert_eq!(map.source_for_line(31), Ok(0x3b));
         assert_eq!(map.source_for_line(63), Ok(0x3b));
         assert_eq!(map.source_for_line(64), Err(GpioError::LineOutOfRange));
+    }
+
+    #[test]
+    fn partial_gpio_irq_map_keeps_unmapped_lines_available_for_io() {
+        let sources = [0x3bu32; 60];
+        let board_map = GpioIrqMap::new(64, &sources, true).unwrap();
+        assert!(board_map.has_source_for_line(59));
+        assert!(!board_map.has_source_for_line(60));
+        assert!(!board_map.has_source_for_line(64));
+        assert_eq!(board_map.source_for_line(59), Ok(0x3b));
         assert_eq!(
-            GpioIrqMap::new(64, &sources[..63], true),
+            board_map.source_for_line(60),
+            Err(GpioError::InterruptsUnsupported)
+        );
+        assert_eq!(
+            board_map.source_for_line(64),
+            Err(GpioError::LineOutOfRange)
+        );
+        assert_eq!(
+            board_gpio_layout().output_sequence(63, true),
+            Ok([
+                RegisterUpdate {
+                    address: GPIO_BASE + 0x10,
+                    clear_mask: 0,
+                    set_mask: 1u64 << 63,
+                },
+                RegisterUpdate {
+                    address: GPIO_BASE,
+                    clear_mask: 1u64 << 63,
+                    set_mask: 0,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn gpio_irq_map_accepts_empty_map_and_rejects_excess_sources() {
+        let empty_map = GpioIrqMap::new(64, &[], true).unwrap();
+        assert!(!empty_map.has_source_for_line(0));
+        assert_eq!(
+            empty_map.source_for_line(0),
+            Err(GpioError::InterruptsUnsupported)
+        );
+        let excess_sources = [0x3au32; 64];
+        assert_eq!(
+            GpioIrqMap::new(63, &excess_sources, true),
             Err(GpioError::InvalidIrqDescription)
         );
         assert_eq!(
-            GpioIrqMap::new(64, &sources, false),
+            GpioIrqMap::new(64, &excess_sources, false),
             Err(GpioError::InterruptsUnsupported)
         );
     }

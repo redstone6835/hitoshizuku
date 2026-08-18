@@ -43,7 +43,7 @@ fn main() {
 ///
 /// 每个架构只手维护一份规范脚本（`qemu-loongarch64.ld` /
 /// `qemu-riscv64.ld`），全部变体只差头注释、`OUTPUT_FORMAT`、
-/// `BASE_ADDRESS`/`VIRTUAL_BASE_ADDRESS` 与调试段集合，统一在这里按
+/// `BASE_ADDRESS` 与调试段集合，统一在这里按
 /// 精确字符串替换生成到 `$OUT_DIR/linker/`，避免多份近重复脚本漂移
 /// （此前 RV 的 debug 脚本就因手改而残留 PECOFF 段、缺失 trap 段）。
 /// 任何替换失败都直接 panic，防止悄悄产出错误布局。
@@ -63,11 +63,6 @@ fn generate_linker_variants(root: &Path, out_dir: &Path) {
         &la,
         "BASE_ADDRESS = 0x90000000;",
         "BASE_ADDRESS = 0x200000;",
-    );
-    let board = replace_exact(
-        &board,
-        "VIRTUAL_BASE_ADDRESS = 0x9000000090000000;",
-        "VIRTUAL_BASE_ADDRESS = 0x9000000002000000;",
     );
     let board = replace_first_comment(&board, LS2K1000_BOARD_HEADER);
     std::fs::write(linker_dir.join("ls2k1000.ld"), board)
@@ -102,8 +97,8 @@ const LS2K1000_BOARD_HEADER: &str =
     "/* 生成文件：由 qemu-loongarch64.ld 派生（kernel/build.rs），勿手改。
    龙芯 2K1000LA 开发板（LS2K1000-DP-FACTORY / BPI1001）fork U-Boot 装载基址。
    板载 U-Boot 2022.04（Loongson fork）经 bootm 传统镜像把内核解压到物理
-   0x200000 后跳转（实测 \"Load Address: 00200000\"）。虚拟基址落在 DMW1
-   直映窗口（0x9000_0000_0000_0000 起，映射物理 0 起）。 */";
+   0x200000 后跳转（实测 \"Load Address: 00200000\"）。虚拟基址由 DMW1
+   窗口基址与物理装载地址相加得到，即 0x9000_0000_0020_0000。 */";
 
 /// LoongArch64 调试脚本头注释。
 const LA_DEBUG_HEADER: &str =

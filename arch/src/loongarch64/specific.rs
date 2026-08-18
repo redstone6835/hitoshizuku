@@ -65,6 +65,7 @@ pub const CSR_TVAL: usize = 0x42;
 pub const CSR_CNTC: usize = 0x43;
 pub const CSR_TICLR: usize = 0x44;
 pub const CSR_LLBCTL: usize = 0x60;
+pub const CSR_IMPCTL1: usize = 0x80;
 pub const CSR_TLBRENTRY: usize = 0x88;
 pub const CSR_TLBRBADV: usize = 0x89;
 pub const CSR_TLBRERA: usize = 0x8a;

@@ -14,16 +14,25 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use general::dev::pnp::{PNP_DEVICES, PNP_DRIVERS, PnpDevice, PnpError, PnpId};
-use general::dev::usb::{
-    UsbDevice, UsbDeviceInfo, UsbEndpointDesc, UsbInterfaceInfo, UsbSpeed,
-};
+use general::dev::usb::{UsbDevice, UsbDeviceInfo, UsbEndpointDesc, UsbInterfaceInfo, UsbSpeed};
 
 use crate::regs::*;
+
+fn delay_ns(duration_ns: u64) {
+    let deadline = hal::time::monotonic_ns().saturating_add(duration_ns);
+    while hal::time::monotonic_ns() < deadline {
+        core::hint::spin_loop();
+    }
+}
 
 /// 主机控制器能力接口。
 pub trait UsbHcd: Send + Sync {
     fn name(&self) -> &'static str;
     fn port_count(&self) -> usize;
+    /// 停止控制器及其 DMA。返回成功后才允许释放 HCD 持有的 DMA 对象。
+    fn shutdown(&self) -> Result<(), &'static str> {
+        Ok(())
+    }
     fn port_power_on(&self, port: usize) -> Result<(), &'static str>;
     /// 复位端口并返回连接设备速度（USB_SPEED_HIGH/FULL/LOW）。
     fn port_reset(&self, port: usize) -> Result<u8, &'static str>;
@@ -78,12 +87,10 @@ impl UsbBus {
     }
 
     fn alloc_address(&self) -> u8 {
-        let address = self.next_address.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if address == 0 {
-            1
-        } else {
-            address & 0x7f
-        }
+        let address = self
+            .next_address
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if address == 0 { 1 } else { address & 0x7f }
     }
 
     /// 扫描所有端口，为已连接设备执行枚举。
@@ -164,7 +171,19 @@ impl UsbBus {
         // 3) 分配地址。
         let address = self.alloc_address();
         let mut empty = [];
-        self.control(address, USB_REQ_SET_ADDRESS, u16::from(address), 0, &mut empty, false, 0)?;
+        // USB 2.0 9.4.6：SET_ADDRESS 本身仍发送到默认地址 0，设备在成功
+        // 完成状态阶段后才启用新地址。规范还要求主机至少等待 2 ms，再向新
+        // 地址发起下一次控制传输。
+        self.control(
+            0,
+            USB_REQ_SET_ADDRESS,
+            u16::from(address),
+            0,
+            &mut empty,
+            false,
+            0,
+        )?;
+        delay_ns(2_000_000);
         // 4) 完整设备描述符。
         let got = self.get_descriptor(address, USB_DT_DEVICE, 0, &mut device_desc)?;
         if got < 18 || device_desc[1] != USB_DT_DEVICE {
@@ -193,12 +212,8 @@ impl UsbBus {
             }
             let mut config = vec![0u8; total_len];
             config[..9].copy_from_slice(&config_head);
-            let got = self.get_descriptor(
-                address,
-                USB_DT_CONFIG,
-                u16::from(config_index),
-                &mut config,
-            )?;
+            let got =
+                self.get_descriptor(address, USB_DT_CONFIG, u16::from(config_index), &mut config)?;
             if got < total_len {
                 continue;
             }
@@ -310,8 +325,12 @@ impl UsbBus {
         let usb_device = UsbDevice::from_pnp(&pnp).ok_or("usb device wrapper failed")?;
 
         for interface in interfaces {
-            let interface_name: String =
-                alloc::format!("usb-{}:{}.{}", self.bus_id, address, interface.interface_number);
+            let interface_name: String = alloc::format!(
+                "usb-{}:{}.{}",
+                self.bus_id,
+                address,
+                interface.interface_number
+            );
             let child = usb_device
                 .create_interface(
                     interface.interface_number,

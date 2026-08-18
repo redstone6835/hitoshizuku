@@ -642,6 +642,7 @@ unsafe extern "C" fn secondary_main() -> ! {
     }
 
     unsafe { install_exception_entry() };
+    super::paging::LoongArch64Paging::initialize_tlb_page_sizes();
     unsafe { activate_kernel_page_table_for_secondary() };
     configure_local_timer(timer_hz());
     init_local_ipi();
