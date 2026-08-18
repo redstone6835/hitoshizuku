@@ -581,10 +581,11 @@ pub(super) fn sys_fcntl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         F_SETFL => {
             let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            let current = file.flags();
             file.set_status_flags(
                 (arg & O_APPEND) != 0,
                 (arg & O_NONBLOCK) != 0,
-                (arg & O_SYNC) != 0,
+                current.sync, // O_SYNC 不可经 F_SETFL 修改，保留 open 时值
                 (arg & O_DIRECT) != 0,
             );
             Ok(0)
