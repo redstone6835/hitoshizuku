@@ -25,7 +25,9 @@ use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
 use vfs::superblock::{FsDriver, FsDriverFlags, Superblock, SuperblockOps};
 use vfs::sync::Spinlock;
 
-use crate::dev::block::{BlockAttributes, BlockFeatures, BlockGeometry, BlockIoStatsSnapshot};
+use crate::dev::block::{
+    BlockAttributes, BlockFeatures, BlockGeometry, BlockIoStatsSnapshot, BlockLimits,
+};
 use crate::dev::enumerate::{DEVICES, PNP_DEVICES};
 use crate::dev::net::NET_CLASS;
 use crate::dev::pnp::{PnpDependency, PnpId, PnpOwnedResourceSnapshot, PnpResourceKind, PnpState};
@@ -492,6 +494,12 @@ const DEVICES_SYSTEM_CPU_POSSIBLE_INO: u64 = 15;
 const DEVICES_SYSTEM_CPU_PRESENT_INO: u64 = 16;
 const DEVICES_VIRTUAL_INO: u64 = 17;
 const DEVICES_PNP_INO: u64 = 18;
+const DEVICES_SYSTEM_CLOCKEVENTS_INO: u64 = 32;
+const KERNEL_UEVENT_SEQNUM_INO: u64 = 33;
+const KERNEL_UEVENT_HELPER_INO: u64 = 34;
+const KERNEL_HOTPLUG_INO: u64 = 35;
+const POWER_STATE_INO: u64 = 41;
+const POWER_WAKEUP_COUNT_INO: u64 = 42;
 const KERNEL_HOSTNAME_INO: u64 = 19;
 const KERNEL_OSTYPE_INO: u64 = 20;
 const KERNEL_OSRELEASE_INO: u64 = 21;
@@ -561,6 +569,40 @@ const SYSFS_DYNAMIC_INO_START: u64 = 1_000_000_000;
 const SYSFS_BLOCK_CLASS: &str = "block";
 const SYSFS_CHAR_CLASS: &str = "char";
 const SYSFS_NET_CLASS: &str = NET_CLASS.as_str();
+
+/// Linux 常驻 class 目录:即使内核当前没有对应设备,也保持稳定空目录。
+///
+/// `mem`/`tty`/`misc` 还会被 device_numbers 的 `major_name` 投影真实设备;
+/// `thermal`/`wdt` 由 PnP function 投影;input/led/gpio/power_supply 目前没有
+/// 设备模型,先提供稳定空目录供用户空间探测布局。
+const STATIC_SYSFS_CLASSES: &[&str] = &[
+    "mem",
+    "tty",
+    "thermal",
+    "wdt",
+    "input",
+    "misc",
+    "gpio",
+    "power_supply",
+    "leds",
+];
+
+/// Linux 常驻总线目录:dev core 没有 cpu/memory/clockevents/clocksource/virtio
+/// 的 PnP 设备模型,这里提供稳定空 `devices` 子目录,与 Linux 布局保持一致。
+const STATIC_SYSFS_BUSES: &[&str] = &["cpu", "memory", "clockevents", "clocksource", "virtio"];
+
+fn is_static_sysfs_bus(name: &str) -> bool {
+    STATIC_SYSFS_BUSES.contains(&name)
+}
+
+/// uevent 序号:Linux 中 `kobject_uevent` 每投递一次事件就 +1,udev 据此检测漏事件。
+///
+/// 本内核尚未接入 netlink uevent 通道,这里只维护内核内计数器;`/sys/devices/*/uevent`
+/// 写一个合法动作词时递增,使 `/sys/kernel/uevent_seqnum` 具备可观测语义。
+static UEVENT_SEQNUM: AtomicU64 = AtomicU64::new(0);
+
+/// 用户态 uevent helper 路径(对应 Linux `/sys/kernel/uevent_helper`)。
+static UEVENT_HELPER_PATH: Spinlock<String> = Spinlock::new(String::new());
 
 pub type ElmSysfsRenderer = fn(&str) -> String;
 
@@ -635,9 +677,10 @@ impl SysfsUserViewPolicy {
     }
 
     fn net_ifindex(self, iface_id: u32) -> u32 {
-        // 当前网络栈 snapshot 尚未携带独立 ifindex。把编号策略集中在用户视图
-        // policy 内，后续接入 stable interface index 时无需改属性渲染路径。
-        iface_id.saturating_add(1)
+        // `NetDeviceId` 是网络栈在本次启动内稳定且不复用的编号,起始值为 1,
+        // 语义与 Linux 的 interface index 一致,直接作为 ifindex 暴露。此前这里
+        // 额外 +1 造成 off-by-one,现移除。
+        iface_id
     }
 }
 
@@ -916,8 +959,11 @@ struct BlockDevSnapshot {
     geometry: BlockGeometry,
     features: BlockFeatures,
     attributes: BlockAttributes,
+    limits: BlockLimits,
     io_stats: BlockIoStatsSnapshot,
     class_name: &'static str,
+    /// 父块设备目录名(分区→整盘);整盘无块级父设备时为 `None`。
+    parent_name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1169,6 +1215,43 @@ fn class_for_devnode(
         .unwrap_or(fallback)
 }
 
+/// 把设备号表的传统主设备名映射到 Linux sysfs class。
+///
+/// `null/zero/full/kmsg/random/urandom` 的 major_name 是 `mem`,`console/tty/ptmx`
+/// 是 `console`,`tty0..7` 是 `tty`;Linux 把它们分别归入 `/sys/class/mem` 和
+/// `/sys/class/tty`(console 与 tty 同属 tty class)。misc 主设备名归入
+/// `/sys/class/misc`。其余(私有动态 major 或未声明主设备名的)返回 `None`,
+/// 调用方回退到 function class。
+fn sysfs_class_for_major_name(major_name: &str) -> Option<&'static str> {
+    match major_name {
+        "mem" => Some("mem"),
+        "console" | "tty" => Some("tty"),
+        "misc" => Some("misc"),
+        _ => None,
+    }
+}
+
+/// 由 PnP function 推导 sysfs class(仅覆盖没有 devtmpfs 投影的设备类型)。
+///
+/// RTC 已经有 rtc projector 并走 device_numbers 投影路径,这里不再重复发布。
+/// WDT 的 class_id 是内建 `wdt`;温度传感器是动态 class,只能通过 operation
+/// contract `mygo.device.thermal@1` 识别。
+fn pnp_function_sysfs_class(
+    function: &dyn crate::dev::function::DeviceFunction,
+) -> Option<&'static str> {
+    match function.class_name() {
+        "wdt" => Some("wdt"),
+        "dynamic" => function.operation_contract().and_then(|contract| {
+            if contract.starts_with("mygo.device.thermal@1") {
+                Some("thermal")
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    }
+}
+
 fn push_sys_class(snap: &mut SysSnapshot, name: &'static str) {
     if !snap.classes.iter().any(|class| class.name == name) {
         snap.classes.push(SysClassSnapshot { name });
@@ -1202,6 +1285,11 @@ impl SysSnapshot {
         let records = device_numbers::try_records().unwrap_or_default();
         let devnode_classes = published_devnode_classes();
 
+        // Linux 常驻 class 目录先稳定发布,后续真实设备以 class node 挂入。
+        for class in STATIC_SYSFS_CLASSES {
+            push_sys_class(&mut snap, class);
+        }
+
         // PnP 设备是 dev core 的硬件身份与 driver 绑定视图。这里先把它们放入
         // sysfs 快照，即便设备没有 `/dev` 投影，也能在 `/sys/devices/pnp` 中诊断。
         for dev in PNP_DEVICES.try_list().unwrap_or_default() {
@@ -1223,15 +1311,28 @@ impl SysSnapshot {
                 sysfs_name = sysfs_component_name(&format!("{}-{}-{suffix}", dev.name, dev.id));
                 suffix = suffix.saturating_add(1);
             }
-            let functions = dev
-                .try_functions()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|function| SysPnpFunctionSnapshot {
-                    class_name: function.class_name().to_string(),
-                    dev_name: function.dev_name().to_string(),
-                })
-                .collect();
+            // 没有 devtmpfs 投影的 function(thermal/wdt)也要进入 `/sys/class`;
+            // class node 直接链接到 PnP 设备目录,保持 class 视图的硬件反向关联。
+            let raw_functions = dev.try_functions().unwrap_or_default();
+            let mut functions = Vec::new();
+            for function in raw_functions {
+                let class_name = function.class_name().to_string();
+                let dev_name = function.dev_name().to_string();
+                if let Some(sysfs_class) = pnp_function_sysfs_class(function.as_ref()) {
+                    push_class_node(
+                        &mut snap,
+                        sysfs_class,
+                        sysfs_component_name(&dev_name),
+                        SysClassNodeKind::Symlink {
+                            target: format!("../../devices/pnp/{}/{}", bus_type, sysfs_name),
+                        },
+                    );
+                }
+                functions.push(SysPnpFunctionSnapshot {
+                    class_name,
+                    dev_name,
+                });
+            }
             let resources = dev.try_owned_resources().unwrap_or_default();
             let parent = dev.parent().map(|parent| parent.name.to_string());
             let child_count = dev
@@ -1270,8 +1371,10 @@ impl SysSnapshot {
                 geometry: *dev.geometry(),
                 features: dev.features(),
                 attributes: dev.attributes(),
+                limits: *dev.limits(),
                 io_stats: dev.io_stats(),
                 class_name: projection.class_id().as_str(),
+                parent_name: dev.parent().map(|parent| parent.name().to_string()),
             });
         }
 
@@ -1311,8 +1414,12 @@ impl SysSnapshot {
         for record in records {
             match record.kind {
                 device_numbers::DeviceNumberKind::Char => {
+                    // 传统主设备名(mem/console/tty/misc)优先决定 Linux class,
+                    // 否则回退到 function class(rtc/wdt/char 等)。
                     let class_name =
-                        class_for_devnode(&devnode_classes, &record.node_name, SYSFS_CHAR_CLASS);
+                        sysfs_class_for_major_name(&record.major_name).unwrap_or_else(|| {
+                            class_for_devnode(&devnode_classes, &record.node_name, SYSFS_CHAR_CLASS)
+                        });
                     let backing_name = snap
                         .devices
                         .iter()
@@ -1550,10 +1657,13 @@ enum BlockDevSlot {
     Dev,
     Range,
     QueueDir,
-    Holders,
+    HoldersDir,
     Stat,
     Inflight,
     Periodic,
+    Diskseq,
+    DeviceLink,
+    SubsystemLink,
 }
 
 impl BlockDevSlot {
@@ -1565,10 +1675,13 @@ impl BlockDevSlot {
             Self::Dev => 3,
             Self::Range => 4,
             Self::QueueDir => 5,
-            Self::Holders => 6,
+            Self::HoldersDir => 6,
             Self::Stat => 7,
             Self::Inflight => 8,
             Self::Periodic => 9,
+            Self::Diskseq => 10,
+            Self::DeviceLink => 11,
+            Self::SubsystemLink => 12,
         }
     }
 }
@@ -1581,6 +1694,12 @@ enum BlockQueueSlot {
     NrRequests,
     HwSectorSize,
     DiscardZeroes,
+    DiscardMaxBytes,
+    DiscardGranularity,
+    WriteZeroesMaxBytes,
+    MaxSectorsKb,
+    MaxSegments,
+    MaxSegmentSize,
 }
 
 impl BlockQueueSlot {
@@ -1592,6 +1711,12 @@ impl BlockQueueSlot {
             Self::NrRequests => 3,
             Self::HwSectorSize => 4,
             Self::DiscardZeroes => 5,
+            Self::DiscardMaxBytes => 6,
+            Self::DiscardGranularity => 7,
+            Self::WriteZeroesMaxBytes => 8,
+            Self::MaxSectorsKb => 9,
+            Self::MaxSegments => 10,
+            Self::MaxSegmentSize => 11,
         }
     }
 }
@@ -2162,6 +2287,11 @@ enum SysRegFile {
     CpuOnline,
     CpuPossible,
     CpuPresent,
+    UeventSeqnum,
+    UeventHelper,
+    Hotplug,
+    PowerState,
+    PowerWakeupCount,
     Hostname,
     Ostype,
     Osrelease,
@@ -2349,7 +2479,11 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
         }
         BlockDevSlot::Dev => format_rdev(snap.blocks[idx].rdev),
         BlockDevSlot::Range => "1\n".into(),
-        BlockDevSlot::Holders => String::new(),
+        // holders 是目录,symlink(device/subsystem)不渲染内容;这里只覆盖枚举穷尽。
+        BlockDevSlot::HoldersDir | BlockDevSlot::DeviceLink | BlockDevSlot::SubsystemLink => {
+            String::new()
+        }
+        BlockDevSlot::Diskseq => format!("{}\n", dev.attributes.diskseq().unwrap_or(0)),
         BlockDevSlot::Stat => {
             let stats = dev.io_stats;
             // 这里输出通用块层维护的兼容 diskstats 字段。合并计数和队列总耗时
@@ -2410,6 +2544,55 @@ fn render_block_queue_file(snap: &SysSnapshot, idx: usize, slot: BlockQueueSlot)
             } else {
                 "0\n".into()
             }
+        }
+        // 范围类命令(trim/write-zeroes)与 scatter/gather 限制在 BlockLimits 中
+        // 已有真实数据源;缺失时输出 0,与 Linux「未声明限制即无限制/不支持」一致。
+        BlockQueueSlot::DiscardMaxBytes => {
+            let bytes = dev
+                .limits
+                .discard_limits()
+                .and_then(|limits| limits.max_blocks_per_io())
+                .map(|blocks| blocks.get() as u64 * geom.logical_block_size().get() as u64)
+                .unwrap_or(0);
+            format!("{}\n", bytes)
+        }
+        BlockQueueSlot::DiscardGranularity => {
+            let bytes = dev
+                .limits
+                .discard_limits()
+                .and_then(|limits| limits.alignment_blocks())
+                .map(|blocks| blocks.get() as u64 * geom.logical_block_size().get() as u64)
+                .unwrap_or(0);
+            format!("{}\n", bytes)
+        }
+        BlockQueueSlot::WriteZeroesMaxBytes => {
+            let bytes = dev
+                .limits
+                .write_zeroes_limits()
+                .and_then(|limits| limits.max_blocks_per_io())
+                .map(|blocks| blocks.get() as u64 * geom.logical_block_size().get() as u64)
+                .unwrap_or(0);
+            format!("{}\n", bytes)
+        }
+        BlockQueueSlot::MaxSectorsKb => {
+            let kb = dev
+                .limits
+                .max_blocks_per_io()
+                .map(|blocks| blocks.get() as u64 * geom.logical_block_size().get() as u64 / 1024)
+                .unwrap_or(0);
+            format!("{}\n", kb)
+        }
+        BlockQueueSlot::MaxSegments => {
+            let segments = dev.limits.max_data_segments().map(|n| n.get()).unwrap_or(0);
+            format!("{}\n", segments)
+        }
+        BlockQueueSlot::MaxSegmentSize => {
+            let bytes = dev
+                .limits
+                .max_data_segment_size()
+                .map(|n| n.get())
+                .unwrap_or(0);
+            format!("{}\n", bytes)
         }
     }
 }
@@ -2873,12 +3056,24 @@ fn same_thread_sibling(left: CpuTopologyView<'_>, right: CpuTopologyView<'_>) ->
         && left.core_id == right.core_id
 }
 
-fn render_cpu_file(_snap: &SysSnapshot, _cpu_id: usize, slot: CpuSlot) -> String {
+fn cpu_in_mask(cpu_id: usize, mask: u64) -> bool {
+    cpu_id < u64::BITS as usize && mask & (1u64 << cpu_id) != 0
+}
+
+fn render_cpu_file(_snap: &SysSnapshot, cpu_id: usize, slot: CpuSlot) -> String {
     match slot {
         CpuSlot::TopoDir => String::new(),
-        CpuSlot::Online => "1\n".into(),
-        CpuSlot::Possible => "1\n".into(),
-        CpuSlot::Present => "1\n".into(),
+        // per-CPU 目录只对 online CPU 发布,online 恒为 1;possible/present 按
+        // 支持掩码求值,避免与顶层 mask 语义脱节。
+        CpuSlot::Online => {
+            format!("{}\n", u8::from(cpu_in_mask(cpu_id, online_cpu_mask())))
+        }
+        CpuSlot::Possible => {
+            format!("{}\n", u8::from(cpu_in_mask(cpu_id, supported_cpu_mask())))
+        }
+        CpuSlot::Present => {
+            format!("{}\n", u8::from(cpu_in_mask(cpu_id, supported_cpu_mask())))
+        }
     }
 }
 
@@ -3358,8 +3553,23 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
         }
         SysRegFile::CpuOnline => format_cpu_mask_range(online_cpu_mask()),
         SysRegFile::CpuPossible => format_cpu_mask_range(supported_cpu_mask()),
-        // 当前内核尚未区分“已发现但离线”的 CPU；present 先反映在线 CPU 集合。
-        SysRegFile::CpuPresent => format_cpu_mask_range(online_cpu_mask()),
+        // 本内核尚未区分“已发现但离线”的 CPU;present 与 possible 相同,
+        // 都取固件/调度暴露的支持 CPU 集合,不再错误地等同于 online。
+        SysRegFile::CpuPresent => format_cpu_mask_range(supported_cpu_mask()),
+        SysRegFile::UeventSeqnum => format!("{}\n", UEVENT_SEQNUM.load(Ordering::Relaxed)),
+        SysRegFile::UeventHelper | SysRegFile::Hotplug => {
+            let value = UEVENT_HELPER_PATH.lock();
+            if value.is_empty() {
+                String::new()
+            } else {
+                format!("{}\n", &*value)
+            }
+        }
+        // /sys/power/state:本内核没有 suspend 状态机,只支持写 "0" 触发关机的
+        // 最小语义;读取返回空(无可用睡眠状态),避免向用户空间宣称未实现的
+        // freeze/mem/disk 能力。
+        SysRegFile::PowerState => String::new(),
+        SysRegFile::PowerWakeupCount => "0\n".into(),
         SysRegFile::Hostname => "mygo\n".into(),
         SysRegFile::Ostype => "MyGO\n".into(),
         SysRegFile::Osrelease => env!("CARGO_PKG_VERSION").to_string() + "\n",
@@ -3608,8 +3818,9 @@ impl FileOps for SysRegFileOps {
         read_bytes_at(buf, offset, s.as_bytes())
     }
     fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        // uevent 文件写:接受 Linux 的动作词并触发事件回调(当前为校验 +
-        // 钩子占位;mdev/udevadm trigger 兼容)。非法动作返回 EINVAL。
+        // uevent 文件写:接受 Linux 的动作词并递增 uevent 序号。本内核尚未接入
+        // netlink uevent 通道,也没有 dev core 重扫描 hook,因此这里以序号递增
+        // 作为最小可观测的事件投递信号;真正的 mdev/udev 通知需 dev core 支持。
         if matches!(
             self.kind,
             SysRegFile::DevCharInner {
@@ -3622,8 +3833,48 @@ impl FileOps for SysRegFileOps {
                 .trim();
             return match action {
                 "add" | "remove" | "change" | "bind" | "unbind" | "online" | "offline" => {
+                    UEVENT_SEQNUM.fetch_add(1, Ordering::Relaxed);
                     Ok(buf.len())
                 }
+                _ => Err(VfsError::InvalidArgument),
+            };
+        }
+        if matches!(self.kind, SysRegFile::UeventHelper | SysRegFile::Hotplug) {
+            if _offset != 0 {
+                return Err(VfsError::InvalidArgument);
+            }
+            let text = core::str::from_utf8(buf).map_err(|_| VfsError::InvalidArgument)?;
+            let trimmed = text.trim_end_matches(|ch| ch == '\n' || ch == '\0');
+            let mut stored = UEVENT_HELPER_PATH.lock();
+            stored.clear();
+            stored
+                .try_reserve(trimmed.len())
+                .map_err(|_| VfsError::OutOfMemory)?;
+            stored.push_str(trimmed);
+            return Ok(buf.len());
+        }
+        if matches!(self.kind, SysRegFile::PowerState) {
+            let action = core::str::from_utf8(buf)
+                .map_err(|_| VfsError::InvalidArgument)?
+                .trim();
+            // 最小关机语义:写 "0" 触发固件关机;其余状态本内核不支持,返回 EINVAL。
+            if action != "0" {
+                return Err(VfsError::InvalidArgument);
+            }
+            return match crate::firmware::power::shutdown() {
+                Ok(()) => Ok(buf.len()),
+                Err(crate::firmware::power::PowerError::NotInstalled) => Err(VfsError::NoDevice),
+                Err(_) => Err(VfsError::Io),
+            };
+        }
+        if matches!(self.kind, SysRegFile::PowerWakeupCount) {
+            let value = core::str::from_utf8(buf)
+                .map_err(|_| VfsError::InvalidArgument)?
+                .trim();
+            // 本内核不跟踪 wakeup 事件,当前计数恒为 0;写 0 成功,写其它返回 EINVAL
+            // (Linux 语义:写入值必须与当前 wakeup 计数一致,否则拒绝)。
+            return match value {
+                "0" => Ok(buf.len()),
                 _ => Err(VfsError::InvalidArgument),
             };
         }
@@ -3779,14 +4030,11 @@ fn build_child_inode(
         kind,
         snap: Arc::clone(snap),
     });
-    #[cfg(feature = "performance-profile")]
-    let mode = if matches!(kind, SysRegFile::ProfileControl) {
+    let mode = if sys_reg_file_writable(kind) {
         0o644
     } else {
         0o444
     };
-    #[cfg(not(feature = "performance-profile"))]
-    let mode = 0o444;
     Some(mk_inode(
         fs_id,
         weak_sb,
@@ -3796,6 +4044,23 @@ fn build_child_inode(
         1,
         ops,
     ))
+}
+
+/// 判断 sysfs 属性文件是否接受写入(用于报告 0644 权限)。
+fn sys_reg_file_writable(kind: SysRegFile) -> bool {
+    match kind {
+        SysRegFile::UeventHelper
+        | SysRegFile::Hotplug
+        | SysRegFile::PowerState
+        | SysRegFile::PowerWakeupCount => true,
+        SysRegFile::DevCharInner {
+            slot: DevCharInnerSlot::Uevent,
+            ..
+        } => true,
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileControl => true,
+        _ => false,
+    }
 }
 
 fn build_dir_inode(
@@ -3861,6 +4126,7 @@ enum SysDirKind {
     BlockQueue {
         name: String,
     },
+    BlockHolders,
     Devices,
     Device {
         class_name: &'static str,
@@ -3933,6 +4199,7 @@ enum SysDirKind {
     DevicesSystem,
     DevicesSystemCpu,
     DevicesSystemNode,
+    DevicesSystemClockevents,
     NumaNode {
         node_id: u32,
     },
@@ -4142,10 +4409,22 @@ impl SysDirInodeOps {
                     .ok_or(VfsError::NotFound)?;
                 let slot = block_slot_by_name(name).ok_or(VfsError::NotFound)?;
                 let ino = block_dev_slot_ino(&block_name, slot.to_u64());
-                if matches!(slot, BlockDevSlot::QueueDir) {
-                    Ok(mk_dir(ino, SysDirKind::BlockQueue { name: block_name }))
-                } else {
-                    mk_reg(ino, SysRegFile::BlockDev { idx, slot })
+                match slot {
+                    BlockDevSlot::QueueDir => {
+                        Ok(mk_dir(ino, SysDirKind::BlockQueue { name: block_name }))
+                    }
+                    BlockDevSlot::HoldersDir => Ok(mk_dir(ino, SysDirKind::BlockHolders)),
+                    BlockDevSlot::DeviceLink => {
+                        let parent = snap.blocks[idx]
+                            .parent_name
+                            .as_ref()
+                            .ok_or(VfsError::NotFound)?;
+                        Ok(mk_link(ino, format!("../{}", parent)))
+                    }
+                    BlockDevSlot::SubsystemLink => {
+                        Ok(mk_link(ino, "../../class/block".to_string()))
+                    }
+                    _ => mk_reg(ino, SysRegFile::BlockDev { idx, slot }),
                 }
             }
             SysDirKind::BlockQueue { name: block_name } => {
@@ -4158,6 +4437,8 @@ impl SysDirInodeOps {
                 let ino = block_queue_slot_ino(&block_name, slot.to_u64());
                 mk_reg(ino, SysRegFile::BlockQueue { idx, slot })
             }
+            // holders 当前没有 dm/md holder 模型,保持稳定空目录。
+            SysDirKind::BlockHolders => Err(VfsError::NotFound),
             SysDirKind::Devices => {
                 if let Some(idx) = snap.devices.iter().position(|dev| dev.sysfs_name == name) {
                     let dev = &snap.devices[idx];
@@ -4369,6 +4650,11 @@ impl SysDirInodeOps {
                     mk_reg(KERNEL_DEVICE_FUNCTIONS_INO, SysRegFile::DeviceFunctions)
                 }
                 "net_stats" => mk_reg(KERNEL_NET_STATS_INO, SysRegFile::NetStats),
+                // Linux uevent ABI:uevent_seqnum 只读,uevent_helper 可写。
+                // hotplug 是 /proc/sys/kernel/hotplug 的 /sys 别名,便于旧工具迁移。
+                "uevent_seqnum" => mk_reg(KERNEL_UEVENT_SEQNUM_INO, SysRegFile::UeventSeqnum),
+                "uevent_helper" => mk_reg(KERNEL_UEVENT_HELPER_INO, SysRegFile::UeventHelper),
+                "hotplug" => mk_reg(KERNEL_HOTPLUG_INO, SysRegFile::Hotplug),
                 #[cfg(feature = "performance-profile")]
                 "profile_stats" => mk_reg(KERNEL_PROFILE_STATS_INO, SysRegFile::ProfileStats),
                 #[cfg(feature = "performance-profile")]
@@ -4546,15 +4832,15 @@ impl SysDirInodeOps {
                 }
             }
             SysDirKind::Bus => {
-                let bus_idx = snap
-                    .pnp_buses
-                    .iter()
-                    .position(|bus| *bus == name)
-                    .ok_or(VfsError::NotFound)?;
+                // 常驻总线(cpu/memory/clockevents/clocksource/virtio)与 PnP 派生的
+                // 总线(pci/usb/platform)统一提供 `devices` 子目录。
+                if !is_static_sysfs_bus(name) && !snap.pnp_buses.iter().any(|bus| *bus == name) {
+                    return Err(VfsError::NotFound);
+                }
                 Ok(mk_dir(
-                    bus_class_ino(&snap.pnp_buses[bus_idx]),
+                    bus_class_ino(name),
                     SysDirKind::BusClass {
-                        bus: snap.pnp_buses[bus_idx].clone(),
+                        bus: name.to_string(),
                     },
                 ))
             }
@@ -4566,6 +4852,10 @@ impl SysDirInodeOps {
                 _ => Err(VfsError::NotFound),
             },
             SysDirKind::BusClassDevices { bus } => {
+                // 常驻总线没有 PnP 设备模型,devices 保持稳定空目录。
+                if is_static_sysfs_bus(&bus) {
+                    return Err(VfsError::NotFound);
+                }
                 if !snap.pnp_buses.iter().any(|entry| *entry == bus) {
                     return Err(VfsError::NotFound);
                 }
@@ -4582,7 +4872,12 @@ impl SysDirInodeOps {
                     ),
                 ))
             }
-            SysDirKind::Module | SysDirKind::Power => Err(VfsError::NotFound),
+            SysDirKind::Module => Err(VfsError::NotFound),
+            SysDirKind::Power => match name {
+                "state" => mk_reg(POWER_STATE_INO, SysRegFile::PowerState),
+                "wakeup_count" => mk_reg(POWER_WAKEUP_COUNT_INO, SysRegFile::PowerWakeupCount),
+                _ => Err(VfsError::NotFound),
+            },
             SysDirKind::Firmware => {
                 let firmware = installed_device_tree().ok_or(VfsError::NotFound)?;
                 match name {
@@ -4648,8 +4943,13 @@ impl SysDirInodeOps {
             SysDirKind::DevicesSystem => match name {
                 "cpu" => Ok(mk_dir(DEVICES_SYSTEM_CPU_INO, SysDirKind::DevicesSystemCpu)),
                 "node" => Ok(mk_dir(numa_root_ino(), SysDirKind::DevicesSystemNode)),
+                "clockevents" => Ok(mk_dir(
+                    DEVICES_SYSTEM_CLOCKEVENTS_INO,
+                    SysDirKind::DevicesSystemClockevents,
+                )),
                 _ => Err(VfsError::NotFound),
             },
+            SysDirKind::DevicesSystemClockevents => Err(VfsError::NotFound),
             SysDirKind::DevicesSystemNode => {
                 if let Some(slot) = numa_root_slot_by_name(name) {
                     return mk_reg(
@@ -4770,14 +5070,14 @@ impl SysDirInodeOps {
                 entries
             }
             SysDirKind::BlockDev { name } => {
-                let Some(_) = snap
+                let Some(idx) = snap
                     .blocks
                     .iter()
                     .position(|block| block.sysfs_name == name)
                 else {
                     return Vec::new();
                 };
-                vec![
+                let mut entries = vec![
                     mk_dir_entry(
                         block_dev_slot_ino(&name, BlockDevSlot::Size.to_u64()),
                         "size",
@@ -4809,9 +5109,9 @@ impl SysDirInodeOps {
                         FileType::Directory,
                     ),
                     mk_dir_entry(
-                        block_dev_slot_ino(&name, BlockDevSlot::Holders.to_u64()),
+                        block_dev_slot_ino(&name, BlockDevSlot::HoldersDir.to_u64()),
                         "holders",
-                        FileType::Regular,
+                        FileType::Directory,
                     ),
                     mk_dir_entry(
                         block_dev_slot_ino(&name, BlockDevSlot::Stat.to_u64()),
@@ -4828,8 +5128,28 @@ impl SysDirInodeOps {
                         "periodic",
                         FileType::Regular,
                     ),
-                ]
+                    mk_dir_entry(
+                        block_dev_slot_ino(&name, BlockDevSlot::Diskseq.to_u64()),
+                        "diskseq",
+                        FileType::Regular,
+                    ),
+                ];
+                // 整盘没有块级父设备时按 Linux 省略 device 链接;分区链到父整盘。
+                if snap.blocks[idx].parent_name.is_some() {
+                    entries.push(mk_dir_entry(
+                        block_dev_slot_ino(&name, BlockDevSlot::DeviceLink.to_u64()),
+                        "device",
+                        FileType::Symlink,
+                    ));
+                }
+                entries.push(mk_dir_entry(
+                    block_dev_slot_ino(&name, BlockDevSlot::SubsystemLink.to_u64()),
+                    "subsystem",
+                    FileType::Symlink,
+                ));
+                entries
             }
+            SysDirKind::BlockHolders => Vec::new(),
             SysDirKind::BlockQueue { name } => {
                 let Some(_) = snap
                     .blocks
@@ -4867,6 +5187,36 @@ impl SysDirInodeOps {
                     mk_dir_entry(
                         block_queue_slot_ino(&name, BlockQueueSlot::DiscardZeroes.to_u64()),
                         "discard_zeroes_data",
+                        FileType::Regular,
+                    ),
+                    mk_dir_entry(
+                        block_queue_slot_ino(&name, BlockQueueSlot::DiscardMaxBytes.to_u64()),
+                        "discard_max_bytes",
+                        FileType::Regular,
+                    ),
+                    mk_dir_entry(
+                        block_queue_slot_ino(&name, BlockQueueSlot::DiscardGranularity.to_u64()),
+                        "discard_granularity",
+                        FileType::Regular,
+                    ),
+                    mk_dir_entry(
+                        block_queue_slot_ino(&name, BlockQueueSlot::WriteZeroesMaxBytes.to_u64()),
+                        "write_zeroes_max_bytes",
+                        FileType::Regular,
+                    ),
+                    mk_dir_entry(
+                        block_queue_slot_ino(&name, BlockQueueSlot::MaxSectorsKb.to_u64()),
+                        "max_sectors_kb",
+                        FileType::Regular,
+                    ),
+                    mk_dir_entry(
+                        block_queue_slot_ino(&name, BlockQueueSlot::MaxSegments.to_u64()),
+                        "max_segments",
+                        FileType::Regular,
+                    ),
+                    mk_dir_entry(
+                        block_queue_slot_ino(&name, BlockQueueSlot::MaxSegmentSize.to_u64()),
+                        "max_segment_size",
                         FileType::Regular,
                     ),
                 ]
@@ -5152,6 +5502,9 @@ impl SysDirInodeOps {
                     FileType::Regular,
                 ),
                 mk_dir_entry(KERNEL_NET_STATS_INO, "net_stats", FileType::Regular),
+                mk_dir_entry(KERNEL_UEVENT_SEQNUM_INO, "uevent_seqnum", FileType::Regular),
+                mk_dir_entry(KERNEL_UEVENT_HELPER_INO, "uevent_helper", FileType::Regular),
+                mk_dir_entry(KERNEL_HOTPLUG_INO, "hotplug", FileType::Regular),
                 #[cfg(feature = "performance-profile")]
                 mk_dir_entry(KERNEL_PROFILE_STATS_INO, "profile_stats", FileType::Regular),
                 #[cfg(feature = "performance-profile")]
@@ -5391,6 +5744,16 @@ impl SysDirInodeOps {
             }
             SysDirKind::Bus => {
                 let mut entries = Vec::new();
+                for bus in STATIC_SYSFS_BUSES {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        bus_class_ino(bus),
+                        bus,
+                        FileType::Directory,
+                    ) {
+                        return entries;
+                    }
+                }
                 for bus in &snap.pnp_buses {
                     if !push_sysfs_dir_entry(
                         &mut entries,
@@ -5404,9 +5767,9 @@ impl SysDirInodeOps {
                 entries
             }
             SysDirKind::BusClass { bus } => {
-                let Some(_) = snap.pnp_buses.iter().position(|entry| *entry == bus) else {
+                if !is_static_sysfs_bus(&bus) && !snap.pnp_buses.iter().any(|entry| *entry == bus) {
                     return Vec::new();
-                };
+                }
                 vec![mk_dir_entry(
                     bus_class_devices_ino(&bus),
                     "devices",
@@ -5414,6 +5777,9 @@ impl SysDirInodeOps {
                 )]
             }
             SysDirKind::BusClassDevices { bus } => {
+                if is_static_sysfs_bus(&bus) {
+                    return Vec::new();
+                }
                 let Some(_) = snap.pnp_buses.iter().position(|entry| *entry == bus) else {
                     return Vec::new();
                 };
@@ -5430,7 +5796,11 @@ impl SysDirInodeOps {
                 }
                 entries
             }
-            SysDirKind::Module | SysDirKind::Power => Vec::new(),
+            SysDirKind::Module => Vec::new(),
+            SysDirKind::Power => vec![
+                mk_dir_entry(POWER_STATE_INO, "state", FileType::Regular),
+                mk_dir_entry(POWER_WAKEUP_COUNT_INO, "wakeup_count", FileType::Regular),
+            ],
             SysDirKind::Firmware => {
                 if installed_device_tree().is_none() {
                     Vec::new()
@@ -5492,7 +5862,14 @@ impl SysDirInodeOps {
             SysDirKind::DevicesSystem => vec![
                 mk_dir_entry(DEVICES_SYSTEM_CPU_INO, "cpu", FileType::Directory),
                 mk_dir_entry(numa_root_ino(), "node", FileType::Directory),
+                mk_dir_entry(
+                    DEVICES_SYSTEM_CLOCKEVENTS_INO,
+                    "clockevents",
+                    FileType::Directory,
+                ),
             ],
+            // dev core 没有 clockevent 设备模型,只提供稳定空目录。
+            SysDirKind::DevicesSystemClockevents => Vec::new(),
             SysDirKind::DevicesSystemNode => {
                 let view = NumaSysfsView::snapshot();
                 let mut entries = Vec::new();
@@ -5613,10 +5990,13 @@ fn block_slot_by_name(name: &str) -> Option<BlockDevSlot> {
         "dev" => BlockDevSlot::Dev,
         "range" => BlockDevSlot::Range,
         "queue" => BlockDevSlot::QueueDir,
-        "holders" => BlockDevSlot::Holders,
+        "holders" => BlockDevSlot::HoldersDir,
         "stat" => BlockDevSlot::Stat,
         "inflight" => BlockDevSlot::Inflight,
         "periodic" => BlockDevSlot::Periodic,
+        "diskseq" => BlockDevSlot::Diskseq,
+        "device" => BlockDevSlot::DeviceLink,
+        "subsystem" => BlockDevSlot::SubsystemLink,
         _ => return None,
     })
 }
@@ -5629,6 +6009,12 @@ fn block_queue_slot_by_name(name: &str) -> Option<BlockQueueSlot> {
         "nr_requests" => BlockQueueSlot::NrRequests,
         "hw_sector_size" => BlockQueueSlot::HwSectorSize,
         "discard_zeroes_data" => BlockQueueSlot::DiscardZeroes,
+        "discard_max_bytes" => BlockQueueSlot::DiscardMaxBytes,
+        "discard_granularity" => BlockQueueSlot::DiscardGranularity,
+        "write_zeroes_max_bytes" => BlockQueueSlot::WriteZeroesMaxBytes,
+        "max_sectors_kb" => BlockQueueSlot::MaxSectorsKb,
+        "max_segments" => BlockQueueSlot::MaxSegments,
+        "max_segment_size" => BlockQueueSlot::MaxSegmentSize,
         _ => return None,
     })
 }
@@ -5813,8 +6199,11 @@ mod tests {
             vec![
                 ("cpu".to_string(), FileType::Directory),
                 ("node".to_string(), FileType::Directory),
+                ("clockevents".to_string(), FileType::Directory),
             ]
         );
+
+        assert!(matches!(system.lookup_child("clockevents"), Ok(_)));
 
         let node = system.lookup_child("node").unwrap();
         assert_eq!(
@@ -5827,6 +6216,26 @@ mod tests {
             ]
         );
         assert!(matches!(node.lookup("node0"), Err(VfsError::NotFound)));
+    }
+
+    #[test]
+    fn sysfs_class_for_major_name_maps_linux_traditional_classes() {
+        assert_eq!(sysfs_class_for_major_name("mem"), Some("mem"));
+        assert_eq!(sysfs_class_for_major_name("console"), Some("tty"));
+        assert_eq!(sysfs_class_for_major_name("tty"), Some("tty"));
+        assert_eq!(sysfs_class_for_major_name("misc"), Some("misc"));
+        assert_eq!(sysfs_class_for_major_name("uart0"), None);
+        assert_eq!(sysfs_class_for_major_name(""), None);
+    }
+
+    #[test]
+    fn cpu_in_mask_bounds_shifts_and_matches_supported_mask() {
+        assert!(cpu_in_mask(0, 0b11));
+        assert!(cpu_in_mask(1, 0b11));
+        assert!(!cpu_in_mask(2, 0b11));
+        // cpu_id 超出 u64 掩码宽度时视为不在掩码内。
+        assert!(!cpu_in_mask(64, u64::MAX));
+        assert!(!cpu_in_mask(usize::MAX, u64::MAX));
     }
 
     struct InstalledDeviceTreeReset {
