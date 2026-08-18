@@ -93,11 +93,7 @@ pub fn scan_and_register(disk: &Arc<BlockDevice>) -> Vec<Arc<BlockDevice>> {
     let infos = scan(disk);
     let mut out = Vec::new();
     let disk_name = disk.name();
-    let separator = if disk_name
-        .chars()
-        .last()
-        .is_some_and(|c| c.is_ascii_digit())
-    {
+    let separator = if disk_name.chars().last().is_some_and(|c| c.is_ascii_digit()) {
         "p"
     } else {
         ""
@@ -178,13 +174,10 @@ fn read_single_blocks(
 ) -> Result<(), BioError> {
     let block_size = disk.geometry().logical_block_size().get() as usize;
     for (index, chunk) in buf.chunks_mut(block_size).enumerate() {
-        let lba = start_lba
-            .checked_add(index as u64)
-            .ok_or_else(|| BioError::Submit(BlockSubmitError::InvalidRequest(BioReqError::OutOfBounds)))?;
-        disk.submit_bio_wait_borrowed_read(
-            BlockRange { lba, blocks: 1 },
-            chunk,
-        )?;
+        let lba = start_lba.checked_add(index as u64).ok_or_else(|| {
+            BioError::Submit(BlockSubmitError::InvalidRequest(BioReqError::OutOfBounds))
+        })?;
+        disk.submit_bio_wait_borrowed_read(BlockRange { lba, blocks: 1 }, chunk)?;
     }
     Ok(())
 }
@@ -226,8 +219,7 @@ fn parse_gpt(disk: &Arc<BlockDevice>, head: &[u8]) -> Vec<PartitionInfo> {
         return Vec::new();
     };
     let entries_lba = u64::from_le_bytes(header[72..80].try_into().expect("gpt header slice"));
-    let entry_count =
-        u32::from_le_bytes(header[80..84].try_into().expect("gpt count")) as usize;
+    let entry_count = u32::from_le_bytes(header[80..84].try_into().expect("gpt count")) as usize;
     let entry_size =
         u32::from_le_bytes(header[84..88].try_into().expect("gpt entry size")) as usize;
     if entries_lba == 0 || entry_count == 0 || entry_size < GPT_ENTRY_SIZE {

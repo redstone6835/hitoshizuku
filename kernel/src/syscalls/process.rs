@@ -1162,8 +1162,8 @@ pub(super) fn sys_uname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     write_uts_field(&mut out, 0, b"MyGo");
     let hostname = uts.hostname();
     write_uts_ns_field(&mut out, 1, &hostname, b"mygo");
-    // release/version 由编译期信息驱动（Linux 由 uname_release/version 编译宏驱动）。
-    write_uts_field(&mut out, 2, env!("CARGO_PKG_VERSION").as_bytes());
+    // release 是用户态兼容版本，不能使用低于 glibc 下限的 Cargo 包版本。
+    write_uts_field(&mut out, 2, b"6.6.0-mygo");
     write_uts_field(
         &mut out,
         3,

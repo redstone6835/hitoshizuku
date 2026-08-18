@@ -266,7 +266,11 @@ impl Ls7aRtc {
     }
 
     fn alarm_irq_supported(&self) -> bool {
-        self.alarm_supported()
+        // 没有 PM 状态/使能窗口时，直连 TOY_MATCH 中断无法可靠地屏蔽和清除。
+        // QEMU 的 LS7A RTC 还会在启用 TOY 计数器时为默认匹配值启动定时器，
+        // 这类路径若注册 IRQ 会把一个不可清除的电平送入 PCH 级联，形成中断风暴。
+        // 保留闹钟读写能力，但只有具备独立 PM 控制语义时才声明可处理中断。
+        self.alarm_supported() && self.pm_base.is_some()
     }
 
     fn ensure_fix_year(&self) -> Result<u32, Ls7aRtcError> {

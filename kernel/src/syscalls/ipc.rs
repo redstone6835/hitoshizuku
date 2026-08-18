@@ -2543,7 +2543,7 @@ fn encode_msginfo(info: &MsgSystemInfo, limits: bool) -> [u8; MSGINFO_SIZE] {
 
 #[cfg(feature = "kernel-tests")]
 mod tests {
-    use general::ipc::sem::{IPC_NOWAIT, SemManager, SemOpAttempt, SemOperation};
+    use general::ipc::sem::{IPC_NOWAIT, SemBlockKind, SemManager, SemOpAttempt, SemOperation};
     use general::ipc::shm::{IPC_CREAT, IPC_EXCL};
     use ktest::ktest;
     use vfs::cred::Credentials;
@@ -2563,18 +2563,21 @@ mod tests {
         let manager = SemManager::new();
         let cred = Credentials::root();
         let id = manager
-            .semget(SemKey::PRIVATE, 2, IPC_CREAT | 0o700, &cred)
+            .semget(SemKey::PRIVATE, 2, IPC_CREAT | 0o700, &cred, 0)
             .expect("创建 semaphore set");
         let set = manager.set_for_operation(id).expect("查找 semaphore set");
 
         assert_eq!(
-            set.try_apply(&[operation(0, 1, 0), operation(0, -2, 0)], &cred),
-            Ok(SemOpAttempt::WouldBlock)
+            set.try_apply(&[operation(0, 1, 0), operation(0, -2, 0)], &cred, 7, 0),
+            Ok(SemOpAttempt::WouldBlock {
+                sem_num: 0,
+                kind: SemBlockKind::Increment
+            })
         );
         assert_eq!(manager.get_value(id, 0, &cred), Ok(0));
 
         assert_eq!(
-            set.try_apply(&[operation(0, 2, 0), operation(0, -1, 0)], &cred),
+            set.try_apply(&[operation(0, 2, 0), operation(0, -1, 0)], &cred, 7, 0),
             Ok(SemOpAttempt::Applied)
         );
         assert_eq!(manager.get_value(id, 0, &cred), Ok(1));
@@ -2585,12 +2588,12 @@ mod tests {
         let manager = SemManager::new();
         let cred = Credentials::root();
         let id = manager
-            .semget(SemKey::PRIVATE, 1, IPC_CREAT | 0o700, &cred)
+            .semget(SemKey::PRIVATE, 1, IPC_CREAT | 0o700, &cred, 0)
             .expect("创建 semaphore set");
         let set = manager.set_for_operation(id).expect("查找 semaphore set");
 
         assert_eq!(
-            set.try_apply(&[operation(0, -1, IPC_NOWAIT)], &cred),
+            set.try_apply(&[operation(0, -1, IPC_NOWAIT)], &cred, 7, 0),
             Err(errno::Errno::EAGAIN)
         );
         assert_eq!(manager.get_value(id, 0, &cred), Ok(0));
@@ -2602,19 +2605,19 @@ mod tests {
         let cred = Credentials::root();
         let key = SemKey(0x1234);
         let id = manager
-            .semget(key, 2, IPC_CREAT | 0o700, &cred)
+            .semget(key, 2, IPC_CREAT | 0o700, &cred, 0)
             .expect("创建 keyed semaphore set");
 
-        assert_eq!(manager.semget(key, 0, 0, &cred), Ok(id));
+        assert_eq!(manager.semget(key, 0, 0, &cred, 0), Ok(id));
         assert_eq!(
-            manager.semget(key, 2, IPC_CREAT | IPC_EXCL | 0o700, &cred),
+            manager.semget(key, 2, IPC_CREAT | IPC_EXCL | 0o700, &cred, 0),
             Err(errno::Errno::EEXIST)
         );
 
         let stable_set = manager.set_for_operation(id).expect("保留稳定对象引用");
         manager.remove(id, &cred).expect("删除 semaphore set");
         assert!(matches!(
-            stable_set.try_apply(&[operation(0, 1, 0)], &cred),
+            stable_set.try_apply(&[operation(0, 1, 0)], &cred, 7, 0),
             Err(errno::Errno::EIDRM)
         ));
         assert!(matches!(

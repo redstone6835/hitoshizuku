@@ -805,7 +805,7 @@ mod tests {
         assert_eq!(
             set.try_apply(&[operation(0, 1, 0), operation(0, -2, 0)], &cred, 7, 0),
             Ok(SemOpAttempt::WouldBlock {
-                sem_num: 1,
+                sem_num: 0,
                 kind: SemBlockKind::Increment
             })
         );

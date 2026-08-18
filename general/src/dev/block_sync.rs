@@ -204,7 +204,10 @@ impl extfs::BlockBackend for FsBlockAdapter {
             let chunk_blocks = remaining.min(MAX_BLOCKS_PER_BIO);
             let chunk_bytes = chunk_blocks as usize * bps;
             let start = offset as usize * bps;
-            let range = BlockRange { lba: lba + offset, blocks: chunk_blocks };
+            let range = BlockRange {
+                lba: lba + offset,
+                blocks: chunk_blocks,
+            };
             self.dev
                 .submit_bio_wait_borrowed_read(range, &mut buf[start..start + chunk_bytes])
                 .map_err(|_| extfs::BlockBackendError::Io)?;
@@ -270,7 +273,10 @@ impl extfs::BlockBackend for FsBlockAdapter {
             let chunk_blocks = remaining.min(MAX_BLOCKS_PER_BIO);
             let chunk_bytes = chunk_blocks as usize * bps;
             let start = offset as usize * bps;
-            let range = BlockRange { lba: lba + offset, blocks: chunk_blocks };
+            let range = BlockRange {
+                lba: lba + offset,
+                blocks: chunk_blocks,
+            };
             self.dev
                 .submit_bio_wait_borrowed_write(range, &buf[start..start + chunk_bytes])
                 .map_err(|error| {

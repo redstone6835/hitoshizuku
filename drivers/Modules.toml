@@ -279,6 +279,7 @@ path = "jh7110-uart"
 config = "CONFIG_JH7110_UART"
 prompt = "StarFive JH7110 / DesignWare APB UART 驱动"
 default = "y"
+targets = "riscv64gc-unknown-none-elf"
 after = "platform.firmware-bus,platform.plic"
 
 [[modules]]
@@ -287,6 +288,7 @@ path = "jh7110-crg"
 config = "CONFIG_JH7110_CRG"
 prompt = "StarFive JH7110 Clock / CRG 驱动"
 default = "y"
+targets = "riscv64gc-unknown-none-elf"
 after = "platform.firmware-bus"
 
 [[modules]]
@@ -295,6 +297,7 @@ path = "jh7110-pinctrl"
 config = "CONFIG_JH7110_PINCTRL"
 prompt = "StarFive JH7110 pinctrl / GPIO 驱动"
 default = "y"
+targets = "riscv64gc-unknown-none-elf"
 after = "platform.firmware-bus"
 
 [[modules]]
@@ -303,6 +306,7 @@ path = "jh7110-mmc"
 config = "CONFIG_JH7110_MMC"
 prompt = "StarFive JH7110 MMC/eMMC/SD 驱动"
 default = "y"
+targets = "riscv64gc-unknown-none-elf"
 after = "platform.firmware-bus,platform.jh7110-crg,platform.jh7110-pinctrl"
 
 [[modules]]
@@ -345,4 +349,3 @@ config = "CONFIG_CDNS_USB3"
 prompt = "Cadence USB3 (cdns,usb3) 驱动"
 default = "m"
 after = "platform.firmware-bus"
-

@@ -295,4 +295,3 @@ fn export_boot_log_to_mmc(command_line: Option<&[u8]>) {
     }
     log::warning!("[mygo-mmclog] no writable block device for boot log");
 }
-

@@ -886,9 +886,8 @@ pub fn map_kernel_heap_range(
         return false;
     }
 
-    let result = with_kernel_page_table_lock(|| {
-        map_range_with_policy(vaddr, paddr, size, page_policy)
-    });
+    let result =
+        with_kernel_page_table_lock(|| map_range_with_policy(vaddr, paddr, size, page_policy));
     match result {
         Ok(()) => {
             // log::debug!(
