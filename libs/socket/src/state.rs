@@ -464,6 +464,30 @@ impl Socket {
         }
     }
 
+    /// 返回当前已缓冲、可立即读出的字节数（供 `FIONREAD` ioctl 使用）。
+    ///
+    /// 对面向连接的 Stream/Sequenced 统计其接收队列字节数；Datagram 统计其
+    /// 接收队列中尚未消费的报文总字节数。未连接或已关闭时返回 0。
+    pub fn readable_bytes(&self) -> usize {
+        match &self.inner.kind_impl {
+            SocketKind::Stream(stream) => {
+                let state = stream.state.lock();
+                state
+                    .connected_ref()
+                    .map(|conn| conn.rx.state.lock().bytes)
+                    .unwrap_or(0)
+            }
+            SocketKind::Datagram(dgram) => dgram.state.lock().queued_bytes,
+            SocketKind::Sequenced(seq) => {
+                let state = seq.state.lock();
+                state
+                    .connected_ref()
+                    .map(|conn| conn.rx.state.lock().bytes)
+                    .unwrap_or(0)
+            }
+        }
+    }
+
     pub fn set_readiness_observer(&self, observer: Weak<dyn SocketReadinessObserver>) {
         *self.inner.readiness_observer.lock() = Some(observer);
         self.attach_readiness_observer();
