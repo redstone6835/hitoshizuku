@@ -844,14 +844,19 @@ fn chmod_inode(
     mut mode: FileMode,
 ) -> VfsResult<()> {
     let inode_uid = inode.meta_snapshot().uid;
+    let inode_gid = inode.meta_snapshot().gid;
     let cred = ctx.cred();
     if !cred.is_owner(inode_uid) {
         return Err(VfsError::OperationNotPermitted);
     }
 
-    // POSIX：非特权进程 chmod 时必须清除 setuid/setgid 位，防止权限提升
-    if !cred.has_cap(cred::Capability::FSetId) {
-        mode = mode.without(FileMode::SUID_SGID);
+    // POSIX：chmod 不清除 SUID；SGID 仅在进程无 CAP_FSETID 且不是文件组成员时
+    // 清除，防止非成员借组权限提升。
+    if !cred.has_cap(cred::Capability::FSetId)
+        && cred.egid != inode_gid
+        && !cred.groups.contains(&inode_gid)
+    {
+        mode = mode.without(FileMode::ISGID);
     }
 
     inode.ops.chmod(inode, mode)?;
