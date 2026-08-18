@@ -1393,8 +1393,9 @@ pub(super) fn sys_clock_getres(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     let tp = ctx.args[1];
     let res_ns = match clock_id {
         CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => 1,
-        CLOCK_TAI => crate::vdso::clock_getres_ns(crate::vdso::CLOCK_REALTIME)
-            .ok_or(Errno::EINVAL)?,
+        CLOCK_TAI => {
+            crate::vdso::clock_getres_ns(crate::vdso::CLOCK_REALTIME).ok_or(Errno::EINVAL)?
+        }
         _ => crate::vdso::clock_getres_ns(clock_id).ok_or(Errno::EINVAL)?,
     } as i64;
     if tp != 0 {
@@ -1762,8 +1763,10 @@ pub(super) fn sys_sched_setscheduler(ctx: &mut SyscallContext<'_>) -> Result<usi
     let mut raw = [0u8; 4];
     copy_from_user(param_user, &mut raw).map_err(|e| e.as_errno())?;
     let priority = i32::from_le_bytes(raw);
-    if matches!(policy, SchedPolicy::Fair | SchedPolicy::Batch | SchedPolicy::Idle)
-        && priority != 0
+    if matches!(
+        policy,
+        SchedPolicy::Fair | SchedPolicy::Batch | SchedPolicy::Idle
+    ) && priority != 0
     {
         return Err(Errno::EINVAL);
     }
@@ -5639,15 +5642,34 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(0)
         }
         PTRACE_PEEKSIGINFO => {
-            // 位图式 pending 信号不保留排队 siginfo；按 Linux 语义返回
-            // 已拷贝数量（本实现无排队信号 → 0）。
+            // 返回目标排队中的 pending siginfo（非破坏性快照）。
+            // struct ptrace_peeksiginfo_args { u64 off; u32 flags; s32 nr; }。
+            let target = ptrace_target_task(pid)?;
             let mut args = [0u8; 16];
             copy_from_user(addr, &mut args).map_err(|e| e.as_errno())?;
+            let off = u64::from_le_bytes(args[0..8].try_into().unwrap()) as usize;
             let flags = u32::from_le_bytes(args[8..12].try_into().unwrap());
-            if flags != 0 {
+            let nr = i32::from_le_bytes(args[12..16].try_into().unwrap());
+            const PTRACE_PEEKSIGINFO_SHARED: u32 = 1;
+            // 取舍：负 nr 的倒序读取（Linux 反向遍历）未实现，按 EINVAL 拒绝。
+            if flags & !PTRACE_PEEKSIGINFO_SHARED != 0 || nr < 0 {
                 return Err(Errno::EINVAL);
             }
-            Ok(0)
+            let infos = if flags & PTRACE_PEEKSIGINFO_SHARED != 0 {
+                target.shared_signal().shared_pending_infos_snapshot()
+            } else {
+                target.signal.pending_infos_snapshot()
+            };
+            let mut copied = 0usize;
+            for (index, info) in infos.iter().skip(off).enumerate() {
+                if copied >= nr as usize {
+                    break;
+                }
+                let slot = data.checked_add(index * 128).ok_or(Errno::EFAULT)?;
+                super::signal::write_siginfo(slot, info)?;
+                copied += 1;
+            }
+            Ok(copied)
         }
         PTRACE_GET_SYSCALL_INFO => {
             let target = ptrace_target_task(pid)?;
@@ -5659,7 +5681,13 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             write_ptrace_rseq_configuration(&target, data)?;
             Ok(0)
         }
+        // PTRACE_GETFDPIC 只在无 MMU 的 FDPIC ABI 上有意义，LA/RV 均为
+        // ELF + MMU，Linux 同架构同样返回 EINVAL。
         PTRACE_GETFDPIC => Err(Errno::EINVAL),
+        // 取舍：SECCOMP_GET_FILTER/GET_METADATA 需反射 seccomp 过滤器 BPF
+        // 程序（general::seccomp 属只读边界，未暴露过滤器镜像接口），暂保持
+        // EINVAL；SYSCALL_USER_DISPATCH / SET_SYSCALL_INFO 依赖 seccomp 调度
+        // 路径，未实现。
         PTRACE_SECCOMP_GET_FILTER | PTRACE_SECCOMP_GET_METADATA => Err(Errno::EINVAL),
         PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG
         | PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG
@@ -5831,27 +5859,27 @@ fn ptrace_regset(
             Ok(())
         }
         NT_FPREGSET => {
-            // 本内核的 trap frame 不保存浮点寄存器（FPU 状态由用户态维护）；
-            // 按 Linux ABI 提供全零的寄存器集。
+            // 架构 trap frame 在 syscall 入口保存了浮点寄存器
+            // （LA：f0-f31+fcsr+fcc；RV：f0-f31+fcsr），这里按 Linux
+            // `struct user_fpregs_struct` 布局读写，供 gdb/CRIU 使用。
             let size = linux_fpregset_size();
             if set {
                 if len < size {
                     return Err(Errno::EIO);
                 }
-                let mut input = [0u8; 1024];
+                let mut input = [0u8; 272];
                 copy_from_user(base, &mut input[..size]).map_err(|e| e.as_errno())?;
-                // 忽略写入值（架构无内核侧 FP 状态）。
-                Ok(())
+                ptrace_write_arch_fpregs(target, &input[..size])?;
             } else {
                 if len < size {
                     len = size;
                     write_iov_len(iov_user, len)?;
                     return Ok(());
                 }
-                let zeros = [0u8; 1024];
-                copy_to_user(base, &zeros[..size]).map_err(|e| e.as_errno())?;
-                Ok(())
+                let out = ptrace_read_arch_fpregs(target)?;
+                copy_to_user(base, &out).map_err(|e| e.as_errno())?;
             }
+            Ok(())
         }
         _ => Err(Errno::EINVAL),
     }
@@ -5874,14 +5902,91 @@ fn linux_mcontext_size() -> usize {
 }
 
 /// Linux `struct user_fpregs_struct` 的大小。
+///
+/// - loongarch64：`{ u64 fpr[32]; u64 fcc; u32 fcsr; }`，8 字节对齐后 272；
+/// - riscv64：`{ u64 f[32]; u64 fcsr; }`，264。
 fn linux_fpregset_size() -> usize {
     #[cfg(target_arch = "loongarch64")]
     {
-        33 * 8 // 32 FPR + fcc
+        32 * 8 + 8 + 4 + 4
     }
     #[cfg(target_arch = "riscv64")]
     {
-        33 * 8 + 4 // 32 FPR + fcsr + pad
+        32 * 8 + 8
+    }
+}
+
+/// 从架构 trap frame 读出浮点寄存器，按 `struct user_fpregs_struct` 布局编码。
+fn ptrace_read_arch_fpregs(target: &Arc<Task>) -> Result<Vec<u8>, Errno> {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let frame = target
+            .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
+            .and_then(|payload| payload.downcast::<arch::loongarch64::TrapFrame>().ok())
+            .ok_or(Errno::EIO)?;
+        let mut out = vec![0u8; linux_fpregset_size()];
+        for (index, reg) in frame.f.iter().enumerate() {
+            out[index * 8..index * 8 + 8].copy_from_slice(&reg.to_le_bytes());
+        }
+        out[256..264].copy_from_slice(&frame.fcc.to_le_bytes());
+        out[264..268].copy_from_slice(&(frame.fcsr as u32).to_le_bytes());
+        Ok(out)
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let frame = target
+            .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
+            .and_then(|payload| payload.downcast::<arch::riscv64::TrapFrame>().ok())
+            .ok_or(Errno::EIO)?;
+        let mut out = vec![0u8; linux_fpregset_size()];
+        for (index, reg) in frame.f.iter().enumerate() {
+            out[index * 8..index * 8 + 8].copy_from_slice(&reg.to_le_bytes());
+        }
+        out[256..264].copy_from_slice(&(frame.fcsr as u64).to_le_bytes());
+        Ok(out)
+    }
+}
+
+/// 把 `struct user_fpregs_struct` 布局的字节写回架构 trap frame。
+fn ptrace_write_arch_fpregs(target: &Arc<Task>, bytes: &[u8]) -> Result<(), Errno> {
+    let size = linux_fpregset_size();
+    if bytes.len() < size {
+        return Err(Errno::EIO);
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let frame = target
+            .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
+            .and_then(|payload| payload.downcast::<arch::loongarch64::TrapFrame>().ok())
+            .ok_or(Errno::EIO)?;
+        let mut new = *frame;
+        for (index, reg) in new.f.iter_mut().enumerate() {
+            *reg = u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap());
+        }
+        new.fcc = u64::from_le_bytes(bytes[256..264].try_into().unwrap());
+        new.fcsr = u32::from_le_bytes(bytes[264..268].try_into().unwrap()) as u64;
+        let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(new);
+        target
+            .ext_replace(sched::TASKEXT_PTRACE_FRAME, erased)
+            .map_err(|_| Errno::EIO)?;
+        Ok(())
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let frame = target
+            .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
+            .and_then(|payload| payload.downcast::<arch::riscv64::TrapFrame>().ok())
+            .ok_or(Errno::EIO)?;
+        let mut new = *frame;
+        for (index, reg) in new.f.iter_mut().enumerate() {
+            *reg = u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap());
+        }
+        new.fcsr = u32::from_le_bytes(bytes[256..260].try_into().unwrap());
+        let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(new);
+        target
+            .ext_replace(sched::TASKEXT_PTRACE_FRAME, erased)
+            .map_err(|_| Errno::EIO)?;
+        Ok(())
     }
 }
 
