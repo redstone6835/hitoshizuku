@@ -1137,6 +1137,20 @@ fn pick_fair_locked(
     cpu_mask: u64,
 ) -> Option<Arc<Task>> {
     let avg = avg_vruntime_locked(inner);
+
+    // EEVDF 按 fair deadline 排序。唤醒密集的普通任务通常让队首任务已经
+    // eligible；先检查这个候选可以把常见的 nice=0 调度从整棵 BTreeMap
+    // 扫描降为一次首元素查询。亲和性、buddy-skip 或 preferred 候选存在时
+    // 仍走完整筛选，因而不会改变受限 CPU 集合和公平性语义。
+    if skip_key.is_none()
+        && preferred_key.is_none()
+        && let Some((&key, task)) = inner.fair_tree.iter().next()
+        && task_pickable_on(task, cpu_mask, prev_addr)
+        && task.sched.vruntime() <= avg
+    {
+        return remove_fair_by_key_locked(inner, key);
+    }
+
     let mut preferred = None;
     let mut first_allowed = None;
     let mut first_eligible = None;
