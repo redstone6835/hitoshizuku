@@ -3968,16 +3968,313 @@ pub(super) fn sys_recvmmsg_time64(ctx: &mut SyscallContext<'_>) -> Result<usize,
     sys_recvmmsg(ctx)
 }
 
-pub(super) fn sys_io_uring_setup(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+// ── io_uring 最小同步实现 ────────────────────────────────────────────────────
+//
+// 提供“固定 SQ/CQ 队列 + 同步执行 SQE”的最小闭环：io_uring_setup 分配并映射
+// 一个共享匿名内存对象作为三块 ring（SQ ring + SQE 数组 + CQ ring），io_uring_enter
+// 同步执行 NOP/READ/WRITE/READV/WRITEV/FSYNC，io_uring_register 仅识别清理命令。
+// ring 通过 `SharedAnonObject` 在 setup 时映射进用户地址空间（基址写入
+// `io_uring_params.sq_off.user_addr`），内核侧经 read/write_shared_anon 访问同一
+// 物理页，保证 head/tail 索引相干。这是自洽的最小闭环，但**不兼容标准 liburing**
+// （其自行 mmap(fd, IORING_OFF_*) 会得到写回式文件页而非本共享对象）。
+
+const IORING_SQE_SIZE: usize = 64;
+const IORING_CQE_SIZE: usize = 16;
+const IORING_MAX_ENTRIES: u32 = 4096;
+
+const IORING_OP_NOP: u8 = 0;
+const IORING_OP_READV: u8 = 1;
+const IORING_OP_WRITEV: u8 = 2;
+const IORING_OP_FSYNC: u8 = 3;
+const IORING_OP_READ: u8 = 22;
+const IORING_OP_WRITE: u8 = 23;
+
+const IORING_UNREGISTER_BUFFERS: u32 = 1;
+const IORING_UNREGISTER_FILES: u32 = 3;
+
+struct IoUringState {
+    object: Arc<mm::SharedAnonObject>,
+    sq_entries: u32,
+    cq_entries: u32,
+    sq_ring_size: usize,
+    sqes_size: usize,
+    cq_ring_size: usize,
+    sq_ring_off: u64,
+    sqes_off: u64,
+    cq_ring_off: u64,
 }
 
-pub(super) fn sys_io_uring_enter(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+impl IoUringState {
+    fn new(entries: u32) -> Self {
+        let sq_ring_size = 24 + entries as usize * 4;
+        let sqes_size = entries as usize * IORING_SQE_SIZE;
+        let cq_ring_size = 20 + entries as usize * IORING_CQE_SIZE;
+        let sq_ring_off = 0u64;
+        let sqes_off = sq_ring_size as u64;
+        let cq_ring_off = sqes_off + sqes_size as u64;
+        Self {
+            object: Arc::new(mm::SharedAnonObject::new()),
+            sq_entries: entries,
+            cq_entries: entries,
+            sq_ring_size,
+            sqes_size,
+            cq_ring_size,
+            sq_ring_off,
+            sqes_off,
+            cq_ring_off,
+        }
+    }
+
+    fn total_size(&self) -> usize {
+        self.sq_ring_size + self.sqes_size + self.cq_ring_size
+    }
+
+    fn read_u32(&self, off: u64) -> Result<u32, Errno> {
+        let mut b = [0u8; 4];
+        general::mm::read_shared_anon(&self.object, off, &mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    fn write_u32(&self, off: u64, v: u32) -> Result<(), Errno> {
+        general::mm::write_shared_anon(&self.object, off, &v.to_le_bytes())
+    }
+
+    fn read_bytes(&self, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
+        general::mm::read_shared_anon(&self.object, off, buf)
+    }
+
+    fn write_bytes(&self, off: u64, buf: &[u8]) -> Result<(), Errno> {
+        general::mm::write_shared_anon(&self.object, off, buf)
+    }
+
+    fn init_ring(&self) -> Result<(), Errno> {
+        let mask = self.sq_entries - 1;
+        self.write_u32(self.sq_ring_off, 0)?;
+        self.write_u32(self.sq_ring_off + 4, 0)?;
+        self.write_u32(self.sq_ring_off + 8, mask)?;
+        self.write_u32(self.sq_ring_off + 12, self.sq_entries)?;
+        self.write_u32(self.sq_ring_off + 16, 0)?;
+        self.write_u32(self.sq_ring_off + 20, 0)?;
+        self.write_u32(self.cq_ring_off, 0)?;
+        self.write_u32(self.cq_ring_off + 4, 0)?;
+        self.write_u32(self.cq_ring_off + 8, mask)?;
+        self.write_u32(self.cq_ring_off + 12, self.cq_entries)?;
+        self.write_u32(self.cq_ring_off + 16, 0)?;
+        Ok(())
+    }
 }
 
-pub(super) fn sys_io_uring_register(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+struct IoUringFileOps {
+    state: Arc<IoUringState>,
+}
+
+impl vfs::file::FileOps for IoUringFileOps {
+    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> vfs::error::VfsResult<usize> {
+        Err(VfsError::NotSupported)
+    }
+
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> vfs::error::VfsResult<usize> {
+        Err(VfsError::NotSupported)
+    }
+
+    fn readdir(
+        &self,
+        _pos: u64,
+        _sink: &mut dyn FnMut(vfs::file::DirEntry) -> ControlFlow<()>,
+    ) -> vfs::error::VfsResult<u64> {
+        Err(VfsError::NotADirectory)
+    }
+
+    fn sync(&self) -> vfs::error::VfsResult<()> {
+        Ok(())
+    }
+
+    fn poll(&self, _interest: PollEvents) -> PollEvents {
+        PollEvents::default()
+    }
+
+    fn ioctl(&self, _cmd: IoctlCmd, _arg: usize) -> Result<usize, Errno> {
+        Err(Errno::ENOTTY)
+    }
+
+    fn release(&self) {}
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+/// 同步执行单个 SQE，返回 CQE 的 res 值（错误编码为负 errno）。
+fn execute_uring_sqe(ctx: &mut SyscallContext<'_>, sqe: &[u8]) -> i32 {
+    let opcode = sqe[0];
+    let fd_raw = i32::from_le_bytes(sqe[4..8].try_into().unwrap());
+    let off = u64::from_le_bytes(sqe[8..16].try_into().unwrap());
+    let addr = u64::from_le_bytes(sqe[16..24].try_into().unwrap());
+    let len = u32::from_le_bytes(sqe[24..28].try_into().unwrap());
+    if opcode == IORING_OP_NOP {
+        return 0;
+    }
+    let fd = match fd_arg(fd_raw as usize) {
+        Ok(fd) => fd,
+        Err(e) => return -i32::from(e),
+    };
+    let res: Result<usize, Errno> = match opcode {
+        IORING_OP_READ => {
+            let file = match file_for_fd(fd) {
+                Ok(f) => f,
+                Err(e) => return -i32::from(e),
+            };
+            read_to_user(&file, addr as usize, len as usize, Some(off), false)
+        }
+        IORING_OP_WRITE => {
+            let file = match file_for_fd(fd) {
+                Ok(f) => f,
+                Err(e) => return -i32::from(e),
+            };
+            write_from_user_at(&file, addr as usize, len as usize, Some(off), false)
+        }
+        IORING_OP_READV => {
+            let file = match file_for_fd(fd) {
+                Ok(f) => f,
+                Err(e) => return -i32::from(e),
+            };
+            read_iovecs(ctx, &file, addr as usize, len as usize, Some(off), false)
+        }
+        IORING_OP_WRITEV => {
+            let file = match file_for_fd(fd) {
+                Ok(f) => f,
+                Err(e) => return -i32::from(e),
+            };
+            write_iovecs(ctx, &file, addr as usize, len as usize, Some(off), false)
+        }
+        IORING_OP_FSYNC => {
+            let file = match file_for_fd(fd) {
+                Ok(f) => f,
+                Err(e) => return -i32::from(e),
+            };
+            match file.sync() {
+                Ok(()) => return 0,
+                Err(e) => return -i32::from(e.to_errno()),
+            }
+        }
+        _ => return -i32::from(Errno::EINVAL),
+    };
+    match res {
+        Ok(n) => n as i32,
+        Err(e) => -i32::from(e),
+    }
+}
+
+pub(super) fn sys_io_uring_setup(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let entries = ctx.args[0] as u32;
+    let params_user = ctx.args[1];
+    if entries == 0 || entries > IORING_MAX_ENTRIES || params_user == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let entries = entries.next_power_of_two();
+    let state = Arc::new(IoUringState::new(entries));
+    state.init_ring()?;
+
+    // 将 ring 映射进当前进程地址空间（共享匿名对象，内核/用户相干）。
+    let vm = current_vm_space().ok_or(Errno::ENOMEM)?;
+    let range = vm.alloc_mmap_range(state.total_size())?;
+    let vflags = mm::VmFlags::from_bits(mm::VmFlags::USER | mm::VmFlags::READ | mm::VmFlags::WRITE);
+    vm.map_shared_anon(range.clone(), Arc::clone(&state.object), 0, vflags)?;
+    let user_base = range.start;
+
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let file_flags = OpenOptions {
+        access: AccessMode::ReadWrite,
+        ..OpenOptions::default()
+    };
+    let fd = vfs::anon::create_fd(
+        &fdt,
+        vfs_ctx.cred().clone(),
+        file_flags,
+        FdFlags::default(),
+        alloc::boxed::Box::new(IoUringFileOps {
+            state: Arc::clone(&state),
+        }),
+    )
+    .map_err(|e| e.to_errno())?;
+
+    // struct io_uring_params（128 字节）：sq_off 在偏移 40，cq_off 在偏移 80。
+    let mut params = [0u8; 128];
+    put_u32(&mut params, 0, entries);
+    put_u32(&mut params, 4, entries);
+    // sq_off
+    put_u32(&mut params, 40, 0);
+    put_u32(&mut params, 44, 4);
+    put_u32(&mut params, 48, 8);
+    put_u32(&mut params, 52, 12);
+    put_u32(&mut params, 56, 16);
+    put_u32(&mut params, 60, 20);
+    put_u32(&mut params, 64, 24);
+    put_u64(&mut params, 72, user_base as u64);
+    // cq_off
+    put_u32(&mut params, 80, 0);
+    put_u32(&mut params, 84, 4);
+    put_u32(&mut params, 88, 8);
+    put_u32(&mut params, 92, 12);
+    put_u32(&mut params, 96, 16);
+    put_u32(&mut params, 100, 20);
+    put_u32(&mut params, 104, 24);
+    put_u64(
+        &mut params,
+        112,
+        (user_base + state.cq_ring_off as usize) as u64,
+    );
+    copy_to_user(params_user, &params).map_err(|e| e.as_errno())?;
+    Ok(fd.as_raw() as usize)
+}
+
+pub(super) fn sys_io_uring_enter(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd = fd_arg(ctx.args[0])?;
+    let to_submit = ctx.args[1] as u32;
+    let file = file_for_fd(fd)?;
+    let ring = file.downcast_ops::<IoUringFileOps>().ok_or(Errno::EBADF)?;
+    let st = &ring.state;
+
+    let mask = st.read_u32(st.sq_ring_off + 8)?;
+    let mut sq_head = st.read_u32(st.sq_ring_off)?;
+    let sq_tail = st.read_u32(st.sq_ring_off + 4)?;
+    let mut cq_tail = st.read_u32(st.cq_ring_off + 4)?;
+    let mut completed = 0u32;
+
+    while completed < to_submit && sq_head != sq_tail {
+        let array_off = st.sq_ring_off + 24 + (sq_head & mask) as u64 * 4;
+        let sqe_index = st.read_u32(array_off)?;
+        let sqe_off = st.sqes_off + sqe_index as u64 * IORING_SQE_SIZE as u64;
+        let mut sqe = [0u8; IORING_SQE_SIZE];
+        st.read_bytes(sqe_off, &mut sqe)?;
+        let res = execute_uring_sqe(ctx, &sqe);
+        let user_data = u64::from_le_bytes(sqe[32..40].try_into().unwrap());
+        let mut cqe = [0u8; IORING_CQE_SIZE];
+        put_u64(&mut cqe, 0, user_data);
+        put_i32(&mut cqe, 8, res);
+        let cqe_off = st.cq_ring_off + 20 + (cq_tail & mask) as u64 * IORING_CQE_SIZE as u64;
+        st.write_bytes(cqe_off, &cqe)?;
+        cq_tail = cq_tail.wrapping_add(1);
+        sq_head = sq_head.wrapping_add(1);
+        completed += 1;
+    }
+    st.write_u32(st.sq_ring_off, sq_head)?;
+    st.write_u32(st.cq_ring_off + 4, cq_tail)?;
+    Ok(completed as usize)
+}
+
+pub(super) fn sys_io_uring_register(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd = fd_arg(ctx.args[0])?;
+    let opcode = ctx.args[1] as u32;
+    let file = file_for_fd(fd)?;
+    file.downcast_ops::<IoUringFileOps>().ok_or(Errno::EBADF)?;
+    // 最小语义：固定文件/缓冲注册表未实现；仅接受清理命令为 no-op，便于
+    // 用户态 teardown 路径不因 EOPNOTSUPP 中断。
+    match opcode {
+        IORING_UNREGISTER_BUFFERS | IORING_UNREGISTER_FILES => Ok(0),
+        _ => Err(Errno::EOPNOTSUPP),
+    }
 }
 
 /// `fsopen(2)`：按文件系统类型创建 fs_context 并返回其 fd。
