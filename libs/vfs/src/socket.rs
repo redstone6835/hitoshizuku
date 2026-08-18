@@ -634,7 +634,8 @@ pub fn socket(
                 kind,
                 SocketType::Datagram | SocketType::Stream | SocketType::Raw
             ) {
-                return Err(Errno::Other(93));
+                // SOCK_SEQPACKET 等类型在 INET 域不受支持，返回 ESOCKTNOSUPPORT。
+                return Err(Errno::ESOCKTNOSUPPORT);
             }
             let ops = crate::net_socket::create_net_socket(
                 domain as u16,
