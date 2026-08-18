@@ -311,6 +311,20 @@ impl NetSocketFileOps {
 
     pub fn connect(&self, sockaddr: &[u8], nonblocking: bool) -> Result<(), Errno> {
         self.ensure_backend()?;
+        // UDP：connect(AF_UNSPEC) 断开连接（Linux udp_disconnect 语义）。未指定
+        // 地址端点会被 net 层 connect_with_mode 识别并清空已连接 peer 与路由。
+        if self.sock_type() == SOCK_DGRAM
+            && crate::addr::sockaddr_family(sockaddr) == Ok(crate::addr::AF_UNSPEC)
+        {
+            let peer = net::Endpoint {
+                addr: unspecified(self.family()),
+                port: 0,
+            };
+            return self
+                .proxy
+                .connect_with_mode(peer, None, self.bind_options(), nonblocking)
+                .map_err(map_socket_error);
+        }
         let peer = normalize_connect_endpoint(crate::addr::parse_inet_sockaddr_for_socket(
             sockaddr,
             self.family(),
