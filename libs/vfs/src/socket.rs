@@ -1546,21 +1546,27 @@ fn parse_multicast_group_req(
     })
 }
 
-/// 解析 `struct timeval { tv_sec; tv_usec; }`（每个字段 8 字节，LP64 ABI）。
-fn parse_timeval_ns(value: &[u8]) -> u64 {
+/// 解析 `struct timeval { tv_sec; tv_usec; }`（每个字段 8 字节，LP64 ABI），
+/// 返回以纳秒为单位的超时值；两个字段均为 0 表示"无超时"（`Ok(None)`）。
+///
+/// 与 UNIX 路径的 [`parse_timeval`] 语义对齐：长度不足、负的秒数或不在
+/// `0..1_000_000` 范围的微秒数都返回 `Err(Errno::EINVAL)`。
+fn parse_timeval_ns(value: &[u8]) -> Result<Option<u64>, Errno> {
     if value.len() < 16 {
-        return 0;
+        return Err(Errno::EINVAL);
     }
-    let secs = i64::from_ne_bytes([
-        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
-    ])
-    .max(0) as u64;
-    let usecs = i64::from_ne_bytes([
-        value[8], value[9], value[10], value[11], value[12], value[13], value[14], value[15],
-    ])
-    .max(0) as u64;
-    secs.saturating_mul(1_000_000_000)
-        .saturating_add(usecs.saturating_mul(1_000))
+    let secs = i64::from_ne_bytes(value[0..8].try_into().unwrap());
+    let usecs = i64::from_ne_bytes(value[8..16].try_into().unwrap());
+    if secs < 0 || !(0..1_000_000).contains(&usecs) {
+        return Err(Errno::EINVAL);
+    }
+    if secs == 0 && usecs == 0 {
+        return Ok(None);
+    }
+    let ns = (secs as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add((usecs as u64).saturating_mul(1_000));
+    Ok(Some(ns))
 }
 
 fn timeval_from_ns(ns: u64) -> [u8; 16] {
@@ -1849,17 +1855,17 @@ fn inet_setsockopt(
                 Ok(())
             }
             SO_RCVTIMEO => {
-                let ns = parse_timeval_ns(value);
+                let ns = parse_timeval_ns(value)?;
                 net_ops
                     .recv_timeout_ns()
-                    .store(ns, core::sync::atomic::Ordering::Relaxed);
+                    .store(ns.unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             SO_SNDTIMEO => {
-                let ns = parse_timeval_ns(value);
+                let ns = parse_timeval_ns(value)?;
                 net_ops
                     .send_timeout_ns()
-                    .store(ns, core::sync::atomic::Ordering::Relaxed);
+                    .store(ns.unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             SO_SNDBUF => {
