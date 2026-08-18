@@ -6741,9 +6741,39 @@ pub(super) fn sys_landlock_restrict_self(_ctx: &mut SyscallContext<'_>) -> Resul
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_process_mrelease(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    // 进程资源释放（process_mrelease）依赖 mm 引用释放事务，未实现。
-    Err(Errno::ENOSYS)
+pub(super) fn sys_process_mrelease(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // Linux `process_mrelease(pidfd, flags)`：OOM killer 用它提前回收一个已退出
+    // （僵尸）进程的地址空间，而无需等待父进程 reap。
+    //
+    // ABI：arg0 = pidfd，arg1 = flags（必须为 0）。
+    let fd_raw = ctx.args[0] as isize;
+    let flags = ctx.args[1];
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if fd_raw < 0 {
+        return Err(Errno::EBADF);
+    }
+    let fdt = vfs::current_fdtable().ok_or(Errno::EBADF)?;
+    let file = fdt
+        .get_file(Fd::from_raw(fd_raw as u32))
+        .ok_or(Errno::EBADF)?;
+    let group = pidfd::group_from_file(&file).ok_or(Errno::EINVAL)?;
+
+    // 仅对已退出/僵尸进程有效；仍存活的进程返回 EINVAL（Linux 语义）。
+    if group.group_exit_status().is_none() {
+        return Err(Errno::EINVAL);
+    }
+
+    // 强制回收：逐个成员移除 VmSpace 扩展槽，drop 掉其地址空间 Arc。
+    // 这是 exit 路径（KernelExtExitHook::cleanup_on_exit）同款回收动作，对已
+    // 回收过的任务为幂等 no-op；对尚未经 exit hook 回收的僵尸进程则立即
+    // 释放其 PGD 与 resident 页引用。VmSpace 由 mm 内部引用计数管理，
+    // 这里只借用 `ext_remove` 公共接口，不依赖 mm 内部字段。
+    for member in group.snapshot() {
+        let _ = member.ext_remove(sched::TASKEXT_VM_SPACE);
+    }
+    Ok(0)
 }
 
 pub(super) fn sys_lsm_get_self_attr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
