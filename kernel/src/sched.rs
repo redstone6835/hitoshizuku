@@ -192,6 +192,12 @@ impl TaskExtCloneHook for KernelExtCloneHook {
                     Arc::new(child)
                 }
             }
+            general::syscall::TASKEXT_SECCOMP => {
+                let state = Arc::clone(src)
+                    .downcast::<general::seccomp::SeccompState>()
+                    .expect("[sched][ext] seccomp state type mismatch");
+                state.fork_clone()
+            }
             _ => Arc::clone(src),
         }
     }
