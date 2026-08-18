@@ -36,6 +36,9 @@ use sched::{Task, WaitQueue};
 /// `struct inotify_event` 头大小（不含名字）。
 const INOTIFY_EVENT_HEADER: usize = 16;
 
+/// 每个 inotify 实例的监视数上限（对齐 Linux `/proc/sys/fs/inotify/max_user_watches` 默认值）。
+const MAX_WATCHES: usize = 8192;
+
 struct InotifyEvent {
     wd: i32,
     mask: u32,
@@ -105,6 +108,10 @@ impl InotifyInstance {
                 }
                 return Ok(watch.wd);
             }
+        }
+        // 新增监视前检查实例级上限。
+        if watches.len() >= MAX_WATCHES {
+            return Err(Errno::ENOSPC);
         }
         let wd = self.next_wd.fetch_add(1, Ordering::Relaxed);
         if wd <= 0 {
