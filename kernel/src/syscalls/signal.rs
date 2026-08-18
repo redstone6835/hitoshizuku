@@ -291,7 +291,7 @@ pub(super) fn sys_pidfd_send_signal(ctx: &mut SyscallContext<'_>) -> Result<usiz
     }
     let fdt = vfs::current_fdtable().ok_or(Errno::EBADF)?;
     let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
-    let group = pidfd::group_from_file(&file).ok_or(Errno::EINVAL)?;
+    let group = pidfd::group_from_file(&file).ok_or(Errno::EBADF)?;
     let Some(sig) = sig else {
         sched::operation::pidfd_kill(&group, None)?;
         return Ok(0);
