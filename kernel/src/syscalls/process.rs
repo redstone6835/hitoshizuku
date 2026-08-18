@@ -1704,7 +1704,8 @@ fn tasks_by_real_uid(uid: Uid) -> Vec<Arc<Task>> {
 /// 校验 setpriority 的目标权限与优先级提升权限。
 ///
 /// 普通调用者只能修改同属主任务；降低 nice（提高优先级）时，还必须满足
-/// `CAP_SYS_NICE` 或当前线程组的 `RLIMIT_NICE` 下限。
+/// `CAP_SYS_NICE` 或目标任务的 `RLIMIT_NICE` 下限。Linux `can_nice(p, nice)`
+/// 用目标进程 `p` 的 `task_rlimit(p, RLIMIT_NICE)` 判定，故此处取 `target`。
 fn check_setpriority_permission(
     caller: &Arc<Task>,
     target: &Arc<Task>,
@@ -1717,7 +1718,7 @@ fn check_setpriority_permission(
     check_sched_target_owner(&caller_creds, target)?;
 
     let current = target.pi_base_attr().nice as i32;
-    if requested_nice < current && requested_nice < nice_floor_from_rlimit(caller) {
+    if requested_nice < current && requested_nice < nice_floor_from_rlimit(target) {
         return Err(Errno::EACCES);
     }
     Ok(())
