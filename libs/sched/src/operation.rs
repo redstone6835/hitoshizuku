@@ -1629,18 +1629,25 @@ pub fn queueinfo(pid: PidT, info: SigInfo) -> Result<(), Errno> {
 // ── ptrace 完整层 ────────────────────────────────────────────────────────────
 
 /// ptrace 访问权限检查（Linux `ptrace_may_access` 语义）：
-/// 同 uid、或调用者拥有 `CAP_SYS_PTRACE`，或目标 `dumpable == 0` 时仅限
-/// 特权追踪者（dumpable 由 prctl 维护，默认 1）。
+/// 凭据 uid/euid/suid 与 gid/egid/sgid 全等、或调用者拥有 `CAP_SYS_PTRACE`；
+/// 目标 `dumpable != 1`（0 或 `SUID_DUMP_ROOT`=2）时仅限特权追踪者。
 pub fn ptrace_may_access(tracer: &Arc<Task>, target: &Arc<Task>) -> bool {
     let tracer_cred = tracer.credentials();
     let target_cred = target.credentials();
-    if tracer_cred.has_cap(crate::ids::Capability::SysPtrace) {
-        return true;
-    }
-    if target.dumpable() == 0 {
+    let has_cap = tracer_cred.has_cap(crate::ids::Capability::SysPtrace);
+    let uid_ok = tracer_cred.uid == target_cred.uid
+        && tracer_cred.euid == target_cred.euid
+        && tracer_cred.suid == target_cred.suid;
+    let gid_ok = tracer_cred.gid == target_cred.gid
+        && tracer_cred.egid == target_cred.egid
+        && tracer_cred.sgid == target_cred.sgid;
+    if !(uid_ok && gid_ok) && !has_cap {
         return false;
     }
-    tracer_cred.uid == target_cred.uid || tracer_cred.euid == target_cred.uid
+    if target.dumpable() != 1 && !has_cap {
+        return false;
+    }
+    true
 }
 
 /// 标记任务进入 ptrace stop（`PTRACE_EVENT_*` 编码由调用方提前设置；
