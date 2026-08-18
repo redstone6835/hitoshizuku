@@ -3519,9 +3519,15 @@ impl SocketFacade {
         if self.kind == SocketKind::Stream && self.connect_pending.swap(true, Ordering::AcqRel) {
             return Err(SocketError::AlreadyInProgress);
         }
-        if self.peer_endpoint().is_some() {
-            let error = if self.kind == SocketKind::Stream
-                && !self.stream_connected.load(Ordering::Acquire)
+        // UDP 支持 connect(AF_UNSPEC) 断开：peer 为未指定地址时清空已连接端点。
+        if self.kind == SocketKind::Datagram && peer.addr.is_unspecified() {
+            *self.peer.lock() = None;
+            self.clear_local_datagram_route();
+            return Ok(());
+        }
+        // 仅 Stream（TCP）保留"已连接则报错"语义；UDP 允许重连（用新 peer 覆盖）。
+        if self.kind == SocketKind::Stream && self.peer_endpoint().is_some() {
+            let error = if !self.stream_connected.load(Ordering::Acquire)
                 && matches!(self.owner(), OwnerRef::Flow { .. })
             {
                 SocketError::AlreadyInProgress
