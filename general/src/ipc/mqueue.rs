@@ -213,7 +213,9 @@ impl MqObject {
 
     /// 校验 `mq_timedsend` 的优先级。
     pub fn validate_priority(priority: u32) -> Result<(), Errno> {
-        if priority as i32 >= MQ_PRIO_MAX {
+        // 按无符号比较（Linux `msg_prio >= MQ_PRIO_MAX` 语义），避免高位为 1
+        // 的 u32 经 `as i32` 变成负数而绕过校验。
+        if priority >= MQ_PRIO_MAX as u32 {
             return Err(Errno::EINVAL);
         }
         Ok(())
