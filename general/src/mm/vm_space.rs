@@ -3902,6 +3902,12 @@ impl VmSpace {
         }
         let old_len = old_range.end - old_range.start;
         if new_len <= old_len {
+            {
+                let vmas = self.vmas.lock();
+                if !vmas.contains_range(&old_range) {
+                    return Err(Errno::EFAULT);
+                }
+            }
             if new_len < old_len {
                 self.unmap(old_range.start + new_len..old_range.end)?;
             }
@@ -3945,7 +3951,7 @@ impl VmSpace {
         let (removed_target, mapped_tail, removed_pages, moved_pages) = {
             let mut vmas = self.vmas.lock();
             if !vmas.contains_range(&old_range) {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
             if Self::contains_sealed(&vmas, &new_range) {
                 return Err(Errno::EPERM);
@@ -3961,7 +3967,7 @@ impl VmSpace {
             let old_pieces = vmas.unmap_range(&old_range);
             let old_covered = covered_len(&old_pieces, &old_range);
             if old_covered != old_len {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
 
             let mut cursor = new_range.start;
@@ -4043,7 +4049,7 @@ impl VmSpace {
         {
             let set = self.vmas.lock();
             if !set.contains_range(&old_range) {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
             for area in set.iter_overlap(&old_range) {
                 if !matches!(area.backing, VmBacking::Anon { .. })
@@ -4071,7 +4077,7 @@ impl VmSpace {
         let (removed_target, empty_anon, tail, moved_pages) = {
             let mut vmas = self.vmas.lock();
             if !vmas.contains_range(&old_range) {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
             if Self::contains_sealed(&vmas, &new_range) {
                 return Err(Errno::EPERM);
@@ -4087,7 +4093,7 @@ impl VmSpace {
             let old_pieces = vmas.unmap_range(&old_range);
             let old_covered = covered_len(&old_pieces, &old_range);
             if old_covered != old_len {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
 
             // 1) 旧地址:插入空匿名 VMA(保留原权限/标志,换用全新合并域)。
@@ -7241,7 +7247,7 @@ impl VmSpace {
         let mapped_tail = {
             let mut vmas = self.vmas.lock();
             if !vmas.contains_range(old_range) {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
             if !vmas.is_range_free(tail_range) {
                 return Ok(false);
