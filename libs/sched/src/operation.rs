@@ -288,11 +288,20 @@ fn deliver_to_process_group(pg: Arc<ProcessGroup>, sig: Option<SignalNumber>) ->
     let Some(sig) = sig else { return Ok(()) };
     let info = make_siginfo(sig);
 
+    // `ProcessGroup::snapshot()` 以线程为粒度返回成员，多线程进程会出现多个
+    // 成员；同一线程组共享 pending，必须按 `ThreadGroup` 去重，否则一条信号
+    // 会被重复投进同一进程。
+    let mut delivered_groups: Vec<Arc<ThreadGroup>> = Vec::new();
     for m in pg.snapshot() {
         if m.is_kernel_task() {
             continue;
         }
+        let group = m.thread_group();
+        if delivered_groups.iter().any(|g| Arc::ptr_eq(g, &group)) {
+            continue;
+        }
         if check_kill_permission(&m).is_ok() {
+            delivered_groups.push(group);
             let _ = deliver_to_thread_group(&m, info);
         }
     }
@@ -1507,6 +1516,7 @@ pub fn kill(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
         let info = make_siginfo(sig);
         let my_tg = me.thread_group();
         let mut delivered = false;
+        let mut delivered_groups: Vec<Arc<ThreadGroup>> = Vec::new();
         for (p, weak) in root_pid_ns().registry().snapshot() {
             if p == 1 {
                 continue;
@@ -1515,21 +1525,24 @@ pub fn kill(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
             if t.is_kernel_task() {
                 continue;
             }
-            // 同 tg 直接跳过（覆盖 init 整个线程组）。
-            if Arc::ptr_eq(&t.thread_group(), &my_tg) {
+            let group = t.thread_group();
+            // registry 快照逐线程枚举：同一线程组只投一次，避免多线程进程
+            // 的共享 pending 被重复投递。
+            if delivered_groups.iter().any(|g| Arc::ptr_eq(g, &group)) {
                 continue;
             }
-            let tg_leader_pid = t
-                .thread_group()
-                .leader()
-                .and_then(|l| l.pid_root())
-                .unwrap_or(0);
+            // 同 tg 直接跳过（覆盖 init 整个线程组）。
+            if Arc::ptr_eq(&group, &my_tg) {
+                continue;
+            }
+            let tg_leader_pid = group.leader().and_then(|l| l.pid_root()).unwrap_or(0);
             if tg_leader_pid == 1 {
                 continue;
             }
             if check_kill_permission(&t).is_err() {
                 continue;
             }
+            delivered_groups.push(group);
             delivered |= deliver_to_thread_group(&t, info);
         }
         return if delivered { Ok(()) } else { Err(Errno::EPERM) };
