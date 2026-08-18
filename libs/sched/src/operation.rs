@@ -1629,18 +1629,25 @@ pub fn queueinfo(pid: PidT, info: SigInfo) -> Result<(), Errno> {
 // ── ptrace 完整层 ────────────────────────────────────────────────────────────
 
 /// ptrace 访问权限检查（Linux `ptrace_may_access` 语义）：
-/// 同 uid、或调用者拥有 `CAP_SYS_PTRACE`，或目标 `dumpable == 0` 时仅限
-/// 特权追踪者（dumpable 由 prctl 维护，默认 1）。
+/// 凭据 uid/euid/suid 与 gid/egid/sgid 全等、或调用者拥有 `CAP_SYS_PTRACE`；
+/// 目标 `dumpable != 1`（0 或 `SUID_DUMP_ROOT`=2）时仅限特权追踪者。
 pub fn ptrace_may_access(tracer: &Arc<Task>, target: &Arc<Task>) -> bool {
     let tracer_cred = tracer.credentials();
     let target_cred = target.credentials();
-    if tracer_cred.has_cap(crate::ids::Capability::SysPtrace) {
-        return true;
-    }
-    if target.dumpable() == 0 {
+    let has_cap = tracer_cred.has_cap(crate::ids::Capability::SysPtrace);
+    let uid_ok = tracer_cred.uid == target_cred.uid
+        && tracer_cred.euid == target_cred.euid
+        && tracer_cred.suid == target_cred.suid;
+    let gid_ok = tracer_cred.gid == target_cred.gid
+        && tracer_cred.egid == target_cred.egid
+        && tracer_cred.sgid == target_cred.sgid;
+    if !(uid_ok && gid_ok) && !has_cap {
         return false;
     }
-    tracer_cred.uid == target_cred.uid || tracer_cred.euid == target_cred.uid
+    if target.dumpable() != 1 && !has_cap {
+        return false;
+    }
+    true
 }
 
 /// 标记任务进入 ptrace stop（`PTRACE_EVENT_*` 编码由调用方提前设置；
@@ -1664,18 +1671,29 @@ fn ptrace_target(pid: PidT) -> Result<Arc<Task>, Errno> {
     if target.is_kernel_task() || !target.is_ptrace_traced() {
         return Err(Errno::ESRCH);
     }
-    check_kill_permission(&target)?;
+    let me = current_task();
+    if !ptrace_may_access(&me, &target) {
+        return Err(Errno::EPERM);
+    }
+    // 仅允许记录的 tracer 对目标执行 cont/syscall/detach 等操作。
+    if !target.ptracer_is(&me) {
+        return Err(Errno::EPERM);
+    }
     Ok(target)
 }
 
 pub fn ptrace_traceme() -> Result<(), Errno> {
     let me = current_task();
-    if me.is_kernel_task() || me.parent().is_none() {
+    if me.is_kernel_task() {
         return Err(Errno::EPERM);
     }
+    let Some(parent) = me.parent() else {
+        return Err(Errno::EPERM);
+    };
     if !me.enable_ptrace_traced() {
         return Err(Errno::EPERM);
     }
+    me.set_ptracer(Some(Arc::downgrade(&parent)));
     Ok(())
 }
 
@@ -1692,6 +1710,7 @@ pub fn ptrace_attach(pid: PidT) -> Result<(), Errno> {
     if !target.enable_ptrace_traced() {
         return Err(Errno::EPERM);
     }
+    target.set_ptracer(Some(Arc::downgrade(&me)));
     target.set_ptrace_seized(false);
     let _ = mark_task_stopped(&target, SignalNumber::SIGSTOP);
     // 等待 stop 生效（Linux `PTRACE_ATTACH` 在目标停下后才返回）。
@@ -1714,13 +1733,21 @@ pub fn ptrace_seize(pid: PidT) -> Result<(), Errno> {
     if !target.enable_ptrace_traced() {
         return Err(Errno::EPERM);
     }
+    target.set_ptracer(Some(Arc::downgrade(&me)));
     target.set_ptrace_seized(true);
     Ok(())
 }
 
+/// `PTRACE_INTERRUPT` 产生的 group-stop 事件号（`PTRACE_EVENT_STOP`）。
+const PTRACE_EVENT_STOP: u16 = 128;
+
 pub fn ptrace_interrupt(pid: PidT) -> Result<(), Errno> {
     let target = ptrace_target(pid)?;
-    target.set_ptrace_stop_event(0);
+    // PTRACE_INTERRUPT 仅对 PTRACE_SEIZE 附着的目标有效（Linux 返回 EIO）。
+    if !target.is_ptrace_seized() {
+        return Err(Errno::EIO);
+    }
+    target.set_ptrace_stop_event(PTRACE_EVENT_STOP);
     let _ = mark_task_stopped(&target, SignalNumber::SIGTRAP);
     Ok(())
 }
@@ -1770,6 +1797,7 @@ pub fn ptrace_singlestep(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Err
 pub fn ptrace_detach(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
     let target = ptrace_target(pid)?;
     target.clear_ptrace_traced();
+    target.clear_ptracer();
     target.set_ptrace_syscall_stop(false);
     target.clear_singlestep();
     target.set_ptrace_stop_event(0);

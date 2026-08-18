@@ -807,6 +807,9 @@ pub struct Task {
     /// ptrace 的最小状态位。当前只区分任务是否处于 traced 模式，用于把
     /// 信号投递转换成父进程可 wait 的 signal-delivery-stop。
     ptrace_traced: AtomicU8,
+    /// 当前 ptracer（谁在追踪本任务）。用 `Weak` 避免追踪者先退出时形成环；
+    /// 与 `parent` 相同，任务内允许 `Weak<Task>` 自引用。`None` 表示无追踪者。
+    ptracer: Spinlock<Option<Weak<Task>>>,
     /// `PTRACE_SETOPTIONS` 的 `PTRACE_O_*` 选项位。
     ptrace_options: AtomicU64,
     /// 最近一次 `PTRACE_EVENT_*` 的 event 消息（子 pid / 退出码）。
@@ -1032,6 +1035,7 @@ impl Task {
             root_pid_cache: AtomicI32::new(crate::pid::PID_INVALID),
             tgid_cache: AtomicI32::new(crate::pid::PID_INVALID),
             ptrace_traced: AtomicU8::new(0),
+            ptracer: Spinlock::new(None),
             ptrace_options: AtomicU64::new(0),
             ptrace_event_msg: AtomicI64::new(0),
             ptrace_stop_event: AtomicU16::new(0),
@@ -1401,6 +1405,31 @@ impl Task {
 
     pub fn is_ptrace_traced(&self) -> bool {
         self.ptrace_traced.load(Ordering::Acquire) != 0
+    }
+
+    /// 记录当前追踪者。`tracer` 传 `None` 等价于清除追踪关系。
+    /// `ptrace_traceme` 用父任务，`ptrace_attach` / `ptrace_seize` 用调用者。
+    pub fn set_ptracer(&self, tracer: Option<Weak<Task>>) {
+        *self.ptracer.lock() = tracer;
+    }
+
+    /// 清除追踪者记录。
+    pub fn clear_ptracer(&self) {
+        *self.ptracer.lock() = None;
+    }
+
+    /// 判断 `tracer` 是否为当前记录的追踪者（弱引用升级后按指针比较）。
+    pub fn ptracer_is(&self, tracer: &Arc<Task>) -> bool {
+        self.ptracer
+            .lock()
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+            .is_some_and(|recorded| Arc::ptr_eq(&recorded, tracer))
+    }
+
+    /// 当前记录的追踪者（追踪者已退出时升级失败，返回 `None`）。
+    pub fn ptracer(&self) -> Option<Arc<Task>> {
+        self.ptracer.lock().as_ref().and_then(|weak| weak.upgrade())
     }
 
     pub fn set_ptrace_options(&self, options: u64) {
