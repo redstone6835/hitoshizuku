@@ -558,10 +558,10 @@ fn dispatch_message(
 ) -> Vec<Vec<u8>> {
     if flags & NLM_F_REQUEST != 0 {
         match msg_type {
-            RTM_GETLINK => return get_link(seq, local_pid),
-            RTM_GETADDR => return get_addr(seq, local_pid),
-            RTM_GETROUTE => return get_route(seq, local_pid),
-            RTM_GETNEIGH => return get_neigh(seq, local_pid),
+            RTM_GETLINK => return get_link(seq, local_pid, payload),
+            RTM_GETADDR => return get_addr(seq, local_pid, payload),
+            RTM_GETROUTE => return get_route(seq, local_pid, payload),
+            RTM_GETNEIGH => return get_neigh(seq, local_pid, payload),
             _ => {}
         }
     }
@@ -602,21 +602,35 @@ fn nlmsg_ack_or_error(result: Result<(), i32>, seq: u32, local_pid: u32) -> Vec<
     }
 }
 
-fn get_link(seq: u32, local_pid: u32) -> Vec<Vec<u8>> {
+fn get_link(seq: u32, local_pid: u32, payload: &[u8]) -> Vec<Vec<u8>> {
+    // ifinfomsg.ifi_index 位于 payload 偏移 4..8；非零时只返回该接口。
+    let requested = if payload.len() >= 8 {
+        i32::from_ne_bytes(payload[4..8].try_into().unwrap())
+    } else {
+        0
+    };
     let mut messages = net::device::snapshot_devices()
         .into_iter()
+        .filter(|device| requested == 0 || device.id.raw() == requested as u32)
         .map(|device| build_ifinfomsg(&device, seq, local_pid))
         .collect::<Vec<_>>();
     messages.push(build_nlmsg_done(seq, local_pid));
     messages
 }
 
-fn get_addr(seq: u32, local_pid: u32) -> Vec<Vec<u8>> {
+fn get_addr(seq: u32, local_pid: u32, payload: &[u8]) -> Vec<Vec<u8>> {
+    // ifaddrmsg.ifa_index 位于 payload 偏移 4..8；非零时只返回该接口。
+    let requested = if payload.len() >= 8 {
+        u32::from_ne_bytes(payload[4..8].try_into().unwrap())
+    } else {
+        0
+    };
     let mut messages = ADDRESS_SNAPSHOT_PROVIDER
         .lock()
         .map(|provider| provider())
         .unwrap_or_default()
         .into_iter()
+        .filter(|entry| requested == 0 || entry.interface.0 == requested)
         .filter_map(|entry| {
             let device = net::device::snapshot_devices()
                 .into_iter()
@@ -628,24 +642,44 @@ fn get_addr(seq: u32, local_pid: u32) -> Vec<Vec<u8>> {
     messages
 }
 
-fn get_route(seq: u32, local_pid: u32) -> Vec<Vec<u8>> {
+fn get_route(seq: u32, local_pid: u32, payload: &[u8]) -> Vec<Vec<u8>> {
+    // RTM_GETROUTE 的接口过滤由 RTA_OIF 属性携带（rtmsg 头无固定 ifindex 字段）。
+    let requested = if payload.len() >= 12 {
+        parse_attributes(&payload[12..])
+            .into_iter()
+            .find(|(kind, _)| *kind == RTA_OIF)
+            .and_then(|(_, data)| {
+                (data.len() >= 4).then(|| u32::from_ne_bytes(data[..4].try_into().unwrap()))
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let mut messages = ROUTE_SNAPSHOT_PROVIDER
         .lock()
         .map(|provider| provider())
         .unwrap_or_default()
         .into_iter()
+        .filter(|route| requested == 0 || route.interface.0 == requested)
         .map(|route| build_rtmsg(route, seq, local_pid))
         .collect::<Vec<_>>();
     messages.push(build_nlmsg_done(seq, local_pid));
     messages
 }
 
-fn get_neigh(seq: u32, local_pid: u32) -> Vec<Vec<u8>> {
+fn get_neigh(seq: u32, local_pid: u32, payload: &[u8]) -> Vec<Vec<u8>> {
+    // ndmsg.ndm_ifindex 位于 payload 偏移 4..8；非零时只返回该接口。
+    let requested = if payload.len() >= 8 {
+        i32::from_ne_bytes(payload[4..8].try_into().unwrap())
+    } else {
+        0
+    };
     let mut messages = NEIGHBOR_SNAPSHOT_PROVIDER
         .lock()
         .map(|provider| provider())
         .unwrap_or_default()
         .into_iter()
+        .filter(|neighbor| requested == 0 || neighbor.interface.0 == requested as u32)
         .map(|neighbor| build_ndmsg(neighbor, seq, local_pid))
         .collect::<Vec<_>>();
     messages.push(build_nlmsg_done(seq, local_pid));
