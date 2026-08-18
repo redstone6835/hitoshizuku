@@ -599,11 +599,22 @@ fn seccomp_filter_syscall(ctx: &mut SyscallContext<'_>) -> bool {
     let action = result & SECCOMP_RET_ACTION_FULL;
     let data_bits = result & SECCOMP_RET_DATA;
     match action {
-        SECCOMP_RET_KILL_PROCESS | SECCOMP_RET_KILL_THREAD => {
+        SECCOMP_RET_KILL_THREAD => {
+            // 仅终止当前线程，SIGSYS 默认动作终止（seccomp 的 KILL 语义）。
             let _ = sched::operation::tkill(
                 task.pid_root().unwrap_or(0),
-                Some(sched::SignalNumber::from_raw(31).unwrap_or(sched::SignalNumber::SIGSEGV)),
+                Some(sched::SignalNumber::SIGSYS),
             );
+            true
+        }
+        SECCOMP_RET_KILL_PROCESS => {
+            // 终止整个线程组：向线程组 leader 发 SIGSYS。
+            let tgid = task
+                .thread_group()
+                .leader()
+                .and_then(|l| l.pid_root())
+                .unwrap_or_else(|| task.pid_root().unwrap_or(0));
+            let _ = sched::operation::kill(tgid, Some(sched::SignalNumber::SIGSYS));
             true
         }
         SECCOMP_RET_TRAP => {
