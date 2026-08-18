@@ -2726,12 +2726,16 @@ fn parse_inet_send_cmsgs(family: u16, control: &[u8]) -> Result<net::DatagramSen
     let mut offset = 0usize;
     while offset + CMSG_HEADER_LEN <= control.len() {
         let len = usize::from_ne_bytes(control[offset..offset + 8].try_into().expect("cmsg len"));
-        if len < CMSG_HEADER_LEN || offset + len > control.len() {
-            break;
+        if len < CMSG_HEADER_LEN {
+            return Err(Errno::EINVAL);
+        }
+        let end = offset.checked_add(len).ok_or(Errno::EINVAL)?;
+        if end > control.len() {
+            return Err(Errno::EINVAL);
         }
         let level = i32::from_ne_bytes(control[offset + 8..offset + 12].try_into().unwrap());
         let kind = i32::from_ne_bytes(control[offset + 12..offset + 16].try_into().unwrap());
-        let payload = &control[offset + CMSG_HEADER_LEN..offset + len];
+        let payload = &control[offset + CMSG_HEADER_LEN..end];
         match (level, kind) {
             (SOL_IP, IP_PKTINFO) if family == crate::addr::AF_INET => {
                 if payload.len() >= 12 {
