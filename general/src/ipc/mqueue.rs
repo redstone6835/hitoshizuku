@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 use errno::Errno;
 use sched::WaitQueue;
 use spin::Mutex;
-use vfs::cred::{Credentials, Gid, Uid};
+use vfs::cred::{Capability, Credentials, Gid, Uid};
 use vfs::stat::FileMode;
 
 /// 最大消息优先级 + 1（Linux `MQ_PRIO_MAX`）。
@@ -29,6 +29,10 @@ pub const MQ_PRIO_MAX: i32 = 32768;
 pub const MQ_DEFAULT_MAXMSG: i64 = 10;
 /// `mq_open` 默认 `mq_msgsize`（Linux `/proc/sys/fs/mqueue/msgsize_max` 默认）。
 pub const MQ_DEFAULT_MSGSIZE: i64 = 8192;
+/// 特权进程（`CAP_SYS_RESOURCE`）可设的 `mq_maxmsg` 系统上限。
+pub const MQ_MAXMSG_MAX: i64 = 65536;
+/// 特权进程（`CAP_SYS_RESOURCE`）可设的 `mq_msgsize` 系统上限。
+pub const MQ_MSGSIZE_MAX: i64 = 65536;
 /// 系统队列总数上限（Linux `/proc/sys/fs/mqueue/queues_max` 默认）。
 pub const MQ_QUEUES_MAX: usize = 256;
 /// 队列名最大长度（不含 NUL）。
@@ -201,11 +205,24 @@ impl MqObject {
     }
 
     /// 校验 `mq_open` 的 attr（Linux `mq_attr_valid` 语义）。
-    pub fn validate_attr(attr: &MqAttr) -> Result<(), Errno> {
-        if attr.maxmsg < 1 || attr.maxmsg > MQ_DEFAULT_MAXMSG {
+    ///
+    /// 持有 `CAP_SYS_RESOURCE` 的进程可设置超过默认值（`MQ_DEFAULT_MAXMSG`/
+    /// `MQ_DEFAULT_MSGSIZE`）的上限，但不得超过系统级上限。
+    pub fn validate_attr(attr: &MqAttr, cred: &Credentials) -> Result<(), Errno> {
+        if attr.maxmsg < 1 || attr.msgsize < 1 {
             return Err(Errno::EINVAL);
         }
-        if attr.msgsize < 1 || attr.msgsize > MQ_DEFAULT_MSGSIZE {
+        let maxmsg_max = if cred.has_cap(Capability::SysResource) {
+            MQ_MAXMSG_MAX
+        } else {
+            MQ_DEFAULT_MAXMSG
+        };
+        let msgsize_max = if cred.has_cap(Capability::SysResource) {
+            MQ_MSGSIZE_MAX
+        } else {
+            MQ_DEFAULT_MSGSIZE
+        };
+        if attr.maxmsg > maxmsg_max || attr.msgsize > msgsize_max {
             return Err(Errno::EINVAL);
         }
         Ok(())
@@ -410,7 +427,7 @@ impl MqRegistry {
             return Err(Errno::ENOSPC);
         }
         let attr = attr.copied().unwrap_or(MqAttr::default_new());
-        MqObject::validate_attr(&attr)?;
+        MqObject::validate_attr(&attr, cred)?;
         let queue = Arc::new(MqObject::new(attr, mode, cred));
         inner.insert(name.to_string(), Arc::clone(&queue));
         Ok(queue)
