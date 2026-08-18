@@ -1065,12 +1065,11 @@ pub(crate) fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
         | CloneFlags::CLONE_CLEAR_SIGHAND;
     // NEWUSER/NEWNET 未实现（能力语义改造/网络栈 per-ns）；NEWTIME 只能经
     // unshare(2) 使用（clone 报 EINVAL）。NEWNS/NEWCGROUP/NEWUTS/NEWIPC/
-    // NEWPID 由 kernel 侧在 clone 完成后安装命名空间。
-    const UNSUPPORTED: u64 = CloneFlags::CLONE_PTRACE
-        | CloneFlags::CLONE_NEWUSER
-        | CloneFlags::CLONE_NEWNET
-        | CloneFlags::CLONE_NEWTIME
-        | CloneFlags::CLONE_IO;
+    // NEWPID 由 kernel 侧在 clone 完成后安装命名空间。CLONE_PTRACE 在
+    // spawn 路径处理（父被追踪时子也被追踪）；CLONE_IO 无 io_context 记账，
+    // 作为 no-op 接受。
+    const UNSUPPORTED: u64 =
+        CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWTIME;
     if flags.has(CloneFlags::CLONE_NEWNS) && flags.has(CloneFlags::CLONE_FS) {
         return Err(Errno::EINVAL);
     }
@@ -1391,6 +1390,8 @@ fn terminate_thread_group_identity_by_signal_from(
     info: SigInfo,
     current: &Arc<Task>,
 ) -> bool {
+    // 取舍：core dump 文件写入（ELF 头 + 内存段）为 P2，未实现；仅按默认动作
+    // 分类置 WCOREDUMP 位，让 wait 状态与 Linux 语义一致。
     let core_dumped = matches!(default_action(info.sig), DefaultAction::Core);
     // 与 CLONE_THREAD 登记通过 members 锁排序：先登记者会进入本次 snapshot，
     // 后到者被拒绝，避免 SIGKILL 之后仍产生未收到终止请求的新线程。
@@ -1801,9 +1802,7 @@ pub fn ptrace_geteventmsg(pid: PidT) -> Result<i64, Errno> {
 /// `PTRACE_GETSIGINFO`（仅在 stop 期间有效）。
 pub fn ptrace_getsiginfo(pid: PidT) -> Result<crate::signal::SigInfo, Errno> {
     let target = ptrace_target(pid)?;
-    target
-        .take_ptrace_last_siginfo()
-        .ok_or(Errno::EINVAL)
+    target.take_ptrace_last_siginfo().ok_or(Errno::EINVAL)
 }
 
 /// `PTRACE_SETSIGINFO`。
@@ -1821,7 +1820,9 @@ pub fn ptrace_get_sigmask(pid: PidT) -> Result<crate::signal::SigSet, Errno> {
 
 pub fn ptrace_set_sigmask(pid: PidT, mask: crate::signal::SigSet) -> Result<(), Errno> {
     let target = ptrace_target(pid)?;
-    target.signal.block(mask, crate::signal::SigProcMaskHow::SetMask);
+    target
+        .signal
+        .block(mask, crate::signal::SigProcMaskHow::SetMask);
     Ok(())
 }
 

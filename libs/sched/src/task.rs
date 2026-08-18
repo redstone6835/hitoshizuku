@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::ptr::NonNull;
 use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU16, AtomicU8, AtomicU32, AtomicU64,
+    AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64,
     AtomicUsize, Ordering,
 };
 
@@ -384,8 +384,10 @@ fn more_urgent(current: SchedAttr, donated: SchedAttr) -> SchedAttr {
                 _ => SchedAttr::rt_fifo(donated_prio),
             }
         }
-        SchedPolicy::Fair => {
-            if current.policy == SchedPolicy::Fair && donated.nice < current.nice {
+        SchedPolicy::Fair | SchedPolicy::Batch => {
+            if matches!(current.policy, SchedPolicy::Fair | SchedPolicy::Batch)
+                && donated.nice < current.nice
+            {
                 let mut boosted = current;
                 boosted.nice = donated.nice;
                 boosted
@@ -836,6 +838,14 @@ pub struct Task {
     no_new_privs: AtomicU8,
     /// `PR_SET_KEEPCAPS`：setuid 后保留能力位。
     keepcaps: AtomicU8,
+    /// `personality(2)` 的进程 persona 值（`PER_*` 位掩码，默认 `PER_LINUX = 0`）。
+    /// `ADDR_NO_RANDOMIZE` 等位随 fork 继承、exec 保留（Linux 语义）。
+    personality: AtomicU64,
+    /// `PR_SET_PTRACER` 的 yama 追踪者作用域（0 = `PR_SET_PTRACER_ANY`）。
+    /// 非 0 表示仅允许指定 pid 或其后代追踪本进程。
+    ptracer_scope: AtomicI32,
+    /// `PR_SET_SPECULATION_CTRL` 持久化的投机执行控制位图（`PR_SPEC_*`）。
+    speculation_ctrl: AtomicU64,
     /// `PTRACE_SINGLESTEP` 补丁法单步：已把断点指令写入目标地址。
     ptrace_singlestep: AtomicU8,
     /// 被替换指令的地址与原指令（32 位）。
@@ -1038,6 +1048,9 @@ impl Task {
             subreaper: AtomicU8::new(0),
             no_new_privs: AtomicU8::new(0),
             keepcaps: AtomicU8::new(0),
+            personality: AtomicU64::new(0),
+            ptracer_scope: AtomicI32::new(0),
+            speculation_ctrl: AtomicU64::new(0),
             ptrace_singlestep: AtomicU8::new(0),
             ptrace_singlestep_addr: AtomicUsize::new(0),
             ptrace_singlestep_insn: Spinlock::new(None),
@@ -1424,7 +1437,8 @@ impl Task {
     }
 
     pub fn set_ptrace_syscall_stop(&self, enabled: bool) {
-        self.ptrace_syscall_stop.store(enabled as u8, Ordering::Release);
+        self.ptrace_syscall_stop
+            .store(enabled as u8, Ordering::Release);
     }
 
     pub fn ptrace_syscall_stop_enabled(&self) -> bool {
@@ -1525,6 +1539,34 @@ impl Task {
 
     pub fn keepcaps(&self) -> bool {
         self.keepcaps.load(Ordering::Acquire) != 0
+    }
+
+    /// `personality(2)`：写回进程 persona。上层 syscall 负责 Linux 的
+    /// “`0xffffffff` 只读”语义与返回值（旧值）处理。
+    pub fn set_personality(&self, persona: u64) {
+        self.personality.store(persona, Ordering::Release);
+    }
+
+    pub fn personality(&self) -> u64 {
+        self.personality.load(Ordering::Acquire)
+    }
+
+    /// `PR_SET_PTRACER` 的 yama 追踪者作用域；0 表示任意追踪者。
+    pub fn set_ptracer_scope(&self, scope: i32) {
+        self.ptracer_scope.store(scope, Ordering::Release);
+    }
+
+    pub fn ptracer_scope(&self) -> i32 {
+        self.ptracer_scope.load(Ordering::Acquire)
+    }
+
+    /// `PR_SET_SPECULATION_CTRL` 持久化位图。
+    pub fn set_speculation_ctrl(&self, value: u64) {
+        self.speculation_ctrl.store(value, Ordering::Release);
+    }
+
+    pub fn speculation_ctrl(&self) -> u64 {
+        self.speculation_ctrl.load(Ordering::Acquire)
     }
 
     pub fn set_dumpable(&self, value: u8) {
@@ -2595,7 +2637,9 @@ impl Task {
         };
         self.cpu_runtime_ns.fetch_add(charged, Ordering::AcqRel);
         // 同步累计到线程组（CLOCK_PROCESS_CPUTIME_ID 基准）。
-        self.thread_group().cpu_runtime_ns.fetch_add(charged, Ordering::Relaxed);
+        self.thread_group()
+            .cpu_runtime_ns
+            .fetch_add(charged, Ordering::Relaxed);
         if encoded != 0 {
             self.running_since_ns
                 .store(now_ns.saturating_add(1), Ordering::Release);
