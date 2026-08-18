@@ -36,5 +36,5 @@ pub use user_access::{
 };
 pub use vm_space::{
     Mempolicy, UserReadWindows, VmFutexKey, VmSpace, drop_private_file_cache, file_cache_stat,
-    page_size, read_shared_anon, vm_space_diag, write_shared_anon,
+    install_allocator_reclaim_hook, page_size, read_shared_anon, vm_space_diag, write_shared_anon,
 };

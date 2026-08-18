@@ -43,6 +43,11 @@ use vfs::Arc as VfsArc;
 static BOOT_VFS_PARTS: Spinlock<Option<BootVfsParts>> = Spinlock::new(None);
 static BOOT_ROOT_IS_INITRAMFS: AtomicBool = AtomicBool::new(false);
 
+static ALLOCATOR_INTERRUPT_OPS: allocator::InterruptOps = allocator::InterruptOps {
+    save_and_disable: hal::interrupt::save_and_disable_local,
+    restore: hal::interrupt::restore_local,
+};
+
 /// 控制台路径或 devtmpfs 节点名（例如 "/dev/console" 或 "uart0"）。stash 后
 /// install_stdio 用它走 openat 路径打开 fd 0/1/2。
 static BOOT_CONSOLE_NAME: Spinlock<Option<alloc::string::String>> = Spinlock::new(None);
@@ -1391,6 +1396,7 @@ pub fn install_firmware_topology() {
 pub fn boot_init() -> Arc<Task> {
     // 1. arch 侧装入上下文切换 / 时间 / trap-stack / mm / syscall 五套契约。
     hal::sched::register_arch_hooks();
+    assert!(allocator::register_interrupt_ops(&ALLOCATOR_INTERRUPT_OPS));
 
     // 2. 注入 ext clone hook，必须在 sched::init 之前——否则 init 任务后续
     //    任何 fork/clone 都会落到无 hook 的"全共享"分支。

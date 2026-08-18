@@ -310,6 +310,7 @@ pub fn kernel_start_init(context: &StartContext) {
                 err
             )
         });
+        general::mm::install_allocator_reclaim_hook();
     }
 
     printk!(

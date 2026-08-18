@@ -58,6 +58,8 @@ const PRIVATE_FILE_BATCH_MAX_BYTES: usize = 64 * 1024;
 /// 从 ext4 重读刚淘汰的页。物理页分配失败仍会按批次回收，因此该预算不会阻塞
 /// 匿名页和 COW 分配的前进性。
 const PRIVATE_FILE_CACHE_MAX_PAGES: usize = 262_144;
+/// 低内存机器仍保留少量文件页缓存，避免缓存预算退化为零。
+const PRIVATE_FILE_CACHE_MIN_PAGES: usize = 4096;
 /// 独立的私有文件页缓存分片数；32 个分片可覆盖 BuildStorm 的并行 rustc 缺页。
 const PRIVATE_FILE_CACHE_SHARD_COUNT: usize = 32;
 /// Ready 范围索引的分片粒度。
@@ -460,6 +462,7 @@ type PrivateFilePageCache = ShardedPrivateFilePageCache<PRIVATE_FILE_CACHE_SHARD
 
 static PRIVATE_FILE_PAGES: PrivateFilePageCache =
     ShardedPrivateFilePageCache::new(PRIVATE_FILE_CACHE_MAX_PAGES);
+static PRIVATE_FILE_CACHE_CONFIGURED: AtomicBool = AtomicBool::new(false);
 static SHARED_FILE_PAGES: WeakFilePageCache = Spinlock::new(BTreeMap::new());
 static SHARED_ANON_PAGES: Spinlock<BTreeMap<SharedAnonPageKey, SharedAnonPageEntry>> =
     Spinlock::new(BTreeMap::new());
@@ -1202,8 +1205,15 @@ struct ShardedPrivateFilePageCache<const SHARD_COUNT: usize> {
     shards: [Spinlock<PrivateFilePageCacheState>; SHARD_COUNT],
     load_waits: [WaitQueue; PRIVATE_FILE_LOAD_WAIT_BUCKETS],
     next_load_id: AtomicU64,
-    capacity: usize,
+    capacity: AtomicUsize,
     reclaim_shard: AtomicUsize,
+}
+
+fn private_file_cache_capacity(total_physical: usize) -> usize {
+    let total_pages = total_physical / allocator::PAGE_SIZE;
+    total_pages
+        .saturating_div(8)
+        .clamp(PRIVATE_FILE_CACHE_MIN_PAGES, PRIVATE_FILE_CACHE_MAX_PAGES)
 }
 
 /// 已在 `Loading.waiters` 中登记的栈上等待句柄。
@@ -1713,9 +1723,22 @@ impl<const SHARD_COUNT: usize> ShardedPrivateFilePageCache<SHARD_COUNT> {
             load_waits: [const { WaitQueue::new_with_reason(WaitReason::BlockIo) };
                 PRIVATE_FILE_LOAD_WAIT_BUCKETS],
             next_load_id: AtomicU64::new(1),
-            capacity,
+            capacity: AtomicUsize::new(capacity),
             reclaim_shard: AtomicUsize::new(0),
         }
+    }
+
+    fn configure_for_physical_memory(&self, total_physical: usize) {
+        if total_physical == 0 {
+            return;
+        }
+        let target = private_file_cache_capacity(total_physical);
+        self.capacity.fetch_min(target, Ordering::AcqRel);
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.capacity.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -1724,7 +1747,8 @@ impl<const SHARD_COUNT: usize> ShardedPrivateFilePageCache<SHARD_COUNT> {
     }
 
     fn shard_capacity(&self, index: usize) -> usize {
-        self.capacity / SHARD_COUNT + usize::from(index < self.capacity % SHARD_COUNT)
+        let capacity = self.capacity();
+        capacity / SHARD_COUNT + usize::from(index < capacity % SHARD_COUNT)
     }
 
     #[cfg(test)]
@@ -2028,6 +2052,19 @@ impl<const SHARD_COUNT: usize> ShardedPrivateFilePageCache<SHARD_COUNT> {
         reclaimed
     }
 
+    fn reclaim_one(&self) -> bool {
+        let start = self.reclaim_shard.fetch_add(1, Ordering::Relaxed) % SHARD_COUNT;
+        for offset in 0..SHARD_COUNT {
+            let index = (start + offset) % SHARD_COUNT;
+            let retired = self.shards[index].lock().reclaim_oldest();
+            if let Some(retired) = retired {
+                drop(retired);
+                return true;
+            }
+        }
+        false
+    }
+
     /// 仅在回收批次的临时 Vec 无法分配时使用；每次仍先释放锁再析构页面。
     fn reclaim_unbatched(&self, start: usize, limit: usize) -> usize {
         let mut reclaimed = 0usize;
@@ -2050,7 +2087,7 @@ impl<const SHARD_COUNT: usize> ShardedPrivateFilePageCache<SHARD_COUNT> {
 
     fn diag(&self) -> PrivateFilePageCacheDiag {
         let mut diag = PrivateFilePageCacheDiag {
-            capacity: self.capacity,
+            capacity: self.capacity(),
             ..PrivateFilePageCacheDiag::default()
         };
         for shard in &self.shards {
@@ -2861,6 +2898,16 @@ impl VmSpace {
     pub fn new() -> Self {
         let ops = user_pgd_ops().expect("[mm] user_pgd_ops not registered");
         let layout = vm_layout();
+        if !PRIVATE_FILE_CACHE_CONFIGURED.load(Ordering::Acquire) {
+            let total_physical = allocator::KERNEL_ALLOCATOR.detailed_stats().total_physical;
+            if total_physical != 0
+                && PRIVATE_FILE_CACHE_CONFIGURED
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                PRIVATE_FILE_PAGES.configure_for_physical_memory(total_physical);
+            }
+        }
         let pgd = (ops.new_pgd_for_user)();
         VM_SPACE_CREATED.fetch_add(1, Ordering::Relaxed);
         VM_SPACE_LIVE.fetch_add(1, Ordering::Relaxed);
@@ -7790,6 +7837,22 @@ fn reclaim_private_file_cache_pages(limit: usize) -> usize {
     PRIVATE_FILE_PAGES.reclaim(limit)
 }
 
+/// 在 allocator 分配失败重试前无分配地释放私有文件缓存。
+pub fn reclaim_private_file_cache_pages_for_allocator(limit: usize) -> usize {
+    let mut reclaimed = 0usize;
+    while reclaimed < limit && PRIVATE_FILE_PAGES.reclaim_one() {
+        reclaimed += 1;
+    }
+    reclaimed
+}
+
+/// 在全局分配器启用后安装私有文件页缓存回收钩子。
+pub fn install_allocator_reclaim_hook() {
+    assert!(allocator::register_external_reclaim_hook(
+        reclaim_private_file_cache_pages_for_allocator,
+    ));
+}
+
 /// `drop_caches=1`：清空私有干净文件页缓存（逐批回收直到空）。
 pub fn drop_private_file_cache() {
     loop {
@@ -8324,16 +8387,23 @@ mod tests {
         file_fault_around_window, find_cached_file_page, find_cached_private_file_page,
         map_fork_child_batches, observe_anon_store_shadow, permits_file_fault_around,
         plan_file_segment, private_file_batch_error_is_fatal, private_file_batch_page_offset,
-        private_file_batch_plan, private_file_cache_snapshot, publish_cached_file_page,
-        publish_cached_private_file_page, read_file_bytes_exact, read_file_page_exact,
-        remove_cached_file_page, rollback_private_file_page_batch, same_backing_snapshot,
-        shared_file_page_generation, unmapped_prefix_len, user_page_allocation_handle,
+        private_file_batch_plan, private_file_cache_capacity, private_file_cache_snapshot,
+        publish_cached_file_page, publish_cached_private_file_page, read_file_bytes_exact,
+        read_file_page_exact, remove_cached_file_page, rollback_private_file_page_batch,
+        same_backing_snapshot, shared_file_page_generation, unmapped_prefix_len,
+        user_page_allocation_handle,
     };
     use errno::Errno;
     use mm::{FileLike, VmBacking};
     use sched::sync::Spinlock;
 
     const PAGE_SIZE: usize = 4096;
+
+    #[test]
+    fn private_file_cache_budget_scales_down_for_one_gib_guest() {
+        assert_eq!(private_file_cache_capacity(1024 * 1024 * 1024), 32 * 1024);
+        assert_eq!(private_file_cache_capacity(8 * 1024 * 1024 * 1024), 262_144);
+    }
 
     #[test]
     fn fork_child_mapping_batches_contiguous_pages_with_same_flags() {

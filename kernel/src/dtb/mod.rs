@@ -364,6 +364,7 @@ pub fn kernel_start_init(context: &StartContext) {
                 err
             )
         });
+        general::mm::install_allocator_reclaim_hook();
     }
 
     printk!(
@@ -411,7 +412,10 @@ pub fn kernel_start_init(context: &StartContext) {
     raw_mark(b'3');
     raw_mark(b'V');
     let cpu_topology_count = cpu_topology.len();
-    printk!("[dbg] T-b: installing cpu topology ({} entries)", cpu_topology_count);
+    printk!(
+        "[dbg] T-b: installing cpu topology ({} entries)",
+        cpu_topology_count
+    );
     general::dev::cpu::install_topology(cpu_topology);
     raw_mark(b'W');
     printk!("[dbg] T-c: cpu topology installed");
