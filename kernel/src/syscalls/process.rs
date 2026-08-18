@@ -6071,7 +6071,9 @@ fn ptrace_write_arch_fpregs(target: &Arc<Task>, bytes: &[u8]) -> Result<(), Errn
         for (index, reg) in new.f.iter_mut().enumerate() {
             *reg = u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap());
         }
-        new.fcsr = u32::from_le_bytes(bytes[256..260].try_into().unwrap());
+        // user_fpregs_struct.fcsr 是 u64（8 字节），与读路径对称地从 8 字节
+        // 读回后截断为 TrapFrame.fcsr（u32）。
+        new.fcsr = u64::from_le_bytes(bytes[256..264].try_into().unwrap()) as u32;
         let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(new);
         target
             .ext_replace(sched::TASKEXT_PTRACE_FRAME, erased)
