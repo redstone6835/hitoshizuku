@@ -1569,6 +1569,10 @@ pub fn kill(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
 
 /// `tkill(tid, sig)`：投递到**特定线程**（per-task pending）。
 pub fn tkill(tid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
+    // Linux `tkill`：tid==0 无效（`lookup_pid(0)` 会返回 current，需显式拒绝）。
+    if tid <= 0 {
+        return Err(Errno::EINVAL);
+    }
     let target = lookup_pid(tid)?;
     if target.is_kernel_task() {
         return Err(Errno::ESRCH);
@@ -1587,6 +1591,10 @@ pub fn tkill(tid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
 
 /// `tgkill(tgid, tid, sig)`：tid 的 thread_group 必须等于 tgid。
 pub fn tgkill(tgid: PidT, tid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
+    // Linux `tgkill`：tgid/tid==0 无效（`lookup_pid(0)` 会返回 current，需显式拒绝）。
+    if tgid <= 0 || tid <= 0 {
+        return Err(Errno::EINVAL);
+    }
     let target = lookup_pid(tid)?;
     if target.is_kernel_task() {
         return Err(Errno::ESRCH);
