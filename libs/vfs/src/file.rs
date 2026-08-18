@@ -111,6 +111,8 @@ pub struct OpenOptions {
     pub sync: bool,
     /// 直接 I/O（`O_DIRECT`）。
     pub direct: bool,
+    /// 异步通知（`O_ASYNC`）。
+    pub async_: bool,
     /// 执行后关闭（`O_CLOEXEC`）。
     pub cloexec: bool,
 }
@@ -247,6 +249,7 @@ impl StatusFlags {
     const NONBLOCK: u32 = 1 << 1;
     const SYNC: u32 = 1 << 2;
     const DIRECT: u32 = 1 << 3;
+    const ASYNC: u32 = 1 << 4;
 
     fn from_open_options(opts: OpenOptions) -> Self {
         let mut bits = 0u32;
@@ -262,6 +265,9 @@ impl StatusFlags {
         if opts.direct {
             bits |= Self::DIRECT;
         }
+        if opts.async_ {
+            bits |= Self::ASYNC;
+        }
         Self(bits)
     }
 
@@ -270,6 +276,7 @@ impl StatusFlags {
         opts.nonblock = (self.0 & Self::NONBLOCK) != 0;
         opts.sync = (self.0 & Self::SYNC) != 0;
         opts.direct = (self.0 & Self::DIRECT) != 0;
+        opts.async_ = (self.0 & Self::ASYNC) != 0;
         opts
     }
 }
@@ -599,7 +606,14 @@ impl File {
         self.ops.show_fdinfo(out);
     }
 
-    pub fn set_status_flags(&self, append: bool, nonblock: bool, sync: bool, direct: bool) {
+    pub fn set_status_flags(
+        &self,
+        append: bool,
+        nonblock: bool,
+        sync: bool,
+        direct: bool,
+        async_: bool,
+    ) {
         let mut bits = 0u32;
         if append {
             bits |= StatusFlags::APPEND;
@@ -613,8 +627,26 @@ impl File {
         if direct {
             bits |= StatusFlags::DIRECT;
         }
+        if async_ {
+            bits |= StatusFlags::ASYNC;
+        }
         self.status_flags.store(bits, Ordering::Release);
         self.ops.set_status_flags(self.flags());
+    }
+
+    pub fn set_fasync(&self, on: bool) {
+        let mut bits = self.status_flags.load(Ordering::Acquire);
+        if on {
+            bits |= StatusFlags::ASYNC;
+        } else {
+            bits &= !StatusFlags::ASYNC;
+        }
+        self.status_flags.store(bits, Ordering::Release);
+        self.ops.set_status_flags(self.flags());
+    }
+
+    pub fn fasync(&self) -> bool {
+        (self.status_flags.load(Ordering::Acquire) & StatusFlags::ASYNC) != 0
     }
 
     pub fn owner(&self) -> (i32, i32) {

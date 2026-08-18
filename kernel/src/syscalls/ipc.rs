@@ -906,7 +906,7 @@ pub(super) fn sys_mq_getsetattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
             })?;
         }
         if flags != old_flags {
-            file.set_status_flags(false, flags & O_NONBLOCK != 0, false, false);
+            file.set_status_flags(false, flags & O_NONBLOCK != 0, false, false, false);
         }
     }
 

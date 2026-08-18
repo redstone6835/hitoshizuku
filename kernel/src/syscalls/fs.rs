@@ -69,6 +69,7 @@ const O_DIRECTORY: usize = 0o00200000;
 const O_NOFOLLOW: usize = 0o00400000;
 const O_NOCTTY: usize = 0o00000400;
 const O_DSYNC: usize = 0o00010000;
+const O_ASYNC: usize = 0o00020000;
 const O_DIRECT: usize = 0o00040000;
 const O_NOATIME: usize = 0o01000000;
 const O_CLOEXEC: usize = 0o02000000;
@@ -169,6 +170,7 @@ const F_ADD_SEALS: usize = 1033;
 const F_GET_SEALS: usize = 1034;
 const FD_CLOEXEC: usize = 1;
 const FIONBIO: usize = 0x5421;
+const FIOASYNC: usize = 0x5452;
 
 const F_RDLCK: i16 = 0;
 const F_WRLCK: i16 = 1;
@@ -573,6 +575,7 @@ pub(super) fn sys_fcntl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 (arg & O_NONBLOCK) != 0,
                 (arg & O_SYNC) != 0,
                 (arg & O_DIRECT) != 0,
+                (arg & O_ASYNC) != 0,
             );
             Ok(0)
         }
@@ -690,7 +693,12 @@ pub(super) fn sys_ioctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if cmd.raw() == FIONBIO {
         let enabled = read_user_i32(ctx.args[2])? != 0;
         let flags = file.flags();
-        file.set_status_flags(flags.append, enabled, flags.sync, flags.direct);
+        file.set_status_flags(flags.append, enabled, flags.sync, flags.direct, flags.async_);
+        return Ok(0);
+    }
+    if cmd.raw() == FIOASYNC {
+        let on = read_user_i32(ctx.args[2])? != 0;
+        file.set_fasync(on);
         return Ok(0);
     }
     if cmd.raw() == general::dev::tty::TIOCGPTPEER {
@@ -1905,6 +1913,7 @@ pub(super) fn sys_signalfd4(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         (flags & O_NONBLOCK) != 0,
         current.sync,
         current.direct,
+        current.async_,
     );
     Ok(fd.as_raw() as usize)
 }
@@ -5623,6 +5632,9 @@ fn open_options_to_linux_flags(opts: &OpenOptions) -> usize {
     if opts.direct {
         raw |= O_DIRECT;
     }
+    if opts.async_ {
+        raw |= O_ASYNC;
+    }
     raw
 }
 
@@ -5646,6 +5658,7 @@ fn decode_open_options(raw: usize) -> Result<OpenOptions, Errno> {
         nonblock: (raw & O_NONBLOCK) != 0,
         sync: (raw & (O_SYNC | O_DSYNC)) != 0,
         direct: (raw & O_DIRECT) != 0,
+        async_: (raw & O_ASYNC) != 0,
         cloexec: (raw & O_CLOEXEC) != 0,
     })
 }
@@ -5694,6 +5707,7 @@ fn validate_openat2_flags(raw: usize) -> Result<(), Errno> {
         | O_APPEND
         | O_NONBLOCK
         | O_DSYNC
+        | O_ASYNC
         | O_DIRECT
         | O_DIRECTORY
         | O_NOFOLLOW

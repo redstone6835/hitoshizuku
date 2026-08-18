@@ -59,6 +59,7 @@ const O_NOFOLLOW: u32 = 0o400000;
 const O_NOATIME: u32 = 0o1000000;
 const O_CLOEXEC: u32 = 0o2000000;
 const O_PATH: u32 = 0o10000000;
+const O_ASYNC: u32 = 0o20000;
 
 /// 解码 `open(2)` flags → [`OpenOptions`]。
 ///
@@ -82,6 +83,7 @@ pub fn decode_open_flags(raw: u32) -> OpenOptions {
         nonblock: raw & O_NONBLOCK != 0,
         sync: raw & O_SYNC != 0,
         direct: raw & 0o40000 != 0,
+        async_: raw & O_ASYNC != 0,
         directory: raw & O_DIRECTORY != 0,
         nofollow: raw & O_NOFOLLOW != 0,
         noatime: raw & O_NOATIME != 0,
