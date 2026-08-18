@@ -3578,6 +3578,19 @@ pub(super) fn sys_splice(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
     let in_file = file_for_fd(fd_in)?;
     let out_file = file_for_fd(fd_out)?;
+    // splice 至少一端必须是管道,否则 EINVAL。
+    let in_pipe = vfs::pipe::pipe_of(&in_file).is_some();
+    let out_pipe = vfs::pipe::pipe_of(&out_file).is_some();
+    if !in_pipe && !out_pipe {
+        return Err(Errno::EINVAL);
+    }
+    // 非 seekable 描述符不接受非 NULL offset,否则 ESPIPE。
+    if off_in_user != 0 && !in_file.is_seekable() {
+        return Err(Errno::ESPIPE);
+    }
+    if off_out_user != 0 && !out_file.is_seekable() {
+        return Err(Errno::ESPIPE);
+    }
     let mut in_off = read_optional_offset(off_in_user)?;
     let mut out_off = read_optional_offset(off_out_user)?;
     let copied = copy_between_files(
