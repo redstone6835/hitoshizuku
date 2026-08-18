@@ -3104,7 +3104,11 @@ const LINUX_FS_CAP_MASK: u64 = (1u64 << Capability::Chown as u32)
     | (1u64 << 27) // CAP_MKNOD
     | (1u64 << 32); // CAP_MAC_OVERRIDE
 
-fn drop_caps_after_uid_gid_change(old: &Credentials, new: &mut Credentials) {
+/// `SECBIT_KEEP_CAPS`:setuid 从 root 降权时保留 permitted 能力集。
+const SECBIT_KEEP_CAPS: u32 = 1 << 0;
+
+fn drop_caps_after_uid_gid_change(task: &Arc<Task>, old: &Credentials, new: &mut Credentials) {
+    let keepcaps = task.keepcaps() || (old.securebits & SECBIT_KEEP_CAPS) != 0;
     let lost_root_uid = (old.uid == Uid::ROOT || old.euid == Uid::ROOT || old.suid == Uid::ROOT)
         && new.uid != Uid::ROOT
         && new.euid != Uid::ROOT
@@ -3112,9 +3116,15 @@ fn drop_caps_after_uid_gid_change(old: &Credentials, new: &mut Credentials) {
     let lost_effective_root = old.euid == Uid::ROOT && new.euid != Uid::ROOT;
     let gained_effective_root = old.euid != Uid::ROOT && new.euid == Uid::ROOT;
     if lost_root_uid {
-        new.caps = CapSet::EMPTY;
-        new.cap_permitted = CapSet::EMPTY;
-        new.cap_inheritable = CapSet::EMPTY;
+        if !keepcaps {
+            new.caps = CapSet::EMPTY;
+            new.cap_permitted = CapSet::EMPTY;
+            new.cap_inheritable = CapSet::EMPTY;
+        } else {
+            // keepcaps:保留 permitted/inheritable,仅清 effective(仍需后续
+            // lost_effective_root 语义清空 effective)。
+            new.caps = CapSet::EMPTY;
+        }
     } else if lost_effective_root {
         new.caps = CapSet::EMPTY;
     } else if gained_effective_root {
@@ -3147,7 +3157,7 @@ pub(super) fn sys_setuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     } else {
         return Err(Errno::EPERM);
     }
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -3170,7 +3180,7 @@ pub(super) fn sys_setgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     } else {
         return Err(Errno::EPERM);
     }
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -3198,7 +3208,7 @@ pub(super) fn sys_setreuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     if ruid != u32::MAX || (euid != u32::MAX && euid != creds.uid.0) {
         new.suid = new.euid;
     }
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -3226,7 +3236,7 @@ pub(super) fn sys_setregid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     if rgid != u32::MAX || (egid != u32::MAX && egid != creds.gid.0) {
         new.sgid = new.egid;
     }
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -3258,7 +3268,7 @@ pub(super) fn sys_setresuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         new.suid = Uid(suid);
     }
     new.fsuid = new.euid;
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -3290,7 +3300,7 @@ pub(super) fn sys_setresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         new.sgid = Gid(sgid);
     }
     new.fsgid = new.egid;
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -3308,7 +3318,7 @@ pub(super) fn sys_setfsuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     {
         let mut new = (*creds).clone();
         new.fsuid = uid;
-        drop_caps_after_uid_gid_change(&creds, &mut new);
+        // setfsuid/setfsgid 不改变 capabilities,与 Linux 主路径一致。
         install_credentials(ctx.task(), new);
     }
     Ok(old.0 as usize)
