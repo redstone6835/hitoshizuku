@@ -1009,6 +1009,83 @@ pub fn permission_ok(key: &Key, cred: &Credentials, mask: u32) -> bool {
     perm & (mask << 24) != 0
 }
 
+/// 在进程 keyring 链上搜索已实例化的 key（`request_key` 的搜索阶段）。
+///
+/// 链序为 thread → process → session → user-session → user；若调用方经
+/// `KEYCTL_SET_REQKEY_KEYRING` 指定了偏好环，则优先搜索该环。逐环调用
+/// [`KeyManager::search`]，命中即返回 key 序列号。
+pub fn search_process_keyrings(
+    process: &ProcessKeyrings,
+    cred: &Credentials,
+    manager: &KeyManager,
+    key_type: KeyType,
+    description: &str,
+    now_sec: u64,
+) -> Option<KeyId> {
+    let mut candidates: Vec<KeyId> = Vec::new();
+
+    // 偏好环优先（KEY_REQKEY_DEFL_*）。
+    match *process.reqkey_default.lock() {
+        KEY_REQKEY_DEFL_THREAD_KEYRING => {
+            if let Some(id) = *process.thread.lock() {
+                push_unique_keyring(&mut candidates, id);
+            }
+        }
+        KEY_REQKEY_DEFL_PROCESS_KEYRING => {
+            if let Some(id) = *process.process.lock() {
+                push_unique_keyring(&mut candidates, id);
+            }
+        }
+        KEY_REQKEY_DEFL_SESSION_KEYRING => {
+            if let Some(id) = *process.session.lock() {
+                push_unique_keyring(&mut candidates, id);
+            }
+        }
+        KEY_REQKEY_DEFL_USER_KEYRING => {
+            if let Ok(id) = manager.user_keyring(cred.euid.0, cred) {
+                push_unique_keyring(&mut candidates, id);
+            }
+        }
+        KEY_REQKEY_DEFL_USER_SESSION_KEYRING => {
+            if let Ok(id) = manager.user_session(cred.euid.0, cred, now_sec) {
+                push_unique_keyring(&mut candidates, id);
+            }
+        }
+        _ => {}
+    }
+
+    // 默认链：thread → process → session → user-session → user。
+    if let Some(id) = *process.thread.lock() {
+        push_unique_keyring(&mut candidates, id);
+    }
+    if let Some(id) = *process.process.lock() {
+        push_unique_keyring(&mut candidates, id);
+    }
+    if let Some(id) = *process.session.lock() {
+        push_unique_keyring(&mut candidates, id);
+    }
+    if let Ok(id) = manager.user_session(cred.euid.0, cred, now_sec) {
+        push_unique_keyring(&mut candidates, id);
+    }
+    if let Ok(id) = manager.user_keyring(cred.euid.0, cred) {
+        push_unique_keyring(&mut candidates, id);
+    }
+
+    for id in candidates {
+        if let Ok(key) = manager.search(id, key_type, description, cred, now_sec) {
+            return Some(key.id);
+        }
+    }
+    None
+}
+
+/// 把非零 keyring id 去重后加入候选列表（`KeyId(0)` 是"无 keyring"哨兵）。
+fn push_unique_keyring(list: &mut Vec<KeyId>, id: KeyId) {
+    if id.0 > 0 && !list.contains(&id) {
+        list.push(id);
+    }
+}
+
 /// 供 kernel 层使用的 `KEY_SPEC_*` 解析辅助。
 pub fn default_keyring_chain(
     process: &ProcessKeyrings,
