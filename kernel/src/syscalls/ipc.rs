@@ -1691,9 +1691,9 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                     &cred,
                     now,
                 )?;
-                if let Ok(dest_keyring) = manager.key(dest) {
-                    dest_keyring.add_member(key.id, key_type.name(), &description);
-                }
+                // dest 链接等价 KEYCTL_LINK：要求 dest 写权限 + key link 权限 +
+                // keyring restriction；dest 非 keyring 时由 link 返回 ENOTDIR。
+                manager.link(dest, key.id, &cred)?;
             }
             Ok(key.id.0 as usize)
         }
