@@ -1067,6 +1067,15 @@ pub(super) fn sys_msgsnd(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let mut mtype_raw = [0u8; 8];
     copy_from_user(msgp, &mut mtype_raw).map_err(|e| e.as_errno())?;
     let mtype = i64::from_le_bytes(mtype_raw);
+    // 对齐 Linux `do_msgsnd`：先校验 `msgsz`/`mtype`（EINVAL），再读 data。
+    // 否则"坏指针 + 超限"同时发生时，会先因 data 的 `copy_from_user` 返回
+    // EFAULT，而 Linux 此处返回 EINVAL。
+    if msgsz > MSGMAX {
+        return Err(Errno::EINVAL);
+    }
+    if mtype < 1 {
+        return Err(Errno::EINVAL);
+    }
     let mut data = vec![0u8; msgsz];
     if msgsz > 0 {
         copy_from_user(msgp + 8, &mut data).map_err(|e| e.as_errno())?;
