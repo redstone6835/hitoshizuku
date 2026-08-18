@@ -4,29 +4,33 @@
 //! asm-generic ABI 编解码、当前任务凭据转换、阻塞调度和 VM 映射操作。
 
 use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use errno::Errno;
 use general::ipc::keys::{
-    KEY_DEFAULT_PERM, KEY_SPEC_REQKEY_AUTH_KEY, KEY_SPEC_SESSION_KEYRING, KeyId, KeyManager,
-    KeyState, KeyType, ProcessKeyrings,
+    KEY_DEFAULT_PERM, KEY_REQKEY_DEFL_DEFAULT, KEY_REQKEY_DEFL_NO_CHANGE,
+    KEY_REQKEY_DEFL_PROCESS_KEYRING, KEY_REQKEY_DEFL_REQUESTOR_KEYRING,
+    KEY_REQKEY_DEFL_SESSION_KEYRING, KEY_REQKEY_DEFL_THREAD_KEYRING, KEY_REQKEY_DEFL_USER_KEYRING,
+    KEY_REQKEY_DEFL_USER_SESSION_KEYRING, KEY_SPEC_REQKEY_AUTH_KEY, KEY_SPEC_SESSION_KEYRING,
+    KeyId, KeyManager, KeyState, KeyType, ProcessKeyrings,
 };
 use general::ipc::mqueue::{
     MQ_ATTR_CURMSGS, MQ_ATTR_FLAGS, MQ_ATTR_MAXMSG, MQ_ATTR_MSGSIZE, MQ_ATTR_SIZE, MQ_NAME_MAX,
-    SI_MESGQ, MqAttr, MqNotifyKind, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD,
+    MqAttr, MqNotifyKind, SI_MESGQ, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD,
 };
 use general::ipc::msg::{
-    MSG_COPY, MSG_EXCEPT, MSG_INFO, MSG_NOERROR, MSG_STAT, MSG_STAT_ANY, MSG_TRUNC, MSGMAX,
-    MSGMNB, MSGMNI, MsgId, MsgKey, MsgManager, MsgMetadata, MsgOpAttempt, MsgRecvOutcome,
-    MsgSystemInfo,
+    MSG_COPY, MSG_EXCEPT, MSG_INFO, MSG_NOERROR, MSG_STAT, MSG_STAT_ANY, MSG_TRUNC, MSGMAX, MSGMNB,
+    MSGMNI, MsgId, MsgKey, MsgManager, MsgMetadata, MsgOpAttempt, MsgRecvOutcome, MsgSystemInfo,
 };
 use general::ipc::sem::{
-    SEM_UNDO, SEM_INFO, SEM_STAT, SEM_STAT_ANY, SEMCTL_GETALL, SEMCTL_GETNCNT, SEMCTL_GETPID,
+    SEM_INFO, SEM_STAT, SEM_STAT_ANY, SEM_UNDO, SEMCTL_GETALL, SEMCTL_GETNCNT, SEMCTL_GETPID,
     SEMCTL_GETVAL, SEMCTL_GETZCNT, SEMCTL_SETALL, SEMCTL_SETVAL, SEMOPM, SemBlockKind, SemId,
     SemKey, SemManager, SemMetadata, SemOpAttempt, SemOperation, SemSystemInfo,
 };
@@ -227,12 +231,25 @@ pub(super) fn sys_shmctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(0)
         }
         SHM_LOCK | SHM_UNLOCK => {
-            manager.lock(shmid, cmd == SHM_LOCK, &cred)?;
+            let lock = cmd == SHM_LOCK;
+            if lock {
+                // Linux `user_shm_lock`：锁定新增页数不得超出 `RLIMIT_MEMLOCK`
+                //（`CAP_IPC_LOCK` 或 `RLIM_INFINITY` 豁免）。超限返回 `ENOMEM`。
+                let additional = manager.would_lock_pages(shmid)?;
+                check_shm_memlock_limit(ctx, manager.locked_pages(), additional)?;
+            }
+            manager.lock(shmid, lock, &cred)?;
             Ok(0)
         }
-        IPC_INFO | SHM_INFO => {
+        IPC_INFO => {
             let info = manager.info();
-            let raw = encode_shminfo(&info, cmd == IPC_INFO);
+            let raw = encode_shminfo(&info);
+            copy_to_user(buf, &raw).map_err(|e| e.as_errno())?;
+            Ok(info.max_index as usize)
+        }
+        SHM_INFO => {
+            let info = manager.info();
+            let raw = encode_shm_info(&info);
             copy_to_user(buf, &raw).map_err(|e| e.as_errno())?;
             Ok(info.max_index as usize)
         }
@@ -240,24 +257,303 @@ pub(super) fn sys_shmctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
 }
 
-pub(super) fn sys_io_setup(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+// ── libaio（最小同步实现）──────────────────────────────────────────────────
+//
+// 本内核没有真正的异步 I/O 执行队列：`io_submit` 同步执行每个 iocb
+// （pread/pwrite/fsync/fdatasync 子集），并把完成事件写入 `io_getevents` 可读
+// 的事件队列。ABI 对齐 asm-generic 的 `struct iocb`（64 字节）与
+// `struct io_event`（32 字节）。
+
+const IOCB_SIZE: usize = 64;
+const IOEVENT_SIZE: usize = 32;
+const AIO_MAX_EVENTS_PER_CTX: usize = 4096;
+const AIO_MAX_CONTEXTS: usize = 64;
+/// 单个 iocb 的最大负载字节数（Linux `MAX_RW_COUNT` 的保守近似）。
+const AIO_MAX_NBYTES: usize = 32 * 1024 * 1024;
+
+// `struct iocb` 字段偏移（asm-generic 64 位布局）。
+const IOCB_AIO_DATA: usize = 0;
+const IOCB_AIO_LIO_OPCODE: usize = 16;
+const IOCB_AIO_FILDES: usize = 20;
+const IOCB_AIO_BUF: usize = 24;
+const IOCB_AIO_NBYTES: usize = 32;
+const IOCB_AIO_OFFSET: usize = 40;
+
+// `struct io_event` 字段偏移。
+const IOEVENT_DATA: usize = 0;
+const IOEVENT_OBJ: usize = 8;
+const IOEVENT_RES: usize = 16;
+const IOEVENT_RES2: usize = 24;
+
+// `aio_lio_opcode`（Linux `linux/aio_abi.h` 子集）。
+const IOCB_CMD_PREAD: u16 = 0;
+const IOCB_CMD_PWRITE: u16 = 1;
+const IOCB_CMD_FSYNC: u16 = 2;
+const IOCB_CMD_FDSYNC: u16 = 3;
+
+/// 一条已完成的 AIO 事件（`struct io_event`）。
+#[derive(Clone, Copy)]
+struct AioEvent {
+    data: u64,
+    obj: u64,
+    res: i64,
+    res2: i64,
 }
 
-pub(super) fn sys_io_destroy(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+struct AioContext {
+    completed: Spinlock<VecDeque<AioEvent>>,
 }
 
-pub(super) fn sys_io_submit(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+static AIO_CONTEXTS: Spinlock<Option<BTreeMap<u64, Arc<AioContext>>>> = Spinlock::new(None);
+static AIO_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn aio_context(id: u64) -> Result<Arc<AioContext>, Errno> {
+    let slot = AIO_CONTEXTS.lock();
+    let Some(map) = slot.as_ref() else {
+        return Err(Errno::EINVAL);
+    };
+    map.get(&id).cloned().ok_or(Errno::EINVAL)
 }
 
-pub(super) fn sys_io_cancel(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+fn aio_err(data: u64, obj: u64, error: Errno) -> AioEvent {
+    AioEvent {
+        data,
+        obj,
+        res: -(error.as_i32_internal() as i64),
+        res2: 0,
+    }
 }
 
-pub(super) fn sys_io_getevents(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+fn aio_file(fd: u32) -> Result<Arc<vfs::file::File>, Errno> {
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    fdt.get_file(vfs::fdtable::Fd::from_raw(fd))
+        .ok_or(Errno::EBADF)
+}
+
+pub(super) fn sys_io_setup(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let nr_events = ctx.args[0];
+    let ctx_idp = ctx.args[1];
+    if nr_events == 0 || nr_events > AIO_MAX_EVENTS_PER_CTX {
+        return Err(Errno::EINVAL);
+    }
+    if ctx_idp == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let id = AIO_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let context = Arc::new(AioContext {
+        completed: Spinlock::new(VecDeque::new()),
+    });
+    {
+        let mut slot = AIO_CONTEXTS.lock();
+        if slot.is_none() {
+            *slot = Some(BTreeMap::new());
+        }
+        let map = slot.as_mut().unwrap();
+        if map.len() >= AIO_MAX_CONTEXTS {
+            return Err(Errno::EAGAIN);
+        }
+        map.insert(id, Arc::clone(&context));
+    }
+    copy_to_user(ctx_idp, &id.to_le_bytes()).map_err(|e| e.as_errno())?;
+    Ok(0)
+}
+
+pub(super) fn sys_io_destroy(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let id = ctx.args[0] as u64;
+    let mut slot = AIO_CONTEXTS.lock();
+    let Some(map) = slot.as_mut() else {
+        return Err(Errno::EINVAL);
+    };
+    if map.remove(&id).is_none() {
+        return Err(Errno::EINVAL);
+    }
+    Ok(0)
+}
+
+pub(super) fn sys_io_submit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let id = ctx.args[0] as u64;
+    let nr = ctx.args[1];
+    let iocbpp = ctx.args[2];
+    let context = aio_context(id)?;
+    if nr == 0 {
+        return Ok(0);
+    }
+    if nr > AIO_MAX_EVENTS_PER_CTX {
+        return Err(Errno::EINVAL);
+    }
+    if iocbpp == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut submitted = 0usize;
+    for index in 0..nr {
+        match submit_one(&context, iocbpp, index) {
+            Ok(()) => submitted += 1,
+            Err(error) => {
+                return if submitted > 0 {
+                    Ok(submitted)
+                } else {
+                    Err(error)
+                };
+            }
+        }
+    }
+    Ok(submitted)
+}
+
+pub(super) fn sys_io_cancel(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // 同步执行：iocb 在 io_submit 内立即完成，永远没有"进行中"的请求可取消。
+    let id = ctx.args[0] as u64;
+    let _ = aio_context(id)?;
+    Err(Errno::EAGAIN)
+}
+
+pub(super) fn sys_io_getevents(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    sys_io_getevents_common(ctx)
+}
+
+/// `io_getevents`/`io_pgetevents` 共用：从完成事件队列取出最多 `nr` 条事件。
+///
+/// 由于本内核的 iocb 在 `io_submit` 内同步完成，事件提交后立即可读；若可用
+/// 事件少于 `min_nr`，这里直接返回当前可用数（不阻塞），这是最小同步实现与
+/// Linux 异步等待语义的取舍。
+fn sys_io_getevents_common(ctx: &SyscallContext<'_>) -> Result<usize, Errno> {
+    let id = ctx.args[0] as u64;
+    let nr = ctx.args[2];
+    let events_user = ctx.args[3];
+    let context = aio_context(id)?;
+    if nr == 0 {
+        return Ok(0);
+    }
+    if events_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let drained: Vec<AioEvent> = {
+        let mut completed = context.completed.lock();
+        let count = nr.min(completed.len());
+        completed.drain(..count).collect()
+    };
+    for (index, event) in drained.iter().enumerate() {
+        let mut raw = [0u8; IOEVENT_SIZE];
+        write_u64(&mut raw, IOEVENT_DATA, event.data);
+        write_u64(&mut raw, IOEVENT_OBJ, event.obj);
+        write_i64(&mut raw, IOEVENT_RES, event.res);
+        write_i64(&mut raw, IOEVENT_RES2, event.res2);
+        let addr = events_user
+            .checked_add(index * IOEVENT_SIZE)
+            .ok_or(Errno::EFAULT)?;
+        copy_to_user(addr, &raw).map_err(|e| e.as_errno())?;
+    }
+    Ok(drained.len())
+}
+
+/// 解析并同步执行一条 iocb，把完成事件写入所属 context。
+fn submit_one(context: &Arc<AioContext>, iocbpp: usize, index: usize) -> Result<(), Errno> {
+    let ptr_addr = iocbpp
+        .checked_add(index * size_of::<usize>())
+        .ok_or(Errno::EFAULT)?;
+    let mut ptr_raw = [0u8; size_of::<usize>()];
+    copy_from_user(ptr_addr, &mut ptr_raw).map_err(|e| e.as_errno())?;
+    let iocb_user = usize::from_le_bytes(ptr_raw);
+    if iocb_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut raw = [0u8; IOCB_SIZE];
+    copy_from_user(iocb_user, &mut raw).map_err(|e| e.as_errno())?;
+    let event = aio_execute(iocb_user, &raw);
+    context.completed.lock().push_back(event);
+    Ok(())
+}
+
+fn aio_execute(iocb_user: usize, raw: &[u8; IOCB_SIZE]) -> AioEvent {
+    let data = read_u64(raw, IOCB_AIO_DATA);
+    let obj = iocb_user as u64;
+    let opcode = read_u16(raw, IOCB_AIO_LIO_OPCODE);
+    let fd = read_u32(raw, IOCB_AIO_FILDES);
+    let buf = read_u64(raw, IOCB_AIO_BUF) as usize;
+    let nbytes = read_u64(raw, IOCB_AIO_NBYTES) as usize;
+    let offset = read_i64(raw, IOCB_AIO_OFFSET);
+
+    match opcode {
+        IOCB_CMD_PREAD => aio_pread(data, obj, fd, buf, nbytes, offset),
+        IOCB_CMD_PWRITE => aio_pwrite(data, obj, fd, buf, nbytes, offset),
+        IOCB_CMD_FSYNC => aio_fsync(data, obj, fd, false),
+        IOCB_CMD_FDSYNC => aio_fsync(data, obj, fd, true),
+        _ => aio_err(data, obj, Errno::EINVAL),
+    }
+}
+
+fn aio_pread(data: u64, obj: u64, fd: u32, buf: usize, nbytes: usize, offset: i64) -> AioEvent {
+    if offset < 0 || nbytes > AIO_MAX_NBYTES {
+        return aio_err(data, obj, Errno::EINVAL);
+    }
+    let file = match aio_file(fd) {
+        Ok(file) => file,
+        Err(error) => return aio_err(data, obj, error),
+    };
+    let mut tmp = vec![0u8; nbytes];
+    let res = match file.read_at(&mut tmp, offset as u64) {
+        Ok(n) => n as i64,
+        Err(error) => -(error.to_errno().as_i32_internal() as i64),
+    };
+    if res > 0 {
+        if let Err(error) = copy_to_user(buf, &tmp[..res as usize]) {
+            return aio_err(data, obj, error.as_errno());
+        }
+    }
+    AioEvent {
+        data,
+        obj,
+        res,
+        res2: 0,
+    }
+}
+
+fn aio_pwrite(data: u64, obj: u64, fd: u32, buf: usize, nbytes: usize, offset: i64) -> AioEvent {
+    if offset < 0 || nbytes > AIO_MAX_NBYTES {
+        return aio_err(data, obj, Errno::EINVAL);
+    }
+    let file = match aio_file(fd) {
+        Ok(file) => file,
+        Err(error) => return aio_err(data, obj, error),
+    };
+    let mut tmp = vec![0u8; nbytes];
+    if nbytes > 0 {
+        if let Err(error) = copy_from_user(buf, &mut tmp) {
+            return aio_err(data, obj, error.as_errno());
+        }
+    }
+    let res = match file.write_at(&tmp, offset as u64) {
+        Ok(n) => n as i64,
+        Err(error) => -(error.to_errno().as_i32_internal() as i64),
+    };
+    AioEvent {
+        data,
+        obj,
+        res,
+        res2: 0,
+    }
+}
+
+fn aio_fsync(data: u64, obj: u64, fd: u32, fdatasync: bool) -> AioEvent {
+    let file = match aio_file(fd) {
+        Ok(file) => file,
+        Err(error) => return aio_err(data, obj, error),
+    };
+    let result = if fdatasync {
+        file.datasync()
+    } else {
+        file.sync()
+    };
+    let res = match result {
+        Ok(()) => 0,
+        Err(error) => -(error.to_errno().as_i32_internal() as i64),
+    };
+    AioEvent {
+        data,
+        obj,
+        res,
+        res2: 0,
+    }
 }
 
 pub(super) fn sys_mq_open(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -296,11 +592,17 @@ pub(super) fn sys_mq_open(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
         None
     };
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
+    // Linux `mq_open`：创建队列时用 `mode` 经 current umask 掩码作为权限；
+    // 查找已有队列时 mode 被忽略。
+    let perm_mode = general::vfs::current_vfs_context()
+        .map(|ctx| ctx.apply_umask(FileMode::new(mode & MODE_MASK)))
+        .unwrap_or_else(|| FileMode::new(mode & MODE_MASK));
     let queue = mq_registry().open(
         &name,
         oflag & O_CREAT != 0,
         oflag & O_EXCL != 0,
         attr.as_ref(),
+        perm_mode,
         &cred,
     )?;
     if access != AccessMode::WriteOnly {
@@ -321,7 +623,6 @@ pub(super) fn sys_mq_open(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     } else {
         FdFlags::default()
     };
-    let _ = mode; // 队列权限位固定 0600；mode 仅用于兼容性保留
     vfs::anon::create_fd(
         &fdt,
         Arc::new(cred),
@@ -570,9 +871,7 @@ pub(super) fn sys_mq_notify(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     }
     // Linux `ipc/mqueue.c`：注册通知要求读权限（ipcperms）。
     queue.check_access(false, &cred)?;
-    queue
-        .register_notify(kind, pid, cred.uid.0)
-        .map(|_| 0)
+    queue.register_notify(kind, pid, cred.uid.0).map(|_| 0)
 }
 
 pub(super) fn sys_mq_getsetattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1105,6 +1404,10 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     const KEYCTL_INVALIDATE: usize = 21;
     const KEYCTL_GET_PERSISTENT: usize = 22;
     const KEYCTL_RESTRICT_KEYRING: usize = 29;
+    const KEYCTL_SUPPORTS_ENCRYPT: usize = 32;
+    const KEYCTL_SUPPORTS_DECRYPT: usize = 33;
+    const KEYCTL_SUPPORTS_SIGN: usize = 34;
+    const KEYCTL_SUPPORTS_VERIFY: usize = 35;
     const KEYCTL_CAPABILITIES: usize = 36;
 
     let cmd = ctx.args[0];
@@ -1283,9 +1586,25 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(0)
         }
         KEYCTL_SET_REQKEY_KEYRING => {
-            // 记录默认请求 keyring 偏好；本内核支持默认链，接受但不切换。
-            let _reqkey = ctx.args[1];
-            Ok(0)
+            // 设置默认请求 keyring 偏好（Linux `jit_keyring`）。返回旧偏好；
+            // `KEY_REQKEY_DEFL_NO_CHANGE` 只查询不修改。
+            let reqkey = ctx.args[1] as i32;
+            let process = process_keyrings(ctx);
+            let mut guard = process.reqkey_default.lock();
+            let old = *guard;
+            if reqkey != KEY_REQKEY_DEFL_NO_CHANGE {
+                match reqkey {
+                    KEY_REQKEY_DEFL_DEFAULT
+                    | KEY_REQKEY_DEFL_THREAD_KEYRING
+                    | KEY_REQKEY_DEFL_PROCESS_KEYRING
+                    | KEY_REQKEY_DEFL_SESSION_KEYRING
+                    | KEY_REQKEY_DEFL_USER_KEYRING
+                    | KEY_REQKEY_DEFL_USER_SESSION_KEYRING
+                    | KEY_REQKEY_DEFL_REQUESTOR_KEYRING => *guard = reqkey,
+                    _ => return Err(Errno::EINVAL),
+                }
+            }
+            Ok(old as usize)
         }
         KEYCTL_SET_TIMEOUT => {
             let key_id = KeyId(ctx.args[1] as i32);
@@ -1300,7 +1619,11 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 *process.reqkey_auth.lock() = None;
                 Ok(0)
             } else if key_arg == KEY_SPEC_REQKEY_AUTH_KEY {
-                Ok(process.reqkey_auth.lock().map(|id| id.0 as usize).unwrap_or(0))
+                Ok(process
+                    .reqkey_auth
+                    .lock()
+                    .map(|id| id.0 as usize)
+                    .unwrap_or(0))
             } else {
                 *process.reqkey_auth.lock() = Some(KeyId(key_arg));
                 Ok(0)
@@ -1308,13 +1631,20 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         KEYCTL_GET_SECURITY => {
             let key_id = KeyId(ctx.args[1] as i32);
-            let buffer = ctx.args[2];
-            let buflen = ctx.args[3];
-            // 无 LSM：返回空的安全标签（Linux 无 LSM 时的行为）。
+            // 无 LSM：返回空的安全标签（长度 0，Linux 无 LSM 时
+            // `security_key_getsecurity` 返回 0 的行为）。
             let _ = manager.describe(key_id, &cred)?;
-            keyctl_copy_string(buffer, buflen, "")
+            Ok(0)
         }
-        KEYCTL_SESSION_TO_PARENT => Err(Errno::EOPNOTSUPP),
+        KEYCTL_SESSION_TO_PARENT => {
+            // 把当前进程的 session keyring 安装到父进程（Linux 语义）。
+            let session = *process_keyrings(ctx).session.lock();
+            let Some(parent) = ctx.task().parent() else {
+                return Err(Errno::ENOKEY);
+            };
+            *process_keyrings_of(&parent).session.lock() = session;
+            Ok(0)
+        }
         KEYCTL_INSTANTIATE_IOV => {
             // iovec 版 instantiate：聚合成单个负载。
             let key_id = KeyId(ctx.args[1] as i32);
@@ -1336,19 +1666,29 @@ pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(id.0 as usize)
         }
         KEYCTL_RESTRICT_KEYRING => {
-            // 限制 keyring 可链接的 key 类型；本内核 key 类型固定，接受空限制。
+            // 限制 keyring 可链接的 key 类型；restriction 字符串（LSM 风格）
+            // 本内核不解析，仅在非空时校验可读性后忽略。
             let keyring_id = KeyId(ctx.args[1] as i32);
             let type_user = ctx.args[2];
-            if type_user != 0 {
+            let restriction_user = ctx.args[3];
+            let restriction = if type_user != 0 {
                 let name = copy_cstr_from_user(type_user, 32).map_err(|e| e.as_errno())?;
-                if KeyType::parse(&name).is_none() {
-                    return Err(Errno::ENODEV);
-                }
+                Some(KeyType::parse(&name).ok_or(Errno::ENODEV)?)
+            } else {
+                None
+            };
+            if restriction_user != 0 {
+                let _ = copy_cstr_from_user(restriction_user, KEY_DESC_MAX)
+                    .map_err(|e| e.as_errno())?;
             }
-            let keyring = manager.key(keyring_id)?;
-            if !keyring.is_keyring() {
-                return Err(Errno::ENOTDIR);
-            }
+            manager.restrict_keyring(keyring_id, restriction, &cred)?;
+            Ok(0)
+        }
+        KEYCTL_SUPPORTS_ENCRYPT
+        | KEYCTL_SUPPORTS_DECRYPT
+        | KEYCTL_SUPPORTS_SIGN
+        | KEYCTL_SUPPORTS_VERIFY => {
+            // 本内核不提供 key 加密/解密/签名/验签（无 crypto key 类型）。
             Ok(0)
         }
         KEYCTL_CAPABILITIES => {
@@ -1376,9 +1716,13 @@ fn resolve_keyring(
     now: u64,
 ) -> Result<KeyId, Errno> {
     if spec == 0 {
-        return Ok(general::ipc::keys::default_keyring_chain(process, cred, manager, now));
+        return Ok(general::ipc::keys::default_keyring_chain(
+            process, cred, manager, now,
+        ));
     }
-    manager.resolve_spec(spec, process, cred, now).map(|key| key.id)
+    manager
+        .resolve_spec(spec, process, cred, now)
+        .map(|key| key.id)
 }
 
 /// 复制以 NUL 结尾的字符串到用户缓冲区；返回包含 NUL 的长度（Linux 语义）。
@@ -1423,12 +1767,14 @@ fn read_iovec_payload(iov_user: usize, iovcnt: usize) -> Result<Vec<u8>, Errno> 
     Ok(payload)
 }
 
-pub(super) fn sys_io_pgetevents(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_io_pgetevents(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // sigmask（args[5]）本内核不处理（无阻塞等待），事件读取语义与
+    // `io_getevents` 一致。
+    sys_io_getevents_common(ctx)
 }
 
-pub(super) fn sys_io_pgetevents_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_io_pgetevents_time64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    sys_io_getevents_common(ctx)
 }
 
 pub(super) fn sys_mq_timedsend_time64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1481,8 +1827,12 @@ fn keys_manager() -> Arc<KeyManager> {
 
 /// 取当前任务的 keyring 引用集；不存在时惰性创建并挂载。
 fn process_keyrings(ctx: &SyscallContext<'_>) -> Arc<ProcessKeyrings> {
-    if let Some(process) = ctx
-        .task()
+    process_keyrings_of(ctx.task())
+}
+
+/// 取任意任务的 keyring 引用集（`KEYCTL_SESSION_TO_PARENT` 需操作父任务）。
+fn process_keyrings_of(task: &Arc<sched::Task>) -> Arc<ProcessKeyrings> {
+    if let Some(process) = task
         .ext_lookup(TASKEXT_KEYRINGS)
         .and_then(|payload| payload.downcast::<ProcessKeyrings>().ok())
     {
@@ -1490,7 +1840,7 @@ fn process_keyrings(ctx: &SyscallContext<'_>) -> Arc<ProcessKeyrings> {
     }
     let process = Arc::new(ProcessKeyrings::new());
     let erased: Arc<dyn core::any::Any + Send + Sync> = process.clone();
-    ctx.task().ext_install(TASKEXT_KEYRINGS, erased);
+    task.ext_install(TASKEXT_KEYRINGS, erased);
     process
 }
 
@@ -1657,7 +2007,10 @@ pub(super) fn apply_sem_undo_on_exit(task: &Arc<sched::Task>) {
 }
 
 /// 注销本等待周期的阻塞统计登记。
-fn unregister_sem_blocked(set: &general::ipc::sem::SemSet, registered: Option<(usize, SemBlockKind)>) {
+fn unregister_sem_blocked(
+    set: &general::ipc::sem::SemSet,
+    registered: Option<(usize, SemBlockKind)>,
+) {
     if let Some((sem_num, kind)) = registered {
         set.unregister_blocked(sem_num, kind);
     }
@@ -1746,8 +2099,33 @@ fn now_sec() -> i64 {
     crate::vdso::clock_time_ns(0).unwrap_or(0) as i64 / 1_000_000_000
 }
 
+/// `shmctl(SHM_LOCK)` 的 `RLIMIT_MEMLOCK` 检查（Linux `user_shm_lock` 语义）。
+///
+/// `locked_pages` 是 shm 管理器已锁页数，`additional_pages` 是本次新增页数；
+/// 持有 `CAP_IPC_LOCK` 或软上限为 `RLIM_INFINITY` 时豁免。超限返回 `ENOMEM`。
+fn check_shm_memlock_limit(
+    ctx: &SyscallContext<'_>,
+    locked_pages: usize,
+    additional_pages: usize,
+) -> Result<(), Errno> {
+    if ctx.task().credentials().has_cap(sched::Capability::IpcLock) {
+        return Ok(());
+    }
+    let pair = sched::operation::get_rlimit(sched::rlimit::Resource::Memlock)
+        .map_err(|_| Errno::ENOMEM)?;
+    let limit_pages = (pair.soft.0 / hal::memory::page_size() as u64) as usize;
+    if locked_pages.saturating_add(additional_pages) > limit_pages {
+        return Err(Errno::ENOMEM);
+    }
+    Ok(())
+}
+
 fn align_up(value: usize, align: usize) -> Option<usize> {
     Some(value.checked_add(align - 1)? & !(align - 1))
+}
+
+fn read_u16(raw: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes(raw[off..off + 2].try_into().unwrap())
 }
 
 fn read_u32(raw: &[u8], off: usize) -> u32 {
@@ -1908,32 +2286,33 @@ fn encode_seminfo(info: &SemSystemInfo, limits: bool) -> [u8; SEMINFO_SIZE] {
     raw
 }
 
-/// 编码 `struct shminfo`（40 字节）。`limits` 为真时填 `IPC_INFO` 的系统限制，
-/// 否则填 `SHM_INFO` 的当前用量（Linux `ipc/shm.c` 语义）。
-fn encode_shminfo(info: &ShmSystemInfo, limits: bool) -> [u8; 40] {
+/// 编码 `struct shminfo`（40 字节，`IPC_INFO` 的系统限制）。
+fn encode_shminfo(info: &ShmSystemInfo) -> [u8; 40] {
     let mut raw = [0u8; 40];
-    let (shmmax, shmmin, shmmni, shmseg, shmall) = if limits {
-        (
-            info.limits.max_segment_size,
-            info.limits.min_segment_size,
-            info.limits.max_segments as u64,
-            info.limits.max_segments as u64,
-            info.limits.max_total_pages as u64,
-        )
-    } else {
-        (
-            info.used_segments as u64,
-            info.total_pages as u64,
-            info.limits.max_segments as u64,
-            info.limits.max_segments as u64,
-            info.limits.max_total_pages as u64,
-        )
-    };
-    write_u64(&mut raw, 0, shmmax);
-    write_u64(&mut raw, 8, shmmin);
-    write_u64(&mut raw, 16, shmmni);
-    write_u64(&mut raw, 24, shmseg);
-    write_u64(&mut raw, 32, shmall);
+    write_u64(&mut raw, 0, info.limits.max_segment_size);
+    write_u64(&mut raw, 8, info.limits.min_segment_size);
+    write_u64(&mut raw, 16, info.limits.max_segments as u64);
+    write_u64(&mut raw, 24, info.limits.max_segments as u64);
+    write_u64(&mut raw, 32, info.limits.max_total_pages as u64);
+    raw
+}
+
+/// 编码 `struct shm_info`（48 字节，asm-generic 64 位布局）。
+///
+/// Linux `shmctl(SHM_INFO)` 返回 `struct shm_info{int used_ids; ulong shm_tot,
+/// shm_rss, shm_swp, swap_attempts, swap_successes;}`，与 `IPC_INFO` 的
+/// `struct shminfo` 布局不同；`shm_tot`/`shm_rss`/`shm_swp` 以页为单位
+/// （`ipcs -u` 打印 "pages allocated/resident/swapped"）。本内核无 swap，
+/// 因此 resident == total、swapped 与 swap 尝试/成功恒 0。
+fn encode_shm_info(info: &ShmSystemInfo) -> [u8; 48] {
+    let mut raw = [0u8; 48];
+    let pages = info.total_pages as u64;
+    write_i32(&mut raw, 0, info.used_segments as i32);
+    write_u64(&mut raw, 8, pages); // shm_tot
+    write_u64(&mut raw, 16, pages); // shm_rss
+    write_u64(&mut raw, 24, 0); // shm_swp
+    write_u64(&mut raw, 32, 0); // swap_attempts
+    write_u64(&mut raw, 40, 0); // swap_successes
     raw
 }
 
