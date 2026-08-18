@@ -1821,6 +1821,9 @@ fn inet_setsockopt(
                 Ok(())
             }
             SO_MARK => {
+                if !cred.has_cap(crate::vfs::cred::Capability::NetAdmin) {
+                    return Err(Errno::EPERM);
+                }
                 if value.len() < 4 {
                     return Err(Errno::EINVAL);
                 }
