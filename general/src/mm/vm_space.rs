@@ -83,6 +83,9 @@ pub struct Mempolicy {
     pub mode: u32,
     /// 节点位图（本内核只有 node 0，合法掩码只能是 0 或 1）。
     pub node_mask: u64,
+    /// `MPOL_BIND`/`MPOL_PREFERRED` 的 home node（`set_mempolicy_home_node`）。
+    /// 单节点系统恒为 0；未显式设置时与 `node_mask` 首个节点一致。
+    pub home_node: u32,
 }
 
 /// 地址空间级内存策略状态：进程默认策略 + `mbind` 区域覆盖。
@@ -395,6 +398,24 @@ fn vm_layout() -> &'static UserVmLayoutOps {
 #[kernel_symbols::export(name = "general.mm.page_size", contract = "kernel.mm.query@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
 pub fn page_size() -> usize {
     vm_layout().page_size
+}
+
+/// 栈向低地址生长的最大字节数，取 `RLIMIT_STACK` 软上限与架构布局上限的较小值。
+///
+/// Linux 栈扩展按 `RLIMIT_STACK` 软上限限制；`RLIM_INFINITY` 或调度器尚未就绪
+/// （启动早期自检）时退回架构布局硬上限 `max_grows_down_bytes`。
+fn stack_growth_limit() -> usize {
+    let layout_max = vm_layout().max_grows_down_bytes;
+    if !sched::is_ready() {
+        return layout_max;
+    }
+    match sched::operation::get_rlimit(sched::rlimit::Resource::Stack) {
+        Ok(pair) if !pair.soft.is_infinity() => {
+            let soft = usize::try_from(pair.soft.0).unwrap_or(usize::MAX);
+            soft.min(layout_max)
+        }
+        _ => layout_max,
+    }
 }
 
 #[inline]
@@ -2858,6 +2879,56 @@ impl VmSpace {
         self.committed_pages.load(Ordering::Acquire)
     }
 
+    /// 全部 VMA 的几何页数（含 `MAP_NORESERVE`），供 `RLIMIT_AS` 检查。
+    ///
+    /// 口径与 Linux `mm->total_vm` 一致：不区分是否预留承诺，只统计地址空间
+    /// 当前占用的虚拟页几何大小。
+    pub fn total_vm_pages(&self) -> usize {
+        self.vmas.lock().iter().map(Self::area_page_count).sum()
+    }
+
+    /// 私有可写非栈 VMA 的几何页数，供 `RLIMIT_DATA` 检查。
+    ///
+    /// 判定条件对齐 Linux `is_data_mapping`：`VM_WRITE` 置位且 `VM_SHARED`/
+    /// `VM_STACK` 均未置位。本内核没有独立的 `VM_STACK` 位，`MAP_GROWSDOWN`/
+    /// 主栈用 `GROWS_DOWN` 近似 `VM_STACK`。
+    pub fn data_vm_pages(&self) -> usize {
+        let set = self.vmas.lock();
+        set.iter()
+            .filter(|area| {
+                area.flags.has(VmFlags::WRITE)
+                    && !area.flags.has(VmFlags::SHARED)
+                    && !area.flags.has(VmFlags::GROWS_DOWN)
+            })
+            .map(Self::area_page_count)
+            .sum()
+    }
+
+    /// `range` 是否与任何 `SEALED`（mseal）区域相交。
+    ///
+    /// `mprotect`/`munmap`/`mremap`/`MAP_FIXED` 之外的修改性 `madvise` 也按
+    /// Linux `can_modify_mm` 语义拦截。
+    pub fn has_sealed_in(&self, range: &Range<usize>) -> bool {
+        Self::contains_sealed(&self.vmas.lock(), range)
+    }
+
+    /// `addr` 所在 VMA 是否计入 `RLIMIT_DATA`（Linux `is_data_mapping`）。
+    pub fn vma_is_data(&self, addr: usize) -> bool {
+        self.vmas.lock().find(addr).is_some_and(|area| {
+            area.flags.has(VmFlags::WRITE)
+                && !area.flags.has(VmFlags::SHARED)
+                && !area.flags.has(VmFlags::GROWS_DOWN)
+        })
+    }
+
+    /// `addr` 所在页当前是否驻留（resident ledger 中是否存在条目）。
+    ///
+    /// 不触发缺页、不修改页表；`move_pages` 用它与 `mincore` 同口径判断页是否
+    /// 存在（Linux `move_pages` 的 status 以页是否驻留为准，而非 VMA 是否可读）。
+    pub fn is_page_resident(&self, addr: usize) -> bool {
+        self.pages.lock().contains_key(page_base(addr))
+    }
+
     #[kernel_symbols::export(name = "general.mm.VmSpace.current_brk", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn current_brk(&self) -> usize {
         self.brk_current.load(Ordering::Acquire)
@@ -3951,12 +4022,8 @@ impl VmSpace {
         self.validate_range(&range)?;
         let page_size = page_size();
         let page_count = (range.end - range.start) / page_size;
-        {
-            let set = self.vmas.lock();
-            if !set.contains_range(&range) {
-                return Err(Errno::ENOMEM);
-            }
-        }
+        // Linux `mincore(2)` 逐页遍历页表：VMA 空洞（未映射页）在向量中置 0，
+        // 不要求范围被 VMA 连续覆盖，也不返回 ENOMEM/EFAULT。
         let pages = self.pages.lock();
         let mut out = Vec::new();
         out.try_reserve_exact(page_count)
@@ -4305,6 +4372,40 @@ impl VmSpace {
             }
         }
         (state.default_policy, false)
+    }
+
+    /// `set_mempolicy_home_node(2)`：为范围上已存在的 `MPOL_BIND`（或
+    /// `MPOL_PREFERRED`）区域策略设置 home node。
+    ///
+    /// Linux 语义：范围必须被带 `MPOL_BIND`/`MPOL_PREFERRED` 策略的 VMA 连续
+    /// 覆盖，否则返回 `EINVAL`；home node 必须属于该策略的节点集，否则 `EINVAL`。
+    /// 单节点系统 home node 只能为 0，因此这里主要校验"范围确实存在可设置
+    /// home node 的策略"，并记录该设置（供 `get_mempolicy` 观测）。
+    pub fn set_mempolicy_home_node(
+        &self,
+        range: Range<usize>,
+        home_node: u32,
+    ) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        let mut state = self.mempolicy.lock();
+        let mut cursor = range.start;
+        for ((start, end), policy) in state.ranges.iter_mut() {
+            if *end <= range.start || *start >= range.end {
+                continue;
+            }
+            if *start > cursor {
+                return Err(Errno::EINVAL);
+            }
+            if !matches!(policy.mode, 2 /* MPOL_BIND */ | 1 /* MPOL_PREFERRED */) {
+                return Err(Errno::EINVAL);
+            }
+            policy.home_node = home_node;
+            cursor = cursor.max(*end);
+            if cursor >= range.end {
+                return Ok(());
+            }
+        }
+        Err(Errno::EINVAL)
     }
 
     /// 确保远程地址空间（其它进程的 `VmSpace`）的 `addr` 页可访问。
@@ -5024,8 +5125,7 @@ impl VmSpace {
         let Some(area) = area else {
             drop(set);
             let mut set = self.vmas.lock();
-            let Some((_added, flags)) = set.grow_down_to(page, vm_layout().max_grows_down_bytes)
-            else {
+            let Some((_added, flags)) = set.grow_down_to(page, stack_growth_limit()) else {
                 return FaultOutcome::Segv;
             };
             let grown_area = set

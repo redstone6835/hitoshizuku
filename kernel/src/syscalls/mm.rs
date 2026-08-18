@@ -129,7 +129,18 @@ pub(super) fn sys_brk(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let Some(vm) = task_vm(ctx) else {
         return Err(Errno::ENOMEM);
     };
-    Ok(vm.set_brk(ctx.args[0]))
+    let requested = ctx.args[0];
+    // brk 增长按 `RLIMIT_AS`/`RLIMIT_DATA` 强制（Linux `check_data_rlimit`）。
+    if requested != 0 {
+        let old = vm.current_brk();
+        if requested > old {
+            let page_size = hal::memory::page_size();
+            let grow = (requested - old).div_ceil(page_size);
+            check_as_limit(ctx, grow)?;
+            check_data_limit(ctx, grow)?;
+        }
+    }
+    Ok(vm.set_brk(requested))
 }
 
 pub(super) fn sys_mmap(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -195,6 +206,14 @@ pub(super) fn sys_mmap(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 
     if (fixed || fixed_noreplace) && req_addr % page_size != 0 {
         return Err(Errno::EINVAL);
+    }
+
+    // RLIMIT_AS / RLIMIT_DATA 强制（Linux `may_expand_vm` + `check_data_rlimit`）。
+    let additional_pages = len / page_size;
+    check_as_limit(ctx, additional_pages)?;
+    let is_data = (prot & PROT_WRITE) != 0 && is_private && (flags & MAP_GROWSDOWN) == 0;
+    if is_data {
+        check_data_limit(ctx, additional_pages)?;
     }
 
     let result = if fixed || fixed_noreplace {
@@ -350,6 +369,21 @@ fn apply_madvise(
     let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
     let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
     let range = addr..end;
+    // mseal 语义：密封区域禁止"修改映射内容/驻留"的 madvise（Linux
+    // `can_do_madvise`），命中任何密封区域即返回 EPERM。
+    if matches!(
+        advice,
+        MADV_DONTNEED
+            | MADV_DONTNEED_LOCKED
+            | MADV_FREE
+            | MADV_PAGEOUT
+            | MADV_REMOVE
+            | MADV_POPULATE_READ
+            | MADV_POPULATE_WRITE
+    ) && vm.has_sealed_in(&range)
+    {
+        return Err(Errno::EPERM);
+    }
     match advice {
         // 访问策略类：当前 VM 无策略状态，完成可见校验即可（同原有语义）。
         MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL => {
@@ -431,6 +465,15 @@ pub(super) fn sys_mremap(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let old_len = align_up(old_size, page_size).ok_or(Errno::EINVAL)?;
     let new_len = align_up(new_size, page_size).ok_or(Errno::EINVAL)?;
     let old_end = old_addr.checked_add(old_len).ok_or(Errno::EINVAL)?;
+    // 扩展时强制 RLIMIT_AS / RLIMIT_DATA（Linux 对 mremap 增长同样走
+    // `may_expand_vm` + `check_data_rlimit`）。
+    if new_len > old_len {
+        let grow = (new_len - old_len) / page_size;
+        check_as_limit(ctx, grow)?;
+        if vm.vma_is_data(old_addr) {
+            check_data_limit(ctx, grow)?;
+        }
+    }
     let fixed = if (flags & MREMAP_FIXED) != 0 {
         Some(new_addr)
     } else {
@@ -511,13 +554,18 @@ pub(super) fn sys_msync(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if (flags & !MS_SUPPORTED) != 0 || (flags & MS_ASYNC) != 0 && (flags & MS_SYNC) != 0 {
         return Err(Errno::EINVAL);
     }
+    // Linux 要求 flags 至少含 MS_ASYNC 或 MS_SYNC 之一（MS_INVALIDATE 可单独
+    // 搭配使用，但不能单独作为有效调用）。
+    if (flags & (MS_ASYNC | MS_SYNC)) == 0 {
+        return Err(Errno::EINVAL);
+    }
     if len == 0 {
         return Ok(0);
     }
     let range = page_aligned_range(addr, len)?;
-    if (flags & MS_ASYNC) == 0 {
-        vm.sync_range(range)?;
-    }
+    // MS_ASYNC 语义是"发起写回、不等待完成"。本内核无异步回写线程，脏
+    // MAP_SHARED 页的回写退化为同步执行（保证发起写回、而非完全无动作）。
+    vm.sync_range(range)?;
     Ok(0)
 }
 
@@ -579,12 +627,53 @@ fn check_memlock_limit(ctx: &SyscallContext<'_>, additional_pages: usize) -> Res
     Ok(())
 }
 
+/// `RLIMIT_AS` 检查：地址空间总几何页数（含 `MAP_NORESERVE`）加新增页不得
+/// 超过软上限，否则返回 `ENOMEM`（Linux `may_expand_vm` 语义）。
+///
+/// `MAP_FIXED` 覆盖已有映射时按完整长度保守检查，可能比 Linux 更严格（未做
+/// 净增长核算）；软上限为 `RLIM_INFINITY` 时不受限制。
+fn check_as_limit(ctx: &SyscallContext<'_>, additional_pages: usize) -> Result<(), Errno> {
+    let pair = get_rlimit(Resource::As).map_err(|_| Errno::ENOMEM)?;
+    if pair.soft.is_infinity() {
+        return Ok(());
+    }
+    let limit_pages = (pair.soft.0 / hal::memory::page_size() as u64) as usize;
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    if vm.total_vm_pages().saturating_add(additional_pages) > limit_pages {
+        return Err(Errno::ENOMEM);
+    }
+    Ok(())
+}
+
+/// `RLIMIT_DATA` 检查：私有可写非栈映射（Linux `is_data_mapping`）几何页数加
+/// 新增页不得超过软上限，否则返回 `ENOMEM`（Linux `check_data_rlimit` 语义）。
+fn check_data_limit(ctx: &SyscallContext<'_>, additional_pages: usize) -> Result<(), Errno> {
+    let pair = get_rlimit(Resource::Data).map_err(|_| Errno::ENOMEM)?;
+    if pair.soft.is_infinity() {
+        return Ok(());
+    }
+    let limit_pages = (pair.soft.0 / hal::memory::page_size() as u64) as usize;
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    if vm.data_vm_pages().saturating_add(additional_pages) > limit_pages {
+        return Err(Errno::ENOMEM);
+    }
+    Ok(())
+}
+
 pub(super) fn sys_mlock2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let flags = ctx.args[2];
     if (flags & !MLOCK_ONFAULT) != 0 {
         return Err(Errno::EINVAL);
     }
-    sys_mlock(ctx)
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    let Some(range) = rounded_page_range(ctx.args[0], ctx.args[1])? else {
+        return Ok(0);
+    };
+    check_memlock_limit(ctx, vm.would_lock_pages(&range))?;
+    // MLOCK_ONFAULT：只锁 VMA、不预读入物理页（缺页时才填充）；未置位时与
+    // mlock(2) 一致，先同步 fault-in 全部页再锁。
+    vm.mlock_range(range, (flags & MLOCK_ONFAULT) == 0)?;
+    Ok(0)
 }
 
 pub(super) fn sys_mincore(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -689,6 +778,7 @@ fn validate_mempolicy(mode: u32, mask: u64) -> Result<Option<Mempolicy>, Errno> 
                 Ok(Some(Mempolicy {
                     mode,
                     node_mask: mask,
+                    home_node: 0,
                 }))
             }
         }
@@ -699,6 +789,7 @@ fn validate_mempolicy(mode: u32, mask: u64) -> Result<Option<Mempolicy>, Errno> 
             Ok(Some(Mempolicy {
                 mode,
                 node_mask: mask,
+                home_node: 0,
             }))
         }
         _ => Err(Errno::EINVAL),
@@ -797,7 +888,11 @@ pub(super) fn sys_mbind(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
     // 单节点语义：所有页都在 node 0，STRICT/MOVE/MOVEALL 恒可满足；只登记
     // 区域策略（范围未映射时 mbind_range 返回 ENOMEM，与 Linux 一致）。
-    let policy = policy.unwrap_or(Mempolicy { mode, node_mask: 0 });
+    let policy = policy.unwrap_or(Mempolicy {
+        mode,
+        node_mask: 0,
+        home_node: 0,
+    });
     vm.mbind_range(addr..end, policy)?;
     Ok(0)
 }
@@ -842,8 +937,13 @@ pub(super) fn sys_move_pages(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
         return Err(Errno::EPERM);
     }
     let vm = target_vm(&target).ok_or(Errno::ENOMEM)?;
+    let page_size = hal::memory::page_size();
+    let mut not_migrated = 0usize;
     for index in 0..nr_pages {
         let page_user = read_user_usize(pages_user + index * 8)?;
+        if page_user % page_size != 0 {
+            return Err(Errno::EINVAL);
+        }
         if nodes_user != 0 {
             // 节点数组：单节点系统只接受 node 0。
             let mut raw = [0u8; 4];
@@ -853,17 +953,24 @@ pub(super) fn sys_move_pages(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
                 return Err(Errno::EINVAL);
             }
         }
+        // Linux `move_pages` 的 status 反映页迁移结果：页不存在 → -ENOENT；
+        // 存在且已在目标节点（单节点系统恒在 node 0）→ 0（无需迁移）。
+        // 本内核无 NUMA 迁移，以"页是否驻留"作为 status 判定。
+        let status: i32 = if vm.is_page_resident(page_user) {
+            0
+        } else {
+            -(Errno::ENOENT.as_i32_direct() as i32)
+        };
+        if status != 0 {
+            not_migrated += 1;
+        }
         if status_user != 0 {
-            let status: i32 = if vm.is_user_range_readable(page_user, 1) {
-                0
-            } else {
-                -(Errno::ENOENT.as_i32_direct() as i32)
-            };
             let raw = status.to_le_bytes();
             copy_to_user(status_user + index * 4, &raw).map_err(|e| e.as_errno())?;
         }
     }
-    Ok(0)
+    // 返回值 = 未能迁移（或不存在）的页数。
+    Ok(not_migrated)
 }
 
 pub(super) fn sys_set_mempolicy_home_node(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -882,6 +989,12 @@ pub(super) fn sys_set_mempolicy_home_node(ctx: &mut SyscallContext<'_>) -> Resul
     if home_node != 0 {
         return Err(Errno::EINVAL);
     }
+    let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+    let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    // 范围必须被 `MPOL_BIND`/`MPOL_PREFERRED` 区域策略覆盖（Linux 语义），
+    // 否则 EINVAL；成功时记录 home node 供 `get_mempolicy` 观测。
+    vm.set_mempolicy_home_node(addr..end, home_node as u32)?;
     Ok(0)
 }
 
@@ -1119,14 +1232,25 @@ pub(super) fn sys_process_madvise(ctx: &mut SyscallContext<'_>) -> Result<usize,
         return Err(Errno::EPERM);
     }
     let vm = target_vm(&leader).ok_or(Errno::ENOMEM)?;
+    // Linux 语义：返回已成功建议的字节数；某个 iovec 失败时返回此前累计的
+    // 字节数，仅当尚未处理任何字节时才返回该错误。
+    let mut total = 0usize;
     for index in 0..vlen {
         let (base, len) = read_iovec(iov, index)?;
         if len == 0 {
             continue;
         }
-        apply_madvise(&vm, base, len, advice, ctx)?;
+        match apply_madvise(&vm, base, len, advice, ctx) {
+            Ok(()) => total = total.saturating_add(len),
+            Err(err) => {
+                if total != 0 {
+                    return Ok(total);
+                }
+                return Err(err);
+            }
+        }
     }
-    Ok(0)
+    Ok(total)
 }
 
 // ── cachestat ────────────────────────────────────────────────────────────────
