@@ -413,11 +413,17 @@ impl NetlinkSocketFileOps {
         if buf.len() < 16 {
             return Err(VfsError::InvalidArgument);
         }
+        // nlmsghdr.nlmsg_len（u32）必须完整包含 16 字节头且不越出输入缓冲，
+        // 并按该长度界定消息体，避免把缓冲区尾部无关字节当作 payload 处理。
+        let msg_len = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
+        if msg_len < 16 || msg_len > buf.len() {
+            return Err(VfsError::InvalidArgument);
+        }
         let msg_type = u16::from_ne_bytes([buf[4], buf[5]]);
         let flags = u16::from_ne_bytes([buf[6], buf[7]]);
         let seq = u32::from_ne_bytes([buf[8], buf[9], buf[10], buf[11]]);
         let local_pid = self.local_pid.load(Ordering::Acquire);
-        let responses = dispatch_message(msg_type, flags, seq, local_pid, &buf[16..]);
+        let responses = dispatch_message(msg_type, flags, seq, local_pid, &buf[16..msg_len]);
         let mut combined = Vec::new();
         for response in responses {
             combined.extend_from_slice(&response);
@@ -1235,6 +1241,19 @@ mod tests {
             u16::from_ne_bytes(responses[0][4..6].try_into().unwrap()),
             NLMSG_DONE
         );
+    }
+
+    #[test]
+    fn dispatch_rejects_malformed_nlmsg_len() {
+        let ops = NetlinkSocketFileOps::new(0, false);
+        // nlmsg_len 小于 16 字节头。
+        let mut too_short = [0u8; 16];
+        too_short[0..4].copy_from_slice(&4u32.to_ne_bytes());
+        assert_eq!(ops.dispatch(&too_short), Err(VfsError::InvalidArgument));
+        // nlmsg_len 超出输入缓冲。
+        let mut too_long = [0u8; 16];
+        too_long[0..4].copy_from_slice(&100u32.to_ne_bytes());
+        assert_eq!(ops.dispatch(&too_long), Err(VfsError::InvalidArgument));
     }
 
     #[test]
