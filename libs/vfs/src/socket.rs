@@ -1266,6 +1266,13 @@ fn recv_inner(
 pub fn getsockopt(fdt: &FdTable, fd: Fd, level: i32, optname: i32) -> Result<Vec<u8>, Errno> {
     let file = file_from_fd(fdt, fd)?;
 
+    // AF_PACKET socket
+    if let Some(packet_ops) = file.downcast_ops::<crate::packet_socket::PacketSocketFileOps>() {
+        if level != crate::packet_socket::SOL_PACKET {
+            return Err(Errno::ENOPROTOOPT);
+        }
+        return packet_ops.packet_getsockopt(optname);
+    }
     // AF_NETLINK socket
     if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
         return crate::netlink_socket::netlink_getsockopt(nl_ops, level, optname);
@@ -1327,6 +1334,13 @@ pub fn setsockopt(
 ) -> Result<(), Errno> {
     let file = file_from_fd(fdt, fd)?;
 
+    // AF_PACKET socket
+    if let Some(packet_ops) = file.downcast_ops::<crate::packet_socket::PacketSocketFileOps>() {
+        if level != crate::packet_socket::SOL_PACKET {
+            return Err(Errno::ENOPROTOOPT);
+        }
+        return packet_ops.packet_setsockopt(optname, value);
+    }
     if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
         return crate::netlink_socket::netlink_setsockopt(nl_ops, level, optname, value);
     }

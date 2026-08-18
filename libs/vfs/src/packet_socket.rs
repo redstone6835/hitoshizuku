@@ -64,7 +64,7 @@ const PACKET_FANOUT_RNG: u32 = 3;
 const PACKET_FANOUT_ROLLOVER: u32 = 4;
 const PACKET_FANOUT_FLAG_DEFRAG: u32 = 0x8000;
 
-const SOL_PACKET: i32 = 263;
+pub const SOL_PACKET: i32 = 263;
 
 // ── 发送回调（内核 net_runtime 安装）────────────────────────────────────────
 
