@@ -96,6 +96,8 @@ pub enum MqNotifyKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MqNotification {
     pub kind: MqNotifyKind,
+    /// 注册者 pid（通知投递目标：`SIGEV_SIGNAL` 投递信号、`SIGEV_THREAD` 克隆线程）。
+    pub notify_pid: i32,
     /// 触发时 `siginfo.si_pid`（Linux 语义为发送消息的进程）。
     pub sender_pid: i32,
     /// 触发时 `siginfo.si_uid`。
@@ -241,6 +243,7 @@ impl MqObject {
         priority: u32,
         data: &[u8],
         sender_pid: i32,
+        sender_uid: u32,
         nonblock: bool,
     ) -> Result<(bool, Option<MqNotification>), Errno> {
         Self::validate_priority(priority)?;
@@ -266,7 +269,16 @@ impl MqObject {
                 data: data.to_vec(),
             });
         inner.curmsgs += 1;
-        let notify = if was_empty { inner.notify.take() } else { None };
+        // Linux：通知的 si_pid/si_uid 是触发该通知的消息发送者身份。
+        let notify = if was_empty {
+            inner.notify.take().map(|mut notification| {
+                notification.sender_pid = sender_pid;
+                notification.sender_uid = sender_uid;
+                notification
+            })
+        } else {
+            None
+        };
         drop(inner);
         self.receivers.wake_all();
         self.notify_state_changed();
@@ -306,8 +318,7 @@ impl MqObject {
     pub fn register_notify(
         &self,
         kind: MqNotifyKind,
-        sender_pid: i32,
-        sender_uid: u32,
+        notify_pid: i32,
     ) -> Result<(), Errno> {
         if kind == MqNotifyKind::None {
             // SIGEV_NONE：清除注册（Linux 语义）。
@@ -319,14 +330,15 @@ impl MqObject {
             return Err(Errno::EINVAL);
         }
         if let Some(existing) = inner.notify.as_ref() {
-            if existing.sender_pid != sender_pid {
+            if existing.notify_pid != notify_pid {
                 return Err(Errno::EBUSY);
             }
         }
         inner.notify = Some(MqNotification {
             kind,
-            sender_pid,
-            sender_uid,
+            notify_pid,
+            sender_pid: 0,
+            sender_uid: 0,
         });
         Ok(())
     }

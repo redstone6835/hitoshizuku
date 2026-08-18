@@ -143,7 +143,7 @@ impl FileOps for MqFileOps {
         let (sent, notify) = self
             .shared
             .queue
-            .try_send(0, buf, 0, true)
+            .try_send(0, buf, 0, 0, true)
             .map_err(errno_to_vfs)?;
         if !sent {
             return Err(VfsError::WouldBlock);
