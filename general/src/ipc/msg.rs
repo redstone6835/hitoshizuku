@@ -107,7 +107,8 @@ enum SearchMode {
     Any,
     /// `msgtyp > 0`：第一条类型等于 `msgtyp` 的消息。
     Number(i64),
-    /// `msgtyp < 0`：第一条类型小于等于 `|msgtyp|` 的消息。
+    /// `msgtyp < 0`：类型小于等于 `|msgtyp|` 的消息中 `mtype` 最小的一条
+    /// （Linux `SEARCH_LESSEQUAL` 语义；同类型取入队最早的一条）。
     LessEqual(i64),
     /// `MSG_EXCEPT`：第一条类型不等于 `msgtyp` 的消息。
     NotEqual(i64),
@@ -243,7 +244,11 @@ impl MsgQueue {
         check_operation_permissions(cred, &inner.perm, Access::Send)?;
 
         let added = data.len();
-        if inner.bytes.checked_add(added).map_or(true, |b| b > inner.qbytes) {
+        if inner
+            .bytes
+            .checked_add(added)
+            .map_or(true, |b| b > inner.qbytes)
+        {
             if flags & IPC_NOWAIT != 0 {
                 return Err(Errno::EAGAIN);
             }
@@ -283,9 +288,7 @@ impl MsgQueue {
             if flags & MSG_EXCEPT != 0 || flags & IPC_NOWAIT == 0 {
                 return Err(Errno::EINVAL);
             }
-            if !cred.has_cap(Capability::CheckpointRestore)
-                && !cred.has_cap(Capability::SysAdmin)
-            {
+            if !cred.has_cap(Capability::CheckpointRestore) && !cred.has_cap(Capability::SysAdmin) {
                 return Err(Errno::EPERM);
             }
         }
@@ -319,6 +322,17 @@ impl MsgQueue {
             } else {
                 Some(index)
             }
+        } else if let SearchMode::LessEqual(bound) = mode {
+            // Linux `SEARCH_LESSEQUAL`：不是取第一条 `mtype <= bound`，而是取
+            // `mtype <= bound` 的消息里 `mtype` 最小的一条（`min_by_key` 在并列
+            // 时返回入队最早者，与 Linux `find_msg` 的扫描行为一致）。
+            inner
+                .messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message.mtype <= bound)
+                .min_by_key(|(_, message)| message.mtype)
+                .map(|(index, _)| index)
         } else {
             inner
                 .messages
@@ -497,12 +511,7 @@ impl MsgManager {
 
     /// `msgget`：`IPC_PRIVATE` 总是创建；普通 key 按 `IPC_CREAT/IPC_EXCL`
     /// 查找或创建。存在 key 时按请求 mode 校验权限。
-    pub fn msgget(
-        &self,
-        key: MsgKey,
-        flags: u32,
-        cred: &Credentials,
-    ) -> Result<MsgId, Errno> {
+    pub fn msgget(&self, key: MsgKey, flags: u32, cred: &Credentials) -> Result<MsgId, Errno> {
         let mut state = self.state.lock();
         if key != MsgKey::PRIVATE {
             if let Some(id) = state.by_key.get(&key).copied() {
@@ -650,11 +659,7 @@ fn check_operation_permissions(
         Access::Receive => cred.can_read(perm.uid, perm.gid, perm.mode),
         Access::Send => cred.can_write(perm.uid, perm.gid, perm.mode),
     };
-    if allowed {
-        Ok(())
-    } else {
-        Err(Errno::EACCES)
-    }
+    if allowed { Ok(()) } else { Err(Errno::EACCES) }
 }
 
 fn check_control_owner(cred: &Credentials, perm: &MsgPerm) -> Result<(), Errno> {
@@ -732,6 +737,30 @@ mod tests {
     }
 
     #[ktest]
+    fn msgrcv_negative_type_returns_minimum_type() {
+        let manager = MsgManager::new();
+        let cred = Credentials::root();
+        let id = manager
+            .msgget(MsgKey::PRIVATE, IPC_CREAT | 0o700, &cred)
+            .expect("创建队列");
+        let queue = manager.queue_for_operation(id).expect("查找队列");
+
+        // 大 type 排在小 type 之前：msgtyp=-2 必须返回 type=1（最小），
+        // 而非按入队顺序命中的第一条 type=3。
+        send(&manager, id, 3, b"big", 0);
+        send(&manager, id, 1, b"small", 0);
+        let got = recv(&queue, -2, 16, 0, &cred, 2, 0);
+        assert_eq!((got.mtype, got.data.as_slice()), (1, b"small".as_slice()));
+
+        // 并列最小 type 取入队最早者。
+        send(&manager, id, 2, b"first-two", 0);
+        send(&manager, id, 2, b"second-two", 0);
+        send(&manager, id, 1, b"one", 0);
+        let got = recv(&queue, -2, 16, 0, &cred, 2, 0);
+        assert_eq!((got.mtype, got.data.as_slice()), (1, b"one".as_slice()));
+    }
+
+    #[ktest]
     fn msg_copy_noerror_and_e2big() {
         let manager = MsgManager::new();
         let cred = Credentials::root();
@@ -742,10 +771,7 @@ mod tests {
         send(&manager, id, 1, b"0123456789", 0);
 
         // 无 MSG_NOERROR 且缓冲区太短 → E2BIG，消息保留。
-        assert_eq!(
-            queue.try_receive(0, 4, 0, &cred, 2, 0),
-            Err(Errno::E2BIG)
-        );
+        assert_eq!(queue.try_receive(0, 4, 0, &cred, 2, 0), Err(Errno::E2BIG));
         let got = recv(&queue, 0, 4, MSG_NOERROR, &cred, 2, 0);
         assert_eq!(got.data, b"0123");
         assert_eq!(got.full_size, 10);
@@ -835,5 +861,35 @@ mod tests {
             queue.try_send(1, &oversized, 0, &root, 1, 0),
             Err(Errno::EINVAL)
         );
+    }
+}
+
+/// 宿主测试（`cargo test -p general --target x86_64-unknown-linux-gnu`）。
+#[cfg(test)]
+mod host_tests {
+    use super::super::shm::IPC_CREAT;
+    use super::{MsgKey, MsgManager, MsgRecvOutcome};
+    use vfs::cred::Credentials;
+
+    #[test]
+    fn msgrcv_negative_type_returns_minimum_type() {
+        let manager = MsgManager::new();
+        let cred = Credentials::root();
+        let id = manager
+            .msgget(MsgKey::PRIVATE, IPC_CREAT | 0o700, &cred)
+            .expect("创建队列");
+        let queue = manager.queue_for_operation(id).expect("查找队列");
+
+        // 大 type 排在小 type 之前：msgtyp=-2 必须返回 type=1（最小），
+        // 而非按入队顺序命中的第一条 type=3。
+        queue.try_send(3, b"big", 0, &cred, 1, 0).expect("发送");
+        queue.try_send(1, b"small", 0, &cred, 1, 0).expect("发送");
+        match queue.try_receive(-2, 16, 0, &cred, 2, 0).expect("接收") {
+            MsgRecvOutcome::Received(received) => {
+                assert_eq!(received.mtype, 1);
+                assert_eq!(received.data, b"small");
+            }
+            MsgRecvOutcome::WouldBlock => panic!("队列应有消息"),
+        }
     }
 }
