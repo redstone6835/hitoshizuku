@@ -1739,15 +1739,28 @@ pub fn ptrace_interrupt(pid: PidT) -> Result<(), Errno> {
 }
 
 /// `PTRACE_CONT`：恢复执行（清除 syscall-stop 与单步状态）。
+///
+/// `sig == Some(n)` 时按 tracer 指定信号投递（覆盖信号投递停里保存的那条）。
+/// `sig == None`（data == 0）时，本内核选择**重投**语义：把信号投递停里保存的
+/// siginfo 重新投回目标而不是丢弃（Linux 的 PTRACE_CONT(0) 会丢弃该信号），
+/// 避免 tracer 简单续跑时把原信号弄丢。
 pub fn ptrace_cont(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
     let target = ptrace_target(pid)?;
     target.set_ptrace_syscall_stop(false);
     target.clear_singlestep();
     target.set_ptrace_stop_event(0);
-    target.clear_ptrace_last_siginfo();
+    let saved = target.take_ptrace_last_siginfo();
     let _ = continue_task(&target);
-    if let Some(sig) = sig {
-        tkill(pid, Some(sig))?;
+    match sig {
+        Some(sig) => {
+            tkill(pid, Some(sig))?;
+        }
+        None => {
+            if let Some(info) = saved {
+                target.signal.deliver(info);
+                signal_wakeup(&target, &info);
+            }
+        }
     }
     Ok(())
 }
@@ -2203,6 +2216,9 @@ pub fn consume_native_external_control_for_task(task: &Arc<Task>) -> NativeExter
 
     let _ = task.consume_pending_signal(|info| {
         if task.is_ptrace_traced() && info.sig != SignalNumber::SIGKILL {
+            // 保留完整 siginfo 供 PTRACE_GETSIGINFO 读取，并在 PTRACE_CONT(0)
+            // 时重投（见 `ptrace_cont`），避免信号投递停把信号整条丢弃。
+            task.set_ptrace_last_siginfo(info);
             let _ = mark_task_stopped(task, info.sig);
             return;
         }
@@ -2252,6 +2268,9 @@ pub fn deliver_pending_signals_for_task(
     }
     me.consume_pending_signal(|info| {
         if me.is_ptrace_traced() && info.sig != SignalNumber::SIGKILL {
+            // 保留完整 siginfo 供 PTRACE_GETSIGINFO 读取，并在 PTRACE_CONT(0)
+            // 时重投（见 `ptrace_cont`），避免信号投递停把信号整条丢弃。
+            me.set_ptrace_last_siginfo(info);
             let _ = mark_task_stopped(me, info.sig);
             return None;
         }
