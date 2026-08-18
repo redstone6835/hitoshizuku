@@ -2254,6 +2254,7 @@ enum ResidentPageKind {
     SharedFile {
         file: Arc<dyn FileLike>,
         offset: u64,
+        generation: u64,
     },
     Direct,
 }
@@ -2289,10 +2290,19 @@ impl ResidentPage {
         })
     }
 
-    fn new_shared_file(paddr: usize, file: Arc<dyn FileLike>, offset: u64) -> Arc<Self> {
+    fn new_shared_file(
+        paddr: usize,
+        file: Arc<dyn FileLike>,
+        offset: u64,
+        generation: u64,
+    ) -> Arc<Self> {
         Arc::new(Self {
             paddr,
-            kind: ResidentPageKind::SharedFile { file, offset },
+            kind: ResidentPageKind::SharedFile {
+                file,
+                offset,
+                generation,
+            },
             dirty: AtomicBool::new(false),
         })
     }
@@ -2345,7 +2355,7 @@ impl ResidentPage {
         if !self.dirty.load(Ordering::Acquire) {
             return Ok(());
         }
-        let ResidentPageKind::SharedFile { file, offset } = &self.kind else {
+        let ResidentPageKind::SharedFile { file, offset, .. } = &self.kind else {
             return Ok(());
         };
         let file_size = file.size();
@@ -2377,10 +2387,14 @@ impl ResidentPage {
 impl Drop for ResidentPage {
     fn drop(&mut self) {
         match &self.kind {
-            ResidentPageKind::SharedFile { file, offset } => {
+            ResidentPageKind::SharedFile {
+                file,
+                offset,
+                generation,
+            } => {
                 remove_cached_file_page(
                     &SHARED_FILE_PAGES,
-                    FilePageKey::new(file, *offset, 0),
+                    FilePageKey::new(file, *offset, *generation),
                     self,
                 );
             }
@@ -3672,6 +3686,9 @@ impl VmSpace {
     /// MAP_FIXED 原子操作：在同一把 VMA 锁内先 unmap 再 insert，消除竞态窗口。
     pub fn map_fixed_anon(&self, range: Range<usize>, flags: VmFlags) -> Result<(), Errno> {
         self.validate_range(&range)?;
+        if range.end > vm_layout().user_mmap_limit {
+            return Err(Errno::ENOMEM);
+        }
         let flags = self.with_future_mlock(flags);
         let backing = if flags.has(VmFlags::SHARED) {
             VmBacking::SharedAnon {
@@ -3730,6 +3747,9 @@ impl VmSpace {
         flags: VmFlags,
     ) -> Result<(), Errno> {
         self.validate_range(&range)?;
+        if range.end > vm_layout().user_mmap_limit {
+            return Err(Errno::ENOMEM);
+        }
         let flags = self.with_future_mlock(flags);
         let shared_writable = flags.contains_all(VmFlags::SHARED | VmFlags::WRITE);
         let mapped_file = Arc::clone(&file);
@@ -3902,6 +3922,12 @@ impl VmSpace {
         }
         let old_len = old_range.end - old_range.start;
         if new_len <= old_len {
+            {
+                let vmas = self.vmas.lock();
+                if !vmas.contains_range(&old_range) {
+                    return Err(Errno::EFAULT);
+                }
+            }
             if new_len < old_len {
                 self.unmap(old_range.start + new_len..old_range.end)?;
             }
@@ -3945,7 +3971,7 @@ impl VmSpace {
         let (removed_target, mapped_tail, removed_pages, moved_pages) = {
             let mut vmas = self.vmas.lock();
             if !vmas.contains_range(&old_range) {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
             if Self::contains_sealed(&vmas, &new_range) {
                 return Err(Errno::EPERM);
@@ -3961,7 +3987,7 @@ impl VmSpace {
             let old_pieces = vmas.unmap_range(&old_range);
             let old_covered = covered_len(&old_pieces, &old_range);
             if old_covered != old_len {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
 
             let mut cursor = new_range.start;
@@ -4043,7 +4069,7 @@ impl VmSpace {
         {
             let set = self.vmas.lock();
             if !set.contains_range(&old_range) {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
             for area in set.iter_overlap(&old_range) {
                 if !matches!(area.backing, VmBacking::Anon { .. })
@@ -4071,7 +4097,7 @@ impl VmSpace {
         let (removed_target, empty_anon, tail, moved_pages) = {
             let mut vmas = self.vmas.lock();
             if !vmas.contains_range(&old_range) {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
             if Self::contains_sealed(&vmas, &new_range) {
                 return Err(Errno::EPERM);
@@ -4087,7 +4113,7 @@ impl VmSpace {
             let old_pieces = vmas.unmap_range(&old_range);
             let old_covered = covered_len(&old_pieces, &old_range);
             if old_covered != old_len {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
 
             // 1) 旧地址:插入空匿名 VMA(保留原权限/标志,换用全新合并域)。
@@ -4691,7 +4717,12 @@ impl VmSpace {
             }
             // 锁内换页：页仍驻留才替换，否则丢弃新页。
             let new_page = if flags.has(VmFlags::SHARED) {
-                ResidentPage::new_shared_file(new_paddr, Arc::clone(&file), file_off)
+                ResidentPage::new_shared_file(
+                    new_paddr,
+                    Arc::clone(&file),
+                    file_off,
+                    shared_file_page_generation(&file),
+                )
             } else {
                 ResidentPage::new_private_file(new_paddr)
             };
@@ -5341,6 +5372,12 @@ impl VmSpace {
     /// [`Self::would_lock_pages`] 完成，这里只负责状态与记账。
     pub fn mlock_range(&self, range: Range<usize>, populate: bool) -> Result<(), Errno> {
         self.validate_range(&range)?;
+        {
+            let set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(Errno::ENOMEM);
+            }
+        }
         if populate {
             self.prefault_user_range(range.clone(), true)
                 .map_err(|_| Errno::EAGAIN)?;
@@ -7241,7 +7278,7 @@ impl VmSpace {
         let mapped_tail = {
             let mut vmas = self.vmas.lock();
             if !vmas.contains_range(old_range) {
-                return Err(Errno::ENOMEM);
+                return Err(Errno::EFAULT);
             }
             if !vmas.is_range_free(tail_range) {
                 return Ok(false);
@@ -7413,13 +7450,23 @@ fn pte_flags_for(flags: VmFlags, access: PageAccess) -> VmFlags {
     }
 }
 
+/// 读取文件当前的共享页缓存代际；实现未提供信号时退化为 `0`，与既有行为一致。
+///
+/// 该函数是共享页缓存代际感知的唯一切入点：加载、查找、发布、删除共享页时都使用
+/// 同一代际，保证旧代际的驻留页在新代际下不再命中，同时 `Drop` 仍能按其加载时
+/// 的代际正确从缓存移除。
+fn shared_file_page_generation(file: &Arc<dyn FileLike>) -> u64 {
+    file.shared_page_cache_generation().unwrap_or(0)
+}
+
 fn shared_file_page(file: Arc<dyn FileLike>, file_off: u64) -> Result<Arc<ResidentPage>, Errno> {
-    let key = FilePageKey::new(&file, file_off, 0);
+    let generation = shared_file_page_generation(&file);
+    let key = FilePageKey::new(&file, file_off, generation);
     if let Some(page) = find_cached_file_page(&SHARED_FILE_PAGES, key) {
         return Ok(page);
     }
     let paddr = load_file_page(&*file, file_off)?;
-    let page = ResidentPage::new_shared_file(paddr, Arc::clone(&file), file_off);
+    let page = ResidentPage::new_shared_file(paddr, Arc::clone(&file), file_off, generation);
     Ok(publish_cached_file_page(&SHARED_FILE_PAGES, key, page))
 }
 
@@ -8264,7 +8311,7 @@ mod tests {
     use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use super::{
         ANON_STORE_FAULT_AROUND_PAGES, ANON_STORE_SHADOW_PAGES, AnonStoreFaultAround,
@@ -8274,12 +8321,13 @@ mod tests {
         PrivateFilePageBatch, PrivateFilePageCacheClaim, PrivateFilePageCacheEntry,
         PrivateFilePageLoadOwners, ResidentPage, ShardedPrivateFilePageCache, VmFlags, VmSpace,
         WeakFilePageCache, access_for_private_file, anon_store_fault_around_end, fault_from_errno,
-        file_fault_around_window, find_cached_private_file_page, map_fork_child_batches,
-        observe_anon_store_shadow, permits_file_fault_around, plan_file_segment,
-        private_file_batch_error_is_fatal, private_file_batch_page_offset, private_file_batch_plan,
-        private_file_cache_snapshot, publish_cached_file_page, publish_cached_private_file_page,
-        read_file_bytes_exact, read_file_page_exact, rollback_private_file_page_batch,
-        same_backing_snapshot, unmapped_prefix_len, user_page_allocation_handle,
+        file_fault_around_window, find_cached_file_page, find_cached_private_file_page,
+        map_fork_child_batches, observe_anon_store_shadow, permits_file_fault_around,
+        plan_file_segment, private_file_batch_error_is_fatal, private_file_batch_page_offset,
+        private_file_batch_plan, private_file_cache_snapshot, publish_cached_file_page,
+        publish_cached_private_file_page, read_file_bytes_exact, read_file_page_exact,
+        remove_cached_file_page, rollback_private_file_page_batch, same_backing_snapshot,
+        shared_file_page_generation, unmapped_prefix_len, user_page_allocation_handle,
     };
     use errno::Errno;
     use mm::{FileLike, VmBacking};
@@ -8479,6 +8527,86 @@ mod tests {
         fn size(&self) -> u64 {
             self.bytes.len() as u64
         }
+    }
+
+    struct SharedGenFile {
+        generation: AtomicU64,
+        provide: bool,
+    }
+
+    impl FileLike for SharedGenFile {
+        fn cache_key(&self) -> usize {
+            self as *const Self as usize
+        }
+
+        fn shared_page_cache_generation(&self) -> Option<u64> {
+            self.provide
+                .then(|| self.generation.load(Ordering::Acquire))
+        }
+
+        fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, Errno> {
+            Err(Errno::EIO)
+        }
+
+        fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, Errno> {
+            Err(Errno::EIO)
+        }
+
+        fn sync(&self) -> Result<(), Errno> {
+            Ok(())
+        }
+
+        fn size(&self) -> u64 {
+            PAGE_SIZE as u64
+        }
+    }
+
+    #[test]
+    fn shared_file_page_generation_defaults_to_zero_when_signal_absent() {
+        let file: Arc<dyn FileLike> = Arc::new(SharedGenFile {
+            generation: AtomicU64::new(0),
+            provide: false,
+        });
+        assert_eq!(shared_file_page_generation(&file), 0);
+    }
+
+    #[test]
+    fn shared_file_page_generation_uses_provided_value() {
+        let file: Arc<dyn FileLike> = Arc::new(SharedGenFile {
+            generation: AtomicU64::new(7),
+            provide: true,
+        });
+        assert_eq!(shared_file_page_generation(&file), 7);
+    }
+
+    #[test]
+    fn shared_file_page_cache_misses_after_generation_change() {
+        let cache: WeakFilePageCache = Spinlock::new(BTreeMap::new());
+        let implementation = Arc::new(SharedGenFile {
+            generation: AtomicU64::new(0),
+            provide: true,
+        });
+        let file: Arc<dyn FileLike> = implementation.clone();
+        let file_off = 0x1000u64;
+
+        // 代际 0：发布并命中。
+        let old_gen = shared_file_page_generation(&file);
+        let old_key = FilePageKey::new(&file, file_off, old_gen);
+        let page = ResidentPage::new_direct(0x5000);
+        publish_cached_file_page(&cache, old_key, Arc::clone(&page));
+        assert!(find_cached_file_page(&cache, old_key).is_some());
+
+        // 内容变更前推进代际：旧代际条目仍驻留（等待 Drop 回收），但新代际键不再命中。
+        implementation.generation.store(1, Ordering::Release);
+        let new_gen = shared_file_page_generation(&file);
+        assert_ne!(new_gen, old_gen);
+        let new_key = FilePageKey::new(&file, file_off, new_gen);
+        assert!(find_cached_file_page(&cache, new_key).is_none());
+
+        // 旧条目仍能按其加载时代际精确删除。
+        remove_cached_file_page(&cache, old_key, &page);
+        assert!(find_cached_file_page(&cache, old_key).is_none());
+        assert_eq!(cache.lock().len(), 0);
     }
 
     #[test]

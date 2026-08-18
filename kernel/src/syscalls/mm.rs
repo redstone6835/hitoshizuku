@@ -204,6 +204,11 @@ pub(super) fn sys_mmap(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fixed_noreplace = (flags & MAP_FIXED_NOREPLACE) != 0;
     let anonymous = (flags & MAP_ANONYMOUS) != 0;
 
+    if !anonymous {
+        // Linux file_mmap_ok：文件映射 offset+len 回绕 → EOVERFLOW。
+        offset.checked_add(len as u64).ok_or(Errno::EOVERFLOW)?;
+    }
+
     if (fixed || fixed_noreplace) && req_addr % page_size != 0 {
         return Err(Errno::EINVAL);
     }
@@ -359,8 +364,11 @@ pub(super) fn sys_mprotect(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let page_size = hal::memory::page_size();
     let len = align_up(ctx.args[1], page_size).ok_or(Errno::EINVAL)?;
     let prot = ctx.args[2];
-    if addr % page_size != 0 || len == 0 {
+    if addr % page_size != 0 {
         return Err(Errno::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
     }
     let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
     vm.mprotect(addr..end, prot_to_vm_flags(prot).with(VmFlags::USER))?;
@@ -623,6 +631,8 @@ pub(super) fn sys_mlockall(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     if (flags & MCL_ONFAULT) != 0 && (flags & (MCL_CURRENT | MCL_FUTURE)) == 0 {
         return Err(Errno::EINVAL);
     }
+    // Linux `mlockall` 即使只带 `MCL_FUTURE` 也要求 can_do_mlock 通过，否则 EPERM。
+    check_can_do_mlock(ctx)?;
     if (flags & MCL_CURRENT) != 0 {
         check_memlock_limit(ctx, vm.would_lock_all_pages())?;
         vm.mlock_all_current((flags & MCL_ONFAULT) == 0)?;
@@ -639,12 +649,23 @@ pub(super) fn sys_munlockall(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     Ok(0)
 }
 
-/// `RLIMIT_MEMLOCK` 检查：超出软上限时返回 `ENOMEM`（Linux 语义）；持有
-/// `CAP_IPC_LOCK` 的进程不受限制。
-fn check_memlock_limit(ctx: &SyscallContext<'_>, additional_pages: usize) -> Result<(), Errno> {
+/// Linux `can_do_mlock`：无 `CAP_IPC_LOCK` 且 `RLIMIT_MEMLOCK == 0` 时返回
+/// `EPERM`；持有能力或软上限非零时通过。
+fn check_can_do_mlock(ctx: &SyscallContext<'_>) -> Result<(), Errno> {
     if ctx.task().credentials().has_cap(sched::Capability::IpcLock) {
         return Ok(());
     }
+    let pair = get_rlimit(Resource::Memlock).map_err(|_| Errno::ENOMEM)?;
+    if pair.soft.0 == 0 {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
+}
+
+/// `RLIMIT_MEMLOCK` 检查：超出软上限时返回 `ENOMEM`（Linux 语义）；持有
+/// `CAP_IPC_LOCK` 的进程不受限制。
+fn check_memlock_limit(ctx: &SyscallContext<'_>, additional_pages: usize) -> Result<(), Errno> {
+    check_can_do_mlock(ctx)?;
     let pair = get_rlimit(Resource::Memlock).map_err(|_| Errno::ENOMEM)?;
     let limit_pages = (pair.soft.0 / hal::memory::page_size() as u64) as usize;
     let locked = task_vm(ctx).map(|vm| vm.locked_pages()).unwrap_or(0);
