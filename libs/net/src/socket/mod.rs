@@ -246,6 +246,18 @@ pub struct MulticastMembership {
     pub interface: Option<InterfaceId>,
 }
 
+/// 单次数据报发送的逐包覆盖项（sendmsg cmsg / sockaddr scope_id 语义）。
+///
+/// Linux 允许 sendmsg 通过 IP_PKTINFO / IP_TTL / IPV6_PKTINFO 等辅助数据逐包指定
+/// 源地址、出接口与 TTL；`scope_id` 也在此统一为出接口覆盖。None 表示沿用 socket
+/// 级设置（setsockopt 或 bind 的结果）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DatagramSendOptions {
+    pub hop_limit: Option<u8>,
+    pub interface: Option<InterfaceId>,
+    pub source: Option<IpAddr>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SocketErrorOrigin {
     Local,
@@ -365,9 +377,9 @@ pub fn new_raw_socket_facade(
     family: AddressFamily,
     protocol: u8,
 ) -> Result<Arc<SocketFacade>, SocketError> {
-    if protocol == 0 {
-        return Err(SocketError::InvalidState);
-    }
+    // protocol == 0（IPPROTO_IP / IPPROTO_IPV6）是合法的「全协议」原始套接字：
+    // 接收方向不过滤 IP 协议号（tcpdump 式抓包），发送方向把 0 写入 IP 头协议字段
+    // （Linux 建议改用 IP_HDRINCL 明确指定，此处保持最小语义）。
     let boot = crate::stack::boot_config().ok_or(SocketError::RuntimeUnavailable)?;
     let boot_nonce = u64::from_le_bytes(boot.generation_nonce()[..8].try_into().unwrap());
     let counter = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
@@ -1476,6 +1488,9 @@ struct TxEntry {
     destination: Endpoint,
     dont_route: bool,
     confirm: bool,
+    hop_limit: Option<u8>,
+    interface: Option<InterfaceId>,
+    source: Option<IpAddr>,
     dma_payload: Option<PacketChain>,
 }
 
@@ -1555,6 +1570,7 @@ impl TxRing {
             destination,
             dont_route,
             confirm,
+            DatagramSendOptions::default(),
             &mut |offset, output| {
                 output.copy_from_slice(&payload[offset..offset + output.len()]);
                 Ok::<(), core::convert::Infallible>(())
@@ -1572,10 +1588,19 @@ impl TxRing {
         destination: Endpoint,
         dont_route: bool,
         confirm: bool,
+        send: DatagramSendOptions,
         copy: &mut impl FnMut(usize, &mut [u8]) -> Result<(), E>,
     ) -> Result<(), DatagramCopyError<E>> {
         if let Some(pool) = self.dma_pool.as_ref().cloned() {
-            return self.push_dma_from(payload_len, destination, dont_route, confirm, pool, copy);
+            return self.push_dma_from(
+                payload_len,
+                destination,
+                dont_route,
+                confirm,
+                send,
+                pool,
+                copy,
+            );
         }
         let chunk_count = payload_len.div_ceil(SOCKET_CHUNK_BYTES);
         if chunk_count > MAX_DATAGRAM_CHUNKS
@@ -1615,6 +1640,9 @@ impl TxRing {
             destination,
             dont_route,
             confirm,
+            hop_limit: send.hop_limit,
+            interface: send.interface,
+            source: send.source,
             dma_payload: None,
         });
         self.queued.push_back(slot);
@@ -1633,6 +1661,7 @@ impl TxRing {
         destination: Endpoint,
         dont_route: bool,
         confirm: bool,
+        send: DatagramSendOptions,
         pool: SharedNetBufPool,
         copy: &mut impl FnMut(usize, &mut [u8]) -> Result<(), E>,
     ) -> Result<(), DatagramCopyError<E>> {
@@ -1682,6 +1711,9 @@ impl TxRing {
             destination,
             dont_route,
             confirm,
+            hop_limit: send.hop_limit,
+            interface: send.interface,
+            source: send.source,
             dma_payload: Some(chain),
         });
         self.queued.push_back(slot);
@@ -1702,6 +1734,9 @@ impl TxRing {
             len: entry.len,
             dont_route: entry.dont_route,
             confirm: entry.confirm,
+            hop_limit: entry.hop_limit,
+            interface: entry.interface,
+            source: entry.source,
             completed: false,
         })
     }
@@ -2604,6 +2639,9 @@ pub struct UdpTxLease {
     pub len: u16,
     pub dont_route: bool,
     pub confirm: bool,
+    pub hop_limit: Option<u8>,
+    pub interface: Option<InterfaceId>,
+    pub source: Option<IpAddr>,
     completed: bool,
 }
 
@@ -3676,11 +3714,17 @@ impl SocketFacade {
         payload_len: usize,
         dont_route: bool,
         confirm: bool,
+        send: DatagramSendOptions,
     ) -> bool {
         let epoch_matches = route.epoch == local_datagram_route_epoch();
         #[cfg(test)]
         let epoch_matches = epoch_matches || route.epoch == u64::MAX;
+        // 逐包覆盖（TTL/接口/源地址）意味着本次发送不能复用 socket 级缓存路由，
+        // 否则覆盖项会被忽略或路由到错误的接口。
+        let no_overrides =
+            send.hop_limit.is_none() && send.interface.is_none() && send.source.is_none();
         epoch_matches
+            && no_overrides
             && local_transport_fast_path_eligible()
             && route.stack_generation == self.stack_generation()
             && route.sender_generation == self.generation()
@@ -3708,7 +3752,15 @@ impl SocketFacade {
         nonblocking: bool,
         deadline_ns: Option<u64>,
     ) -> Result<usize, SocketError> {
-        self.send_datagram(payload, destination, nonblocking, deadline_ns, false, false)
+        self.send_datagram(
+            payload,
+            destination,
+            nonblocking,
+            deadline_ns,
+            false,
+            false,
+            DatagramSendOptions::default(),
+        )
     }
 
     pub fn send_datagram(
@@ -3719,6 +3771,7 @@ impl SocketFacade {
         deadline_ns: Option<u64>,
         dont_route: bool,
         confirm: bool,
+        send: DatagramSendOptions,
     ) -> Result<usize, SocketError> {
         match self.send_datagram_from(
             payload.len(),
@@ -3727,6 +3780,7 @@ impl SocketFacade {
             deadline_ns,
             dont_route,
             confirm,
+            send,
             |offset, output| {
                 output.copy_from_slice(&payload[offset..offset + output.len()]);
                 Ok::<(), core::convert::Infallible>(())
@@ -3749,6 +3803,7 @@ impl SocketFacade {
         deadline_ns: Option<u64>,
         dont_route: bool,
         confirm: bool,
+        send: DatagramSendOptions,
         mut copy: impl FnMut(usize, &mut [u8]) -> Result<(), E>,
     ) -> Result<usize, DatagramCopyError<E>> {
         self.ensure_stack_attached()
@@ -3781,6 +3836,7 @@ impl SocketFacade {
                 payload_len,
                 dont_route,
                 confirm,
+                send,
             ) {
                 #[cfg(feature = "performance-profile")]
                 let direct_start = profiling::read_counter();
@@ -3843,7 +3899,14 @@ impl SocketFacade {
                 let mut tx_guard = self.tx.lock();
                 let tx = tx_guard.as_mut().expect("UDP facade 必须拥有 TX ring");
                 let was_empty = tx.is_empty();
-                match tx.push_from(payload_len, destination, dont_route, confirm, &mut copy) {
+                match tx.push_from(
+                    payload_len,
+                    destination,
+                    dont_route,
+                    confirm,
+                    send,
+                    &mut copy,
+                ) {
                     Ok(()) => Ok(was_empty),
                     Err(DatagramCopyError::Socket(error)) => Err((error, tx.exhausted_pool_key())),
                     Err(DatagramCopyError::Copy(error)) => {
@@ -7416,6 +7479,7 @@ mod tests {
             destination,
             false,
             false,
+            DatagramSendOptions::default(),
             &mut |offset, output| {
                 if offset != 0 {
                     return Err(7u8);
@@ -7449,6 +7513,7 @@ mod tests {
             None,
             false,
             false,
+            DatagramSendOptions::default(),
             |offset, output| {
                 output.copy_from_slice(&payload[offset..offset + output.len()]);
                 Ok::<(), u8>(())
@@ -7527,6 +7592,7 @@ mod tests {
                 None,
                 false,
                 false,
+                DatagramSendOptions::default(),
                 |offset, output| {
                     output.copy_from_slice(&payload[offset..offset + output.len()]);
                     Ok::<(), u8>(())
@@ -7579,6 +7645,7 @@ mod tests {
                         None,
                         false,
                         false,
+                        DatagramSendOptions::default(),
                         |_, output| {
                             output[0] = value;
                             Ok::<(), u8>(())
@@ -7629,6 +7696,7 @@ mod tests {
                     None,
                     false,
                     false,
+                    DatagramSendOptions::default(),
                     |_, output| {
                         output[0] = 0x73;
                         Ok::<(), u8>(())
@@ -7677,6 +7745,7 @@ mod tests {
             None,
             false,
             false,
+            DatagramSendOptions::default(),
             |offset, output| {
                 if offset != 0 {
                     return Err(9u8);
@@ -7713,6 +7782,7 @@ mod tests {
                 None,
                 false,
                 false,
+                DatagramSendOptions::default(),
                 |offset, output| {
                     output.copy_from_slice(&payload[offset..offset + output.len()]);
                     Ok::<(), u8>(())

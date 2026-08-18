@@ -1396,13 +1396,19 @@ impl FlowShard {
             return Err((SocketError::Closed, payload));
         };
         let destination = payload.destination;
-        let bound_source = (!endpoint.local.addr.is_unspecified()).then_some(endpoint.local.addr);
+        // sendmsg cmsg（IP_PKTINFO ipi_spec_dst / IPV6_PKTINFO）与 sockaddr scope_id
+        // 逐包覆盖 socket 级 bind/route 选择。
+        let bound_source = payload
+            .source
+            .or_else(|| (!endpoint.local.addr.is_unspecified()).then_some(endpoint.local.addr));
         let facade = payload.facade();
-        let interface_scope = if destination.addr.is_multicast() {
-            endpoint.interface.or_else(|| facade.multicast_interface())
-        } else {
-            endpoint.interface
-        };
+        let interface_scope = payload.interface.or_else(|| {
+            if destination.addr.is_multicast() {
+                endpoint.interface.or_else(|| facade.multicast_interface())
+            } else {
+                endpoint.interface
+            }
+        });
         let route_result = if destination.addr.is_multicast() {
             config.multicast_route(
                 destination.addr,
@@ -1472,6 +1478,13 @@ impl FlowShard {
                 None => ([0; 6], Some(key)),
             }
         };
+        let hop_limit = payload
+            .hop_limit
+            .unwrap_or(if destination.addr.is_multicast() {
+                facade.multicast_hops()
+            } else {
+                facade.ip_hop_limit()
+            });
         Ok(PreparedUdpTx {
             payload,
             route,
@@ -1480,11 +1493,7 @@ impl FlowShard {
             source_mac: interface.mac_address,
             destination_mac,
             unresolved_neighbor,
-            hop_limit: if destination.addr.is_multicast() {
-                facade.multicast_hops()
-            } else {
-                facade.ip_hop_limit()
-            },
+            hop_limit,
             traffic_class: facade.ip_traffic_class(),
             ip_options: facade.ip_options(),
             mark,
@@ -1508,14 +1517,23 @@ impl FlowShard {
             return Err((SocketError::Closed, payload));
         };
         let destination = payload.destination.addr;
-        let bound_source = (!endpoint.local.is_unspecified()).then_some(endpoint.local);
+        let bound_source = payload
+            .source
+            .or_else(|| (!endpoint.local.is_unspecified()).then_some(endpoint.local));
+        let interface_scope = payload.interface.or_else(|| {
+            if destination.is_multicast() {
+                endpoint
+                    .interface
+                    .or_else(|| payload.facade().multicast_interface())
+            } else {
+                endpoint.interface
+            }
+        });
         let route_result = if destination.is_multicast() {
             config.multicast_route(
                 destination,
                 bound_source,
-                endpoint
-                    .interface
-                    .or_else(|| payload.facade().multicast_interface()),
+                interface_scope,
                 endpoint.free_bind,
             )
         } else {
@@ -1523,7 +1541,7 @@ impl FlowShard {
                 destination,
                 mark,
                 bound_source,
-                endpoint.interface,
+                interface_scope,
                 endpoint.free_bind,
             )
         };
@@ -1567,6 +1585,7 @@ impl FlowShard {
             }
         };
         let facade = payload.facade();
+        let hop_limit = payload.hop_limit.unwrap_or_else(|| facade.ip_hop_limit());
         Ok(PreparedRawTx {
             payload,
             route,
@@ -1576,7 +1595,7 @@ impl FlowShard {
             unresolved_neighbor,
             protocol: endpoint.protocol,
             header_included: facade.raw_header_included(),
-            hop_limit: facade.ip_hop_limit(),
+            hop_limit,
             traffic_class: facade.ip_traffic_class(),
             ip_options: facade.ip_options(),
             ipv6_checksum_offset: facade.ipv6_checksum_offset(),
