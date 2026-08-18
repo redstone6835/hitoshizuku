@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 use core::mem;
 use core::num::NonZeroU32;
 use core::ptr::read_volatile;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(feature = "block-profile")]
 use super::common::VirtioBlkProfile;
@@ -96,6 +96,8 @@ struct VirtioBlkInner {
     operations: VirtioBlkOperationGate,
     irq_count: AtomicUsize,
     poll_irq_mark: AtomicUsize,
+    /// probe 完成后是否已注册 MSI/INTx IRQ handler。
+    irq_registered: AtomicBool,
     #[cfg(feature = "block-profile")]
     profile: VirtioBlkProfile,
 }
@@ -277,6 +279,7 @@ impl VirtioBlkPci {
             operations: VirtioBlkOperationGate::new(),
             irq_count: AtomicUsize::new(0),
             poll_irq_mark: AtomicUsize::new(0),
+            irq_registered: AtomicBool::new(false),
             #[cfg(feature = "block-profile")]
             profile: VirtioBlkProfile::new(),
         });
@@ -457,6 +460,16 @@ impl VirtioBlkPci {
             Ordering::Relaxed,
         );
         true
+    }
+
+    pub fn set_irq_registered(&self, registered: bool) {
+        self.inner
+            .irq_registered
+            .store(registered, Ordering::Release);
+    }
+
+    fn completion_is_interrupt_driven(&self) -> bool {
+        self.inner.irq_registered.load(Ordering::Acquire)
     }
 
     pub fn into_block_dev(self, name: &str) -> Result<(Arc<BlockDevice>, Arc<Self>), &'static str> {
@@ -708,7 +721,7 @@ impl BlockDriver for VirtioBlkPciIo {
     }
 
     fn completion_is_interrupt_driven(&self) -> bool {
-        true
+        self.driver.completion_is_interrupt_driven()
     }
 
     #[cfg(feature = "block-profile")]
@@ -872,6 +885,7 @@ impl PnpDriver for VirtioPciBlkDriver {
             PnpError::registration_failed(PnpResourceKind::Function, "block function")
         })?;
         let irq = register_virtio_pci_irq(dev, &pci, Arc::clone(&driver))?;
+        driver.set_irq_registered(irq.is_some());
 
         let func = BlockFunction::with_projection_name_arc(&dev.name, &dev_name, block_dev);
         if let Err(err) = dev.register_function(func) {

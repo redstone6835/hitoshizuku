@@ -4,7 +4,6 @@
 //! 分层。Fair class 使用 EEVDF；RT class 提供 FIFO/RR 队列骨架；Deadline
 //! class 提供 EDF + runtime budget 框架。AP 启动和真实 IPI 不在本模块内。
 
-use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -22,250 +21,6 @@ use crate::task::{Task, TaskState};
 struct FairKey {
     deadline: u64,
     addr: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FairIndexEntry {
-    key: FairKey,
-    vruntime: u64,
-}
-
-/// 按虚拟截止时间排序、同时维护子树最小 vruntime 的增强 AVL 索引。
-///
-/// `BTreeMap` 无法回答“截止时间最早且 vruntime 不超过 avg”的二维查询，过去
-/// 只能遍历整棵 fair tree。该索引使 EEVDF eligible 查询、最小 vruntime 查询和
-/// 按 key 删除都保持 O(log n)；任务对象仍只由 `fair_tree` 持有，索引节点只保存
-/// 小型 Copy 元数据。
-struct FairIndexNode {
-    entry: FairIndexEntry,
-    height: u16,
-    subtree_min_vruntime: u64,
-    left: Option<Box<FairIndexNode>>,
-    right: Option<Box<FairIndexNode>>,
-}
-
-impl FairIndexNode {
-    fn new(entry: FairIndexEntry) -> Box<Self> {
-        Box::new(Self {
-            entry,
-            height: 1,
-            subtree_min_vruntime: entry.vruntime,
-            left: None,
-            right: None,
-        })
-    }
-
-    #[inline]
-    fn height(node: &Option<Box<Self>>) -> u16 {
-        node.as_ref().map_or(0, |node| node.height)
-    }
-
-    #[inline]
-    fn subtree_min(node: &Option<Box<Self>>) -> u64 {
-        node.as_ref()
-            .map_or(u64::MAX, |node| node.subtree_min_vruntime)
-    }
-
-    fn refresh(&mut self) {
-        self.height = 1 + Self::height(&self.left).max(Self::height(&self.right));
-        self.subtree_min_vruntime = self
-            .entry
-            .vruntime
-            .min(Self::subtree_min(&self.left))
-            .min(Self::subtree_min(&self.right));
-    }
-
-    fn rotate_left(mut root: Box<Self>) -> Box<Self> {
-        let mut pivot = root
-            .right
-            .take()
-            .expect("[sched] fair AVL left rotation without right child");
-        root.right = pivot.left.take();
-        root.refresh();
-        pivot.left = Some(root);
-        pivot.refresh();
-        pivot
-    }
-
-    fn rotate_right(mut root: Box<Self>) -> Box<Self> {
-        let mut pivot = root
-            .left
-            .take()
-            .expect("[sched] fair AVL right rotation without left child");
-        root.left = pivot.right.take();
-        root.refresh();
-        pivot.right = Some(root);
-        pivot.refresh();
-        pivot
-    }
-
-    fn rebalance(mut root: Box<Self>) -> Box<Self> {
-        root.refresh();
-        let balance = i32::from(Self::height(&root.left)) - i32::from(Self::height(&root.right));
-        if balance > 1 {
-            let left = root
-                .left
-                .as_ref()
-                .expect("[sched] invalid fair AVL balance");
-            if Self::height(&left.right) > Self::height(&left.left) {
-                root.left = root.left.take().map(Self::rotate_left);
-            }
-            return Self::rotate_right(root);
-        }
-        if balance < -1 {
-            let right = root
-                .right
-                .as_ref()
-                .expect("[sched] invalid fair AVL balance");
-            if Self::height(&right.left) > Self::height(&right.right) {
-                root.right = root.right.take().map(Self::rotate_right);
-            }
-            return Self::rotate_left(root);
-        }
-        root
-    }
-
-    fn insert(root: Option<Box<Self>>, entry: FairIndexEntry) -> Box<Self> {
-        let Some(mut root) = root else {
-            return Self::new(entry);
-        };
-        if entry.key < root.entry.key {
-            root.left = Some(Self::insert(root.left.take(), entry));
-        } else if entry.key > root.entry.key {
-            root.right = Some(Self::insert(root.right.take(), entry));
-        } else {
-            root.entry = entry;
-        }
-        Self::rebalance(root)
-    }
-
-    fn take_min(mut root: Box<Self>) -> (Option<Box<Self>>, FairIndexEntry) {
-        let Some(left) = root.left.take() else {
-            return (root.right.take(), root.entry);
-        };
-        let (new_left, entry) = Self::take_min(left);
-        root.left = new_left;
-        (Some(Self::rebalance(root)), entry)
-    }
-
-    fn remove(
-        root: Option<Box<Self>>,
-        key: FairKey,
-    ) -> (Option<Box<Self>>, Option<FairIndexEntry>) {
-        let Some(mut root) = root else {
-            return (None, None);
-        };
-        let removed = if key < root.entry.key {
-            let (left, removed) = Self::remove(root.left.take(), key);
-            root.left = left;
-            removed
-        } else if key > root.entry.key {
-            let (right, removed) = Self::remove(root.right.take(), key);
-            root.right = right;
-            removed
-        } else {
-            let removed = root.entry;
-            return match (root.left.take(), root.right.take()) {
-                (None, right) => (right, Some(removed)),
-                (left, None) => (left, Some(removed)),
-                (left, Some(right)) => {
-                    let (new_right, successor) = Self::take_min(right);
-                    root.entry = successor;
-                    root.left = left;
-                    root.right = new_right;
-                    (Some(Self::rebalance(root)), Some(removed))
-                }
-            };
-        };
-        (Some(Self::rebalance(root)), removed)
-    }
-
-    fn first_eligible(root: &Option<Box<Self>>, avg_vruntime: u64) -> Option<FairKey> {
-        let root = root.as_ref()?;
-        if root.subtree_min_vruntime > avg_vruntime {
-            return None;
-        }
-        if Self::subtree_min(&root.left) <= avg_vruntime {
-            return Self::first_eligible(&root.left, avg_vruntime);
-        }
-        if root.entry.vruntime <= avg_vruntime {
-            return Some(root.entry.key);
-        }
-        Self::first_eligible(&root.right, avg_vruntime)
-    }
-
-    fn min_vruntime_key(root: &Option<Box<Self>>) -> Option<FairKey> {
-        let root = root.as_ref()?;
-        let target = root.subtree_min_vruntime;
-        if Self::subtree_min(&root.left) == target {
-            return Self::min_vruntime_key(&root.left);
-        }
-        if root.entry.vruntime == target {
-            return Some(root.entry.key);
-        }
-        Self::min_vruntime_key(&root.right)
-    }
-
-    fn first_key(root: &Option<Box<Self>>) -> Option<FairKey> {
-        let mut cursor = root.as_ref()?;
-        while let Some(left) = cursor.left.as_ref() {
-            cursor = left;
-        }
-        Some(cursor.entry.key)
-    }
-
-    fn last_key(root: &Option<Box<Self>>) -> Option<FairKey> {
-        let mut cursor = root.as_ref()?;
-        while let Some(right) = cursor.right.as_ref() {
-            cursor = right;
-        }
-        Some(cursor.entry.key)
-    }
-}
-
-struct FairIndex {
-    root: Option<Box<FairIndexNode>>,
-}
-
-impl FairIndex {
-    const fn new() -> Self {
-        Self { root: None }
-    }
-
-    fn insert(&mut self, entry: FairIndexEntry) {
-        self.root = Some(FairIndexNode::insert(self.root.take(), entry));
-    }
-
-    fn remove(&mut self, key: FairKey) -> Option<FairIndexEntry> {
-        let (root, removed) = FairIndexNode::remove(self.root.take(), key);
-        self.root = root;
-        removed
-    }
-
-    fn first_eligible(&self, avg_vruntime: u64) -> Option<FairKey> {
-        FairIndexNode::first_eligible(&self.root, avg_vruntime)
-    }
-
-    fn min_vruntime_key(&self) -> Option<FairKey> {
-        FairIndexNode::min_vruntime_key(&self.root)
-    }
-
-    fn min_vruntime(&self) -> Option<u64> {
-        self.root.as_ref().map(|root| root.subtree_min_vruntime)
-    }
-
-    fn first_key(&self) -> Option<FairKey> {
-        FairIndexNode::first_key(&self.root)
-    }
-
-    fn last_key(&self) -> Option<FairKey> {
-        FairIndexNode::last_key(&self.root)
-    }
-
-    #[cfg(test)]
-    fn height(&self) -> u16 {
-        FairIndexNode::height(&self.root)
-    }
 }
 
 impl FairKey {
@@ -338,7 +93,6 @@ impl DeadlineThrottleKey {
 
 struct RqInner {
     fair_tree: BTreeMap<FairKey, Arc<Task>>,
-    fair_index: FairIndex,
     rt_tree: BTreeMap<RtKey, Arc<Task>>,
     deadline_tree: BTreeMap<DeadlineKey, Arc<Task>>,
     deadline_throttled: BTreeMap<DeadlineThrottleKey, Arc<Task>>,
@@ -473,7 +227,6 @@ impl Runqueue {
         Self {
             inner: Spinlock::new(RqInner {
                 fair_tree: BTreeMap::new(),
-                fair_index: FairIndex::new(),
                 rt_tree: BTreeMap::new(),
                 deadline_tree: BTreeMap::new(),
                 deadline_throttled: BTreeMap::new(),
@@ -545,7 +298,6 @@ impl Runqueue {
         Self {
             inner: Spinlock::new(RqInner {
                 fair_tree: BTreeMap::new(),
-                fair_index: FairIndex::new(),
                 rt_tree: BTreeMap::new(),
                 deadline_tree: BTreeMap::new(),
                 deadline_throttled: BTreeMap::new(),
@@ -1302,10 +1054,6 @@ fn enqueue_fair_locked(inner: &mut RqInner, task: Arc<Task>) {
     inner.weighted_vruntime_sum += new_vr as u128 * weight;
     let key = FairKey::of(&task);
     task.sched.store_rq_fair_deadline(key.deadline);
-    inner.fair_index.insert(FairIndexEntry {
-        key,
-        vruntime: new_vr,
-    });
     let replaced_task = inner.fair_tree.insert(key, task);
     debug_assert!(replaced_task.is_none(), "[sched] duplicate fair tree key");
 }
@@ -1389,102 +1137,61 @@ fn pick_fair_locked(
     cpu_mask: u64,
 ) -> Option<Arc<Task>> {
     let avg = avg_vruntime_locked(inner);
-    let preferred = preferred_key.and_then(|key| {
-        inner
-            .fair_tree
-            .get(&key)
-            .filter(|task| task_pickable_on(task, cpu_mask, prev_addr))
-            .map(|_| key)
-    });
 
-    // 常规 EEVDF 选择直接沿增强索引下降：左子树只有在其最小 vruntime 已
-    // eligible 时才访问，因此不再遍历 fair_tree。刚让出 CPU 的任务先从索引
-    // 暂时摘除，保留原有的 buddy-skip 语义。
-    let key = preferred
-        .or_else(|| {
-            find_indexed_fair_candidate(
-                inner,
-                FairIndexQuery::Eligible(avg),
-                skip_key,
-                cpu_mask,
-                prev_addr,
-            )
-        })
-        .or_else(|| {
-            skip_key.and_then(|_| {
-                find_indexed_fair_candidate(
-                    inner,
-                    FairIndexQuery::MinVruntime,
-                    skip_key,
-                    cpu_mask,
-                    prev_addr,
-                )
-            })
-        })
-        .or_else(|| {
-            find_indexed_fair_candidate(inner, FairIndexQuery::First, None, cpu_mask, prev_addr)
-        })?;
-    remove_fair_by_key_locked(inner, key)
-}
-
-#[derive(Clone, Copy)]
-enum FairIndexQuery {
-    Eligible(u64),
-    MinVruntime,
-    First,
-}
-
-fn query_fair_index(index: &FairIndex, query: FairIndexQuery) -> Option<FairKey> {
-    match query {
-        FairIndexQuery::Eligible(avg) => index.first_eligible(avg),
-        FairIndexQuery::MinVruntime => index.min_vruntime_key(),
-        FairIndexQuery::First => index.first_key(),
+    // EEVDF 按 fair deadline 排序。唤醒密集的普通任务通常让队首任务已经
+    // eligible；先检查这个候选可以把常见的 nice=0 调度从整棵 BTreeMap
+    // 扫描降为一次首元素查询。亲和性、buddy-skip 或 preferred 候选存在时
+    // 仍走完整筛选，因而不会改变受限 CPU 集合和公平性语义。
+    if skip_key.is_none()
+        && preferred_key.is_none()
+        && let Some((&key, task)) = inner.fair_tree.iter().next()
+        && task_pickable_on(task, cpu_mask, prev_addr)
+        && task.sched.vruntime() <= avg
+    {
+        return remove_fair_by_key_locked(inner, key);
     }
-}
 
-fn find_indexed_fair_candidate(
-    inner: &mut RqInner,
-    query: FairIndexQuery,
-    skip_key: Option<FairKey>,
-    cpu_mask: u64,
-    prev_addr: Option<usize>,
-) -> Option<FairKey> {
-    let skipped = skip_key.and_then(|key| inner.fair_index.remove(key));
-    let mut temporarily_blocked = Vec::new();
+    let mut preferred = None;
+    let mut first_allowed = None;
+    let mut first_eligible = None;
+    let mut min_non_skip: Option<(FairKey, u64)> = None;
 
-    let selected = loop {
-        let Some(key) = query_fair_index(&inner.fair_index, query) else {
-            break None;
-        };
-        let pickable = inner
-            .fair_tree
-            .get(&key)
-            .is_some_and(|task| task_pickable_on(task, cpu_mask, prev_addr));
-        if pickable {
-            break Some(key);
+    for (key, task) in inner.fair_tree.iter() {
+        if !task_pickable_on(task, cpu_mask, prev_addr) {
+            continue;
         }
+        if preferred_key == Some(*key) {
+            preferred = Some(*key);
+        }
+        first_allowed.get_or_insert(*key);
+        if skip_key == Some(*key) {
+            continue;
+        }
+        let vruntime = task.sched.vruntime();
+        if vruntime <= avg {
+            first_eligible.get_or_insert(*key);
+        }
+        if min_non_skip
+            .as_ref()
+            .is_none_or(|(_, current_min)| vruntime < *current_min)
+        {
+            min_non_skip = Some((*key, vruntime));
+        }
+    }
 
-        // 亲和性收窄或远端上下文尚未释放时，索引中的排序元数据仍然有效，
-        // 但该节点此刻不能在目标 CPU 运行。暂时摘除后继续做增强查询，最后
-        // 原样恢复；这类节点仅存在于迁移过渡窗口，不影响常规 O(log n) 路径。
-        let Some(entry) = inner.fair_index.remove(key) else {
-            break None;
-        };
-        temporarily_blocked.push(entry);
+    let key = if skip_key.is_some() {
+        first_eligible
+            .or_else(|| min_non_skip.map(|(key, _)| key))
+            .or(first_allowed)
+    } else {
+        first_eligible.or(first_allowed)
     };
-
-    if let Some(entry) = skipped {
-        inner.fair_index.insert(entry);
-    }
-    for entry in temporarily_blocked {
-        inner.fair_index.insert(entry);
-    }
-    selected
+    let key = preferred.or(key)?;
+    remove_fair_by_key_locked(inner, key)
 }
 
 fn remove_fair_by_key_locked(inner: &mut RqInner, key: FairKey) -> Option<Arc<Task>> {
     let task = inner.fair_tree.remove(&key)?;
-    debug_assert!(inner.fair_index.remove(key).is_some());
     account_fair_remove_locked(inner, &task);
     Some(task)
 }
@@ -1704,26 +1411,14 @@ fn migratable_candidate(task: &Arc<Task>, allowed_cpu_mask: u64) -> bool {
 }
 
 fn take_fair_migratable_locked(inner: &mut RqInner, allowed_cpu_mask: u64) -> Option<Arc<Task>> {
-    let mut blocked = Vec::new();
-    let key = loop {
-        let Some(key) = inner.fair_index.last_key() else {
-            for entry in blocked {
-                inner.fair_index.insert(entry);
-            }
-            return None;
-        };
-        let migratable = inner.fair_tree.get(&key).is_some_and(|task| {
+    let key = inner
+        .fair_tree
+        .iter()
+        .rev()
+        .find(|(_, task)| {
             task.running_cpu().is_none() && migratable_candidate(task, allowed_cpu_mask)
-        });
-        if migratable {
-            break key;
-        }
-        let entry = inner.fair_index.remove(key)?;
-        blocked.push(entry);
-    };
-    for entry in blocked {
-        inner.fair_index.insert(entry);
-    }
+        })
+        .map(|(key, _)| *key)?;
     let task = remove_fair_by_key_locked(inner, key)?;
     store_fair_lag_locked(inner, &task);
     // 迁移事务开始：任务已不在本 rq 索引中，但归属权归迁移方独占。绝不能置
@@ -1855,7 +1550,12 @@ fn update_fair_curr_locked(inner: &mut RqInner, curr: &Arc<Task>, delta_ns: u64)
     let new_vr = old_vr.saturating_add(delta_vr);
     curr.sched.store_vruntime(new_vr);
     if new_vr > inner.min_vruntime {
-        let tree_min = inner.fair_index.min_vruntime().unwrap_or(new_vr);
+        let tree_min = inner
+            .fair_tree
+            .values()
+            .map(|task| task.sched.vruntime())
+            .min()
+            .unwrap_or(new_vr);
         let candidate = tree_min.min(new_vr);
         if candidate > inner.min_vruntime {
             inner.min_vruntime = candidate;
@@ -1913,55 +1613,4 @@ fn next_seq(inner: &mut RqInner) -> u64 {
 
 fn task_addr(task: &Arc<Task>) -> usize {
     Arc::as_ptr(task) as *const () as usize
-}
-
-#[cfg(test)]
-mod fair_index_tests {
-    use super::{FairIndex, FairIndexEntry, FairKey};
-
-    #[test]
-    fn augmented_fair_index_stays_logarithmic_and_keeps_queries_ordered() {
-        let mut index = FairIndex::new();
-        for n in 0..256usize {
-            index.insert(FairIndexEntry {
-                key: FairKey {
-                    deadline: n as u64,
-                    addr: n,
-                },
-                vruntime: (255 - n) as u64,
-            });
-        }
-        // AVL height is bounded by a logarithmic constant; this is deliberately
-        // generous so the assertion remains valid if node metadata is extended.
-        assert!(
-            index.height() <= 20,
-            "unexpected AVL height {}",
-            index.height()
-        );
-        assert_eq!(
-            index.first_eligible(3),
-            Some(FairKey {
-                deadline: 252,
-                addr: 252,
-            })
-        );
-        assert_eq!(
-            index.min_vruntime_key(),
-            Some(FairKey {
-                deadline: 255,
-                addr: 255,
-            })
-        );
-        for n in 0..256usize {
-            assert!(
-                index
-                    .remove(FairKey {
-                        deadline: n as u64,
-                        addr: n,
-                    })
-                    .is_some()
-            );
-        }
-        assert!(index.first_key().is_none());
-    }
 }

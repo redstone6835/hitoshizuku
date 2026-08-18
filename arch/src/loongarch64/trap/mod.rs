@@ -116,35 +116,22 @@ pub unsafe extern "C" fn __loongarch_tlb_refill_entry() {
 
         // 4 级页表遍历：Dir3 -> Dir2 -> Dir1 -> PTE。
         "lddir $r12, $r12, 3",
-        "beqz $r12, .L_tlb_refill_invalid",
         "lddir $r12, $r12, 2",
-        "beqz $r12, .L_tlb_refill_invalid",
         "lddir $r12, $r12, 1",
-        "beqz $r12, .L_tlb_refill_invalid",
 
         // 从当前 $r12 指向的 PTE 页的物理地址处加载一对页表项（PTE0 和 PTE1），
-        // 并将其填充到 TLB 中，完成 TLB 重填。
+        // 并将其填充到 TLB 中。目录或叶项缺失时也必须执行 ldpte：硬件会据此
+        // 生成一个可匹配但 V=0 的 TLB 项，使重试转入普通 PIF/PIL/PIS 缺页异常。
         "ldpte $r12, 0",
         "ldpte $r12, 1",
         "tlbfill",
 
-        ".L_tlb_refill_return:",
         // 恢复 $r12 寄存器的值并返回。
         "csrrd $r12, {csr_tlbrsave}",
         "ertn",
 
-        // 空目录表示该地址没有可供 TLB 重填的页表路径。安装一个无效的匹配项，
-        // 让重试转入普通 PIF/PIL/PIS 异常，而不是继续从物理地址 0 读取伪 PTE。
-        ".L_tlb_refill_invalid:",
-        "csrwr $r0, {csr_tlbrelo0}",
-        "csrwr $r0, {csr_tlbrelo1}",
-        "tlbfill",
-        "b .L_tlb_refill_return",
-
         csr_pgd = const CSR_PGD,
         csr_tlbrsave = const CSR_TLBRSAVE,
-        csr_tlbrelo0 = const CSR_TLBRELO0,
-        csr_tlbrelo1 = const CSR_TLBRELO1,
     )
 }
 

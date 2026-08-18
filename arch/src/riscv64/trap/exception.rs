@@ -96,9 +96,10 @@ fn finish_fast_syscall_return_work(tf_ptr: usize, task: &alloc::sync::Arc<sched:
         if cpu_work {
             require_full_restore = true;
             sched::run_post_syscall_handoff_lazy();
-            if sched::needs_resched_current() {
-                sched::preempt_if_needed(kernel_timestamp_ns());
-            }
+            // CPU 返回工作不只包含 need_resched；周期负载均衡可以只置
+            // need_balance。这里已经处在安全调度边界，必须让调度器统一消费，
+            // 否则 refresh_user_return_work_on() 会不断重新武装 hint 而形成活锁。
+            sched::preempt_if_needed(kernel_timestamp_ns());
         }
         if task.has_deliverable_signal() {
             require_full_restore = true;
