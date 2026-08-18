@@ -33,9 +33,7 @@ use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
 use vfs::superblock::{FsDriver, FsDriverFlags, Superblock, SuperblockOps};
 use vfs::sync::Spinlock;
 
-use crate::ipc::mqueue::{
-    MqNotification, MqObject, MqRegistry, MqStateObserver, MqAttr,
-};
+use crate::ipc::mqueue::{MqAttr, MqNotification, MqObject, MqRegistry, MqStateObserver};
 
 static MQ_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static MQ_REGISTRY: Spinlock<Option<Arc<MqRegistry>>> = Spinlock::new(None);
@@ -360,7 +358,9 @@ impl MqRootOps {
             ino,
             FileType::Regular,
             0o600,
-            Arc::new(MqFileInodeOps { name: name.to_string() }),
+            Arc::new(MqFileInodeOps {
+                name: name.to_string(),
+            }),
         ))
     }
 }
@@ -372,7 +372,14 @@ impl InodeOps for MqRootOps {
         }
         let registry = mq_registry();
         registry
-            .open(name, false, false, None, &Credentials::root())
+            .open(
+                name,
+                false,
+                false,
+                None,
+                FileMode::new(0o600),
+                &Credentials::root(),
+            )
             .map_err(errno_to_vfs)?;
         self.queue_inode(name)
     }
@@ -381,12 +388,12 @@ impl InodeOps for MqRootOps {
         &self,
         _: &Inode,
         name: &str,
-        _mode: FileMode,
+        mode: FileMode,
         cred: &Credentials,
     ) -> VfsResult<Arc<Inode>> {
         let registry = mq_registry();
         registry
-            .open(name, true, true, None, cred)
+            .open(name, true, true, None, mode, cred)
             .map_err(errno_to_vfs)?;
         self.queue_inode(name)
     }
@@ -399,9 +406,7 @@ impl InodeOps for MqRootOps {
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         // 目录本身以 ProcDirFile 风格的快照列出队列名。
         let mut snapshot = Vec::new();
-        snapshot
-            .try_reserve(64)
-            .map_err(|_| VfsError::NoSpace)?;
+        snapshot.try_reserve(64).map_err(|_| VfsError::NoSpace)?;
         for name in mq_registry().names() {
             snapshot.push(DirEntry {
                 ino: 2 + stable_name_hash(&name),
@@ -445,7 +450,7 @@ impl InodeOps for MqFileInodeOps {
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         let registry = mq_registry();
         let queue = registry
-            .open(&self.name, false, false, None, cred)
+            .open(&self.name, false, false, None, FileMode::new(0o600), cred)
             .map_err(errno_to_vfs)?;
         // 按打开方式校验权限（Linux：mq_open 时按 O_RDONLY/O_WRONLY/O_RDWR）。
         let readable = options.readable();
