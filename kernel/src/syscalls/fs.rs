@@ -1272,6 +1272,9 @@ pub(super) fn sys_chroot(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 
 pub(super) fn sys_mount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    if !vfs_ctx.cred().has_cap(vfs::cred::Capability::SysAdmin) {
+        return Err(Errno::EPERM);
+    }
     let _fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let source = copy_optional_path_from_user(ctx.args[0])?;
     let target = copy_path_from_user(ctx.args[1])?;
