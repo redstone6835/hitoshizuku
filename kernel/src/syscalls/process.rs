@@ -5399,18 +5399,25 @@ fn timer_create_common(ctx: &mut SyscallContext<'_>, _time64: bool) -> Result<us
                 .try_into()
                 .unwrap(),
         );
-        signo = SignalNumber::from_raw(i32::from_le_bytes(
-            buf[SIGEV_SIGNO_OFF..SIGEV_SIGNO_OFF + 4]
-                .try_into()
-                .unwrap(),
-        ))
-        .ok_or(Errno::EINVAL)?;
         notify = i32::from_le_bytes(
             buf[SIGEV_NOTIFY_OFF..SIGEV_NOTIFY_OFF + 4]
                 .try_into()
                 .unwrap(),
         );
         thread_id = i32::from_le_bytes(buf[SIGEV_TID_OFF..SIGEV_TID_OFF + 4].try_into().unwrap());
+        // 仅信号类 notify 需要校验 signo；SIGEV_NONE 忽略 signo 与 sigev_value。
+        if notify == SIGEV_SIGNAL || notify == SIGEV_THREAD_ID {
+            signo = SignalNumber::from_raw(i32::from_le_bytes(
+                buf[SIGEV_SIGNO_OFF..SIGEV_SIGNO_OFF + 4]
+                    .try_into()
+                    .unwrap(),
+            ))
+            .ok_or(Errno::EINVAL)?;
+            // SIGKILL/SIGSTOP 不可作为定时器投递信号。
+            if signo == SignalNumber::SIGKILL || signo == SignalNumber::SIGSTOP {
+                return Err(Errno::EINVAL);
+            }
+        }
     }
 
     let caller = ctx.task();
