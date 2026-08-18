@@ -6192,6 +6192,13 @@ fn write_iovecs(
     mut offset: Option<u64>,
     nowait: bool,
 ) -> Result<usize, Errno> {
+    // 进入循环前先累加各段 len 校验溢出，避免部分 I/O 之后才返回 EINVAL。
+    let mut total_len = 0usize;
+    for i in 0..iovcnt {
+        let (_, len) = read_iovec(iov, i)?;
+        total_len = total_len.checked_add(len).ok_or(Errno::EINVAL)?;
+    }
+
     let mut total = 0usize;
     for i in 0..iovcnt {
         let (base, len) = read_iovec(iov, i)?;
@@ -6224,6 +6231,13 @@ fn read_iovecs(
     mut offset: Option<u64>,
     nowait: bool,
 ) -> Result<usize, Errno> {
+    // 进入循环前先累加各段 len 校验溢出，避免部分 I/O 之后才返回 EINVAL。
+    let mut total_len = 0usize;
+    for i in 0..iovcnt {
+        let (_, len) = read_iovec(iov, i)?;
+        total_len = total_len.checked_add(len).ok_or(Errno::EINVAL)?;
+    }
+
     let mut total = 0usize;
     for i in 0..iovcnt {
         let (base, len) = read_iovec(iov, i)?;
