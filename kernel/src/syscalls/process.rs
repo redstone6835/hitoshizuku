@@ -1479,7 +1479,10 @@ pub(super) fn sys_getrusage(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     Ok(0)
 }
 
-/// 当前驻留页数折算为 KB（`ru_maxrss` best-effort）。
+/// 把当前驻留页数折算为 KB（`ru_maxrss` best-effort）。
+///
+/// 本内核无峰值记账，报告的是当前（而非峰值）驻留集，与 Linux `ru_maxrss`
+/// 的峰值驻留集语义存在偏差，属已注明的 best-effort 取舍。
 fn task_rss_kb(task: &Arc<Task>) -> u64 {
     task_vm_space(task)
         .map(|vm| (vm.mapped_pages() as u64).saturating_mul(hal::memory::page_size() as u64) / 1024)
@@ -1515,8 +1518,9 @@ fn write_rusage(user: usize, usage: sched::TaskUsage, maxrss_kb: u64) -> Result<
     let mut raw = [0u8; 144];
     write_timeval_pair(&mut raw, 0, usage.user_ns);
     write_timeval_pair(&mut raw, 16, usage.system_ns);
-    // ru_maxrss：Linux 报告峰值驻留集（KB）。本内核无峰值记账，取当前
-    // 驻留页数折算为 KB（best-effort，见任务书取舍说明）。
+    // ru_maxrss：Linux 报告峰值驻留集（KB）。本内核无峰值记账，报告当前
+    // （而非峰值）驻留集，与 Linux ru_maxrss 峰值语义存在偏差，属已注明的
+    // best-effort 取舍。
     put_i64(&mut raw, 32, maxrss_kb.min(i64::MAX as u64) as i64);
     put_i64(&mut raw, 64, usage.minflt.min(i64::MAX as u64) as i64);
     put_i64(&mut raw, 72, usage.majflt.min(i64::MAX as u64) as i64);
