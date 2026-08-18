@@ -373,7 +373,7 @@ fn find_entry_impl(
     visit_mapped_dir_blocks(state, &ranges, &dx_skip, csum_ctx, |block| {
         scan_dir_block_bytes(block, has_ft, |ino, file_type, name_bytes| {
             let hit = if casefold {
-                name_bytes.eq_ignore_ascii_case(name)
+                casefold_eq(name_bytes, name)
             } else {
                 name_bytes == name
             };
@@ -385,6 +385,37 @@ fn find_entry_impl(
         })
     })?;
     Ok(found)
+}
+
+/// CASEFOLD 目录的大小写不敏感文件名比较。
+///
+/// ext4 casefold 的完整语义是 UTF-8 编码 + NFKD 归一化 + Unicode casefold
+/// (可产生多码点折叠,如 `ß→ss`、`İ→i̇`)。本实现只做 **简单折叠**(Unicode
+/// 简单小写映射,1:1 码点),覆盖 ASCII、Latin-1、拉丁扩展、希腊、西里尔等
+/// 常用脚本,足以处理带变音符号/多字节 UTF-8 名;完整 casefold 与 NFKD 归一化
+/// 未实现(见 lib.rs 取舍说明)。非 UTF-8 的目录项名退化为字节精确比较。
+fn casefold_eq(a: &[u8], b: &[u8]) -> bool {
+    // 常见 ASCII 名走无分配快路径;非 ASCII 再逐码点折叠。
+    if a.is_ascii() && b.is_ascii() {
+        return a.eq_ignore_ascii_case(b);
+    }
+    fold_simple(a) == fold_simple(b)
+}
+
+/// 把字节序列按 Unicode 简单小写折叠成 UTF-8 字节序列。
+fn fold_simple(s: &[u8]) -> Vec<u8> {
+    let Ok(text) = core::str::from_utf8(s) else {
+        // ext 目录项名允许任意字节;非法 UTF-8 不参与折叠,按原始字节比较。
+        return s.to_vec();
+    };
+    let mut out = Vec::with_capacity(s.len());
+    for c in text.chars() {
+        for folded in c.to_lowercase() {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(folded.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out
 }
 
 /// 逻辑块号 -> 物理块号:ext4 用 extent,否则走间接块。inline_data 已在
@@ -409,5 +440,44 @@ pub(crate) fn file_type_of(ty: u8) -> Option<vfs::stat::FileType> {
         DT_DIR => Some(vfs::stat::FileType::Directory),
         DT_LNK => Some(vfs::stat::FileType::Symlink),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{casefold_eq, fold_simple};
+
+    #[test]
+    fn casefold_matches_ascii_insensitive() {
+        assert!(casefold_eq(b"Hello", b"hello"));
+        assert!(casefold_eq(b"HELLO", b"hello"));
+        assert!(casefold_eq(b"hello", b"HELLO"));
+        assert!(!casefold_eq(b"hello", b"hellp"));
+    }
+
+    #[test]
+    fn casefold_matches_latin1_accents() {
+        // "CAFÉ" vs "café":É(U+00C9) 简单小写 → é(U+00E9)。
+        assert!(casefold_eq("CAFÉ".as_bytes(), "café".as_bytes()));
+        assert!(casefold_eq("STRASSE".as_bytes(), "strasse".as_bytes()));
+    }
+
+    #[test]
+    fn casefold_matches_greek_and_cyrillic() {
+        // 希腊 Α→α、Φ→φ;西里尔 А→а。
+        assert!(casefold_eq("ΑΛΦΑ".as_bytes(), "αλφα".as_bytes()));
+        assert!(casefold_eq("МОСКВА".as_bytes(), "москва".as_bytes()));
+    }
+
+    #[test]
+    fn casefold_distinguishes_different_multibyte_names() {
+        assert!(!casefold_eq("café".as_bytes(), "cafe".as_bytes()));
+        assert!(!casefold_eq("straße".as_bytes(), "strasse".as_bytes()));
+    }
+
+    #[test]
+    fn fold_simple_keeps_invalid_utf8_as_is() {
+        let invalid = [0xff, 0xfe, b'a'];
+        assert_eq!(fold_simple(&invalid), invalid.to_vec());
     }
 }
