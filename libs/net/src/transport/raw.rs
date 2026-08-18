@@ -98,7 +98,7 @@ impl RawEndpointTable {
         facade: Arc<SocketFacade>,
         free_bind: bool,
     ) -> Result<FlowId, RawBindError> {
-        if family(local) != facade.family() || facade.protocol() == 0 {
+        if family(local) != facade.family() {
             return Err(RawBindError::InvalidEndpoint);
         }
         if self.endpoints.len() >= RAW_ENDPOINT_LIMIT {
@@ -343,7 +343,7 @@ impl RawEndpointTable {
             .values()
             .filter(|entry| {
                 entry.family == family
-                    && entry.protocol == ip.next_header
+                    && (entry.protocol == 0 || entry.protocol == ip.next_header)
                     && entry.interface.is_none_or(|scope| scope == interface)
                     && (entry.local.is_unspecified() || entry.local == ip.destination)
                     && (!ip.destination.is_multicast()
@@ -684,6 +684,18 @@ mod tests {
         let result = table.ingest(InterfaceId(1), packet(58));
         assert_eq!(result.delivered, 0);
         assert!(result.undelivered.is_some());
+    }
+
+    #[test]
+    fn protocol_zero_raw_socket_receives_any_protocol() {
+        let receiver = facade(1, 0);
+        let mut table = RawEndpointTable::new();
+        table
+            .bind_facade(IpAddr::V4(Ipv4Addr::UNSPECIFIED), None, receiver)
+            .unwrap();
+        // protocol=0（IPPROTO_IP）原始套接字匹配任意 IP 协议号。
+        assert_eq!(table.ingest(InterfaceId(1), packet(99)).delivered, 1);
+        assert_eq!(table.ingest(InterfaceId(1), packet(58)).delivered, 1);
     }
 
     #[test]
