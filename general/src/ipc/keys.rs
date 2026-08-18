@@ -502,18 +502,34 @@ impl KeyManager {
             .ok_or(Errno::ENOKEY)
     }
 
-    /// 销毁 key（引用为 0 时由 `drop` 自然回收；此处移除注册与配额）。
+    /// 销毁 key。
+    ///
+    /// 引用计数语义：全局 map（`KeyManagerState::keys`）是 key 的唯一注册
+    /// 持有者；keyring 只存 `KeyId`，不持 `Arc<Key>`。若 map 之外仍有强引用
+    /// （如调用方经 [`KeyManager::key`]/[`KeyManager::search`] 拿到的 `Arc<Key>`
+    /// 仍存活），此时从 map 注销会留下"悬空引用 + 配额提前释放"：key 对象仍
+    /// 存活，但已不在注册表、配额也不再记账，反复 create/unlink 可绕过配额。
+    ///
+    /// 因此只有当 map 是最后一个强引用（移除后 `strong_count == 1`，即仅剩
+    /// 本函数局部引用）时才注销并结算配额；否则标记为 Revoked 并保留在 map，
+    /// 待引用自然归零后由后续清理路径回收。
     fn destroy(&self, id: KeyId) {
         let mut guard = self.state.lock();
-        if let Some(key) = guard.keys.remove(&id) {
-            let inner = key.inner.lock();
-            let bytes = inner.payload.len().saturating_add(inner.description.len());
-            if let Some(quota_keys) = guard.quota_keys.get_mut(&inner.uid) {
-                *quota_keys = quota_keys.saturating_sub(1);
-            }
-            if let Some(quota_bytes) = guard.quota_bytes.get_mut(&inner.uid) {
-                *quota_bytes = quota_bytes.saturating_sub(bytes);
-            }
+        let Some(key) = guard.keys.remove(&id) else {
+            return;
+        };
+        if Arc::strong_count(&key) > 1 {
+            key.set_state(KeyState::Revoked);
+            guard.keys.insert(id, key);
+            return;
+        }
+        let inner = key.inner.lock();
+        let bytes = inner.payload.len().saturating_add(inner.description.len());
+        if let Some(quota_keys) = guard.quota_keys.get_mut(&inner.uid) {
+            *quota_keys = quota_keys.saturating_sub(1);
+        }
+        if let Some(quota_bytes) = guard.quota_bytes.get_mut(&inner.uid) {
+            *quota_bytes = quota_bytes.saturating_sub(bytes);
         }
     }
 
@@ -722,8 +738,12 @@ impl KeyManager {
         keyring.add_member(key.id, key_type.name(), description);
         if let Some(old) = existing {
             if old.id != key.id {
-                keyring.remove_member(old.id);
-                self.destroy(old.id);
+                let old_id = old.id;
+                keyring.remove_member(old_id);
+                // 释放调用方持有的 `Arc<Key>`，让 `destroy` 能看到 map 是否
+                // 是最后一个强引用，从而正确结算配额（见 `destroy` 注释）。
+                drop(old);
+                self.destroy(old_id);
             }
         }
         Ok(key.id)
@@ -1323,5 +1343,33 @@ mod tests {
             .update(key.id, vec![0u8; 10], &cred(1000, 0))
             .unwrap();
         assert_eq!(quota_bytes(&manager, 1000), base + 10);
+    }
+
+    #[test]
+    fn destroy_defers_while_externally_referenced() {
+        let manager = KeyManager::new();
+        let ring = make_keyring(&manager, 1000);
+        let creds = cred(1000, 0);
+        let id = manager
+            .add_key(KeyType::User, "k", b"payload".to_vec(), ring, &creds, 0)
+            .unwrap();
+        let quota_before = quota_bytes(&manager, 1000);
+        assert!(quota_before > 0);
+
+        // 持有外部 Arc 时 unlink：不注销、不释放配额，只标记 Revoked。
+        let held = manager.key(id).unwrap();
+        manager.unlink(ring, id, &creds).unwrap();
+        assert_eq!(manager.key(id).unwrap().state(), KeyState::Revoked);
+        assert_eq!(quota_bytes(&manager, 1000), quota_before);
+        drop(held);
+
+        // 无外部引用时 unlink：正常注销并释放配额。
+        let id2 = manager
+            .add_key(KeyType::User, "k2", b"payload".to_vec(), ring, &creds, 0)
+            .unwrap();
+        let quota_mid = quota_bytes(&manager, 1000);
+        manager.unlink(ring, id2, &creds).unwrap();
+        assert!(manager.key(id2).is_err());
+        assert!(quota_bytes(&manager, 1000) < quota_mid);
     }
 }
