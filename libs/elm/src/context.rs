@@ -4,8 +4,9 @@
 //! 恢复上一层。子系统可以通过 [`current_context`] 取得当前 cell、generation、状态、kind
 //! 和允许动作，从而执行 per-cell 策略检查，而不需要反向依赖 elm-mgr。
 //!
-//! 正式内核运行时应使用 [`register_current_context_ops`] 把上下文绑定到调度任务，保证任务
-//! 迁移 CPU 后仍得到正确身份。按 CPU 固定栈只是独立测试和无调度器环境的后备实现。
+//! 正式内核运行时使用 [`register_current_context_ops`] 把普通上下文绑定到调度任务，保证任务
+//! 迁移 CPU 后仍得到正确身份。按 CPU 固定栈用于硬中断上下文，以及独立测试和无调度器环境
+//! 的后备实现。
 
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -311,6 +312,10 @@ pub fn enter_current_context(context: &ElmContext) -> Option<ElmCurrentContextGu
 /// 已注册任务级后端时委托给后端；否则使用按 CPU 原子固定栈。后备模式不适合可迁移任务，
 /// 正式内核必须在启动早期注册任务级后端。
 pub fn try_enter_current_context(context: &ElmContext) -> Option<ElmCurrentContextGuard> {
+    let cpu_id = current_cpu_id();
+    if cpu_context_depth(cpu_id) != 0 {
+        return try_enter_cpu_context(cpu_id, ElmCurrentContext::from_context(context));
+    }
     if let Some(ops) = current_context_ops() {
         let backend_token = (ops.enter)(ElmCurrentContext::from_context(context))?;
         return Some(ElmCurrentContextGuard {
@@ -320,22 +325,16 @@ pub fn try_enter_current_context(context: &ElmContext) -> Option<ElmCurrentConte
             task_backed: true,
         });
     }
-    let cpu_id = current_cpu_id();
-    let depth = CURRENT_DEPTH[cpu_id].load(Ordering::Acquire);
-    if depth >= ELM_CONTEXT_MAX_DEPTH {
-        return None;
-    }
-    store_context_slot(
-        context_slot(cpu_id, depth),
-        ElmCurrentContext::from_context(context),
-    );
-    CURRENT_DEPTH[cpu_id].store(depth + 1, Ordering::Release);
-    Some(ElmCurrentContextGuard {
-        cpu_id,
-        depth,
-        backend_token: 0,
-        task_backed: false,
-    })
+    try_enter_cpu_context(cpu_id, ElmCurrentContext::from_context(context))
+}
+
+/// 在当前 CPU 上进入硬中断专用的 ELM 上下文。
+///
+/// 此入口始终使用按 CPU 固定栈，不访问任务级后端。IRQ 回调可能打断持有任务扩展锁的
+/// 内核路径，因此不能通过当前任务取得或创建 ELM 执行状态。guard 存活期间的嵌套进入、
+/// 暂停和查询也会继续使用同一个固定栈；退出最外层 IRQ guard 后恢复被打断任务的上下文。
+pub fn try_enter_interrupt_context(context: &ElmContext) -> Option<ElmCurrentContextGuard> {
+    try_enter_cpu_context(current_cpu_id(), ElmCurrentContext::from_context(context))
 }
 
 /// 暂时隐藏当前 ELM owner，并在 guard drop 时恢复。
@@ -344,6 +343,11 @@ pub fn try_enter_current_context(context: &ElmContext) -> Option<ElmCurrentConte
 /// 压入一个空标记，不分配内存，也不会丢弃外层上下文。暂停边界内仍可通过
 /// [`enter_current_context`] 进入一个显式 provider 上下文。
 pub fn suspend_current_context() -> Option<ElmCurrentContextSuspensionGuard> {
+    let cpu_id = current_cpu_id();
+    let depth = cpu_context_depth(cpu_id);
+    if depth != 0 {
+        return try_suspend_cpu_context(cpu_id, depth);
+    }
     if let Some(ops) = current_context_ops() {
         let backend_token = (ops.suspend)()?;
         return Some(ElmCurrentContextSuspensionGuard {
@@ -353,8 +357,47 @@ pub fn suspend_current_context() -> Option<ElmCurrentContextSuspensionGuard> {
             task_backed: true,
         });
     }
+    try_suspend_cpu_context(cpu_id, depth)
+}
+
+/// 返回当前任务最内层 ELM 身份快照。
+///
+/// 不在 ELM 调用边界内、栈为空或后端无上下文时返回 `None`。此函数不获取 elm-mgr 核心锁，
+/// 可供 allocator、VFS、调度和设备子系统执行快速 per-cell 检查。
+pub fn current_context() -> Option<ElmCurrentContext> {
     let cpu_id = current_cpu_id();
-    let depth = CURRENT_DEPTH[cpu_id].load(Ordering::Acquire);
+    let depth = cpu_context_depth(cpu_id);
+    if depth != 0 {
+        return cpu_context(cpu_id, depth);
+    }
+    if let Some(ops) = current_context_ops() {
+        return (ops.current)();
+    }
+    None
+}
+
+fn try_enter_cpu_context(
+    cpu_id: usize,
+    context: ElmCurrentContext,
+) -> Option<ElmCurrentContextGuard> {
+    let depth = cpu_context_depth(cpu_id);
+    if depth >= ELM_CONTEXT_MAX_DEPTH {
+        return None;
+    }
+    store_context_slot(context_slot(cpu_id, depth), context);
+    CURRENT_DEPTH[cpu_id].store(depth + 1, Ordering::Release);
+    Some(ElmCurrentContextGuard {
+        cpu_id,
+        depth,
+        backend_token: 0,
+        task_backed: false,
+    })
+}
+
+fn try_suspend_cpu_context(
+    cpu_id: usize,
+    depth: usize,
+) -> Option<ElmCurrentContextSuspensionGuard> {
     if depth >= ELM_CONTEXT_MAX_DEPTH {
         return None;
     }
@@ -368,17 +411,8 @@ pub fn suspend_current_context() -> Option<ElmCurrentContextSuspensionGuard> {
     })
 }
 
-/// 返回当前任务最内层 ELM 身份快照。
-///
-/// 不在 ELM 调用边界内、栈为空或后端无上下文时返回 `None`。此函数不获取 elm-mgr 核心锁，
-/// 可供 allocator、VFS、调度和设备子系统执行快速 per-cell 检查。
-pub fn current_context() -> Option<ElmCurrentContext> {
-    if let Some(ops) = current_context_ops() {
-        return (ops.current)();
-    }
-    let cpu_id = current_cpu_id();
-    let depth = CURRENT_DEPTH[cpu_id].load(Ordering::Acquire);
-    if depth == 0 || depth > ELM_CONTEXT_MAX_DEPTH {
+fn cpu_context(cpu_id: usize, depth: usize) -> Option<ElmCurrentContext> {
+    if depth > ELM_CONTEXT_MAX_DEPTH {
         return None;
     }
     let slot = context_slot(cpu_id, depth - 1);
@@ -401,6 +435,10 @@ pub fn current_context() -> Option<ElmCurrentContext> {
         flags: CURRENT_FLAGS[slot].load(Ordering::Acquire),
         allowed_actions: CURRENT_ALLOWED_ACTIONS[slot].load(Ordering::Acquire),
     })
+}
+
+fn cpu_context_depth(cpu_id: usize) -> usize {
+    CURRENT_DEPTH[cpu_id].load(Ordering::Acquire)
 }
 
 /// 返回当前 ELM cell id；不在 ELM 上下文中时返回 `None`。

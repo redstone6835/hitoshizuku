@@ -14,7 +14,7 @@ use crate::eevdf::{SchedParams, scale_delta_by_weight};
 use crate::sched_class::{
     DEFAULT_RT_PERIOD_NS, DEFAULT_RT_RUNTIME_NS, RT_PRIO_MAX, SchedAttr, SchedClass, SchedPolicy,
 };
-use crate::sync::Spinlock;
+use crate::sync::IrqSpinlock;
 use crate::task::{Task, TaskState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -116,7 +116,7 @@ struct RqInner {
 
 /// 单 CPU 运行队列。每个 online CPU 持有一份。
 pub(crate) struct Runqueue {
-    inner: Spinlock<RqInner>,
+    inner: IrqSpinlock<RqInner>,
     published_deadline: AtomicUsize,
     published_deadline_utilization: AtomicU64,
     published_realtime: AtomicUsize,
@@ -225,7 +225,7 @@ impl RunqueueClassLoad {
 impl Runqueue {
     pub(crate) const fn new() -> Self {
         Self {
-            inner: Spinlock::new(RqInner {
+            inner: IrqSpinlock::new(RqInner {
                 fair_tree: BTreeMap::new(),
                 rt_tree: BTreeMap::new(),
                 deadline_tree: BTreeMap::new(),
@@ -296,7 +296,7 @@ impl Runqueue {
     pub(crate) fn new_with_rt_bandwidth(period_ns: u64, runtime_ns: u64) -> Self {
         let period_ns = period_ns.max(1);
         Self {
-            inner: Spinlock::new(RqInner {
+            inner: IrqSpinlock::new(RqInner {
                 fair_tree: BTreeMap::new(),
                 rt_tree: BTreeMap::new(),
                 deadline_tree: BTreeMap::new(),
@@ -475,8 +475,8 @@ impl Runqueue {
         let _ = update_curr_locked(&mut inner, now_ns);
         task.set_state(TaskState::Runnable);
         task.sched.set_on_rq(true);
-        let preferred_fair = preferred
-            && matches!(task.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch);
+        let preferred_fair =
+            preferred && matches!(task.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch);
         let preferred_task = preferred_fair.then(|| Arc::clone(&task));
         enqueue_queued_locked_at(&mut inner, task, now_ns, "enqueue");
         if let Some(task) = preferred_task {

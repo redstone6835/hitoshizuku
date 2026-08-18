@@ -191,7 +191,7 @@ impl LocalInterruptGuard {
         Self::with_ops(local_interrupt())
     }
 
-    fn with_ops(ops: Option<&ArchLocalInterruptOps>) -> Self {
+    pub(crate) fn with_ops(ops: Option<&ArchLocalInterruptOps>) -> Self {
         match ops {
             Some(ops) => Self {
                 state: (ops.save_and_disable)(),

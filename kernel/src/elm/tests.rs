@@ -5329,16 +5329,23 @@ fn elm_msi_pnp_resource_retires_after_last_vector() {
     let controller_handle =
         general::dev::msi::register_msi_controller(RETIRING_MSI_CONTROLLER_ID, controller).unwrap();
     let vector = general::dev::msi::allocate_msi(RETIRING_MSI_CONTROLLER_ID, 42).unwrap();
-    let resource =
+    let vector_resource = general::dev::msi::vector_pnp_resource(vector, "elm-test-msi-vector");
+    let controller_resource =
         general::dev::msi::controller_pnp_resource(controller_handle, "elm-test-msi-controller");
 
-    general::dev::pnp::PnpResource::release(alloc::boxed::Box::new(resource)).unwrap();
+    assert!(
+        general::dev::pnp::PnpResource::release(alloc::boxed::Box::new(controller_resource))
+            .is_err()
+    );
+    general::dev::pnp::PnpResource::release(alloc::boxed::Box::new(vector_resource)).unwrap();
+    let controller_resource =
+        general::dev::msi::controller_pnp_resource(controller_handle, "elm-test-msi-controller");
+    general::dev::pnp::PnpResource::release(alloc::boxed::Box::new(controller_resource)).unwrap();
     assert_eq!(
         general::dev::msi::allocate_msi(RETIRING_MSI_CONTROLLER_ID, 43),
         Err(general::dev::msi::MsiError::NotFound)
     );
 
-    general::dev::msi::free_msi(vector).unwrap();
     assert_eq!(releases.load(Ordering::Acquire), 1);
     assert_eq!(
         general::dev::msi::unregister_msi_controller(controller_handle),

@@ -16,6 +16,8 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::scheduler::{online_cpu_mask, runqueue_of};
+use crate::sync::IrqSpinlock;
+#[cfg(test)]
 use crate::sync::Spinlock;
 
 /// 定点基数：1.0 负载 = `AVENRUN_ONE`（与 Linux 的 11 位定点一致）。
@@ -42,7 +44,7 @@ struct AvenrunState {
     loads: [u64; 3],
 }
 
-static STATE: Spinlock<AvenrunState> = Spinlock::new(AvenrunState {
+static STATE: IrqSpinlock<AvenrunState> = IrqSpinlock::new(AvenrunState {
     last_tick_ns: 0,
     loads: [0; 3],
 });

@@ -39,7 +39,7 @@ use crate::sched_class::{
 };
 use crate::scheduler_state::{HandoffReason, HandoffTarget, SCHEDULER, TopologySnapshot};
 use crate::signal::{DefaultAction, SigHandler, SigInfo, SignalNumber, default_action};
-use crate::sync::Spinlock;
+use crate::sync::{IrqSpinlock, Spinlock};
 use crate::task::Task;
 use crate::{ExitCode, TaskState};
 
@@ -219,7 +219,7 @@ fn invalidate_deadline_cache() {
 static CPU_HOTPLUG_LOCK: Spinlock<()> = Spinlock::new(());
 // 跨多个 runqueue 采样时统一取得这把锁，保证所有采样者以同一顺序观察
 // CPU 队列。单个 runqueue 的调度操作不取得它，避免把普通切换路径串行化。
-static RUNQUEUE_SNAPSHOT_LOCK: Spinlock<()> = Spinlock::new(());
+static RUNQUEUE_SNAPSHOT_LOCK: IrqSpinlock<()> = IrqSpinlock::new(());
 
 const NSEC_PER_USEC: u64 = 1_000;
 const NSEC_PER_MSEC: u64 = 1_000_000;

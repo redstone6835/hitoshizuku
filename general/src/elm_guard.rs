@@ -410,7 +410,7 @@ impl ElmGuard {
         true
     }
 
-    pub fn enter_domain(&self, domain: ElmExecutionDomain) -> Option<ElmExecutionDomainGuard> {
+    pub fn enter_domain(&self, domain: ElmExecutionDomain) -> Option<ElmExecutionDomainGuard<'_>> {
         if self.state.guard_depth.load(Ordering::Acquire) != self.depth + 1 {
             return None;
         }
@@ -422,7 +422,7 @@ impl ElmGuard {
         }
         frame.domain.store(domain as usize, Ordering::Release);
         Some(ElmExecutionDomainGuard {
-            state: Arc::clone(&self.state),
+            state: &self.state,
             depth: self.depth,
             previous,
         })
@@ -469,13 +469,13 @@ impl Drop for ElmGuard {
     }
 }
 
-pub struct ElmExecutionDomainGuard {
-    state: Arc<ElmTaskExecutionState>,
+pub struct ElmExecutionDomainGuard<'a> {
+    state: &'a ElmTaskExecutionState,
     depth: usize,
     previous: usize,
 }
 
-impl Drop for ElmExecutionDomainGuard {
+impl Drop for ElmExecutionDomainGuard<'_> {
     fn drop(&mut self) {
         if self.state.guard_depth.load(Ordering::Acquire) == self.depth + 1 {
             self.state.frames[self.depth]
@@ -490,8 +490,10 @@ pub fn register_task_context_backend() -> bool {
     register_current_context_ops(&TASK_CONTEXT_OPS)
 }
 
-pub fn enter_current_domain(domain: ElmExecutionDomain) -> Option<ElmExecutionDomainGuard> {
-    let state = current_state_arc()?;
+pub fn enter_current_domain(
+    domain: ElmExecutionDomain,
+) -> Option<ElmExecutionDomainGuard<'static>> {
+    let state = current_state_ref()?;
     let (depth, frame) = state.current_frame()?;
     let previous = frame.domain.load(Ordering::Acquire);
     let current = ElmExecutionDomain::from_raw(previous)?;
@@ -945,13 +947,6 @@ fn ensure_current_state() -> Option<Arc<ElmTaskExecutionState>> {
     Some(state)
 }
 
-fn current_state_arc() -> Option<Arc<ElmTaskExecutionState>> {
-    sched::current_task_fast()
-        .ext_lookup(sched::TASKEXT_ELM_EXECUTION)?
-        .downcast::<ElmTaskExecutionState>()
-        .ok()
-}
-
 fn current_state_ref() -> Option<&'static ElmTaskExecutionState> {
     let raw = sched::try_current_task_ref()?.elm_execution_ptr();
     if raw == 0 {
@@ -1092,5 +1087,38 @@ mod tests {
         assert_eq!(state.current_context_cell(), Some(11));
         state.pop_context(outer);
         assert_eq!(state.current_context_cell(), None);
+    }
+
+    #[test]
+    fn execution_domain_guard_borrows_existing_state() {
+        let state = Arc::new(ElmTaskExecutionState::new());
+        state.frames[0].cell.store(1, Ordering::Release);
+        state.frames[0]
+            .domain
+            .store(ElmExecutionDomain::Runtime as usize, Ordering::Release);
+        state.guard_depth.store(1, Ordering::Release);
+        let guard = ElmGuard {
+            state: Arc::clone(&state),
+            depth: 0,
+            cell: 1,
+            entry_cpu: 0,
+            deadline_armed: false,
+        };
+        let owners_before = Arc::strong_count(&state);
+
+        let domain_guard = guard
+            .enter_domain(ElmExecutionDomain::KernelCall)
+            .expect("应能进入内核调用域");
+
+        assert_eq!(Arc::strong_count(&state), owners_before);
+        assert_eq!(
+            state.frames[0].domain.load(Ordering::Acquire),
+            ElmExecutionDomain::KernelCall as usize
+        );
+        drop(domain_guard);
+        assert_eq!(
+            state.frames[0].domain.load(Ordering::Acquire),
+            ElmExecutionDomain::Runtime as usize
+        );
     }
 }

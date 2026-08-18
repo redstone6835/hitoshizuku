@@ -136,7 +136,7 @@ struct ElmIrqHandlerProxy {
 
 impl IrqHandler for ElmIrqHandlerProxy {
     fn handle_irq(&self, line: IrqLine) -> IrqStatus {
-        let Some(_guard) = super::pnp::enter_elm_snapshot(self.context) else {
+        let Some(_guard) = super::pnp::enter_elm_interrupt_snapshot(self.context) else {
             log::error!(
                 "[irq] cannot enter ELM handler context: owner={} cell={} generation={}",
                 self.owner,
@@ -175,7 +175,7 @@ struct ElmIrqBottomHalfProxy {
 
 impl IrqBottomHalf for ElmIrqBottomHalfProxy {
     fn run_bottom_half(&self, line: IrqLine) {
-        let Some(_guard) = super::pnp::enter_elm_snapshot(self.context) else {
+        let Some(_guard) = super::pnp::enter_elm_interrupt_snapshot(self.context) else {
             log::error!(
                 "[irq] cannot enter ELM bottom-half context: owner={} cell={} generation={}",
                 self.owner,
@@ -608,10 +608,7 @@ impl IrqRegistry {
                 continue;
             }
             if entry.state.retiring.load(Ordering::Acquire) {
-                entry
-                    .state
-                    .calls_in_flight
-                    .fetch_sub(1, Ordering::Release);
+                entry.state.calls_in_flight.fetch_sub(1, Ordering::Release);
                 continue;
             }
             // 级联 interrupt-controller handler 会继续调用 dispatch_irq_line()
@@ -624,10 +621,7 @@ impl IrqRegistry {
                     bottom_half.run_bottom_half(line);
                 }
             }
-            entry
-                .state
-                .calls_in_flight
-                .fetch_sub(1, Ordering::Release);
+            entry.state.calls_in_flight.fetch_sub(1, Ordering::Release);
         }
 
         if handled {

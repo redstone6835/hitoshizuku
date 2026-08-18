@@ -53,9 +53,13 @@ impl<T> Completion<T> {
 
     /// 标记完成，存储结果，唤醒所有等待者。
     pub fn complete(&self, value: T) {
+        // 块设备会在中断上下文完成 BIO。若本核在进程上下文持有 Completion
+        // 内部锁时被该中断打断，IRQ 路径会重入同一把锁并永久自旋。
+        let _irq_guard = sched::arch_hooks::disable_local_interrupts();
         *self.result.lock() = Some(value);
         self.done.store(true, Ordering::Release);
-        if let Some(w) = self.waker.lock().take() {
+        let waker = self.waker.lock().take();
+        if let Some(w) = waker {
             w.wake();
         }
         // Completion<T> 当前是单消费者原语；T 不要求 Clone，不能把同一结果发给多个 waiter。
@@ -77,6 +81,7 @@ impl<T> Completion<T> {
 
     /// 供 Future::poll 使用。
     pub fn poll(&self, cx: &mut Context<'_>) -> Poll<T> {
+        let _irq_guard = sched::arch_hooks::disable_local_interrupts();
         if self.done.load(Ordering::Acquire) {
             return self
                 .result
@@ -102,7 +107,7 @@ impl<T> Completion<T> {
         // 快速路径：virtio 在 QEMU 上几乎同步完成，先 spin 避免不必要的 context switch
         for _ in 0..64 {
             if self.done.load(Ordering::Acquire) {
-                if let Some(result) = self.result.lock().take() {
+                if let Some(result) = self.take_result_irq_safe() {
                     return result;
                 }
             }
@@ -110,11 +115,12 @@ impl<T> Completion<T> {
         }
         loop {
             if self.done.load(Ordering::Acquire) {
-                if let Some(result) = self.result.lock().take() {
+                if let Some(result) = self.take_result_irq_safe() {
                     return result;
                 }
             }
             let task = sched::current_task();
+            let irq_guard = sched::arch_hooks::disable_local_interrupts();
             let entry = self
                 .wait_queue
                 .prepare_to_wait(&task, sched::TaskState::Sleeping);
@@ -124,20 +130,30 @@ impl<T> Completion<T> {
                     return result;
                 }
             }
+            drop(irq_guard);
             drop(task);
             sched::schedule_once(sched::now_ns_public());
-            self.wait_queue.finish_wait(&entry);
+            {
+                let _irq_guard = sched::arch_hooks::disable_local_interrupts();
+                self.wait_queue.finish_wait(&entry);
+            }
         }
     }
 
     fn wait_spinning(&self) -> T {
         loop {
             if self.done.load(Ordering::Acquire) {
-                if let Some(result) = self.result.lock().take() {
+                if let Some(result) = self.take_result_irq_safe() {
                     return result;
                 }
             }
             core::hint::spin_loop();
         }
+    }
+
+    #[inline]
+    fn take_result_irq_safe(&self) -> Option<T> {
+        let _irq_guard = sched::arch_hooks::disable_local_interrupts();
+        self.result.lock().take()
     }
 }

@@ -760,8 +760,6 @@ struct Relations {
     parent: Weak<Task>,
     /// 直接子任务的强引用列表。Zombie 子在被 reap 之前一直留在这里。
     children: Vec<Arc<Task>>,
-    /// 所属线程组（CLONE_THREAD 共享同一 group，新进程则各自独立）。
-    thread_group: Arc<ThreadGroup>,
     /// 所属进程组（setpgid 可改）。
     process_group: Arc<ProcessGroup>,
     /// 任务在各 namespace 中的 pid。从最外层祖先到自身所在 ns 依序排列，
@@ -775,9 +773,9 @@ struct Relations {
 /// 内核任务。
 ///
 /// 整个结构使用内部可变性：稳定字段（`sched`、`exit_waiters`、`signal`、
-/// `vfork_done`）放在外层；状态字段用原子；亲缘字段集中在 [`Relations`] 内，
-/// 由一把 [`Spinlock`] 保护；其它跨子系统状态（凭据、共享信号表、内核栈、
-/// arch ctx、ext 侧表）各自独立小锁。
+/// `vfork_done`、`thread_group`）放在外层；状态字段用原子；亲缘字段集中在
+/// [`Relations`] 内，由一把 [`Spinlock`] 保护；其它跨子系统状态（凭据、共享
+/// 信号表、内核栈、arch ctx、ext 侧表）各自独立小锁。
 pub struct Task {
     pub sched: SchedEntity,
     /// 用户任务和内核任务的生命周期域不同。该字段用于把内核线程从 POSIX
@@ -855,6 +853,8 @@ pub struct Task {
     ptrace_singlestep_addr: AtomicUsize,
     ptrace_singlestep_insn: Spinlock<Option<u32>>,
     pub exit_waiters: WaitQueue,
+    /// 任务创建后所属线程组不变，直接保存稳定引用，供 timer IRQ 记账无锁读取。
+    thread_group: Arc<ThreadGroup>,
     rel: Spinlock<Relations>,
     /// Native child 的线程组 owner；与 POSIX `parent` 解耦，避免调用线程退出
     /// 时触发错误的 task-level reparent。
@@ -1059,10 +1059,10 @@ impl Task {
             ptrace_singlestep_addr: AtomicUsize::new(0),
             ptrace_singlestep_insn: Spinlock::new(None),
             exit_waiters: WaitQueue::new_with_reason(WaitReason::ProcessExit),
+            thread_group,
             rel: Spinlock::new(Relations {
                 parent,
                 children: Vec::new(),
-                thread_group,
                 process_group,
                 pid_in_ns: Vec::new(),
                 // 占位 ns：sched::init() 完成前 ROOT_PID_NS 未发布，不能在此
@@ -1760,7 +1760,7 @@ impl Task {
     }
 
     pub fn thread_group(&self) -> Arc<ThreadGroup> {
-        Arc::clone(&self.rel.lock().thread_group)
+        Arc::clone(&self.thread_group)
     }
 
     /// 记录该任务由哪个线程组持有 Native child 所有权。

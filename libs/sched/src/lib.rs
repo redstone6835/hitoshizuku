@@ -34,7 +34,7 @@
 //! 1. `RT_SCHEDULING_CONFIG` —— 仅 sysctl 更新路径持有；可依次进入各 CPU
 //!    `Runqueue::inner`，反向获取禁止。
 //! 2. `Runqueue::inner` —— 每 CPU 一把，严禁跨 rq 反序。
-//! 3. `Task::rel` —— 亲子关系（parent / children / tg_link / pid_in_ns）。
+//! 3. `Task::rel` —— 亲子关系、进程组和 PID 命名空间状态。
 //! 4. `Task::creds` / `Task::kstack` / `Task::ctx` / `Task::ext` —— 同一
 //!    Task 内的次级字段锁，彼此独立，禁止互相嵌套。`Task::shared_signal`
 //!    是稳定的 `Arc`，其内部状态按自身规则同步。

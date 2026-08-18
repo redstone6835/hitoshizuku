@@ -1005,10 +1005,11 @@ impl PreparedClone {
                     wait_child.vfork_done.finish_wait(&entry);
                 }
             }
-        } else if !self.args.flags.has(CloneFlags::CLONE_THREAD) {
+        } else {
             // 不在 clone syscall 尚未返回时直接重入调度：父进程的 trap frame
-            // 仍由 syscall 出口负责写返回值和推进 PC。这里只登记一次收尾后的
-            // 启动交接，由 syscall dispatcher 在安全边界切给新子进程。
+            // 仍由 syscall 出口负责写返回值和推进 PC。线程 clone 也必须登记一次
+            // 收尾后的启动交接，否则连续 pthread_create 会让父线程长期独占 CPU，
+            // 子线程无法及时运行和退出清理。
             request_post_syscall_handoff();
         }
 
