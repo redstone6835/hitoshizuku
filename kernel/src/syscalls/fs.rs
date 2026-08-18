@@ -4011,7 +4011,9 @@ pub(super) fn sys_memfd_create(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     let name_user = ctx.args[0];
     let flags = ctx.args[1];
     if (flags & MFD_UNSUPPORTED) != 0 {
-        return Err(Errno::EOPNOTSUPP);
+        // MFD_HUGETLB:本内核未配置 hugetlbfs,与 Linux 无 CONFIG_HUGETLBFS
+        // 时 hugetlb_file_setup 存根返回 ENOSYS 的语义对齐。
+        return Err(Errno::ENOSYS);
     }
     if (flags & (MFD_EXEC | MFD_NOEXEC_SEAL)) == (MFD_EXEC | MFD_NOEXEC_SEAL) {
         return Err(Errno::EINVAL);

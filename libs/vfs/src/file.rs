@@ -1228,6 +1228,10 @@ impl ::mm::FileLike for File {
         self.inode.private_page_cache_generation()
     }
 
+    fn shared_page_cache_generation(&self) -> Option<u64> {
+        self.inode.shared_page_cache_generation()
+    }
+
     fn disable_private_page_cache(&self) {
         self.inode.disable_private_page_cache();
     }

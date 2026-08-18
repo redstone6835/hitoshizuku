@@ -401,6 +401,16 @@ impl Inode {
         data_state_generation(self.data_state.load(Ordering::Acquire))
     }
 
+    /// 返回可供 `MAP_SHARED` 文件页缓存使用的内容代际。
+    ///
+    /// 复用 [`Self::data_generation`]:每次内容变更(`write`/`truncate`/
+    /// `fallocate` 等,经 `begin_data_mutation` 保护)结束发布时递增,单调不降、
+    /// 不复活。与私有页缓存的 `private_page_cache_generation` 不同,这里不要求
+    /// 空闲(mutation 在途时也可返回旧代际,VM 只会在下次缺页时读取最新值)。
+    pub(crate) fn shared_page_cache_generation(&self) -> Option<u64> {
+        Some(self.data_generation())
+    }
+
     /// 返回可用于私有干净页缓存的稳定代际。
     ///
     /// 代际、active 和禁用标志来自同一个原子状态字；VM 在读取文件页之后还会
