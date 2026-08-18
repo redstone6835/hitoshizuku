@@ -45,6 +45,38 @@ pub fn locked_pages() -> u64 {
     LOCKED_PAGES.load(Ordering::Acquire)
 }
 
+/// 文件页累计写回数（成功写回底层存储的页数）。
+///
+/// `cachestat(2)` 的 `nr_writeback` 用。本内核写回为同步执行、无异步 in-flight
+/// 窗口，因此以累计写回数近似（Linux 报"当前正在写回"的瞬时页数）。
+static FILE_WRITEBACK_PAGES: AtomicU64 = AtomicU64::new(0);
+
+/// 文件页累计淘汰数（私有干净文件页缓存被回收的页数）。
+///
+/// `cachestat(2)` 的 `nr_evicted` 用。无 LRU 时钟，`nr_recently_evicted` 同样
+/// 退化为此累计值（见 [`file_evicted_pages`]）。
+static FILE_EVICTED_PAGES: AtomicU64 = AtomicU64::new(0);
+
+/// 记账一次成功写回。
+pub fn record_file_writeback() {
+    FILE_WRITEBACK_PAGES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 记账一次文件缓存淘汰。
+pub fn record_file_evict() {
+    FILE_EVICTED_PAGES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 文件页累计写回数。
+pub fn file_writeback_pages() -> u64 {
+    FILE_WRITEBACK_PAGES.load(Ordering::Acquire)
+}
+
+/// 文件页累计淘汰数（`nr_recently_evicted` 亦退化为该值）。
+pub fn file_evicted_pages() -> u64 {
+    FILE_EVICTED_PAGES.load(Ordering::Acquire)
+}
+
 /// 记账一次承诺页数变化（页为单位，可为负）。
 pub fn commit_pages(delta: i64) {
     if delta > 0 {

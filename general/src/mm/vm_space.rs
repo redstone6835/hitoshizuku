@@ -22,9 +22,11 @@ use crate::mm::fault::{FaultKind, FaultOutcome, KernelFaultReason};
 use crate::mm::memstat;
 use crate::mm::ops::{PgdHandle, UserPteUpdate, UserVmLayoutOps, user_pgd_ops, user_vm_layout};
 use crate::mm::resident_map::RadixPageMap;
+use crate::mm::swap::SwapSlot;
 use crate::mm::uffd::{
-    UFFD_PAGEFAULT_FLAG_WP, UFFD_PAGEFAULT_FLAG_WRITE, UFFDIO_REGISTER_MODE_MISSING,
-    UFFDIO_REGISTER_MODE_WP, UffdRegion, UffdState,
+    UFFD_PAGEFAULT_FLAG_MINOR, UFFD_PAGEFAULT_FLAG_WP, UFFD_PAGEFAULT_FLAG_WRITE,
+    UFFDIO_REGISTER_MODE_MINOR, UFFDIO_REGISTER_MODE_MISSING, UFFDIO_REGISTER_MODE_WP, UffdRegion,
+    UffdState,
 };
 
 /// 顺序只读文件缺页一次最多预装的页数（包含硬件实际命中的页）。
@@ -83,6 +85,9 @@ pub struct Mempolicy {
     pub mode: u32,
     /// 节点位图（本内核只有 node 0，合法掩码只能是 0 或 1）。
     pub node_mask: u64,
+    /// `MPOL_BIND`/`MPOL_PREFERRED` 的 home node（`set_mempolicy_home_node`）。
+    /// 单节点系统恒为 0；未显式设置时与 `node_mask` 首个节点一致。
+    pub home_node: u32,
 }
 
 /// 地址空间级内存策略状态：进程默认策略 + `mbind` 区域覆盖。
@@ -395,6 +400,24 @@ fn vm_layout() -> &'static UserVmLayoutOps {
 #[kernel_symbols::export(name = "general.mm.page_size", contract = "kernel.mm.query@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
 pub fn page_size() -> usize {
     vm_layout().page_size
+}
+
+/// 栈向低地址生长的最大字节数，取 `RLIMIT_STACK` 软上限与架构布局上限的较小值。
+///
+/// Linux 栈扩展按 `RLIMIT_STACK` 软上限限制；`RLIM_INFINITY` 或调度器尚未就绪
+/// （启动早期自检）时退回架构布局硬上限 `max_grows_down_bytes`。
+fn stack_growth_limit() -> usize {
+    let layout_max = vm_layout().max_grows_down_bytes;
+    if !sched::is_ready() {
+        return layout_max;
+    }
+    match sched::operation::get_rlimit(sched::rlimit::Resource::Stack) {
+        Ok(pair) if !pair.soft.is_infinity() => {
+            let soft = usize::try_from(pair.soft.0).unwrap_or(usize::MAX);
+            soft.min(layout_max)
+        }
+        _ => layout_max,
+    }
 }
 
 #[inline]
@@ -1636,6 +1659,7 @@ impl PrivateFilePageCacheState {
         };
         self.ready_pages = self.ready_pages.saturating_sub(1);
         self.evictions = self.evictions.saturating_add(1);
+        memstat::record_file_evict();
         Some(entry.page)
     }
 
@@ -2257,7 +2281,11 @@ impl ResidentPage {
             }
             written += n;
         }
-        file.sync()
+        file.sync()?;
+        // cachestat 的 nr_writeback：累计成功写回底层存储的页数(本内核写回为
+        // 同步执行,无"in-flight"窗口,故以累计值近似)。
+        memstat::record_file_writeback();
+        Ok(())
     }
 }
 
@@ -2690,6 +2718,14 @@ pub struct VmSpace {
     mempolicy: Spinlock<MempolicyState>,
     /// userfaultfd 登记区域。fork 不继承（Linux 语义：子进程不带 uffd 状态）。
     uffd_regions: Spinlock<Vec<UffdRegion>>,
+    /// 已换出匿名页的槽位表（`虚拟页 -> SwapSlot`）。见 [`crate::mm::swap`] 顶部
+    /// 关于"槽位表替代 PTE swap 编码"的说明。
+    swapped: Spinlock<RadixPageMap<SwapSlot>>,
+    /// `MADV_FREE` 标记的可释放页；无 LRU 回收器时仅在显式回收点被丢弃。
+    freeable: Spinlock<RadixPageMap<()>>,
+    /// `MADV_COLD` 标记的冷页；无 LRU 回收器时仅作为 `MADV_PAGEOUT` 的优先级
+    /// 提示并记录可观测状态。
+    cold: Spinlock<RadixPageMap<()>>,
     /// `membarrier(2)` expedited 命令的地址空间级注册位。
     membarrier_registration: AtomicUsize,
     /// 诊断辅助：记录当前已建立页表映射的用户页数。
@@ -2725,6 +2761,9 @@ impl VmSpace {
             locked_pages: AtomicUsize::new(0),
             mempolicy: Spinlock::new(MempolicyState::default()),
             uffd_regions: Spinlock::new(Vec::new()),
+            swapped: Spinlock::new(RadixPageMap::new(layout.page_size)),
+            freeable: Spinlock::new(RadixPageMap::new(layout.page_size)),
+            cold: Spinlock::new(RadixPageMap::new(layout.page_size)),
             membarrier_registration: AtomicUsize::new(0),
             mapped_pages: AtomicUsize::new(0),
             #[cfg(feature = "performance-profile")]
@@ -2856,6 +2895,56 @@ impl VmSpace {
     /// 当前承诺页数（overcommit 记账）。
     pub fn committed_pages(&self) -> usize {
         self.committed_pages.load(Ordering::Acquire)
+    }
+
+    /// 全部 VMA 的几何页数（含 `MAP_NORESERVE`），供 `RLIMIT_AS` 检查。
+    ///
+    /// 口径与 Linux `mm->total_vm` 一致：不区分是否预留承诺，只统计地址空间
+    /// 当前占用的虚拟页几何大小。
+    pub fn total_vm_pages(&self) -> usize {
+        self.vmas.lock().iter().map(Self::area_page_count).sum()
+    }
+
+    /// 私有可写非栈 VMA 的几何页数，供 `RLIMIT_DATA` 检查。
+    ///
+    /// 判定条件对齐 Linux `is_data_mapping`：`VM_WRITE` 置位且 `VM_SHARED`/
+    /// `VM_STACK` 均未置位。本内核没有独立的 `VM_STACK` 位，`MAP_GROWSDOWN`/
+    /// 主栈用 `GROWS_DOWN` 近似 `VM_STACK`。
+    pub fn data_vm_pages(&self) -> usize {
+        let set = self.vmas.lock();
+        set.iter()
+            .filter(|area| {
+                area.flags.has(VmFlags::WRITE)
+                    && !area.flags.has(VmFlags::SHARED)
+                    && !area.flags.has(VmFlags::GROWS_DOWN)
+            })
+            .map(Self::area_page_count)
+            .sum()
+    }
+
+    /// `range` 是否与任何 `SEALED`（mseal）区域相交。
+    ///
+    /// `mprotect`/`munmap`/`mremap`/`MAP_FIXED` 之外的修改性 `madvise` 也按
+    /// Linux `can_modify_mm` 语义拦截。
+    pub fn has_sealed_in(&self, range: &Range<usize>) -> bool {
+        Self::contains_sealed(&self.vmas.lock(), range)
+    }
+
+    /// `addr` 所在 VMA 是否计入 `RLIMIT_DATA`（Linux `is_data_mapping`）。
+    pub fn vma_is_data(&self, addr: usize) -> bool {
+        self.vmas.lock().find(addr).is_some_and(|area| {
+            area.flags.has(VmFlags::WRITE)
+                && !area.flags.has(VmFlags::SHARED)
+                && !area.flags.has(VmFlags::GROWS_DOWN)
+        })
+    }
+
+    /// `addr` 所在页当前是否驻留（resident ledger 中是否存在条目）。
+    ///
+    /// 不触发缺页、不修改页表；`move_pages` 用它与 `mincore` 同口径判断页是否
+    /// 存在（Linux `move_pages` 的 status 以页是否驻留为准，而非 VMA 是否可读）。
+    pub fn is_page_resident(&self, addr: usize) -> bool {
+        self.pages.lock().contains_key(page_base(addr))
     }
 
     #[kernel_symbols::export(name = "general.mm.VmSpace.current_brk", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
@@ -3807,6 +3896,139 @@ impl VmSpace {
         Ok(new_range.start)
     }
 
+    /// `mremap(MREMAP_DONTUNMAP)`：把私有匿名映射搬到新地址，同时把旧地址替换为
+    /// 一段不驻留的空匿名映射（Linux 5.7+ 的原地扩展双映射语义）。
+    ///
+    /// 限制与取舍：仅支持私有匿名映射（Linux 同样要求）；不支持 `new_len <
+    /// old_len` 的收缩（返回 `EINVAL`）。迁移后旧地址首次访问得到零页，新地址
+    /// 持有原页。
+    pub fn mremap_dontunmap(
+        &self,
+        old_range: Range<usize>,
+        new_len: usize,
+        fixed_addr: Option<usize>,
+    ) -> Result<usize, Errno> {
+        self.validate_range(&old_range)?;
+        let page_size = page_size();
+        if new_len == 0 || new_len % page_size != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let old_len = old_range.end - old_range.start;
+        if new_len < old_len {
+            return Err(Errno::EINVAL);
+        }
+        // 旧范围必须被私有匿名 VMA 连续覆盖。
+        {
+            let set = self.vmas.lock();
+            if !set.contains_range(&old_range) {
+                return Err(Errno::ENOMEM);
+            }
+            for area in set.iter_overlap(&old_range) {
+                if !matches!(area.backing, VmBacking::Anon { .. })
+                    || area.flags.has(VmFlags::SHARED)
+                {
+                    return Err(Errno::EINVAL);
+                }
+            }
+            if Self::contains_sealed(&set, &old_range) {
+                return Err(Errno::EPERM);
+            }
+        }
+        let new_start = if let Some(addr) = fixed_addr {
+            addr
+        } else {
+            self.alloc_mmap_range(new_len)?.start
+        };
+        let new_end = new_start.checked_add(new_len).ok_or(Errno::EINVAL)?;
+        let new_range = new_start..new_end;
+        self.validate_range(&new_range)?;
+        if ranges_overlap(&old_range, &new_range) {
+            return Err(Errno::EINVAL);
+        }
+
+        let (removed_target, empty_anon, tail, moved_pages) = {
+            let mut vmas = self.vmas.lock();
+            if !vmas.contains_range(&old_range) {
+                return Err(Errno::ENOMEM);
+            }
+            if Self::contains_sealed(&vmas, &new_range) {
+                return Err(Errno::EPERM);
+            }
+            let removed_target = if fixed_addr.is_some() {
+                vmas.unmap_range(&new_range)
+            } else {
+                if !vmas.is_range_free(&new_range) {
+                    return Err(Errno::EEXIST);
+                }
+                Vec::new()
+            };
+            let old_pieces = vmas.unmap_range(&old_range);
+            let old_covered = covered_len(&old_pieces, &old_range);
+            if old_covered != old_len {
+                return Err(Errno::ENOMEM);
+            }
+
+            // 1) 旧地址:插入空匿名 VMA(保留原权限/标志,换用全新合并域)。
+            let mut empty_anon = Vec::with_capacity(old_pieces.len());
+            let mut cursor = old_range.start;
+            for mut area in old_pieces.clone() {
+                let len = area.range.end - area.range.start;
+                area.backing = VmBacking::anonymous();
+                area.flags = area.flags.without(VmFlags::SHARED).with(VmFlags::ANON);
+                area.range = cursor..cursor + len;
+                cursor += len;
+                vmas.insert(area.clone())?;
+                empty_anon.push(area);
+            }
+            // 2) 新地址:插入搬移后的原 VMA。
+            let mut cursor = new_range.start;
+            let mut last_inserted = None;
+            for mut area in old_pieces {
+                let len = area.range.end - area.range.start;
+                area.range = cursor..cursor + len;
+                cursor += len;
+                last_inserted = Some(area.clone());
+                vmas.insert(area)?;
+            }
+            let tail = if cursor < new_range.end {
+                let last = last_inserted.ok_or(Errno::ENOMEM)?;
+                let last_len = last.range.end - last.range.start;
+                let backing = last.backing.checked_shift(last_len).ok_or(Errno::EINVAL)?;
+                let tail = VmArea {
+                    range: cursor..new_range.end,
+                    flags: last.flags,
+                    backing,
+                };
+                vmas.insert(tail.clone())?;
+                Some(tail)
+            } else {
+                None
+            };
+            let removed_pages = self.unmap_page_mappings(new_range.clone())?;
+            let moved_pages =
+                self.move_page_mappings_locked(&vmas, old_range.start, new_range.start, old_len)?;
+            (removed_target, empty_anon, tail, moved_pages)
+        };
+        for area in &removed_target {
+            self.account_area_remove(area);
+        }
+        for area in &empty_anon {
+            self.account_area_insert(area);
+        }
+        if let Some(tail) = &tail {
+            self.account_area_insert(tail);
+        }
+        Self::notify_file_unmapped(&removed_target);
+        if moved_pages {
+            self.invalidate_user_range(old_range.start, old_len);
+            self.invalidate_user_range(new_range.start, old_len);
+        }
+        drop(removed_target);
+        prune_shared_anon_pages();
+        self.mmap_next.store(new_range.end, Ordering::Release);
+        Ok(new_range.start)
+    }
+
     /// 修改权限。要求整个 range 已被 VMA 连续覆盖。
     #[kernel_symbols::export(name = "general.mm.VmSpace.mprotect", contract = "kernel.mm.mapping@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn mprotect(&self, range: Range<usize>, new_flags: VmFlags) -> Result<(), Errno> {
@@ -3951,12 +4173,8 @@ impl VmSpace {
         self.validate_range(&range)?;
         let page_size = page_size();
         let page_count = (range.end - range.start) / page_size;
-        {
-            let set = self.vmas.lock();
-            if !set.contains_range(&range) {
-                return Err(Errno::ENOMEM);
-            }
-        }
+        // Linux `mincore(2)` 逐页遍历页表：VMA 空洞（未映射页）在向量中置 0，
+        // 不要求范围被 VMA 连续覆盖，也不返回 ENOMEM/EFAULT。
         let pages = self.pages.lock();
         let mut out = Vec::new();
         out.try_reserve_exact(page_count)
@@ -4071,7 +4289,8 @@ impl VmSpace {
     ///
     /// - 共享文件页：先写回脏数据再丢弃（内容保留在文件中，重读恢复）；
     /// - 私有文件页：直接丢弃（干净页重读恢复；脏私有页内容丢失，与 Linux 一致）；
-    /// - 匿名页：无 swap 可换出，保持不动（等价无 swap 的 Linux 行为）；
+    /// - 匿名页：有 swap 空间时换出；`MADV_FREE`/`MAP_DROPPABLE` 页直接丢弃
+    ///   （内容读回零页）；无 swap 空间时保持不动（等价无 swap 的 Linux 行为）；
     /// - 已锁页：跳过（unevictable）。
     pub fn madvise_pagout(&self, range: Range<usize>) -> Result<(), Errno> {
         self.validate_range(&range)?;
@@ -4114,6 +4333,111 @@ impl VmSpace {
                 self.invalidate_user_range(sub.start, sub.end - sub.start);
             }
             drop(removed);
+        }
+        self.pagout_anon_subranges(&range)?;
+        Ok(())
+    }
+
+    /// `MADV_PAGEOUT` 的匿名页部分：换出到 swap，或对 FREE/DROPPABLE 页直接丢弃。
+    fn pagout_anon_subranges(&self, range: &Range<usize>) -> Result<(), Errno> {
+        let page_size = page_size();
+        let anon_subranges: Vec<(Range<usize>, bool)> = {
+            let set = self.vmas.lock();
+            let mut out = Vec::new();
+            for area in set.iter_overlap(range) {
+                if area.flags.has(VmFlags::LOCKED) {
+                    continue;
+                }
+                if !matches!(area.backing, VmBacking::Anon { .. }) {
+                    continue;
+                }
+                let sub = area.range.start.max(range.start)..area.range.end.min(range.end);
+                out.push((sub, area.flags.has(VmFlags::DROPPABLE)));
+            }
+            out
+        };
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EINVAL)?;
+        for (sub, area_droppable) in anon_subranges {
+            // 收集驻留的私有匿名页(不持锁做 I/O)。
+            let resident: Vec<(usize, Arc<ResidentPage>)> = {
+                let pages = self.pages.lock();
+                let mut out = Vec::new();
+                pages.for_each_range(sub.clone(), |va, mapping| {
+                    out.push((va, Arc::clone(&mapping.page)));
+                });
+                out
+            };
+            // 先确定每页是否被 MADV_FREE 标记(短锁),换出 I/O 不持任何自旋锁。
+            let freeable_marked: Vec<bool> = {
+                let freeable = self.freeable.lock();
+                resident
+                    .iter()
+                    .map(|(va, _)| freeable.contains_key(*va))
+                    .collect()
+            };
+            let mut to_drop = Vec::new();
+            for ((va, page), freeable) in resident.iter().zip(freeable_marked) {
+                if area_droppable || freeable {
+                    // FREE/DROPPABLE：不写回,直接丢弃,后续读回零页。
+                    to_drop.push(*va);
+                    continue;
+                }
+                // 换出到 swap;无空闲槽位时保持驻留(等价无 swap 的 Linux 行为)。
+                let buf = unsafe {
+                    core::slice::from_raw_parts(virt_fn(page.paddr()) as *const u8, page_size)
+                };
+                if let Ok(slot) = crate::mm::swap::swap_out_page(buf) {
+                    self.swapped.lock().insert(*va, slot);
+                    to_drop.push(*va);
+                }
+            }
+            for va in to_drop {
+                let removed = self.unmap_page_mappings_preserve_swap(va..va + page_size)?;
+                drop(removed);
+                self.invalidate_user_range(va, page_size);
+            }
+        }
+        Ok(())
+    }
+
+    /// `MADV_FREE`：标记范围内已驻留的私有匿名页为可释放，内容保留到实际回收。
+    ///
+    /// 本内核无 LRU/内存压力回收器，页在后续 `MADV_DONTNEED` / `MADV_PAGEOUT` /
+    /// 显式回收点时才会被丢弃；无压力场景下内容始终保留，与 Linux 可观测行为一致。
+    pub fn madvise_free(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        {
+            let set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(Errno::ENOMEM);
+            }
+        }
+        let keys = { self.pages.lock().keys_in_range(range) };
+        let mut freeable = self.freeable.lock();
+        for va in keys {
+            freeable.insert(va, ());
+        }
+        Ok(())
+    }
+
+    /// `MADV_COLD`：标记范围内已驻留的私有匿名页为冷页。
+    ///
+    /// 无 LRU/回收器时"冷"只影响 `MADV_PAGEOUT` 的回收优先级（本内核 PAGEOUT 会
+    /// 换出范围内全部匿名页,因此冷标记不改变换出行为,仅作为可观测状态记录）。
+    pub fn madvise_cold(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        {
+            let set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(Errno::ENOMEM);
+            }
+        }
+        let keys = { self.pages.lock().keys_in_range(range) };
+        let mut cold = self.cold.lock();
+        for va in keys {
+            cold.insert(va, ());
         }
         Ok(())
     }
@@ -4305,6 +4629,40 @@ impl VmSpace {
             }
         }
         (state.default_policy, false)
+    }
+
+    /// `set_mempolicy_home_node(2)`：为范围上已存在的 `MPOL_BIND`（或
+    /// `MPOL_PREFERRED`）区域策略设置 home node。
+    ///
+    /// Linux 语义：范围必须被带 `MPOL_BIND`/`MPOL_PREFERRED` 策略的 VMA 连续
+    /// 覆盖，否则返回 `EINVAL`；home node 必须属于该策略的节点集，否则 `EINVAL`。
+    /// 单节点系统 home node 只能为 0，因此这里主要校验"范围确实存在可设置
+    /// home node 的策略"，并记录该设置（供 `get_mempolicy` 观测）。
+    pub fn set_mempolicy_home_node(
+        &self,
+        range: Range<usize>,
+        home_node: u32,
+    ) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        let mut state = self.mempolicy.lock();
+        let mut cursor = range.start;
+        for ((start, end), policy) in state.ranges.iter_mut() {
+            if *end <= range.start || *start >= range.end {
+                continue;
+            }
+            if *start > cursor {
+                return Err(Errno::EINVAL);
+            }
+            if !matches!(policy.mode, 2 /* MPOL_BIND */ | 1 /* MPOL_PREFERRED */) {
+                return Err(Errno::EINVAL);
+            }
+            policy.home_node = home_node;
+            cursor = cursor.max(*end);
+            if cursor >= range.end {
+                return Ok(());
+            }
+        }
+        Err(Errno::EINVAL)
     }
 
     /// 确保远程地址空间（其它进程的 `VmSpace`）的 `addr` 页可访问。
@@ -4536,6 +4894,37 @@ impl VmSpace {
         Ok(len as u64)
     }
 
+    /// `UFFDIO_CONTINUE`：为 MINOR 模式缺页安装"页缓存中已存在"的页。
+    ///
+    /// 与 Linux 的差异：Linux 的 MINOR 缺页针对 shmem/file 后端（页已在页缓存、
+    /// 只差映射）；本内核仅支持私有匿名后端，没有共享页缓存页可 continue，因此
+    /// 退化为对非驻留页安装零页（等价 ZEROPAGE），并据此注明 shmem/file 后端缺失。
+    pub(crate) fn uffd_continue(&self, start: usize, len: usize) -> Result<u64, Errno> {
+        let page_size = page_size();
+        if start % page_size != 0 || len == 0 || len % page_size != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = start.checked_add(len).ok_or(Errno::EINVAL)?;
+        {
+            let pages = self.pages.lock();
+            let mut va = start;
+            while va < end {
+                if pages.contains_key(va) {
+                    return Err(Errno::EEXIST);
+                }
+                va += page_size;
+            }
+        }
+        let mut va = start;
+        while va < end {
+            let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+            let page = ResidentPage::new_anon(paddr);
+            self.uffd_install_page(va, page, false)?;
+            va += page_size;
+        }
+        Ok(len as u64)
+    }
+
     /// `UFFDIO_WRITEPROTECT`：设置/清除范围内驻留页的写保护。
     ///
     /// 要求范围命中登记了 WP 模式且属于 `state` 的区域（否则 `EINVAL`）。
@@ -4685,6 +5074,57 @@ impl VmSpace {
         } else {
             0
         };
+        state.enqueue_fault(flags, page);
+        let page_present = || self.pages.lock().contains_key(page);
+        let region_alive = || {
+            if !state.alive() {
+                return false;
+            }
+            self.uffd_regions
+                .lock()
+                .iter()
+                .any(|region| region.range.contains(&page) && Arc::ptr_eq(&region.state, &state))
+        };
+        state.wait_fault(|| page_present() || !region_alive());
+        page_present()
+    }
+
+    /// MINOR 拦截：`page` 命中 MINOR 登记区域且未驻留时，入队 MINOR 事件并挂起，
+    /// 由用户态通过 `UFFDIO_CONTINUE`/`UFFDIO_COPY` 解决。
+    ///
+    /// 与 Linux 的差异：Linux 的 MINOR 缺页表示"页已在页缓存、只差映射"；本内核
+    /// 仅支持私有匿名后端，无共享页缓存，因此 MINOR 拦截退化为对非驻留页触发，
+    /// 等价 MISSING 但事件带 `UFFD_PAGEFAULT_FLAG_MINOR`。
+    fn uffd_minor_intercept(&self, page: usize, kind: FaultKind) -> bool {
+        let region = {
+            let regions = self.uffd_regions.lock();
+            if regions.is_empty() {
+                return false;
+            }
+            let Some(region) = regions.iter().find(|region| {
+                region.range.contains(&page) && region.mode & UFFDIO_REGISTER_MODE_MINOR != 0
+            }) else {
+                return false;
+            };
+            region.clone()
+        };
+        if self.pages.lock().contains_key(page) {
+            return false;
+        }
+        {
+            let set = self.vmas.lock();
+            let Some(area) = set.find(page) else {
+                return false;
+            };
+            if !matches!(area.backing, VmBacking::Anon { .. }) || area.flags.has(VmFlags::SHARED) {
+                return false;
+            }
+        }
+        let state = Arc::clone(&region.state);
+        let mut flags = UFFD_PAGEFAULT_FLAG_MINOR;
+        if matches!(kind, FaultKind::Store | FaultKind::PermWrite) {
+            flags |= UFFD_PAGEFAULT_FLAG_WRITE;
+        }
         state.enqueue_fault(flags, page);
         let page_present = || self.pages.lock().contains_key(page);
         let region_alive = || {
@@ -4880,6 +5320,8 @@ impl VmSpace {
     #[kernel_symbols::export(name = "general.mm.VmSpace.fork", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn fork(&self) -> Self {
         let ops = user_pgd_ops().expect("[mm] user_pgd_ops not registered");
+        // 先换入全部换出页,保证子进程看到父进程完整内容(见 swap_in_all 注释)。
+        self.swap_in_all();
         let new_pgd = (ops.new_pgd_for_user)();
         let mut parent_set = self.vmas.lock();
         let cloned_set = parent_set.fork_clone_metadata();
@@ -4945,6 +5387,10 @@ impl VmSpace {
             mempolicy: Spinlock::new(self.mempolicy.lock().clone()),
             // fork 不继承 userfaultfd 登记（Linux 语义）。
             uffd_regions: Spinlock::new(Vec::new()),
+            // 父进程已在 swap_in_all 中完全换入,子进程从零开始建立换出/FREE/COLD 状态。
+            swapped: Spinlock::new(RadixPageMap::new(page_size())),
+            freeable: Spinlock::new(RadixPageMap::new(page_size())),
+            cold: Spinlock::new(RadixPageMap::new(page_size())),
             // fork 创建独立 mm，按 Linux 语义不继承 expedited 注册状态。
             membarrier_registration: AtomicUsize::new(0),
             mapped_pages: AtomicUsize::new(mapped_pages),
@@ -5011,6 +5457,9 @@ impl VmSpace {
         if self.uffd_missing_intercept(page, kind) {
             return FaultOutcome::Fixed;
         }
+        if self.uffd_minor_intercept(page, kind) {
+            return FaultOutcome::Fixed;
+        }
         if self.uffd_wp_intercept(page, kind) {
             return FaultOutcome::Fixed;
         }
@@ -5024,8 +5473,7 @@ impl VmSpace {
         let Some(area) = area else {
             drop(set);
             let mut set = self.vmas.lock();
-            let Some((_added, flags)) = set.grow_down_to(page, vm_layout().max_grows_down_bytes)
-            else {
+            let Some((_added, flags)) = set.grow_down_to(page, stack_growth_limit()) else {
                 return FaultOutcome::Segv;
             };
             let grown_area = set
@@ -5113,6 +5561,25 @@ impl VmSpace {
         let backing = area.backing.clone();
         let area_range = area.range.clone();
         drop(set);
+        // swap 换入：私有匿名页若先前被 MADV_PAGEOUT 换出，先按槽位读回内容，
+        // 而不是重新分配零页。
+        if matches!(&backing, VmBacking::Anon { .. }) {
+            let slot = self.swapped.lock().remove(page);
+            if let Some(slot) = slot {
+                return match self.commit_swap_in(page, slot) {
+                    FaultAroundCommit::Done(outcome) => outcome,
+                    FaultAroundCommit::Retry => self.handle_fault_inner(
+                        addr,
+                        kind,
+                        publish_unchanged_mapping,
+                        false,
+                        profile_phases,
+                        #[cfg(feature = "performance-profile")]
+                        false,
+                    ),
+                };
+            }
+        }
         #[cfg(feature = "performance-profile")]
         if let Some(backing) = hardware_fault_backing {
             record_hardware_user_fault(backing, hardware_fault_access, false);
@@ -6307,6 +6774,83 @@ impl VmSpace {
         FaultAroundCommit::Done(FaultOutcome::Fixed)
     }
 
+    /// swap 换入的缺页提交：槽位已在调用方从换出表中摘除，这里读回内容并安装。
+    fn commit_swap_in(&self, page_va: usize, slot: SwapSlot) -> FaultAroundCommit {
+        match self.swap_in_one(page_va, slot) {
+            Ok(()) => FaultAroundCommit::Done(FaultOutcome::Fixed),
+            Err(Errno::ENOMEM) => FaultAroundCommit::Done(FaultOutcome::OutOfMemory),
+            // 换入失败(交换区损坏/并发变化):退回普通匿名零页缺页路径保证前进性。
+            Err(_) => FaultAroundCommit::Retry,
+        }
+    }
+
+    /// 把 `slot` 的页读回并安装到 `page_va`；槽位无论成败都会被归还。
+    ///
+    /// 调用方负责在此之前把该页从 `self.swapped` 表中摘除，避免与 unmap 的
+    /// 槽位归还重复。失败返回 `Err` 时内容已无法恢复，调用方回退零页或放弃。
+    fn swap_in_one(&self, page_va: usize, slot: SwapSlot) -> Result<(), Errno> {
+        let page_size = page_size();
+        let paddr = match unsafe { alloc_uninitialized_user_page() } {
+            Some(paddr) => paddr,
+            None => {
+                crate::mm::swap::swap_free(slot);
+                return Err(Errno::ENOMEM);
+            }
+        };
+        let read_result = (|| {
+            let virt = allocator::KERNEL_ALLOCATOR
+                .load_phys_to_virt()
+                .ok_or(Errno::EINVAL)?;
+            // Safety: 尚未发布的独占整页,直映地址覆盖 page_size 字节。
+            let buf = unsafe { core::slice::from_raw_parts_mut(virt(paddr) as *mut u8, page_size) };
+            crate::mm::swap::swap_in_page(slot, buf)
+        })();
+        crate::mm::swap::swap_free(slot);
+        if let Err(err) = read_result {
+            free_user_page(paddr);
+            return Err(err);
+        }
+        let page = ResidentPage::new_anon(paddr);
+        let (access, flags) = {
+            let set = self.vmas.lock();
+            let area = set.find(page_va).ok_or(Errno::EINVAL)?;
+            if !matches!(area.backing, VmBacking::Anon { .. }) || area.flags.has(VmFlags::SHARED) {
+                return Err(Errno::EINVAL);
+            }
+            (access_for_new_page(area.flags, &page), area.flags)
+        };
+        let mut pages = self.pages.lock();
+        if pages.contains_key(page_va) {
+            // 并发安装：刚读回的页作废(Arc 析构归还物理页)。
+            return Err(Errno::EEXIST);
+        }
+        if let Err(err) =
+            self.map_page_no_flush(page_va, page.paddr(), pte_flags_for(flags, access))
+        {
+            drop(pages);
+            return Err(err);
+        }
+        pages.insert(page_va, PageMapping { page, access });
+        let mapped = pages.len();
+        self.mapped_pages.store(mapped, Ordering::Release);
+        drop(pages);
+        self.publish_new_user_range(page_va, page_size);
+        Ok(())
+    }
+
+    /// fork 前把父进程全部换出页读回，保证子进程按 COW 语义看到完整内容。
+    ///
+    /// 这是"槽位表不随 fork 共享"这一简化下的正确性兜底：父进程先完全驻留，
+    /// 再走普通 COW fork 快照（Linux 会共享 swap 槽位并延迟换入，本内核不做）。
+    fn swap_in_all(&self) {
+        let mut all = self.swapped.lock().take_all();
+        let mut entries = Vec::new();
+        all.for_each_mut(|va, slot| entries.push((va, *slot)));
+        for (va, slot) in entries {
+            let _ = self.swap_in_one(va, slot);
+        }
+    }
+
     fn finish_resident_fault(
         &self,
         page_va: usize,
@@ -6461,9 +7005,28 @@ impl VmSpace {
     }
 
     fn unmap_page_mappings(&self, range: Range<usize>) -> Result<Vec<(usize, PageMapping)>, Errno> {
+        self.unmap_page_mappings_impl(range, false)
+    }
+
+    /// 同 [`Self::unmap_page_mappings`]，但**保留**范围内已登记的换出槽位。
+    ///
+    /// 供 `MADV_PAGEOUT` 使用：槽位刚在换出路径中登记，摘除驻留页时不能把槽位
+    /// 一起归还；FREE/COLD 标记仍随页失效。
+    fn unmap_page_mappings_preserve_swap(
+        &self,
+        range: Range<usize>,
+    ) -> Result<Vec<(usize, PageMapping)>, Errno> {
+        self.unmap_page_mappings_impl(range, true)
+    }
+
+    fn unmap_page_mappings_impl(
+        &self,
+        range: Range<usize>,
+        preserve_swap: bool,
+    ) -> Result<Vec<(usize, PageMapping)>, Errno> {
         let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
         let mut pages = self.pages.lock();
-        let removed = pages.take_range(range);
+        let removed = pages.take_range(range.clone());
         let page_size = page_size();
         let mut run_start = None;
         let mut run_end = 0usize;
@@ -6483,6 +7046,15 @@ impl VmSpace {
         let mapped = pages.len();
         self.mapped_pages.store(mapped, Ordering::Release);
         drop(pages);
+        if !preserve_swap {
+            // 换出槽位随页一起失效：换出页被丢弃时归还槽位。
+            let swapped = self.swapped.lock().take_range(range.clone());
+            for (_, slot) in swapped {
+                crate::mm::swap::swap_free(slot);
+            }
+        }
+        self.freeable.lock().take_range(range.clone());
+        self.cold.lock().take_range(range);
         Ok(removed)
     }
 
@@ -6522,7 +7094,18 @@ impl VmSpace {
         let mapped = pages.len();
         self.mapped_pages.store(mapped, Ordering::Release);
         drop(pages);
+        // 换出槽位与 FREE/COLD 标记跟随页一起迁移到新地址。
+        self.relocate_aux_maps(old_start, new_start, len);
         Ok(!keys.is_empty())
+    }
+
+    /// mremap 迁移时把 `old_start..old_start+len` 内的换出槽位与 FREE/COLD
+    /// 标记整体搬移到以 `new_start` 开头的对应区间。
+    fn relocate_aux_maps(&self, old_start: usize, new_start: usize, len: usize) {
+        let old_range = old_start..old_start + len;
+        relocate_aux_map(&self.swapped, old_range.clone(), new_start);
+        relocate_aux_map(&self.freeable, old_range.clone(), new_start);
+        relocate_aux_map(&self.cold, old_range, new_start);
     }
 
     fn extend_mapping_in_place(
@@ -6617,6 +7200,18 @@ impl Drop for VmSpace {
         if let Some(ops) = user_pgd_ops() {
             unsafe { (ops.drop_pgd)(self.pgd) };
         }
+    }
+}
+
+/// 把 `old_range` 内的全部条目搬移到以 `new_start` 开头的对应区间。
+///
+/// 供 mremap 迁移换出槽位 / FREE / COLD 标记使用。
+fn relocate_aux_map<T>(map: &Spinlock<RadixPageMap<T>>, old_range: Range<usize>, new_start: usize) {
+    let moves = map.lock().take_range(old_range.clone());
+    let mut map = map.lock();
+    for (old_va, value) in moves {
+        let new_va = new_start + (old_va - old_range.start);
+        map.insert(new_va, value);
     }
 }
 
@@ -7060,17 +7655,16 @@ fn remove_cached_file_page(cache: &WeakFilePageCache, key: FilePageKey, page: &R
 ///
 /// 本内核的页缓存由两部分构成：私有干净文件页强缓存（`PRIVATE_FILE_PAGES`，
 /// 含未映射的缓存页）与共享文件页缓存（`SHARED_FILE_PAGES`，驻留页的弱引用表）。
-/// 返回 `(cached_pages, dirty_pages)`；写回中/最近回收的计数没有对应状态，
-/// 恒为 0。
 ///
-/// 两类缓存的键不同：共享缓存用 [`FileLike::cache_key`]（inode 身份），私有
-/// 缓存用 [`FileLike::private_page_cache_key`]（独立分配的缓存 id）。
+/// 返回 `(cached, dirty, writeback, evicted, recently_evicted)`。前两个按
+/// `[off, off+len)` 精确统计；后三个为**系统级累计计数**（写回/淘汰计数状态，
+/// 无 per-file LRU 台账），`recently_evicted` 因无 LRU 时钟退化为累计淘汰数。
 pub fn file_cache_stat(
     shared_key: usize,
     private_key: Option<usize>,
     off: u64,
     len: u64,
-) -> (u64, u64) {
+) -> (u64, u64, u64, u64, u64) {
     let end = off.saturating_add(len);
     let mut cached = 0u64;
     let mut dirty = 0u64;
@@ -7104,7 +7698,9 @@ pub fn file_cache_stat(
             }
         }
     }
-    (cached, dirty)
+    let writeback = memstat::file_writeback_pages();
+    let evicted = memstat::file_evicted_pages();
+    (cached, dirty, writeback, evicted, evicted)
 }
 
 fn shared_anon_page(
