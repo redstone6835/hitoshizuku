@@ -1617,6 +1617,8 @@ fn build_rust_support_library(
     let nm = target_nm(target)?;
     let objcopy = target_objcopy(target)?;
     let linker = target_ld(target)?;
+    let mut support_rlibs = rlibs.to_vec();
+    support_rlibs.extend(target_rust_support_rlibs(target)?);
     let temporary = output.with_extension(format!("support.tmp.{}", std::process::id()));
     remove_path(&temporary)?;
     fs::create_dir_all(&temporary)
@@ -1624,14 +1626,14 @@ fn build_rust_support_library(
     let result = (|| {
         let mut global_definitions = BTreeSet::new();
         let mut input_objects = Vec::new();
-        for (rlib_index, rlib) in rlibs.iter().enumerate() {
+        for (rlib_index, rlib) in support_rlibs.iter().enumerate() {
             let source = rlib
                 .canonicalize()
                 .map_err(|error| format!("定位 {} 失败: {error}", rlib.display()))?;
             let extract = temporary.join(format!("archive-{rlib_index:04}"));
             fs::create_dir_all(&extract)
                 .map_err(|error| format!("创建 rlib 解包目录失败: {error}"))?;
-            let unpack = Command::new("llvm-ar")
+            let unpack = Command::new("ar")
                 .current_dir(&extract)
                 .arg("x")
                 .arg(&source)
@@ -1639,7 +1641,7 @@ fn build_rust_support_library(
                 .map_err(|error| format!("解包 {} 失败: {error}", source.display()))?;
             if !unpack.status.success() {
                 return Err(format!(
-                    "llvm-ar 无法解包 {}: {}",
+                    "ar 无法解包 {}: {}",
                     source.display(),
                     String::from_utf8_lossy(&unpack.stderr)
                 ));
@@ -1740,7 +1742,7 @@ fn build_rust_support_library(
                 String::from_utf8_lossy(&filter.stderr)
             ));
         }
-        let archive = Command::new("llvm-ar")
+        let archive = Command::new("ar")
             .arg("crs")
             .arg(output)
             .arg(&filtered)
@@ -1748,7 +1750,7 @@ fn build_rust_support_library(
             .map_err(|error| format!("生成 Rust 支持归档失败: {error}"))?;
         if !archive.status.success() {
             return Err(format!(
-                "llvm-ar 生成 Rust 支持归档失败: {}",
+                "ar 生成 Rust 支持归档失败: {}",
                 String::from_utf8_lossy(&archive.stderr)
             ));
         }
@@ -1791,7 +1793,75 @@ fn defined_global_symbols(nm: &str, input: &Path) -> Result<BTreeSet<String>, St
 }
 
 fn is_rust_support_symbol(name: &str) -> bool {
-    name.starts_with("_ZN4core") || name.starts_with("_ZN5alloc")
+    // Rust 1.85+ emits v0 symbols (`_RN..._4core`/`_5alloc`); older toolchains
+    // used the legacy `_ZN4core`/`_ZN5alloc` encoding. Keep both forms so the
+    // host tool works with the default stable toolchain as well as older builds.
+    name.starts_with("_ZN4core")
+        || name.starts_with("_ZN5alloc")
+        || v0_symbol_crate(name) == Some("core")
+        || v0_symbol_crate(name) == Some("alloc")
+}
+
+fn v0_symbol_crate(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("_R")?;
+    let crate_marker = rest.find('C')?;
+    let rest = rest.get(crate_marker + 1..)?;
+    let name_start = rest.find('_')? + 1;
+    let encoded = rest.get(name_start..)?;
+    let digits_end = encoded.bytes().position(|byte| !byte.is_ascii_digit())?;
+    let length = encoded.get(..digits_end)?.parse::<usize>().ok()?;
+    let crate_name = encoded.get(digits_end..digits_end + length)?;
+    (crate_name == "core" || crate_name == "alloc").then_some(crate_name)
+}
+
+fn target_rust_support_rlibs(target: &str) -> Result<Vec<PathBuf>, String> {
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = Command::new(rustc)
+        .arg("--print")
+        .arg("target-libdir")
+        .arg("--target")
+        .arg(target)
+        .output()
+        .map_err(|error| format!("查询 {target} 的 Rust target-libdir 失败: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "rustc 无法查询 {target} 的 target-libdir: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let directory = PathBuf::from(
+        String::from_utf8(output.stdout)
+            .map_err(|_| "rustc target-libdir 输出不是 UTF-8".to_string())?
+            .trim(),
+    );
+    let mut support = Vec::new();
+    for crate_name in ["core", "alloc"] {
+        let prefix = format!("lib{crate_name}-");
+        let mut matches = fs::read_dir(&directory)
+            .map_err(|error| {
+                format!(
+                    "读取 Rust target-libdir {} 失败: {error}",
+                    directory.display()
+                )
+            })?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".rlib"))
+            })
+            .collect::<Vec<_>>();
+        matches.sort();
+        let Some(path) = matches.pop() else {
+            return Err(format!(
+                "Rust target-libdir {} 缺少 {crate_name} rlib",
+                directory.display()
+            ));
+        };
+        support.push(path);
+    }
+    Ok(support)
 }
 
 fn target_nm(target: &str) -> Result<&'static str, String> {
@@ -1812,9 +1882,39 @@ fn target_cc(target: &str) -> Result<&'static str, String> {
 
 fn target_objcopy(target: &str) -> Result<&'static str, String> {
     match target {
-        "loongarch64-unknown-none" | "riscv64gc-unknown-none-elf" => Ok("llvm-objcopy"),
+        "loongarch64-unknown-none" => {
+            if command_available("loongarch64-linux-gnu-objcopy") {
+                Ok("loongarch64-linux-gnu-objcopy")
+            } else if command_available("llvm-objcopy") {
+                Ok("llvm-objcopy")
+            } else {
+                Err(
+                    "缺少 LoongArch objcopy（需要 loongarch64-linux-gnu-objcopy 或 llvm-objcopy）"
+                        .to_string(),
+                )
+            }
+        }
+        "riscv64gc-unknown-none-elf" => {
+            if command_available("riscv64-linux-gnu-objcopy") {
+                Ok("riscv64-linux-gnu-objcopy")
+            } else if command_available("llvm-objcopy") {
+                Ok("llvm-objcopy")
+            } else {
+                Err(
+                    "缺少 RISC-V objcopy（需要 riscv64-linux-gnu-objcopy 或 llvm-objcopy）"
+                        .to_string(),
+                )
+            }
+        }
         _ => Err(format!("不支持为目标 {target} 过滤 Rust 支持对象")),
     }
+}
+
+fn command_available(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 fn target_ld(target: &str) -> Result<&'static str, String> {
@@ -2160,7 +2260,7 @@ fn copy_metadata_rlibs(sources: &[PathBuf], destination: &Path) -> Result<(), St
 }
 
 fn write_metadata_only_rlib(source: &Path, destination: &Path) -> Result<(), String> {
-    let output = Command::new("llvm-ar")
+    let output = Command::new("ar")
         .arg("p")
         .arg(source)
         .arg("lib.rmeta")
@@ -2987,6 +3087,19 @@ mod tests {
             aliases: Vec::new(),
         };
         assert!(forbidden_protocol_engine_reference(&symbol));
+    }
+
+    #[test]
+    fn rust_support_symbols_accept_stable_v0_and_legacy_mangling() {
+        assert!(is_rust_support_symbol(
+            "_RNvNtCshrxc9wA3bCf_4core9panicking5panic"
+        ));
+        assert!(is_rust_support_symbol(
+            "_RNvMs2_NtCsbi9dd3sP7A_5alloc7raw_vec4grow"
+        ));
+        assert!(is_rust_support_symbol("_ZN4core3fmt5write17h00000000E"));
+        assert!(is_rust_support_symbol("_ZN5alloc6string6String3new17h00000000E"));
+        assert!(!is_rust_support_symbol("_RNvNtCabc_7general4dev4pnp3new"));
     }
 
     #[test]

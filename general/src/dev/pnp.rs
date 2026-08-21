@@ -2235,7 +2235,7 @@ impl Default for PnpDeviceList {
     capabilities = kernel_symbols::capability::DEVICE_DRIVER,
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
 )]
-pub fn direct_pnp_device_new(
+pub fn new(
     id: PnpId,
     name: Box<str>,
     info: Box<dyn PnpBusInfo>,
@@ -2253,7 +2253,7 @@ pub fn direct_pnp_device_new(
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
         | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
 )]
-pub fn direct_pnp_get_or_insert(
+pub fn get_or_insert(
     devices: &PnpDeviceList,
     device: Arc<PnpDevice>,
 ) -> Result<PnpDeviceRegistration, PnpError> {
@@ -2269,10 +2269,7 @@ pub fn direct_pnp_get_or_insert(
     capabilities = kernel_symbols::capability::DEVICE_DRIVER,
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
-pub fn direct_pnp_remove_exact(
-    devices: &PnpDeviceList,
-    device: &Arc<PnpDevice>,
-) -> Option<Arc<PnpDevice>> {
+pub fn remove_exact(devices: &PnpDeviceList, device: &Arc<PnpDevice>) -> Option<Arc<PnpDevice>> {
     devices.remove_exact(device)
 }
 
@@ -2284,7 +2281,7 @@ pub fn direct_pnp_remove_exact(
     version = 1,
     capabilities = kernel_symbols::capability::DEVICE_DISCOVERY
 )]
-pub fn direct_pnp_lookup(devices: &PnpDeviceList, id: &PnpId) -> Option<Arc<PnpDevice>> {
+pub fn lookup(devices: &PnpDeviceList, id: &PnpId) -> Option<Arc<PnpDevice>> {
     devices.lookup(id)
 }
 
@@ -2297,7 +2294,7 @@ pub fn direct_pnp_lookup(devices: &PnpDeviceList, id: &PnpId) -> Option<Arc<PnpD
     capabilities = kernel_symbols::capability::DEVICE_DISCOVERY,
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC
 )]
-pub fn direct_pnp_list(devices: &PnpDeviceList) -> Vec<Arc<PnpDevice>> {
+pub fn list(devices: &PnpDeviceList) -> Vec<Arc<PnpDevice>> {
     devices.list()
 }
 
@@ -2310,10 +2307,7 @@ pub fn direct_pnp_list(devices: &PnpDeviceList) -> Vec<Arc<PnpDevice>> {
     capabilities = kernel_symbols::capability::DEVICE_DRIVER,
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
-pub fn direct_pnp_probe_device(
-    drivers: &PnpDriverRegistry,
-    device: &Arc<PnpDevice>,
-) -> Result<(), PnpError> {
+pub fn probe_device(drivers: &PnpDriverRegistry, device: &Arc<PnpDevice>) -> Result<(), PnpError> {
     drivers.probe_device(device)
 }
 
@@ -2326,7 +2320,7 @@ pub fn direct_pnp_probe_device(
     capabilities = kernel_symbols::capability::DEVICE_DRIVER,
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
-pub fn direct_pnp_retry_deferred_devices(drivers: &PnpDriverRegistry) -> Result<usize, PnpError> {
+pub fn retry_deferred_devices(drivers: &PnpDriverRegistry) -> Result<usize, PnpError> {
     drivers.retry_deferred_devices()
 }
 
@@ -2501,10 +2495,7 @@ impl PnpDevice {
     capabilities = kernel_symbols::capability::DEVICE_DRIVER,
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
-pub fn direct_pnp_attach_child(
-    parent: &Arc<PnpDevice>,
-    child: &Arc<PnpDevice>,
-) -> Result<(), PnpError> {
+pub fn attach_child(parent: &Arc<PnpDevice>, child: &Arc<PnpDevice>) -> Result<(), PnpError> {
     parent.attach_child(child)
 }
 
@@ -2517,7 +2508,7 @@ pub fn direct_pnp_attach_child(
     capabilities = kernel_symbols::capability::DEVICE_DRIVER,
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
-pub fn direct_pnp_detach_child(parent: &Arc<PnpDevice>, child: &Arc<PnpDevice>) {
+pub fn detach_child(parent: &Arc<PnpDevice>, child: &Arc<PnpDevice>) {
     parent.detach_child(child);
 }
 
@@ -2530,7 +2521,7 @@ pub fn direct_pnp_detach_child(parent: &Arc<PnpDevice>, child: &Arc<PnpDevice>) 
     capabilities = kernel_symbols::capability::DEVICE_DRIVER,
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
-pub fn direct_pnp_register_function(
+pub fn register_function(
     device: &Arc<PnpDevice>,
     function: Arc<dyn DeviceFunction>,
 ) -> Result<(), PnpError> {
@@ -2571,7 +2562,7 @@ pub fn direct_pnp_register_function(
     capabilities = kernel_symbols::capability::DEVICE_DRIVER,
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
-pub fn direct_pnp_unregister_function(
+pub fn unregister_function(
     device: &Arc<PnpDevice>,
     class_id: crate::dev::function::DeviceClassId,
     name: &str,
@@ -2588,7 +2579,7 @@ pub fn direct_pnp_unregister_function(
     capabilities = kernel_symbols::capability::DEVICE_DRIVER,
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
-pub fn direct_pnp_remove_device(device: &Arc<PnpDevice>) {
+pub fn remove_device(device: &Arc<PnpDevice>) {
     device.remove_device();
 }
 

@@ -1865,12 +1865,21 @@ fn rollback_pci_registration(dev: &Arc<PnpDevice>, inserted: bool) {
     PNP_DEVICES.remove_exact(dev);
 }
 
+#[kernel_symbols::export]
 impl PciDevice {
     /// 从 config space 读取 PCI 信息，构造 PnpDevice 并注册到全局列表，
     /// 然后自动 probe 驱动。一步完成设备的完整发现-绑定流程。
     ///
     /// PnP 设备名是稳定硬件名 `pci-{seg:04x}:{bus:02x}:{dev:02x}.{func}`，
     /// 不承载 `/dev` 节点命名前缀语义。
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.register_and_probe",
+        contract = "kernel.general.pci-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_BUS,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn register_and_probe(
         segment: u16,
         bus: u8,
@@ -1919,6 +1928,12 @@ impl PciDevice {
     ///
     /// 需要 `PCI_CONFIG` 已设置。返回 `None` 表示设备不存在
     /// （vendor == 0xFFFF）或无法访问 config space。
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.read_device_info",
+        contract = "kernel.general.pci-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DISCOVERY
+    )]
     pub fn read_device_info(segment: u16, bus: u8, device: u8, function: u8) -> Option<PciInfo> {
         let guard = PCI_CONFIG.lock();
         let cfg = guard.as_ref()?;
@@ -1959,6 +1974,13 @@ impl PciDevice {
     /// 启动早期可能需要在正式 probe 前先整理 BAR 等资源。该句柄仍通过
     /// [`PciInfo`] 保存真实 config-space 信息，但不会出现在设备树、驱动匹配或
     /// devtmpfs 中；完成资源整理后应继续走 [`register_and_probe`](Self::register_and_probe)。
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.new_unregistered",
+        contract = "kernel.general.pci-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_BUS,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn new_unregistered(segment: u16, bus: u8, device: u8, function: u8) -> Option<Self> {
         let id = PnpId::Pci {
             segment,
@@ -1979,72 +2001,16 @@ impl PciDevice {
     /// 触发设备热拔移除。
     ///
     /// 等效于 `self.pnp().remove_device()`。
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.remove_from_bus",
+        contract = "kernel.general.pci-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_BUS,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn remove_from_bus(&self) {
         self.pnp.remove_device();
     }
-}
-
-#[doc(hidden)]
-#[kernel_symbols::export(
-    name = "general.dev.pci.PciDevice.register_and_probe",
-    contract = "kernel.general.pci-device@1",
-    version = 1,
-    capabilities = kernel_symbols::capability::DEVICE_BUS,
-    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
-        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
-)]
-pub fn direct_pci_register_and_probe(
-    segment: u16,
-    bus: u8,
-    device: u8,
-    function: u8,
-) -> Result<PciRegistration, PciRegisterError> {
-    PciDevice::register_and_probe(segment, bus, device, function)
-}
-
-#[doc(hidden)]
-#[kernel_symbols::export(
-    name = "general.dev.pci.PciDevice.read_device_info",
-    contract = "kernel.general.pci-device@1",
-    version = 1,
-    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY
-)]
-pub fn direct_pci_read_device_info(
-    segment: u16,
-    bus: u8,
-    device: u8,
-    function: u8,
-) -> Option<PciInfo> {
-    PciDevice::read_device_info(segment, bus, device, function)
-}
-
-#[doc(hidden)]
-#[kernel_symbols::export(
-    name = "general.dev.pci.PciDevice.new_unregistered",
-    contract = "kernel.general.pci-device@1",
-    version = 1,
-    capabilities = kernel_symbols::capability::DEVICE_BUS,
-    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
-)]
-pub fn direct_pci_new_unregistered(
-    segment: u16,
-    bus: u8,
-    device: u8,
-    function: u8,
-) -> Option<PciDevice> {
-    PciDevice::new_unregistered(segment, bus, device, function)
-}
-
-#[doc(hidden)]
-#[kernel_symbols::export(
-    name = "general.dev.pci.PciDevice.remove_from_bus",
-    contract = "kernel.general.pci-device@1",
-    version = 1,
-    capabilities = kernel_symbols::capability::DEVICE_BUS,
-    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
-)]
-pub fn direct_pci_remove_from_bus(device: &PciDevice) {
-    device.remove_from_bus();
 }
 
 // ── PCI Bus 扫描器 ──────────────────────────────────────────────────────
