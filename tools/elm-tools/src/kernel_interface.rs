@@ -492,18 +492,15 @@ pub fn export_kernel_interface(
     let deps = target_root.join(target).join(cargo_profile).join("deps");
     let mut metadata = BTreeMap::new();
     let interface_rlibs = exact_kernel_api_rlibs(&deps, kernel, &kernel_bytes)?;
-    let mut roots = Vec::new();
     for (spec, rlib) in kernel_api_crates().iter().zip(&interface_rlibs) {
         let file = rlib
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| format!("{} rlib 文件名不是 UTF-8", spec.name))?
             .to_string();
-        roots.push(rustc_crate_root(rlib)?);
         metadata.insert(spec.name.to_string(), file);
     }
-    let root_refs = roots.iter().map(String::as_str).collect::<Vec<_>>();
-    let metadata_rlibs = exact_dependency_rlibs(&deps, &root_refs, &interface_rlibs)?;
+    let metadata_rlibs = exact_dependency_rlibs(&deps, &interface_rlibs)?;
     let public_api_abis = scan_repository_api_abis(repository, &symbols)?;
     populate_link_aliases(target, &interface_rlibs, &public_api_abis, &mut symbols)?;
     let interface_hash = kernel_api_profile_hash(target, profile, &symbols);
@@ -2121,56 +2118,29 @@ fn parse_cargo_fingerprint(value: &str) -> Result<u64, String> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn rustc_crate_root(metadata: &Path) -> Result<String, String> {
-    let output = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
-        .arg("-Z")
-        .arg("ls=root")
-        .arg(metadata)
-        .output()
-        .map_err(|error| format!("读取 Rust 元数据失败: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "rustc 无法读取 {}: {}",
-            metadata.display(),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    String::from_utf8(output.stdout).map_err(|_| "rustc 元数据输出不是 UTF-8".to_string())
-}
-
 fn exact_dependency_rlibs(
     directory: &Path,
-    roots: &[&str],
     root_rlibs: &[PathBuf],
 ) -> Result<Vec<PathBuf>, String> {
+    // Stable rustc has no replacement for the old `-Z ls=root` query. Cargo's
+    // target/profile deps directory is isolated, so retaining all rlibs there
+    // keeps the metadata closure conservative without selecting a toolchain.
     let mut files = root_rlibs.iter().cloned().collect::<BTreeSet<_>>();
-    for root in roots {
-        let mut dependencies = false;
-        for line in root.lines() {
-            if line == "=External Dependencies=" {
-                dependencies = true;
-                continue;
-            }
-            if !dependencies {
-                continue;
-            }
-            if line.is_empty() {
-                break;
-            }
-            let mut fields = line.split_ascii_whitespace();
-            let Some(index) = fields.next() else {
-                continue;
-            };
-            if index.parse::<usize>().is_err() {
-                continue;
-            }
-            let Some(name) = fields.next() else {
-                return Err("Rust 元数据依赖记录缺少 crate 名称".to_string());
-            };
-            let path = directory.join(format!("lib{name}.rlib"));
-            if path.is_file() {
-                files.insert(path);
-            }
+    let entries = fs::read_dir(directory).map_err(|error| {
+        format!(
+            "读取 Rust metadata 目录 {} 失败: {error}",
+            directory.display()
+        )
+    })?;
+    for entry in entries {
+        let path = entry
+            .map_err(|error| format!("读取 Rust metadata 目录项失败: {error}"))?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "rlib")
+        {
+            files.insert(path);
         }
     }
     if files.iter().any(|path| !path.is_file()) {
@@ -2913,9 +2883,11 @@ mod tests {
                 "缺少 {prefix} 子系统导出"
             );
         }
-        assert!(symbols
-            .iter()
-            .all(|symbol| !forbidden_protocol_engine_reference(symbol)));
+        assert!(
+            symbols
+                .iter()
+                .all(|symbol| !forbidden_protocol_engine_reference(symbol))
+        );
         assert!(kernel_api_crates().iter().any(|spec| spec.name == "net"));
         assert!(kernel_api_crates().iter().any(|spec| spec.name == "socket"));
         for required in [

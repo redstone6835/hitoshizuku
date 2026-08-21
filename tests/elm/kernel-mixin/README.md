@@ -3,7 +3,7 @@
 该工程验证真实 `allocator.GlobalAlloc.alloc` 的 `head`、参数修改、覆盖链和 `return`
 站点，不使用测试 shim。正常镜像、成功替换镜像和迁移拒绝镜像均由同一份源码产生。
 
-先为目标内核导出 `contest-2026` 接口包，然后依次构建三种镜像：
+先为目标内核导出 `hitoshizuku-default` 接口包，然后依次构建三种镜像：
 
 ```sh
 export ELM_KERNEL_INTERFACE_ROOT="$PWD/build/elm-interface-current"

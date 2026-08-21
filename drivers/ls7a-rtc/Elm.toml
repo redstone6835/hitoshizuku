@@ -7,5 +7,5 @@ mode = "m"
 integrated_phase = "device"
 
 [[profiles]]
-id = "contest-2026"
+id = "hitoshizuku-default"
 priority = "100"

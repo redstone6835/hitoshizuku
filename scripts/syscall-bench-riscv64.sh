@@ -1,5 +1,5 @@
 #!/bin/sh
-# 在完全相同的 QEMU RISC-V64 配置下运行 MyGO/Linux syscall 基准。
+# 在完全相同的 QEMU RISC-V64 配置下运行 Hitoshizuku/Linux syscall 基准。
 set -eu
 
 usage() {
@@ -14,7 +14,11 @@ case "$mode" in timing|profile|trace) ;; *) usage ;; esac
 case "$systems" in mygo|linux|both) ;; *) usage ;; esac
 
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
-image=${SYSCALL_BENCH_CONTAINER:-zhouzhouyi/os-contest:20260510}
+image=${SYSCALL_BENCH_CONTAINER:-}
+[ -n "$image" ] || {
+    echo "SYSCALL_BENCH_CONTAINER must name a build image" >&2
+    exit 2
+}
 smp=${SYSCALL_BENCH_SMP:-1}
 memory=${SYSCALL_BENCH_MEMORY:-1G}
 accel=${SYSCALL_BENCH_ACCEL:-tcg,thread=single}

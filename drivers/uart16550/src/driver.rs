@@ -557,7 +557,7 @@ impl CharDriver for Uart16550 {
     fn write_all(&self, buf: &[u8]) -> Result<(), CharIoError> {
         // 整条消息必须在**同一个临界区**内写完。
         //
-        // 之前这里每轮循环都重新取一次 tx 锁：TX ring 写满时（BuildStorm 这类
+        // 之前这里每轮循环都重新取一次 tx 锁：TX ring 写满时（高日志量
         // 高日志量负载下持续满）一条消息会被切成多段，另一个 CPU 的 write_all
         // 正好在段间插入自己的字节，串口上就出现字符级交织——例如
         // `/tmp/p/run.sh` 被打乱成 `/tm/pp/run.sh`。这会破坏宿主侧对串口的

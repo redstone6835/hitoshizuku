@@ -1,4 +1,0 @@
-[toolchain]
-channel = "nightly-2025-05-20"
-profile = "minimal"
-targets = ["loongarch64-unknown-none", "riscv64gc-unknown-none-elf"]

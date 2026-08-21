@@ -1046,10 +1046,10 @@ fn clock_time_ns_for_task(task: &Arc<Task>, clock_id: usize) -> Option<u64> {
 
 pub(super) fn sys_uname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let mut out = [0u8; 65 * 6];
-    write_uts_field(&mut out, 0, b"MyGo");
-    write_uts_dynamic_field(&mut out, 1, &UTS_HOSTNAME, b"mygo");
+    write_uts_field(&mut out, 0, b"Hitoshizuku");
+    write_uts_dynamic_field(&mut out, 1, &UTS_HOSTNAME, b"hitoshizuku");
     write_uts_field(&mut out, 2, b"10.1.0");
-    write_uts_field(&mut out, 3, b"MyGo kernel");
+    write_uts_field(&mut out, 3, b"Hitoshizuku kernel");
     write_uts_field(&mut out, 4, hal::platform::arch_name().as_bytes());
     write_uts_dynamic_field(&mut out, 5, &UTS_DOMAINNAME, b"localdomain");
     copy_to_user(ctx.args[0], &out).map_err(|e| e.as_errno())?;
@@ -1704,7 +1704,7 @@ pub(super) fn sys_mygo_sched_info(ctx: &mut SyscallContext<'_>) -> Result<usize,
     let mut out = Vec::new();
     out.resize(required, 0);
 
-    // 头部只定义 MyGo 私有调度查询格式；具体偏移不进入 sched 核心，避免
+    // 头部只定义 Hitoshizuku 私有调度查询格式；具体偏移不进入 sched 核心，避免
     // 底层调度模型被用户态 ABI 绑死。
     write_u32(&mut out, 0, MYGO_SCHED_INFO_VERSION);
     write_u32(&mut out, 4, MYGO_SCHED_INFO_HEADER_SIZE as u32);

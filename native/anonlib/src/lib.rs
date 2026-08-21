@@ -1,6 +1,6 @@
 #![no_std]
 
-//! MyGO Native 的最小 Rust 安全对象接口。
+//! Hitoshizuku Native 的最小 Rust 安全对象接口。
 
 mod component;
 mod channel;
@@ -53,7 +53,7 @@ fn close_handle(raw: u64) {
     }
 }
 
-/// MyGO Native operation 返回的原始状态。
+/// Hitoshizuku Native operation 返回的原始状态。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Status(u32);
 

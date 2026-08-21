@@ -24,7 +24,7 @@ use crate::mm::resident_map::RadixPageMap;
 
 /// 顺序只读文件缺页一次最多预装的页数（包含硬件实际命中的页）。
 ///
-/// BuildStorm 会反复执行体积较大的 rustc/链接器映像；适度预装可减少 TCG 下的
+/// 大型构建工作负载会反复执行体积较大的 rustc/链接器映像；适度预装可减少 TCG 下的
 /// 硬件缺页陷入，同时避免冷缓存首次缺页同步读取过多无关页面。
 const FILE_FAULT_AROUND_PAGES: usize = 16;
 /// 私有匿名写缺页一次最多向高地址预映射的页数。
@@ -46,12 +46,12 @@ const PRIVATE_FILE_BATCH_MAX_PAGES: usize = 16;
 const PRIVATE_FILE_BATCH_MAX_BYTES: usize = 64 * 1024;
 /// 私有干净文件页的强缓存上限；在 4 KiB 页配置下约为 1 GiB。
 ///
-/// BuildStorm 的完整样本会填满 512 MiB 缓存并在构建结束前触发数万次淘汰；
+/// 完整的大型构建样本会填满 512 MiB 缓存并在构建结束前触发数万次淘汰；
 /// 保留 1 GiB 的有界热集可覆盖当前工具链工作集，避免仍有数 GiB 空闲内存时
 /// 从 ext4 重读刚淘汰的页。物理页分配失败仍会按批次回收，因此该预算不会阻塞
 /// 匿名页和 COW 分配的前进性。
 const PRIVATE_FILE_CACHE_MAX_PAGES: usize = 262_144;
-/// 独立的私有文件页缓存分片数；32 个分片可覆盖 BuildStorm 的并行 rustc 缺页。
+/// 独立的私有文件页缓存分片数；32 个分片可覆盖并行 rustc 缺页。
 const PRIVATE_FILE_CACHE_SHARD_COUNT: usize = 32;
 /// Ready 范围索引的分片粒度。
 ///
@@ -1439,7 +1439,7 @@ impl PrivateFilePageCacheState {
         table_hash: u64,
         next_load_id: &AtomicU64,
     ) -> PrivateFilePageCacheStateClaim {
-        // BuildStorm 的缓存命中占绝大多数。先走只查询路径，避免命中时构造带
+        // 大型构建的缓存命中占绝大多数。先走只查询路径，避免命中时构造带
         // reserve 语义的 HashTable entry；分片锁保证 miss 后不会出现并发插入。
         if let Some(existing) = self.claim_existing(key, table_hash) {
             return existing;

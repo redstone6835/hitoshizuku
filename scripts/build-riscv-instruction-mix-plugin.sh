@@ -3,7 +3,11 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 output=${1:-"$root/build/qemu-plugins/riscv_instruction_mix.so"}
-image=zhouzhouyi/os-contest:20260510
+image=${QEMU_PLUGIN_CONTAINER_IMAGE:-}
+[ -n "$image" ] || {
+    echo "QEMU_PLUGIN_CONTAINER_IMAGE must name a build image" >&2
+    exit 2
+}
 
 case "$output" in
     /*) ;;

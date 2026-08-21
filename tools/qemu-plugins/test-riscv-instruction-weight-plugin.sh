@@ -2,7 +2,11 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd -P)
-image=${RISCV_WEIGHT_CONTAINER:-zhouzhouyi/os-contest:20260510}
+image=${RISCV_WEIGHT_CONTAINER:-}
+[ -n "$image" ] || {
+    echo "RISCV_WEIGHT_CONTAINER must name a build image" >&2
+    exit 2
+}
 timeout_seconds=${RISCV_WEIGHT_TEST_TIMEOUT:-60}
 skip_build=${RISCV_WEIGHT_SKIP_BUILD:-0}
 mkdir -p "$root/build"
@@ -23,10 +27,9 @@ case "$skip_build" in
 esac
 
 if [ "$skip_build" -eq 0 ]; then
-    docker run --rm -v "$root":/work -w /work "$image" \
-        make instruction-weight-rv RISCV_WEIGHT_BASE_BLOCKS=1 \
-            RISCV_WEIGHT_ROUNDS=1 RISCV_WEIGHT_CASE=addi:4 \
-            RISCV_WEIGHT_RUN_ID=plugin-smoke
+    echo "instruction-weight probe construction is owned by the external benchmark workspace" >&2
+    echo "set RISCV_WEIGHT_SKIP_BUILD=1 and provide prebuilt artifacts" >&2
+    exit 2
 else
     echo "reusing instruction-weight artifacts (RISCV_WEIGHT_SKIP_BUILD=1)"
 fi

@@ -87,10 +87,10 @@ grep -q 'io|syscall|filesystem|memory|scheduler|block|network|build|all|full)' \
 grep -q 'write_control "preset=$preset"' "$root/scripts/profile-capture.sh"
 grep -q 'write_control "events=$PROFILE_EVENT_MASK"' "$root/scripts/profile-capture.sh"
 grep -q 'write_control "events_high=$PROFILE_EVENT_MASK_HIGH"' "$root/scripts/profile-capture.sh"
-grep -q 'event_mask=${PROFILE_EVENT_MASK:-0xfef000000}' "$root/scripts/buildstorm-profile-host.sh"
-grep -q 'event_mask_high=${PROFILE_EVENT_MASK_HIGH:-0x0}' "$root/scripts/buildstorm-profile-host.sh"
-grep -q 'event_mask=${PROFILE_EVENT_MASK:-0xfef000000}' "$root/scripts/buildstorm-profile-guest.sh"
-grep -q 'event_mask_high=${PROFILE_EVENT_MASK_HIGH:-0x0}' "$root/scripts/buildstorm-profile-guest.sh"
+grep -q 'event_mask=${PROFILE_EVENT_MASK:-0xfef000000}' "$root/scripts/profile-host.sh"
+grep -q 'event_mask_high=${PROFILE_EVENT_MASK_HIGH:-0x0}' "$root/scripts/profile-host.sh"
+grep -q 'event_mask=${PROFILE_EVENT_MASK:-0xfef000000}' "$root/scripts/profile-guest.sh"
+grep -q 'event_mask_high=${PROFILE_EVENT_MASK_HIGH:-0x0}' "$root/scripts/profile-guest.sh"
 
 PROFILE_CONTROL="$control" \
 PROFILE_STATS="$stats" \

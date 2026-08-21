@@ -6,5 +6,5 @@ source = "kernel-tree:test.elm.kernel-mixin"
 mode = "m"
 
 [[profiles]]
-id = "contest-2026"
+id = "hitoshizuku-default"
 priority = "100"

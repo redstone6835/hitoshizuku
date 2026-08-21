@@ -3,7 +3,11 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
 output=${1:-"$root/build/qemu-plugins/riscv_syscall_model.so"}
-image=${RISCV_SYSCALL_MODEL_CONTAINER:-zhouzhouyi/os-contest:20260510}
+image=${RISCV_SYSCALL_MODEL_CONTAINER:-}
+[ -n "$image" ] || {
+    echo "RISCV_SYSCALL_MODEL_CONTAINER must name a build image" >&2
+    exit 2
+}
 
 case "$output" in
     /*) ;;

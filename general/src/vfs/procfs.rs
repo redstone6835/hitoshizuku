@@ -2499,7 +2499,7 @@ fn render_mountinfo_root() -> String {
 }
 
 fn render_version() -> String {
-    format!("MyGo kernel version 0.1.0 (loongarch64)\n")
+    format!("Hitoshizuku kernel version 0.1.0 (loongarch64)\n")
 }
 
 fn cpuinfo_model_from_compatible(compatible: &str) -> &str {

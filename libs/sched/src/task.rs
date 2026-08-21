@@ -579,7 +579,7 @@ mod wait_reason_profile_tests {
     use super::WaitReason;
 
     #[test]
-    fn buildstorm_wait_reasons_map_to_dedicated_events() {
+    fn profile_wait_reasons_map_to_dedicated_events() {
         assert_eq!(
             WaitReason::ProcessExit.profile_event(),
             profiling::Event::WaitProcessExit

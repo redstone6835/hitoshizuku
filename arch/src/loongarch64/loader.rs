@@ -1134,7 +1134,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
         context
     };
     let context_ptr = addr_of!(start_context) as *const StartContext as usize;
-    printk!("[loader] Welcome to MyGO!!!!! OS");
+    printk!("[loader] Welcome to Hitoshizuku OS");
     unsafe {
         // 将上下文指针放入 $a0 寄存器，然后绝对跳转到内核启动函数
         core::arch::asm!(

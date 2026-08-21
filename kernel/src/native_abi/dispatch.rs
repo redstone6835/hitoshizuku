@@ -1,4 +1,4 @@
-//! MyGO Native Call Slot 分发与调用参数校验。
+//! Hitoshizuku Native Call Slot 分发与调用参数校验。
 
 use alloc::sync::Arc;
 

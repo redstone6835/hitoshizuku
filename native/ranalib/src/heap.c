@@ -6,7 +6,7 @@
 #include <ranalib/stdlib.h>
 #include <ranalib/string.h>
 
-#include "../vendor/tlsf/tlsf.h"
+#include <tlsf.h>
 
 #define RANALIB_HEAP_MAGIC UINT64_C(0x52414e4148454150)
 #define RANALIB_ARENA_SIZE (UINT64_C(1) << 20)

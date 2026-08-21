@@ -18,47 +18,6 @@ use general::dev::pci::{PciBarType, PciDevice};
 
 pub mod virtio_mmio;
 
-#[cfg(all(feature = "elm-provider", feature = "elm-consumer"))]
-compile_error!("virtio API crate 不能同时作为 provider 与 consumer 构建");
-
-#[cfg(feature = "elm-provider")]
-#[elm::export(
-    name = "virtio.framework.revision",
-    contract = "driver.virtio.framework@1",
-    version = 1,
-    mode = "direct-pinned",
-    visibility = "dependency"
-)]
-pub fn framework_revision() -> u32 {
-    1
-}
-
-#[cfg(all(feature = "elm-consumer", not(feature = "elm-integrated")))]
-#[elm::import(
-    name = "virtio.framework.revision",
-    contract = "driver.virtio.framework@1",
-    version = 1,
-    mode = "direct-pinned"
-)]
-static FRAMEWORK_REVISION: elm::DirectImport<fn() -> u32> = elm::DirectImport::new();
-
-/// 验证当前 Block ELM 已经绑定到兼容的 VirtIO Framework。
-///
-/// 动态 ELM 通过 direct-pinned import 固定 provider generation；集成构建中的协议逻辑
-/// 已经编译进同一内核镜像，因此只校验编译期 API 版本。
-#[cfg(feature = "elm-consumer")]
-pub fn framework_ready() -> bool {
-    #[cfg(feature = "elm-integrated")]
-    {
-        true
-    }
-    #[cfg(not(feature = "elm-integrated"))]
-    {
-        // Safety: ELM 装载器已按精确 Rust ABI 摘要绑定该不可变函数指针槽。
-        unsafe { FRAMEWORK_REVISION.get() }.is_some_and(|revision| revision() == 1)
-    }
-}
-
 pub const VIRTQ_DESC_F_NEXT: u16 = 1;
 pub const VIRTQ_DESC_F_WRITE: u16 = 2;
 pub const VIRTQ_DESC_F_INDIRECT: u16 = 4;

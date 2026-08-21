@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""严格校验并逐条比较 MyGO/Linux 的单次陷入动态指令。"""
+"""严格校验并逐条比较 Hitoshizuku/Linux 的单次陷入动态指令。"""
 
 from __future__ import annotations
 
@@ -1111,11 +1111,11 @@ def print_summary(
     else:
         integrity = (
             "零 ecall、每段唯一 sret、故障 load/store 返回后原 PC 重放；"
-            f"缺页段 MyGO={len(kernel_segments(mygo))} "
+            f"缺页段 Hitoshizuku={len(kernel_segments(mygo))} "
             f"Linux={len(kernel_segments(linux))}"
         )
     print(f"  路径完整性：{integrity}，无嵌套 trap")
-    print(f"  {'维度':<12} {'MyGO':>10} {'Linux':>10} {'差值':>11} {'MyGO/Linux':>12}")
+    print(f"  {'维度':<12} {'Hitoshizuku':>10} {'Linux':>10} {'差值':>11} {'Hitoshizuku/Linux':>18}")
     for name in ("总指令", "用户态", "内核态", "2 字节", "4 字节", "静态一致"):
         left_count = mygo_counts[name]
         right_count = linux_counts[name]
@@ -1124,7 +1124,7 @@ def print_summary(
             f"{left_count - right_count:>+11} {ratio(left_count, right_count):>12}"
         )
 
-    for system, rows in (("MyGO", mygo), ("Linux", linux)):
+    for system, rows in (("Hitoshizuku", mygo), ("Linux", linux)):
         mnemonic_counts = Counter(row.mnemonic for row in rows)
         function_counts = Counter(
             f"{row.space}:{row.decoded.function}" for row in rows
@@ -1159,7 +1159,7 @@ def print_summary(
         left_row = mygo[common]
         right_row = linux[common]
         print(
-            "  首个分歧 MyGO："
+            "  首个分歧 Hitoshizuku："
             f"sequence={left_row.trace.sequence} {left_row.space} "
             f"pc=0x{left_row.trace.pc:x} {left_row.decoded.function}"
             f"+0x{left_row.trace.pc - left_row.decoded.function_start:x} "
@@ -1173,11 +1173,11 @@ def print_summary(
             f"{right_row.trace.qemu_assembly}"
         )
     elif len(mygo) != len(linux):
-        longer = "MyGO" if len(mygo) > len(linux) else "Linux"
+        longer = "Hitoshizuku" if len(mygo) > len(linux) else "Linux"
         print(f"  公共前缀后仅 {longer} 仍有动态指令。")
 
     print()
-    print(f"MyGO 完整动态顺序 TSV：{mygo_output}")
+    print(f"Hitoshizuku 完整动态顺序 TSV：{mygo_output}")
     print(f"Linux 完整动态顺序 TSV：{linux_output}")
 
 
@@ -1192,7 +1192,7 @@ def validate_paths(args: argparse.Namespace) -> None:
     mygo_output = args.mygo_output.resolve()
     linux_output = args.linux_output.resolve()
     if mygo_output == linux_output:
-        raise ValueError("MyGO/Linux TSV 输出路径不能相同")
+        raise ValueError("Hitoshizuku/Linux TSV 输出路径不能相同")
     if mygo_output in inputs or linux_output in inputs:
         raise ValueError("TSV 输出路径不能覆盖输入产物")
     if not 1 <= args.top <= 100:
@@ -1208,13 +1208,13 @@ def parse_integer(value: str) -> int:
 
 def build_parser() -> ChineseArgumentParser:
     parser = ChineseArgumentParser(
-        description="严格校验、符号化并比较 MyGO/Linux 单次陷入动态指令跟踪。",
+        description="严格校验、符号化并比较 Hitoshizuku/Linux 单次陷入动态指令跟踪。",
         add_help=False,
     )
-    parser.add_argument("--mygo-trace", required=True, type=Path, help="MyGO 原始指令跟踪")
+    parser.add_argument("--mygo-trace", required=True, type=Path, help="Hitoshizuku 原始指令跟踪")
     parser.add_argument("--linux-trace", required=True, type=Path, help="Linux 原始指令跟踪")
     parser.add_argument("--benchmark-elf", required=True, type=Path, help="共同的 benchmark ELF")
-    parser.add_argument("--mygo-kernel", required=True, type=Path, help="MyGO 可符号化内核 ELF")
+    parser.add_argument("--mygo-kernel", required=True, type=Path, help="Hitoshizuku 可符号化内核 ELF")
     parser.add_argument(
         "--linux-vmlinux",
         "--linux-kernel",
@@ -1223,7 +1223,7 @@ def build_parser() -> ChineseArgumentParser:
         type=Path,
         help="Linux vmlinux",
     )
-    parser.add_argument("--mygo-output", required=True, type=Path, help="MyGO 完整顺序 TSV")
+    parser.add_argument("--mygo-output", required=True, type=Path, help="Hitoshizuku 完整顺序 TSV")
     parser.add_argument("--linux-output", required=True, type=Path, help="Linux 完整顺序 TSV")
     parser.add_argument(
         "--objdump",
@@ -1262,7 +1262,7 @@ def run(args: argparse.Namespace) -> int:
         linux_trace.stop_pc,
     ):
         raise ValueError(
-            "MyGO/Linux marker 地址不一致："
+            "Hitoshizuku/Linux marker 地址不一致："
             f"0x{mygo_trace.start_pc:x}/0x{mygo_trace.stop_pc:x} 与 "
             f"0x{linux_trace.start_pc:x}/0x{linux_trace.stop_pc:x}"
         )
@@ -1275,7 +1275,7 @@ def run(args: argparse.Namespace) -> int:
         objdump, args.benchmark_elf, user_requests, "benchmark ELF"
     )
     mygo_disassembly = disassemble(
-        objdump, args.mygo_kernel, mygo_kernel_requests, "MyGO 内核 ELF"
+        objdump, args.mygo_kernel, mygo_kernel_requests, "Hitoshizuku 内核 ELF"
     )
     linux_disassembly = disassemble(
         objdump, args.linux_vmlinux, linux_kernel_requests, "Linux vmlinux"
@@ -1286,8 +1286,8 @@ def run(args: argparse.Namespace) -> int:
     linux_mismatches = sum(not row.static_match for row in linux_rows)
     if mygo_mismatches:
         raise ValueError(
-            f"MyGO 有 {mygo_mismatches} 条动态字节与 ELF 静态字节不一致；"
-            "Linux alternatives 许可绝不适用于 MyGO"
+            f"Hitoshizuku 有 {mygo_mismatches} 条动态字节与 ELF 静态字节不一致；"
+            "Linux alternatives 许可绝不适用于 Hitoshizuku"
         )
     if linux_mismatches and not args.allow_linux_alternatives:
         raise ValueError(
@@ -1310,7 +1310,7 @@ def run(args: argparse.Namespace) -> int:
         if args.path_kind == "syscall"
         else validate_page_fault_path
     )
-    validator(mygo_rows, "MyGO")
+    validator(mygo_rows, "Hitoshizuku")
     validator(linux_rows, "Linux")
 
     write_tsv(args.mygo_output, mygo_rows)

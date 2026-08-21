@@ -330,7 +330,9 @@ fn split_list(value: Option<&String>) -> Vec<String> {
 fn active_modules(modules: Vec<ModuleSpec>, target: &str) -> Result<Vec<ModuleSpec>, String> {
     let active_names = modules
         .iter()
-        .filter(|module| module.targets.is_empty() || module.targets.iter().any(|item| item == target))
+        .filter(|module| {
+            module.targets.is_empty() || module.targets.iter().any(|item| item == target)
+        })
         .map(|module| module.name.clone())
         .collect::<BTreeSet<_>>();
     let all_names = modules
@@ -353,7 +355,9 @@ fn active_modules(modules: Vec<ModuleSpec>, target: &str) -> Result<Vec<ModuleSp
                 ));
             }
         }
-        module.after.retain(|dependency| active_names.contains(dependency));
+        module
+            .after
+            .retain(|dependency| active_names.contains(dependency));
         active.push(module);
     }
     Ok(active)
@@ -441,11 +445,7 @@ fn resolve_modes(
     Ok(modes)
 }
 
-pub fn configure_set(
-    set_path: &Path,
-    config_path: &Path,
-    mode: ConfigMode,
-) -> Result<(), String> {
+pub fn configure_set(set_path: &Path, config_path: &Path, mode: ConfigMode) -> Result<(), String> {
     let modules = parse_module_set(set_path)?;
     let known = modules
         .iter()
@@ -477,7 +477,10 @@ pub fn configure_set(
             ConfigMode::DefConfig => fallback,
             ConfigMode::OldConfig if existing.contains_key(&module.config) => fallback,
             ConfigMode::Config | ConfigMode::OldConfig => loop {
-                print!("{} ({}) [y/m/n] ({}): ", module.prompt, module.config, fallback);
+                print!(
+                    "{} ({}) [y/m/n] ({}): ",
+                    module.prompt, module.config, fallback
+                );
                 io::stdout()
                     .flush()
                     .map_err(|err| format!("刷新配置提示失败: {err}"))?;
@@ -503,7 +506,7 @@ pub fn configure_set(
         validate_enabled_dependencies(&ordered, &modes)?;
     }
 
-    let mut output = String::from("# 此文件由 make config 生成，请勿提交构建产物。\n");
+    let mut output = String::from("# 此文件由 cargo xtask config 生成，请勿提交构建产物。\n");
     for module in modules {
         output.push_str(&module.config);
         output.push('=');
@@ -693,12 +696,7 @@ fn parse_string(value: &str, line: usize) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    fn module(
-        name: &str,
-        config: &str,
-        depends: &[&str],
-        after: &[&str],
-    ) -> ModuleSpec {
+    fn module(name: &str, config: &str, depends: &[&str], after: &[&str]) -> ModuleSpec {
         ModuleSpec {
             name: name.to_string(),
             path: PathBuf::from(name),
@@ -787,7 +785,10 @@ mod tests {
         let requested = vec!["diagnostic".to_string()];
 
         for module in &modules {
-            assert_eq!(module_build_features(&modules, module, &requested), requested);
+            assert_eq!(
+                module_build_features(&modules, module, &requested),
+                requested
+            );
         }
     }
 }

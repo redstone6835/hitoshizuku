@@ -9,7 +9,7 @@ use super::test_thread_metadata::make_task;
 use crate::{TaskState, WaitQueue, WaitReason};
 
 #[ktest]
-fn buildstorm_wait_reasons_keep_existing_ids_stable() {
+fn profile_wait_reasons_keep_existing_ids_stable() {
     assert_eq!(WaitReason::Other as u8, 7);
     assert_eq!(WaitReason::ProcessExit as u8, 8);
     assert_eq!(WaitReason::Vfork as u8, 9);

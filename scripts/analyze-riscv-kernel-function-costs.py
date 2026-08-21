@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""将 RISC-V BuildStorm 内核指令和微基准成本近似归因到 ELF 函数。"""
+"""将 RISC-V profile 内核指令和微基准成本近似归因到 ELF 函数。"""
 
 from __future__ import annotations
 

@@ -4,7 +4,11 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 plugin=${1:-"$root/build/qemu-plugins/riscv_instruction_mix.so"}
 kernel=${2:-"$root/kernel-rv"}
-image=${QEMU_PLUGIN_CONTAINER_IMAGE:-zhouzhouyi/os-contest:20260510}
+image=${QEMU_PLUGIN_CONTAINER_IMAGE:-}
+[ -n "$image" ] || {
+    echo "QEMU_PLUGIN_CONTAINER_IMAGE must name a build image" >&2
+    exit 2
+}
 temporary=$(mktemp -d)
 container="mygo-riscv-mix-smoke-$$"
 

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 
-DEFAULT_DOCKER_IMAGE = "zhouzhouyi/os-contest:20260510"
+DEFAULT_DOCKER_IMAGE = os.environ.get("HITOSHIZUKU_LTP_IMAGE", "")
 DEFAULT_GROUPS = ("default", "network")
 DEFAULT_OUTPUT = Path("build/ltp-loongarch64")
 DEFAULT_KERNEL = Path("kernel-la")
@@ -895,6 +895,10 @@ def run_one_shard(
 def validate_common_paths(args: argparse.Namespace, root: Path) -> None:
     """在启动长测试前拒绝明显错误的输入。"""
 
+    if not args.docker_image:
+        raise LtpError(
+            "请通过 --docker-image 或 HITOSHIZUKU_LTP_IMAGE 提供运行环境镜像"
+        )
     args.kernel = (root / args.kernel).resolve() if not args.kernel.is_absolute() else args.kernel.resolve()
     args.image = (root / args.image).resolve() if not args.image.is_absolute() else args.image.resolve()
     args.output = (root / args.output).resolve() if not args.output.is_absolute() else args.output.resolve()
@@ -909,6 +913,10 @@ def validate_common_paths(args: argparse.Namespace, root: Path) -> None:
 def inventory_command(args: argparse.Namespace, root: Path) -> int:
     """生成并打印场景清单。"""
 
+    if not args.docker_image:
+        raise LtpError(
+            "请通过 --docker-image 或 HITOSHIZUKU_LTP_IMAGE 提供运行环境镜像"
+        )
     image = (root / args.image).resolve() if not args.image.is_absolute() else args.image.resolve()
     output = (root / args.output).resolve() if not args.output.is_absolute() else args.output.resolve()
     if not image.is_file():

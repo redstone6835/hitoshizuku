@@ -12,5 +12,5 @@ contract = "driver.virtio.framework@1"
 crate = "virtio"
 
 [[profiles]]
-id = "contest-2026"
+id = "hitoshizuku-default"
 priority = "100"

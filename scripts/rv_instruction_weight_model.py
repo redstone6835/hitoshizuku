@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """从 epoch 级 RISC-V 画像估计逐指令耗时权重。
 
-模型只依赖 Python 标准库，供 BuildStorm 报告生成器直接导入。输入中的
+模型只依赖 Python 标准库，供 profile 报告生成器直接导入。输入中的
 ``vcpu_task_clock_ns`` 是响应变量；逐指令精确计数是主解释变量，执行 TB 数、
 翻译指令增量、epoch 持续时间和可辨识的截距是 nuisance 变量。
 

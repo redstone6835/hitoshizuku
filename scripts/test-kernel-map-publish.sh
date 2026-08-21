@@ -211,19 +211,6 @@ for lock in "$source_kernel.lock" "$published_kernel.lock" \
     [ -f "$lock" ] || fail "missing resource lock $lock"
 done
 
-# The Make entrypoint must pass kernel-la into the transaction and must not copy
-# it after the manifest has already been committed.
-make -n -C "$repo" KERNEL_MAP="$root/make-kernel.map" kernel-la >"$root/make.out"
-grep -Fq "KERNEL_LINK_ROOT_OUTPUT=\"$repo/kernel-la\"" "$root/make.out" || {
-    fail "make kernel-la did not pass its root publish output"
-}
-grep -Fqx 'test -s kernel-la' "$root/make.out" || {
-    fail "make kernel-la does not verify the transactional root output"
-}
-if grep -Fqx 'cp build/loongarch64/kernel kernel-la' "$root/make.out"; then
-    fail "make kernel-la still copies the kernel after manifest publication"
-fi
-
 # A copy that writes only a partial temporary kernel must leave every published
 # artifact untouched and must be cleaned up.
 fake_bin=$root/fake-bin

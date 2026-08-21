@@ -1,6 +1,6 @@
 /* 调试版链接脚本 — 输出 ELF 格式，支持 GDB / objdump / addr2line
  * 与 qemu-riscv64.ld 布局一致，但不含 PE/COFF header。
- * 使用方法：cargo-config/config.toml 中将 -Tkernel/linker/qemu-riscv64.ld
+ * 使用方法：在 .cargo/config.toml 中将 -Tkernel/linker/qemu-riscv64.ld
  *          替换为 -Tkernel/linker/qemu-riscv64-debug.ld
  */
 OUTPUT_FORMAT("elf64-littleriscv")

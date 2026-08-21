@@ -21,7 +21,7 @@ from scripts.qemu_profile_compare import (
 
 
 def environment() -> dict[str, str]:
-    """构造 Linux/MyGO 两侧必须完全相同的测量环境身份。"""
+    """构造 Linux/Hitoshizuku 两侧必须完全相同的运行环境身份。"""
 
     return {
         "base_image_sha256": "1" * 64,
@@ -36,11 +36,11 @@ def environment() -> dict[str, str]:
         "qemu_cpu": "la464",
         "qemu_debug_threads": "on",
         "qemu_machine": "virt",
-        "qemu_name": "buildstorm-profile",
+        "qemu_name": "profile",
         "qemu_version": "QEMU emulator version 10.0.2",
         "smp": "8",
         "target_tmpfs": "tmpfs:/work/tgoskits/target:size=5368709120",
-        "toolchain": "nightly-2026-05-28",
+        "toolchain": "default",
         "workload_plan_sha256": "4" * 64,
         "workload_script_sha256": "5" * 64,
     }
@@ -346,7 +346,7 @@ class CommandLineTests(unittest.TestCase):
             run_dir = Path(temporary) / "run"
             run_dir.mkdir()
             (run_dir / "summary.json").write_text(
-                json.dumps({"schema": "mygo.buildstorm-profile", "schema_version": 2}),
+                json.dumps({"schema": "mygo.profile", "schema_version": 2}),
                 encoding="utf-8",
             )
             observer = run_dir / "qemu-profile-summary.json"

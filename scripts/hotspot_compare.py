@@ -2,7 +2,7 @@
 """
 hotspot_compare.py
 
-Compare per-function instruction costs between MyGO and Linux kernels using
+Compare per-function instruction costs between Hitoshizuku and Linux kernels using
 QEMU plugin histograms or daemon summary hotspot samples.
 
 Usage:
@@ -298,7 +298,7 @@ def analyze_invisible_overhead(
     linux_total_ns: int,
 ) -> str:
     """
-    Analyze the invisible overhead categories in MyGO kernel.
+    Analyze the invisible overhead categories in Hitoshizuku kernel.
     Returns a formatted text section for the report.
     """
     lines = []
@@ -470,7 +470,7 @@ def _get_objdump(elf_path: str, cache: dict) -> Optional[Dict[str, List[Tuple[in
 
 
 # ---------------------------------------------------------------------------
-# MyGO -> Linux function name heuristic mapping
+# Hitoshizuku -> Linux function name heuristic mapping
 # ---------------------------------------------------------------------------
 
 # Hand-curated overrides for common pairs.
@@ -514,7 +514,7 @@ def find_linux_equivalents(
 ) -> List[str]:
     """
     Return a ranked list of Linux symbol names that are plausible equivalents
-    for a given MyGO function name.
+    for a given Hitoshizuku function name.
 
     Strategy:
     1. Check hand-curated overrides first.
@@ -568,7 +568,7 @@ def normalize_counts(
     counts: Dict[str, float],
     factor: float,
 ) -> Dict[str, float]:
-    """Multiply every value by factor (scale MyGO to match Linux time base)."""
+    """Multiply every value by factor (scale Hitoshizuku to match Linux time base)."""
     return {k: v * factor for k, v in counts.items()}
 
 
@@ -578,7 +578,7 @@ def build_comparison_table(
     third_counts: Optional[Dict[str, float]] = None,
 ) -> List[dict]:
     """
-    Merge MyGO, Linux, and optional third-system per-function counts.
+    Merge Hitoshizuku, Linux, and optional third-system per-function counts.
 
     Returns a list of dicts sorted by mygo_norm_pct descending.
     """
@@ -621,14 +621,14 @@ def print_table(rows: List[dict], out, third_label: str = "FreeBSD") -> None:
     has_third = rows and rows[0].get("third_insns") is not None
     if has_third:
         hdr = (
-            f"{'Rank':>4}  {'Function':<42}  {'MyGO-Insns':>10}  "
+            f"{'Rank':>4}  {'Function':<42}  {'Hitoshizuku-Insns':>10}  "
             f"{'Linux-Insns':>11}  {third_label+'-Insns':>14}  "
-            f"{'vs Linux':>8}  {'vs '+third_label:>10}  {'MyGO%':>6}  {'Linux%':>6}"
+            f"{'vs Linux':>8}  {'vs '+third_label:>10}  {'Hitoshizuku%':>6}  {'Linux%':>6}"
         )
     else:
         hdr = (
-            f"{'Rank':>4}  {'Function':<42}  {'MyGO-Insns':>10}  "
-            f"{'Linux-Insns':>11}  {'Ratio':>6}  {'MyGO%':>6}  {'Linux%':>6}"
+            f"{'Rank':>4}  {'Function':<42}  {'Hitoshizuku-Insns':>10}  "
+            f"{'Linux-Insns':>11}  {'Ratio':>6}  {'Hitoshizuku%':>6}  {'Linux%':>6}"
         )
     sep = "-" * len(hdr)
     out.write(hdr + "\n")
@@ -742,16 +742,16 @@ def build_pc_counts(histogram_path: Optional[str]) -> Optional[Dict[int, int]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare per-function instruction costs between MyGO and Linux.",
+        description="Compare per-function instruction costs between Hitoshizuku and Linux.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--mygo-histogram", type=str, help="MyGO histogram JSON (optional)")
+    parser.add_argument("--mygo-histogram", type=str, help="Hitoshizuku histogram JSON (optional)")
     parser.add_argument("--linux-histogram", type=str, help="Linux histogram JSON (optional)")
-    parser.add_argument("--mygo-summary", type=str, required=True, help="MyGO summary.json (required)")
+    parser.add_argument("--mygo-summary", type=str, required=True, help="Hitoshizuku summary.json (required)")
     parser.add_argument("--linux-summary", type=str, required=True, help="Linux summary.json (required)")
-    parser.add_argument("--mygo-elf", type=str, help="MyGO ELF file for objdump (auto-detect if not set)")
+    parser.add_argument("--mygo-elf", type=str, help="Hitoshizuku ELF file for objdump (auto-detect if not set)")
     parser.add_argument("--linux-elf", type=str, help="Linux ELF file for objdump")
-    parser.add_argument("--mygo-map", type=str, help="MyGO symbol map (LLD or System.map)")
+    parser.add_argument("--mygo-map", type=str, help="Hitoshizuku symbol map (LLD or System.map)")
     parser.add_argument("--linux-map", type=str, help="Linux symbol map (LLD or System.map)")
     # Third system (e.g. FreeBSD) — all optional
     # FreeBSD nm output uses the same format as Linux System.map and is supported natively.
@@ -798,7 +798,7 @@ def main() -> None:
                 print("warning: no normalization baseline available; using factor=1.0", file=sys.stderr)
                 mygo_cargo64 = linux_cargo64 = 1
 
-    # Compute normalization factor: scale MyGO to match Linux time base
+    # Compute normalization factor: scale Hitoshizuku to match Linux time base
     norm_factor = float(linux_cargo64) / float(mygo_cargo64)
 
     # Load symbol tables
@@ -808,10 +808,10 @@ def main() -> None:
 
     if args.mygo_map:
         if not os.path.exists(args.mygo_map):
-            print(f"warning: MyGO map file not found: {args.mygo_map}", file=sys.stderr)
+            print(f"warning: Hitoshizuku map file not found: {args.mygo_map}", file=sys.stderr)
         else:
             mygo_st = SymbolTable.from_file(args.mygo_map)
-            print(f"  MyGO: loaded {len(mygo_st.all_names())} symbols", file=sys.stderr)
+            print(f"  Hitoshizuku: loaded {len(mygo_st.all_names())} symbols", file=sys.stderr)
 
     if args.linux_map:
         if not os.path.exists(args.linux_map):
@@ -820,15 +820,15 @@ def main() -> None:
             linux_st = SymbolTable.from_file(args.linux_map)
             print(f"  Linux: loaded {len(linux_st.all_names())} symbols", file=sys.stderr)
 
-    # If no MyGO map was provided, try building a symbol table from objdump
+    # If no Hitoshizuku map was provided, try building a symbol table from objdump
     # (catches trap entry, TLB refill, and other assembly functions not in LLD map)
     if mygo_st is None and args.mygo_elf and os.path.exists(args.mygo_elf):
-        print("  MyGO: no map file; building symbol table from objdump...", file=sys.stderr)
+        print("  Hitoshizuku: no map file; building symbol table from objdump...", file=sys.stderr)
         mygo_st = build_objdump_symtab(args.mygo_elf)
         if mygo_st._addrs:
-            print(f"  MyGO: objdump loaded {len(mygo_st._addrs)} symbols", file=sys.stderr)
+            print(f"  Hitoshizuku: objdump loaded {len(mygo_st._addrs)} symbols", file=sys.stderr)
         else:
-            print("  MyGO: objdump produced no symbols; PCs will be used as keys", file=sys.stderr)
+            print("  Hitoshizuku: objdump produced no symbols; PCs will be used as keys", file=sys.stderr)
             mygo_st = None
 
     # Determine instruction count source: histogram or proxy
@@ -838,12 +838,12 @@ def main() -> None:
     third_counts: Optional[Dict[str, float]] = None
 
     if args.mygo_histogram and os.path.exists(args.mygo_histogram):
-        print("Loading MyGO histogram...", file=sys.stderr)
+        print("Loading Hitoshizuku histogram...", file=sys.stderr)
         mygo_counts_int = load_histogram(args.mygo_histogram, mygo_st)
         mygo_counts = {k: float(v) for k, v in mygo_counts_int.items()}
         data_source = "histogram"
     else:
-        print("Using MyGO summary hotspot_offsets (proxy)...", file=sys.stderr)
+        print("Using Hitoshizuku summary hotspot_offsets (proxy)...", file=sys.stderr)
         mygo_counts = hotspot_proxy(mygo_summary)
         data_source = "sample-proxy"
 
@@ -852,12 +852,12 @@ def main() -> None:
         linux_counts_int = load_histogram(args.linux_histogram, linux_st)
         linux_counts = {k: float(v) for k, v in linux_counts_int.items()}
         if data_source == "sample-proxy":
-            data_source = "mixed (MyGO=samples, Linux=histogram)"
+            data_source = "mixed (Hitoshizuku=samples, Linux=histogram)"
     else:
         print("Using Linux summary hotspot_offsets (proxy)...", file=sys.stderr)
         linux_counts = hotspot_proxy(linux_summary)
         if data_source == "histogram":
-            data_source = "mixed (MyGO=histogram, Linux=samples)"
+            data_source = "mixed (Hitoshizuku=histogram, Linux=samples)"
 
     # Load optional third system (e.g. FreeBSD)
     third_label = getattr(args, "third_label", "FreeBSD")
@@ -880,7 +880,7 @@ def main() -> None:
         else:
             third_counts = hotspot_proxy(third_summary)
 
-    # Normalize MyGO counts
+    # Normalize Hitoshizuku counts
     mygo_norm = normalize_counts(mygo_counts, norm_factor)
 
     # Build comparison table
@@ -894,9 +894,9 @@ def main() -> None:
 
     try:
         # Write header
-        out.write("BuildStorm Hotspot Comparison: MyGO vs Linux\n")
+        out.write("profile Hotspot Comparison: Hitoshizuku vs Linux\n")
         out.write("=" * 80 + "\n")
-        out.write(f"MyGO {norm_label} = {fmt_ns(mygo_cargo64)}  ")
+        out.write(f"Hitoshizuku {norm_label} = {fmt_ns(mygo_cargo64)}  ")
         out.write(f"Linux {norm_label} = {fmt_ns(linux_cargo64)}  ")
         out.write(f"(normalization factor = {norm_factor:.3f})\n")
         out.write(f"Instruction counts from: {data_source}\n")
@@ -947,14 +947,14 @@ def main() -> None:
                 rank = row["rank"]
                 mygo_fn = row["function"]
 
-                # MyGO annotation
+                # Hitoshizuku annotation
                 if mygo_objdump and mygo_fn in mygo_objdump:
                     insns = mygo_objdump[mygo_fn]
                     _annotate_function(
-                        mygo_fn, insns, None, mygo_pc_counts, out, "MyGO", rank
+                        mygo_fn, insns, None, mygo_pc_counts, out, "Hitoshizuku", rank
                     )
                 else:
-                    out.write(f"━━━ {rank}. MyGO: {mygo_fn} (no disassembly available)\n\n")
+                    out.write(f"━━━ {rank}. Hitoshizuku: {mygo_fn} (no disassembly available)\n\n")
 
                 # Find Linux equivalent
                 linux_candidates = find_linux_equivalents(mygo_fn, linux_names)

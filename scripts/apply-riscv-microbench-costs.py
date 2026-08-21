@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the independent RISC-V microbenchmark model to one BuildStorm run."""
+"""Apply the independent RISC-V microbenchmark model to one profile run."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from rv_instruction_profile_io import (
 
 MIX_SCHEMA = "mygo.riscv-instruction-mix.v1"
 CATALOG_SCHEMA = "mygo.riscv-tb-catalog.v1"
-OUTPUT_SCHEMA = "mygo.riscv-buildstorm-microbench-costs.v1"
+OUTPUT_SCHEMA = "mygo.riscv-profile-microbench-costs.v1"
 MODEL_KEY = "raw-encoding+semantic-decoding+execution-pattern"
 VCPU_COMM = re.compile(r"CPU ([0-9]+)/TCG\Z")
 

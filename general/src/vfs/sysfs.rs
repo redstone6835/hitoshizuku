@@ -2475,10 +2475,15 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
         SysRegFile::CpuPossible => format_cpu_mask_range(supported_cpu_mask()),
         // 当前内核尚未区分“已发现但离线”的 CPU；present 先反映在线 CPU 集合。
         SysRegFile::CpuPresent => format_cpu_mask_range(online_cpu_mask()),
-        SysRegFile::Hostname => "mygo\n".into(),
-        SysRegFile::Ostype => "MyGO\n".into(),
+        SysRegFile::Hostname => "hitoshizuku\n".into(),
+        SysRegFile::Ostype => "Hitoshizuku\n".into(),
         SysRegFile::Osrelease => env!("CARGO_PKG_VERSION").to_string() + "\n",
-        SysRegFile::Version => format!("mygo {} (mygo-build)\n", env!("CARGO_PKG_VERSION")),
+        SysRegFile::Version => {
+            format!(
+                "Hitoshizuku {} (hitoshizuku-build)\n",
+                env!("CARGO_PKG_VERSION")
+            )
+        }
         SysRegFile::Cmdline => render_kernel_cmdline(),
         SysRegFile::DeviceFunctions => {
             let mut out = String::new();

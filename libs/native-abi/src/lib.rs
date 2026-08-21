@@ -1,6 +1,6 @@
 #![no_std]
 
-//! MyGO Native ABI 的机器身份、启动契约与格式无关绑定模型。
+//! Hitoshizuku Native ABI 的机器身份、启动契约与格式无关绑定模型。
 
 extern crate alloc;
 

@@ -1,5 +1,0 @@
-1	toolchain	^if rustc --version
-2	minibuild	^rm -rf /tmp/minibuild
-3	xtask	^echo "----- pre-build tg-xtask
-4	compile	^echo "----- build arceos-helloworld
-5	teardown	^echo "#### OS COMP TEST GROUP END buildstorm

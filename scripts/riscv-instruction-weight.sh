@@ -27,7 +27,11 @@ case "$mode" in
 esac
 
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
-image=${RISCV_WEIGHT_CONTAINER:-zhouzhouyi/os-contest:20260510}
+image=${RISCV_WEIGHT_CONTAINER:-}
+[ -n "$image" ] || {
+    echo "RISCV_WEIGHT_CONTAINER must name a build image" >&2
+    exit 2
+}
 runs=${RISCV_WEIGHT_RUNS:-$default_runs}
 base_blocks=${RISCV_WEIGHT_BASE_BLOCKS:-$default_blocks}
 rounds=${RISCV_WEIGHT_ROUNDS:-$default_rounds}
@@ -110,12 +114,9 @@ mkdir -p "$output"
 
 echo "[riscv-weight] 构建探针内核与 QEMU 插件"
 if [ "$skip_build" -eq 0 ]; then
-    docker run --rm -v "$root":/work -w /work "$image" \
-        make instruction-weight-rv \
-            RISCV_WEIGHT_BASE_BLOCKS="$base_blocks" \
-            RISCV_WEIGHT_ROUNDS="$rounds" \
-            RISCV_WEIGHT_CASE="$benchmark_case" \
-            RISCV_WEIGHT_RUN_ID=runtime
+    echo "instruction-weight probe construction is owned by the external benchmark workspace" >&2
+    echo "provide prebuilt artifacts or migrate this runner before enabling a new run" >&2
+    exit 2
 else
     echo "[riscv-weight] 复用 instruction-weight 构建产物"
 fi

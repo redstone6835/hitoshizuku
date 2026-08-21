@@ -1,4 +1,4 @@
-//! MyGO Native operation 的内核对象执行路径。
+//! Hitoshizuku Native operation 的内核对象执行路径。
 
 use alloc::sync::Arc;
 use core::ops::Range;

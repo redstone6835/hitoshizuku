@@ -1,4 +1,4 @@
-//! MyGO Native 进程状态与初始 capability 资源。
+//! Hitoshizuku Native 进程状态与初始 capability 资源。
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

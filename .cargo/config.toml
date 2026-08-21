@@ -1,13 +1,8 @@
-[build]
-#target = "riscv64gc-unknown-none-elf"
-target = "loongarch64-unknown-none"
-
 [target.riscv64gc-unknown-none-elf]
 linker = "rust-lld"
 rustflags = [
     "-Clink-arg=-Tkernel/linker/qemu-riscv64.ld",
     "-C", "link-arg=--fatal-warnings",
-    "-Z", "share-generics=no",
 ]
 
 [target.loongarch64-unknown-none]
@@ -17,15 +12,15 @@ rustflags = [
     "-C", "link-arg=--fatal-warnings",
     "-C", "link-arg=--no-gc-sections",
     "-A", "named_asm_labels",
-    "-Z", "share-generics=no",
 ]
 
+# libs/efi contains the small freestanding C shim required by the firmware path.
+# These are compiler names, not Rust toolchain overrides.
 [env]
 CC_loongarch64_unknown_none = "loongarch64-linux-gnu-gcc"
 CC_riscv64gc_unknown_none_elf = "riscv64-linux-gnu-gcc"
 
-[source.crates-io]
-replace-with = "vendored-sources"
-
-[source.vendored-sources]
-directory = "vendor"
+# Keep the build graph invocable through Cargo without a host-tool target
+# accidentally inheriting a bare-metal default.
+[alias]
+xtask = "run -p xtask --"

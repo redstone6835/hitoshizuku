@@ -1,0 +1,5 @@
+[package]
+name = "native-xtask"
+version.workspace = true
+edition.workspace = true
+publish = false

@@ -70,7 +70,7 @@ fi
 
 riscv_linux_cc=${RISCV_LINUX_CC:-riscv64-linux-musl-gcc}
 riscv_clang=${CLANG:-clang}
-native_make=${MAKE:-make}
+native_builder=${HITOSHIZUKU_NATIVE_BUILDER:-}
 command -v "$riscv_linux_cc" >/dev/null 2>&1 || {
     echo "UNAVAILABLE reason=linux_compiler_missing" >&2
     exit 3
@@ -79,8 +79,12 @@ command -v "$riscv_clang" >/dev/null 2>&1 || {
     echo "UNAVAILABLE reason=clang_missing" >&2
     exit 3
 }
-command -v "$native_make" >/dev/null 2>&1 || {
-    echo "UNAVAILABLE reason=make_missing" >&2
+if [ -z "$native_builder" ]; then
+    echo "UNAVAILABLE reason=native_builder_missing (set HITOSHIZUKU_NATIVE_BUILDER)" >&2
+    exit 3
+fi
+command -v "$native_builder" >/dev/null 2>&1 || {
+    echo "UNAVAILABLE reason=native_builder_missing" >&2
     exit 3
 }
 command -v sha256sum >/dev/null 2>&1 || {
@@ -136,23 +140,10 @@ build_native_runtime() {
     manifest=$1
     include_ranalib=$2
     "$soyo_ld" --target riscv64 --manifest "$manifest" --emit-c-header "$binding"
-    # 目标名在 native/Makefile 中是绝对路径，显式请求可避免构建无关示例。
-    if [ "$include_ranalib" = yes ]; then
-        # shellcheck disable=SC2086
-        "$native_make" -C "$native_root" ARCH=riscv64 OUTPUT="$native_output" \
-            MANIFEST="$manifest" \
-            SOYO_LD="$soyo_ld" $mrt_objects $ranalib_objects
-    elif [ "$include_ranalib" = heap ]; then
-        # shellcheck disable=SC2086
-        "$native_make" -C "$native_root" ARCH=riscv64 OUTPUT="$native_output" \
-            MANIFEST="$manifest" \
-            SOYO_LD="$soyo_ld" $mrt_objects $native_heap_objects
-    else
-        # shellcheck disable=SC2086
-        "$native_make" -C "$native_root" ARCH=riscv64 OUTPUT="$native_output" \
-            MANIFEST="$manifest" \
-            SOYO_LD="$soyo_ld" $mrt_objects
-    fi
+    # native builder 由独立的 hitoshizuku-native 仓库提供，负责按清单生成
+    # freestanding C/Rust 对象；内核仓库不再内置该运行时的编排器。
+    "$native_builder" objects --target riscv64 --output "$native_output" \
+        --manifest "$manifest" --runtime "$include_ranalib" --soyo-ld "$soyo_ld"
 }
 
 pack_initramfs() {

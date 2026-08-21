@@ -14,7 +14,11 @@ case "$mode" in trace|timing) ;; *) usage ;; esac
 case "$systems" in mygo|linux|both) ;; *) usage ;; esac
 
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
-image=${MM_BENCH_CONTAINER:-zhouzhouyi/os-contest:20260510}
+image=${MM_BENCH_CONTAINER:-}
+[ -n "$image" ] || {
+    echo "MM_BENCH_CONTAINER must name a build image" >&2
+    exit 2
+}
 smp=${MM_BENCH_SMP:-1}
 memory=${MM_BENCH_MEMORY:-1G}
 accel=${MM_BENCH_ACCEL:-tcg,thread=single}

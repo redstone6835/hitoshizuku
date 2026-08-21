@@ -30,7 +30,7 @@ use crate::TrapFramePtr;
 
 // ── 1. arch 注入契约 ─────────────────────────────────────────────────────────
 
-/// 从用户 trap frame 提取的 MyGO Native 调用。
+/// 从用户 trap frame 提取的 Hitoshizuku Native 调用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeCallFrame {
     pub slot: u64,
@@ -39,7 +39,7 @@ pub struct NativeCallFrame {
     pub reserved_arg: u64,
 }
 
-/// 写回用户 trap frame 的 MyGO Native 调用结果。
+/// 写回用户 trap frame 的 Hitoshizuku Native 调用结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeCallReturn {
     pub status: u32,
@@ -58,7 +58,7 @@ pub enum NativeCallOutcome {
     RetryExternalControl,
 }
 
-/// kernel 在启动期注册的 MyGO Native 调用入口。
+/// kernel 在启动期注册的 Hitoshizuku Native 调用入口。
 pub type NativeDispatchFn =
     fn(&Arc<sched::Task>, NativeCallFrame, sched::UserContextRef) -> NativeCallOutcome;
 
@@ -86,7 +86,7 @@ pub struct SyscallFrameOps {
     pub sys_args: fn(TrapFramePtr) -> [usize; 6],
     /// 写返回值（通常进 a0 / rax）。负数即 -errno。
     pub set_sys_ret: fn(TrapFramePtr, isize),
-    /// 按当前架构的 MyGO Native ABI 提取调用寄存器。
+    /// 按当前架构的 Hitoshizuku Native ABI 提取调用寄存器。
     pub native_call: fn(TrapFramePtr) -> NativeCallFrame,
     /// 写回 status/value0/value1；失败结果必须清零两个 value。
     pub set_native_ret: fn(TrapFramePtr, NativeCallReturn),
@@ -130,7 +130,7 @@ pub fn register_native_dispatcher(dispatch: NativeDispatchFn) {
 
 fn native_dispatcher() -> NativeDispatchFn {
     let raw = NATIVE_DISPATCHER.load(Ordering::Acquire);
-    assert_ne!(raw, 0, "MyGO Native task 缺少已注册 dispatcher");
+    assert_ne!(raw, 0, "Hitoshizuku Native task 缺少已注册 dispatcher");
     // Safety: register_native_dispatcher 只写入 NativeDispatchFn，且发布后不再修改。
     unsafe { core::mem::transmute::<usize, NativeDispatchFn>(raw) }
 }

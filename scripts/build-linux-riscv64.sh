@@ -3,7 +3,11 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-image=${LINUX_BUILD_CONTAINER:-zhouzhouyi/os-contest:20260510}
+image=${LINUX_BUILD_CONTAINER:-}
+[ -n "$image" ] || {
+    echo "LINUX_BUILD_CONTAINER must name a build image" >&2
+    exit 2
+}
 base_archive=${LINUX_BASE_ARCHIVE:-/var/cache/distfiles/linux-6.18.tar.xz}
 stable_patch=${LINUX_STABLE_PATCH:-/var/cache/distfiles/patch-6.18.37.xz}
 gentoo_patches=${LINUX_GENTOO_PATCHES:-/var/cache/distfiles/linux-gentoo-patches-6.18.37_p1.tar.xz}
@@ -54,7 +58,7 @@ docker run --rm \
             CROSS_COMPILE=riscv64-linux-gnu- olddefconfig
         make -C "$source_dir" O="$output_dir" ARCH=riscv \
             CROSS_COMPILE=riscv64-linux-gnu- \
-            KBUILD_BUILD_USER=mygo KBUILD_BUILD_HOST=os-contest \
+            KBUILD_BUILD_USER=hitoshizuku KBUILD_BUILD_HOST=hitoshizuku \
             KBUILD_BUILD_TIMESTAMP="$1" -j"$2" vmlinux Image
 
         kernel_sha=$(sha256sum "$output_dir/vmlinux" | cut -d" " -f1)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate one completed RISC-V BuildStorm instruction profile."""
+"""Validate one completed RISC-V profile instruction profile."""
 
 from __future__ import annotations
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parse and report a versioned MyGO profiling snapshot."""
+"""Parse and report a versioned Hitoshizuku profiling snapshot."""
 
 from __future__ import annotations
 
@@ -433,7 +433,7 @@ def symbolize(binary: Path, addresses: list[int], addr2line: str) -> dict[int, s
     if not addresses:
         return {}
     result = {}
-    # execve 参数受 ARG_MAX 限制；大型 BuildStorm 快照可能包含数万地址，
+    # execve 参数受 ARG_MAX 限制；大型 profile 快照可能包含数万地址，
     # 分批调用避免一次传参过长导致 E2BIG，并保留已成功解析的批次。
     batch_size = 256
     for start in range(0, len(addresses), batch_size):

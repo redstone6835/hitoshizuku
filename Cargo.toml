@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+default-members = ["kernel"]
 members = [
     "libs/ktest",
     "libs/ktest/ktest-mock",
@@ -28,27 +29,27 @@ members = [
     "arch",
     "hal",
     "general",
-    "kernel"
+    "kernel",
+    "xtask",
+    "drivers/*",
+    "drivers/virtio/api",
+    "drivers/virtio/provider-api",
+    "drivers/virtio/consumer-api"
 ]
-exclude = [
-    "drivers/cfi-flash",
-    "drivers/firmware-bus",
-    "drivers/fw-cfg",
-    "drivers/goldfish-rtc",
-    "drivers/loongson-irq",
-    "drivers/loopback",
-    "drivers/net-stack",
-    "drivers/ls7a-rtc",
-    "drivers/plic",
-    "drivers/random",
-    "drivers/syscon",
-    "drivers/uart16550",
-    "drivers/virtio",
-    "drivers/virtio-blk",
-    "drivers/virtio-net",
-    "tests/elm/kernel-mixin",
-]
+exclude = ["tests/elm/kernel-mixin"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-only"
+license-file = "LICENSE"
+repository = "https://github.com/redstone6835/hitoshizuku"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = false
+strip = false

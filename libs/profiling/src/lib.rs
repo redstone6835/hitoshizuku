@@ -3745,7 +3745,7 @@ mod tests {
     }
 
     #[test]
-    fn buildstorm_wait_events_are_appended_without_renumbering_existing_events() {
+    fn profile_wait_events_are_appended_without_renumbering_existing_events() {
         assert_eq!(Event::BlockWait as usize, 39);
         assert_eq!(Event::NetStackRequest as usize, 48);
         assert_eq!(Event::WaitProcessExit as usize, 49);

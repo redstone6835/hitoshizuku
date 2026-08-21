@@ -1,7 +1,7 @@
 //! 基于 ACPI 的内核初始化逻辑。
 //!
 //! 当前 ACPI 的实现只是一个最小的 AIGC 实现，因为工程目前的重心不在于 ACPI，而
-//! 在于 DTB。在决赛的时候可能会对 ACPI 的实现进行充分完善。
+//! 在于 DTB。后续版本可以继续完善 ACPI 支持。
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;

@@ -174,7 +174,14 @@ impl ElmProjectManifest {
 
         reject_unknown_keys(
             &elm,
-            &["name", "version", "kind", "source", "mode", "integrated_phase"],
+            &[
+                "name",
+                "version",
+                "kind",
+                "source",
+                "mode",
+                "integrated_phase",
+            ],
             "[elm]",
         )?;
         reject_unknown_keys(&menu, &["label", "description", "route"], "[menu]")?;
@@ -380,7 +387,6 @@ pub fn scaffold_project(
     write_new(&directory.join("Elm.toml"), &elm_toml(name, kind, source))?;
     write_new(&directory.join("src/main.rs"), &module_rs(name))?;
     write_new(&directory.join("elm.ld"), ELM_LINKER_SCRIPT)?;
-    write_new(&directory.join("rust-toolchain.toml"), ELM_RUST_TOOLCHAIN)?;
     write_new(
         &directory.join(".cargo/config.toml"),
         &elm_cargo_config(None, &[], &[]),
@@ -458,8 +464,6 @@ pub fn sync_framework(project: &Path) -> Result<(), String> {
     remove_if_exists(&backup)?;
     fs::write(project.join("elm.ld"), ELM_LINKER_SCRIPT)
         .map_err(|err| format!("更新 ELM linker script 失败: {err}"))?;
-    fs::write(project.join("rust-toolchain.toml"), ELM_RUST_TOOLCHAIN)
-        .map_err(|err| format!("更新 ELM Rust 工具链声明失败: {err}"))?;
     fs::create_dir_all(project.join(".cargo"))
         .map_err(|err| format!("创建 ELM Cargo 配置目录失败: {err}"))?;
     sync_available_target_interfaces(project, &project_manifest)?;
@@ -798,8 +802,6 @@ pub fn cargo_build(project: &Path, target: &str, cargo_name: &str) -> Result<Pat
         format!("-Clink-arg={}", support_library.display()),
         "-Clink-arg=--no-as-needed".to_string(),
         format!("-Clink-arg={}", import_library.display()),
-        "-Zplt=yes".to_string(),
-        "-Zshare-generics=no".to_string(),
     ];
     let metadata = interface_root.join("metadata");
     rustflags.push(format!("-Ldependency={}", metadata.display()));
@@ -857,9 +859,8 @@ pub fn cargo_build_integrated(
         "--cfg=elm_integrated_phase=\"{}\"",
         project_manifest.integrated_phase.as_str()
     ));
-    rustflags.push(
-        "--check-cfg=cfg(elm_integrated_phase,values(\"device\",\"runtime\"))".to_string(),
-    );
+    rustflags
+        .push("--check-cfg=cfg(elm_integrated_phase,values(\"device\",\"runtime\"))".to_string());
     let mut command = Command::new("cargo");
     command
         .current_dir(&project)
@@ -1168,9 +1169,6 @@ pub fn diagnose_project(project: &Path) -> Result<String, String> {
     let manifest = ElmProjectManifest::load(&project)?;
     if !project.join("Cargo.toml").is_file() {
         return Err("工程缺少 Cargo.toml".to_string());
-    }
-    if !project.join("rust-toolchain.toml").is_file() {
-        return Err("工程缺少 rust-toolchain.toml".to_string());
     }
     let mut report = format!(
         "ELM 工程诊断\nname={}\nversion={}\nkind={}\nsource={}\n",
@@ -2554,12 +2552,6 @@ fn append_toml_array(output: &mut String, values: &[String]) {
     }
 }
 
-const ELM_RUST_TOOLCHAIN: &str = r#"[toolchain]
-channel = "nightly-2025-05-20"
-profile = "minimal"
-targets = ["loongarch64-unknown-none", "riscv64gc-unknown-none-elf"]
-"#;
-
 const ELM_LINKER_SCRIPT: &str = r#"ENTRY(__elm_module_entry_v1)
 
 PHDRS
@@ -2696,7 +2688,7 @@ provider = "demo.base"
 contract = "demo.echo@1"
 
 [[profiles]]
-id = "contest-2026"
+id = "hitoshizuku-default"
 priority = "100"
 "#,
         )
@@ -2704,7 +2696,7 @@ priority = "100"
         assert_eq!(manifest.name, "demo.echo");
         assert_eq!(manifest.dependencies.len(), 1);
         assert_eq!(manifest.profiles.len(), 1);
-        assert_eq!(manifest.profiles[0].id, "contest-2026");
+        assert_eq!(manifest.profiles[0].id, "hitoshizuku-default");
         assert_eq!(manifest.profiles[0].priority, 100);
         assert_eq!(manifest.menu.unwrap().route, "demo.echo");
     }
@@ -2791,9 +2783,15 @@ uri = "forbidden"
                 .join(".elm/framework/vfs/Cargo.toml")
                 .is_file()
         );
-        assert!(service.path().join(".elm/framework/net/Cargo.toml").is_file());
+        assert!(
+            service
+                .path()
+                .join(".elm/framework/net/Cargo.toml")
+                .is_file()
+        );
         assert!(service.path().join(".elm/framework/Cargo.toml").is_file());
         assert!(!service.path().join(".elm/framework/elmmgr").exists());
+        assert!(!service.path().join("rust-toolchain.toml").exists());
 
         let manager = TestDirectory::new("manager-project");
         scaffold_project(manager.path(), "demo.manager", "manager", "local.test").unwrap();

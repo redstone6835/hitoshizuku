@@ -2,8 +2,12 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-output=${1:-"$root/build/qemu-plugins/buildstorm_observer.so"}
-image=${QEMU_PLUGIN_CONTAINER_IMAGE:-zhouzhouyi/os-contest:20260510}
+output=${1:-"$root/build/qemu-plugins/profile_observer.so"}
+image=${QEMU_PLUGIN_CONTAINER_IMAGE:-}
+[ -n "$image" ] || {
+    echo "QEMU_PLUGIN_CONTAINER_IMAGE must name a build image" >&2
+    exit 2
+}
 
 case "$output" in
     /*) ;;
@@ -25,7 +29,7 @@ docker run --rm -v "$root":/work -w /work "$image" sh -c '
     cc -std=c11 -O2 -g0 -Wall -Wextra -Werror -fPIC -shared \
         -I/opt/qemu-bin-10.0.2/include \
         $(pkg-config --cflags glib-2.0) \
-        tools/qemu-plugins/buildstorm_observer.c \
+        tools/qemu-plugins/profile_observer.c \
         -o "$1" $(pkg-config --libs glib-2.0)
 ' sh "$relative_output"
 printf '%s\n' "$output"

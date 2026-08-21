@@ -323,17 +323,17 @@ def validate_pair(mygo: SerialRun, linux: SerialRun) -> None:
     mygo_parameters = tuple(mygo.header[name] for name in keys)
     linux_parameters = tuple(linux.header[name] for name in keys)
     if mygo_parameters != linux_parameters:
-        raise ValueError("MyGO/Linux 串口日志参数不一致")
+        raise ValueError("Hitoshizuku/Linux 串口日志参数不一致")
     if set(mygo.summaries) != set(linux.summaries):
-        raise ValueError("MyGO/Linux syscall case 集合不一致")
+        raise ValueError("Hitoshizuku/Linux syscall case 集合不一致")
     for name in mygo.summaries:
         if mygo.summaries[name]["syscall"] != linux.summaries[name]["syscall"]:
-            raise ValueError(f"MyGO/Linux {name} syscall 编号不一致")
+            raise ValueError(f"Hitoshizuku/Linux {name} syscall 编号不一致")
 
 
 def print_timing(mygo: SerialRun, linux: SerialRun) -> None:
     print("\n延迟对比（单次启动内中位数，已扣除等价空循环）")
-    print("| syscall | MyGO ns/次 | Linux ns/次 | MyGO/Linux | MyGO 总计 ms | Linux 总计 ms |")
+    print("| syscall | Hitoshizuku ns/次 | Linux ns/次 | Hitoshizuku/Linux | Hitoshizuku 总计 ms | Linux 总计 ms |")
     print("| --- | ---: | ---: | ---: | ---: | ---: |")
     for name in sorted(mygo.summaries):
         mygo_value = mygo.summaries[name]
@@ -385,7 +385,7 @@ def validate_manifest_binding(
     values = parse_manifest(manifest_path)
     required = {"schema", "target", "kernel_sha256", "symbol_map_sha256"}
     if exact_fields and set(values) != required:
-        raise ValueError(f"{manifest_path}: MyGO manifest 必须恰好包含四个字段")
+        raise ValueError(f"{manifest_path}: Hitoshizuku manifest 必须恰好包含四个字段")
     if values["target"] != expected_target:
         raise ValueError(
             f"{manifest_path}: target={values['target']} expected={expected_target}"
@@ -1216,7 +1216,7 @@ def run(args: argparse.Namespace) -> int:
             )
         if not args.validate_only:
             if not mygo or not linux:
-                raise ValueError("延迟对比必须同时提供 MyGO/Linux 串口日志")
+                raise ValueError("延迟对比必须同时提供 Hitoshizuku/Linux 串口日志")
             print_timing(mygo, linux)
         return 0
 
@@ -1283,13 +1283,13 @@ def run(args: argparse.Namespace) -> int:
     if not args.mygo_profile and not args.linux_profile:
         raise ValueError("profile 报告至少需要一份 TCG profile")
     if args.mygo_profile and not mygo:
-        raise ValueError("MyGO profile 缺少对应串口日志")
+        raise ValueError("Hitoshizuku profile 缺少对应串口日志")
     if args.linux_profile and not linux:
         raise ValueError("Linux profile 缺少对应串口日志")
     print("\n注意：profile 模式含逐 TB 插桩，仅报告指令计数；延迟对比已禁用。")
     if args.mygo_profile:
         print_hotspots(
-            "MyGO", args.mygo_profile, resolved["mygo_kernel"], args.nm, args.top, parameters
+            "Hitoshizuku", args.mygo_profile, resolved["mygo_kernel"], args.nm, args.top, parameters
         )
     if args.linux_profile:
         print_hotspots(

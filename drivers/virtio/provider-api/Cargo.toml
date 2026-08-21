@@ -1,0 +1,19 @@
+[package]
+name = "virtio-provider"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "virtio_provider"
+path = "src/lib.rs"
+test = false
+doctest = false
+bench = false
+
+[features]
+default = []
+elm-integrated = []
+
+[dependencies]
+elm = { path = "../../../libs/elm", default-features = false, features = ["module", "macros"] }
+virtio = { path = "../api", default-features = false }

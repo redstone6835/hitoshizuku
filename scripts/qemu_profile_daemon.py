@@ -801,13 +801,13 @@ class SerialTimeline:
         if "Finished" in line and ("dev" in line or "release" in line):
             events.append(StageEvent(timestamp_ns, "cargo_finished", "cargo:finished", line[:2048], {}))
         if "pre-build tg-xtask" in line:
-            events.append(StageEvent(timestamp_ns, "buildstorm", "buildstorm:pre-build", line[:2048], {}))
+            events.append(StageEvent(timestamp_ns, "profile", "profile:pre-build", line[:2048], {}))
         elif "build arceos-helloworld" in line:
-            events.append(StageEvent(timestamp_ns, "buildstorm", "buildstorm:kernel-build", line[:2048], {}))
-        elif "OS COMP TEST GROUP START buildstorm" in line:
-            events.append(StageEvent(timestamp_ns, "buildstorm", "buildstorm:start", line[:2048], {}))
-        elif "OS COMP TEST GROUP END buildstorm" in line:
-            events.append(StageEvent(timestamp_ns, "buildstorm", "buildstorm:end", line[:2048], {}))
+            events.append(StageEvent(timestamp_ns, "profile", "profile:kernel-build", line[:2048], {}))
+        elif "PROFILE GROUP START profile" in line:
+            events.append(StageEvent(timestamp_ns, "profile", "profile:start", line[:2048], {}))
+        elif "PROFILE GROUP END profile" in line:
+            events.append(StageEvent(timestamp_ns, "profile", "profile:end", line[:2048], {}))
 
         for name, pattern in self._patterns:
             custom = pattern.search(line)
@@ -1946,7 +1946,7 @@ def parse_stage_patterns(values: Sequence[str]) -> tuple[tuple[str, re.Pattern[s
 
 
 def parse_environment(values: Sequence[str]) -> dict[str, str]:
-    """记录必须跨 MyGO/Linux 保持一致的外部测量条件。"""
+    """记录必须跨 Hitoshizuku/Linux 保持一致的外部运行条件。"""
 
     environment: dict[str, str] = {}
     for value in values:

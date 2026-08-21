@@ -1,4 +1,4 @@
-//! MyGO Native ABI epoch 1 的机器身份注册表。
+//! Hitoshizuku Native ABI epoch 1 的机器身份注册表。
 
 use core::ops::{BitOr, BitOrAssign};
 
