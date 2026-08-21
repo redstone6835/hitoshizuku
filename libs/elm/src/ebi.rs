@@ -56,7 +56,11 @@ pub const ELM_EBI_MAX_EXPORTS: usize = 64;
 /// `ELM_EBI_MAX_SYMBOL_LOCATIONS` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
 pub const ELM_EBI_MAX_SYMBOL_LOCATIONS: usize = 128;
 /// `ELM_EBI_MAX_RELOCATIONS` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
-pub const ELM_EBI_MAX_RELOCATIONS: usize = 8192;
+///
+/// 网络栈等包含大量只读表和函数指针的 PIE 单元可能需要超过 8192 条
+/// 重定位；上限取 16K，仍能限制恶意镜像的内存消耗，同时覆盖实际内核
+/// 驱动的装载需求。
+pub const ELM_EBI_MAX_RELOCATIONS: usize = 16 * 1024;
 /// `ELM_EBI_NAME_LEN` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EBI_NAME_LEN: usize = 128;
 /// `ELM_EBI_SYMBOL_NAME_LEN` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。

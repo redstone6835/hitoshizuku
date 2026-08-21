@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -404,7 +405,13 @@ pub fn sync_framework(project: &Path) -> Result<(), String> {
         ));
     }
     let project_manifest = ElmProjectManifest::load(project)?;
-    migrate_cargo_manifest(&manifest, &project_manifest)?;
+    // 内核 workspace 驱动保留源码 path 依赖，供普通 Cargo 命令统一检查；
+    // ELM 构建则由下方临时包装切换到生成的 facade，不改动已提交清单。
+    let manifest_source =
+        fs::read_to_string(&manifest).map_err(|err| format!("读取 Cargo.toml 失败: {err}"))?;
+    if !has_kernel_source_dependencies(&manifest_source) {
+        migrate_cargo_manifest(&manifest, &project_manifest)?;
+    }
     let elm_root = project.join(".elm");
     fs::create_dir_all(&elm_root)
         .map_err(|err| format!("创建 {} 失败: {err}", elm_root.display()))?;
@@ -489,6 +496,330 @@ pub fn sync_framework(project: &Path) -> Result<(), String> {
     .map_err(|err| format!("更新 ELM Cargo 配置失败: {err}"))?;
     write_elm_lock(project, &project_manifest)?;
     Ok(())
+}
+
+/// 判断一个驱动 manifest 是否仍使用内核 workspace 的源码依赖。
+///
+/// 这类 manifest 是仓库日常 Cargo 构建的规范形式；ELM 编译时会在
+/// `with_framework_manifest` 中临时切换到接口 facade，而不改写工作树中的
+/// `Cargo.toml`。
+fn has_kernel_source_dependencies(input: &str) -> bool {
+    kernel_api_crates()
+        .iter()
+        .any(|spec| input.contains(&format!("path = \"../../{}\"", spec.repository_path)))
+        || input.contains("path = \"../../libs/elm\"")
+}
+
+fn framework_manifest_source(input: &str) -> String {
+    let mut output = input.to_string();
+    // 根驱动通常位于仓库下两级；嵌套 VirtIO API crate 由下方路径感知逻辑处理。
+    for spec in kernel_api_crates() {
+        let source = format!("path = \"../../{}\"", spec.repository_path);
+        let facade = format!("path = \".elm/framework/{}\"", spec.name);
+        output = output.replace(&source, &facade);
+    }
+    // 驱动同时属于根 workspace；将本次 ELM 调用隔离，避免 Cargo 合并 facade
+    // 与根 workspace 中同名的源码包。
+    if !output.lines().any(|line| line.trim() == "[workspace]") {
+        output = format!(
+            "[workspace]\nresolver = \"2\"\n\n[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n\n{output}"
+        );
+    }
+    output
+}
+
+fn relative_path(from: &Path, to: &Path) -> Result<String, String> {
+    let from = from
+        .canonicalize()
+        .map_err(|err| format!("定位 manifest 目录 {} 失败: {err}", from.display()))?;
+    let to = to
+        .canonicalize()
+        .map_err(|err| format!("定位 framework 目录 {} 失败: {err}", to.display()))?;
+    let from_components = from.components().collect::<Vec<_>>();
+    let to_components = to.components().collect::<Vec<_>>();
+    let common = from_components
+        .iter()
+        .zip(&to_components)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut output = PathBuf::new();
+    for _ in common..from_components.len() {
+        output.push("..");
+    }
+    for component in &to_components[common..] {
+        output.push(component.as_os_str());
+    }
+    if output.as_os_str().is_empty() {
+        output.push(".");
+    }
+    Ok(output.to_string_lossy().replace('\\', "/"))
+}
+
+/// 将任意嵌套 Cargo manifest 中指向内核源码的 path 依赖切到 ELM facade。
+///
+/// VirtIO 的 provider/consumer/API crate 位于驱动目录的更深层级。只改
+/// 顶层 manifest 会让 Cargo 同时看到 `.elm/framework/allocator` 与
+/// `libs/allocator` 两个同名 package，进而拒绝生成锁文件；这里按每个
+/// manifest 的真实目录解析 path，避免依赖层级差异。
+fn rewrite_kernel_manifest_paths(
+    input: &str,
+    manifest_dir: &Path,
+    repository: &Path,
+    framework: &Path,
+) -> Result<String, String> {
+    let sources = kernel_api_crates()
+        .iter()
+        .map(|spec| {
+            let source = repository
+                .join(spec.repository_path)
+                .canonicalize()
+                .map_err(|err| format!("定位内核 crate {} 失败: {err}", spec.repository_path))?;
+            let facade = framework.join(spec.name);
+            let relative = relative_path(manifest_dir, &facade)?;
+            Ok::<_, String>((source, relative))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut output = input.to_string();
+    let mut cursor = 0;
+    while let Some(found) = output[cursor..].find("path = \"") {
+        let value_start = cursor + found + "path = \"".len();
+        let Some(value_end) = output[value_start..].find('"') else {
+            break;
+        };
+        let value_end = value_start + value_end;
+        let value = &output[value_start..value_end];
+        let candidate = manifest_dir.join(value);
+        if let Ok(candidate) = candidate.canonicalize()
+            && let Some((_, replacement)) = sources.iter().find(|(source, _)| *source == candidate)
+        {
+            output.replace_range(value_start..value_end, replacement);
+            cursor = value_start + replacement.len();
+        } else {
+            cursor = value_end + 1;
+        }
+    }
+    Ok(output)
+}
+
+fn path_dependency_manifests(manifest: &Path, input: &str, repository: &Path) -> Vec<PathBuf> {
+    let manifest_dir = manifest.parent().unwrap_or_else(|| Path::new("."));
+    let kernel_sources = kernel_api_crates()
+        .iter()
+        .filter_map(|spec| repository.join(spec.repository_path).canonicalize().ok())
+        .collect::<BTreeSet<_>>();
+    let mut dependencies = BTreeSet::new();
+    let mut cursor = 0;
+    while let Some(found) = input[cursor..].find("path = \"") {
+        let value_start = cursor + found + "path = \"".len();
+        let Some(value_end) = input[value_start..].find('"') else {
+            break;
+        };
+        let value_end = value_start + value_end;
+        let candidate = manifest_dir.join(&input[value_start..value_end]);
+        if let Ok(candidate) = candidate.canonicalize()
+            && !candidate.components().any(|component| {
+                matches!(component, std::path::Component::Normal(name) if name == ".elm")
+            })
+            // ELM 只应临时改写当前内核仓库中的 path 依赖；外部工作区可能
+            // 属于另一个项目，不能因为依赖图扫描而被覆盖。
+            && candidate.starts_with(repository)
+            && !kernel_sources.contains(&candidate)
+            && candidate.join("Cargo.toml").is_file()
+        {
+            dependencies.insert(candidate.join("Cargo.toml"));
+        }
+        cursor = value_end + 1;
+    }
+    dependencies.into_iter().collect()
+}
+
+fn reachable_cargo_manifests(project: &Path, repository: &Path) -> Result<Vec<PathBuf>, String> {
+    let root = project
+        .join("Cargo.toml")
+        .canonicalize()
+        .map_err(|err| format!("定位 {} 失败: {err}", project.join("Cargo.toml").display()))?;
+    let mut manifests = BTreeSet::from([root]);
+    let mut pending = manifests.iter().cloned().collect::<Vec<_>>();
+    while let Some(manifest) = pending.pop() {
+        let input = fs::read_to_string(&manifest)
+            .map_err(|err| format!("读取 {} 失败: {err}", manifest.display()))?;
+        for dependency in path_dependency_manifests(&manifest, &input, repository) {
+            if manifests.insert(dependency.clone()) {
+                pending.push(dependency);
+            }
+        }
+    }
+    Ok(manifests.into_iter().collect())
+}
+
+/// 在 ELM Cargo 调用期间临时使用生成的 framework 依赖。
+///
+/// 驱动同时是根 workspace 的普通 Cargo 包，因此其持久 manifest 必须继续
+/// 指向 `../../libs/*`。ELM 模块则必须链接 metadata facade；临时替换只覆盖
+/// 当前 Cargo 子进程，完成后立即恢复原始字节。
+struct FrameworkManifestGuard {
+    originals: Vec<(PathBuf, String)>,
+    lock_path: PathBuf,
+    lock_file: Option<File>,
+    cargo_lock: PathBuf,
+    cargo_lock_backup: Option<Vec<u8>>,
+    active: bool,
+}
+
+impl FrameworkManifestGuard {
+    fn restore_inner(&mut self) -> Result<(), String> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        let mut errors = Vec::new();
+        // 即使某个 manifest 恢复失败，也继续恢复其余文件，避免留下半套
+        // facade 路径；最后一次性报告所有错误。
+        for (path, original) in self.originals.iter().rev() {
+            if let Err(error) = fs::write(path, original) {
+                errors.push(format!(
+                    "恢复 ELM manifest {} 失败: {error}",
+                    path.display()
+                ));
+            }
+        }
+        if let Some(lock) = self.cargo_lock_backup.as_deref()
+            && let Err(error) = fs::write(&self.cargo_lock, lock)
+        {
+            errors.push(format!("恢复 Cargo.lock 失败: {error}"));
+        } else if self.cargo_lock_backup.is_none()
+            && fs::symlink_metadata(&self.cargo_lock).is_ok()
+            && let Err(error) = fs::remove_file(&self.cargo_lock)
+        {
+            errors.push(format!("删除临时 Cargo.lock 失败: {error}"));
+        }
+        self.lock_file.take();
+        if let Err(error) = fs::remove_file(&self.lock_path)
+            && error.kind() != ErrorKind::NotFound
+        {
+            errors.push(format!("删除 ELM manifest 锁失败: {error}"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("；"))
+        }
+    }
+
+    fn restore(mut self) -> Result<(), String> {
+        self.restore_inner()
+    }
+}
+
+impl Drop for FrameworkManifestGuard {
+    fn drop(&mut self) {
+        let _ = self.restore_inner();
+    }
+}
+
+fn with_framework_manifest<T, F>(project: &Path, operation: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    let repository = framework_source_root()?;
+    let manifests = reachable_cargo_manifests(project, &repository)?;
+    let framework = project.join(".elm/framework");
+    let mut originals = Vec::new();
+    let mut changed = Vec::new();
+    for path in manifests {
+        let original = fs::read_to_string(&path)
+            .map_err(|err| format!("读取 {} 失败: {err}", path.display()))?;
+        let manifest_dir = path
+            .parent()
+            .ok_or_else(|| format!("manifest 缺少父目录: {}", path.display()))?;
+        let rewritten =
+            rewrite_kernel_manifest_paths(&original, manifest_dir, &repository, &framework)?;
+        let rewritten = if path == project.join("Cargo.toml") {
+            framework_manifest_source(&rewritten)
+        } else {
+            rewritten
+        };
+        if rewritten != original {
+            originals.push((path.clone(), original));
+            changed.push((path, rewritten));
+        }
+    }
+    if changed.is_empty()
+        && !fs::read_to_string(project.join("Cargo.toml"))
+            .map(|input| has_kernel_source_dependencies(&input))
+            .unwrap_or(false)
+    {
+        return operation();
+    }
+
+    // 同一工程的 ELM 构建会临时改写多个 manifest；使用原子创建锁拒绝并发
+    // 调用，避免两个进程互相覆盖并恢复对方的内容。
+    let lock_path = project.join(".elm/.cargo-elm-manifest.lock");
+    let lock_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+        .map_err(|error| {
+            if error.kind() == ErrorKind::AlreadyExists {
+                format!("ELM 工程正在进行另一个 Cargo 构建: {}", project.display())
+            } else {
+                format!("创建 ELM manifest 锁失败: {error}")
+            }
+        })?;
+    let cargo_lock = project.join("Cargo.lock");
+    let cargo_lock_backup = match fs::read(&cargo_lock) {
+        Ok(lock) => Some(lock),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => {
+            drop(lock_file);
+            return match fs::remove_file(&lock_path) {
+                Ok(()) => Err(format!("读取 Cargo.lock 失败: {error}")),
+                Err(cleanup) if cleanup.kind() == ErrorKind::NotFound => {
+                    Err(format!("读取 Cargo.lock 失败: {error}"))
+                }
+                Err(cleanup) => Err(format!(
+                    "读取 Cargo.lock 失败: {error}；删除 ELM manifest 锁失败: {cleanup}"
+                )),
+            };
+        }
+    };
+    let guard = FrameworkManifestGuard {
+        originals,
+        lock_path,
+        lock_file: Some(lock_file),
+        cargo_lock,
+        cargo_lock_backup,
+        active: true,
+    };
+    if guard.cargo_lock_backup.is_some()
+        && let Err(error) = fs::remove_file(&guard.cargo_lock)
+    {
+        let restore = guard.restore();
+        return Err(match restore {
+            Ok(()) => format!("移除临时 Cargo.lock 失败: {error}"),
+            Err(restore) => format!("移除临时 Cargo.lock 失败: {error}；{restore}"),
+        });
+    }
+    for (path, rewritten) in &changed {
+        if let Err(error) = fs::write(path, rewritten) {
+            let restore = guard.restore();
+            return Err(match restore {
+                Ok(()) => format!("写入临时 ELM manifest {} 失败: {error}", path.display()),
+                Err(restore) => format!(
+                    "写入临时 ELM manifest {} 失败: {error}；{restore}",
+                    path.display()
+                ),
+            });
+        }
+    }
+    let result = operation();
+    let restore = guard.restore();
+    match (result, restore) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(restore)) => Err(restore),
+        (Err(error), Err(restore)) => Err(format!("{error}；{restore}")),
+    }
 }
 
 const ELM_API_SNAPSHOT_MAGIC: &str = "ELM-API-SNAPSHOT-V1";
@@ -657,7 +988,14 @@ fn normalize_published_api_manifest(root: &Path) -> Result<(), String> {
     let path = root.join("Cargo.toml");
     let input =
         fs::read_to_string(&path).map_err(|err| format!("读取 API Cargo.toml 失败: {err}"))?;
-    let output = input.replace("../.elm/framework/", "../../framework/");
+    // API 快照安装到 `<project>/.elm/dependencies/<crate>`。将提交清单中指向
+    // 内核源码的路径规范化到同级 facade，防止消费者重新引入源码包。
+    let mut output = input.replace("../.elm/framework/", "../../framework/");
+    for spec in kernel_api_crates() {
+        let source = format!("path = \"../../../{}\"", spec.repository_path);
+        let facade = format!("path = \"../../framework/{}\"", spec.name);
+        output = output.replace(&source, &facade);
+    }
     if output == input && input.contains(".elm/framework/") {
         return Err("API Cargo.toml 的框架路径必须以 ../.elm/framework/ 开头".to_string());
     }
@@ -811,26 +1149,29 @@ pub fn cargo_build(project: &Path, target: &str, cargo_name: &str) -> Result<Pat
     if target == "loongarch64-unknown-none" {
         rustflags.push("-Anamed_asm_labels".to_string());
     }
-    let mut command = Command::new("cargo");
-    command
-        .current_dir(&project)
-        .env("CARGO_ENCODED_RUSTFLAGS", rustflags.join("\x1f"))
-        .arg("build")
-        .arg("--manifest-path")
-        .arg(project.join("Cargo.toml"))
-        .arg("--bin")
-        .arg(cargo_name)
-        .arg("--no-default-features");
-    append_extra_features(&mut command, &[]);
-    let status = command
-        .arg("--target")
-        .arg(target)
-        .arg("--release")
-        .status()
-        .map_err(|err| format!("启动 cargo build 失败: {err}"))?;
-    if !status.success() {
-        return Err(format!("ELM Rust 构建失败，退出状态 {status}"));
-    }
+    with_framework_manifest(&project, || {
+        let mut command = Command::new("cargo");
+        command
+            .current_dir(&project)
+            .env("CARGO_ENCODED_RUSTFLAGS", rustflags.join("\x1f"))
+            .arg("build")
+            .arg("--manifest-path")
+            .arg(project.join("Cargo.toml"))
+            .arg("--bin")
+            .arg(cargo_name)
+            .arg("--no-default-features");
+        append_extra_features(&mut command, &[]);
+        let status = command
+            .arg("--target")
+            .arg(target)
+            .arg("--release")
+            .status()
+            .map_err(|err| format!("启动 cargo build 失败: {err}"))?;
+        if !status.success() {
+            return Err(format!("ELM Rust 构建失败，退出状态 {status}"));
+        }
+        Ok(())
+    })?;
     Ok(cargo_target_directory(&project)
         .join(target)
         .join("release")
@@ -861,32 +1202,35 @@ pub fn cargo_build_integrated(
     ));
     rustflags
         .push("--check-cfg=cfg(elm_integrated_phase,values(\"device\",\"runtime\"))".to_string());
-    let mut command = Command::new("cargo");
-    command
-        .current_dir(&project)
-        .env("CARGO_ENCODED_RUSTFLAGS", rustflags.join("\x1f"))
-        .env("ELM_KERNEL_PROFILE_ID", &interface.profile)
-        .env(
-            "ELM_KERNEL_PROFILE_HASH",
-            hex_digest(&interface.interface_hash),
-        )
-        .arg("rustc")
-        .arg("--manifest-path")
-        .arg(project.join("Cargo.toml"))
-        .arg("--lib")
-        .arg("--no-default-features");
-    append_extra_features(&mut command, &["elm-integrated"]);
-    let status = command
-        .arg("--target")
-        .arg(target)
-        .arg("--release")
-        .arg("--")
-        .arg("--emit=link")
-        .status()
-        .map_err(|err| format!("启动集成组件 cargo rustc 失败: {err}"))?;
-    if !status.success() {
-        return Err(format!("集成组件 Rust 构建失败，退出状态 {status}"));
-    }
+    with_framework_manifest(&project, || {
+        let mut command = Command::new("cargo");
+        command
+            .current_dir(&project)
+            .env("CARGO_ENCODED_RUSTFLAGS", rustflags.join("\x1f"))
+            .env("ELM_KERNEL_PROFILE_ID", &interface.profile)
+            .env(
+                "ELM_KERNEL_PROFILE_HASH",
+                hex_digest(&interface.interface_hash),
+            )
+            .arg("rustc")
+            .arg("--manifest-path")
+            .arg(project.join("Cargo.toml"))
+            .arg("--lib")
+            .arg("--no-default-features");
+        append_extra_features(&mut command, &["elm-integrated"]);
+        let status = command
+            .arg("--target")
+            .arg(target)
+            .arg("--release")
+            .arg("--")
+            .arg("--emit=link")
+            .status()
+            .map_err(|err| format!("启动集成组件 cargo rustc 失败: {err}"))?;
+        if !status.success() {
+            return Err(format!("集成组件 Rust 构建失败，退出状态 {status}"));
+        }
+        Ok(())
+    })?;
 
     let crate_name = cargo_name.replace('-', "_");
     let target_directory = cargo_target_directory(&project);
@@ -923,7 +1267,7 @@ pub fn cargo_build_integrated(
         let extract_dir = temporary.join(format!("archive-{index:04}"));
         fs::create_dir_all(&extract_dir)
             .map_err(|err| format!("创建 {} 失败: {err}", extract_dir.display()))?;
-        let extract = Command::new("llvm-ar")
+        let extract = Command::new(archive_tool())
             .current_dir(&extract_dir)
             .arg("x")
             .arg(archive)
@@ -931,7 +1275,7 @@ pub fn cargo_build_integrated(
             .map_err(|err| format!("解包 {} 失败: {err}", archive.display()))?;
         if !extract.status.success() {
             return Err(format!(
-                "llvm-ar 无法解包集成组件 {}: {}",
+                "归档工具无法解包集成组件 {}: {}",
                 archive.display(),
                 String::from_utf8_lossy(&extract.stderr)
             ));
@@ -952,13 +1296,13 @@ pub fn cargo_build_integrated(
     }
     let mut has_initcall = false;
     for object in &objects {
-        let sections = Command::new("llvm-objdump")
+        let sections = Command::new(target_objdump(target)?)
             .arg("-h")
             .arg(object)
             .output()
             .map_err(|err| format!("检查 {} 段表失败: {err}", object.display()))?;
         if !sections.status.success() {
-            return Err(format!("llvm-objdump 无法读取 {}", object.display()));
+            return Err(format!("objdump 无法读取 {}", object.display()));
         }
         has_initcall |=
             String::from_utf8_lossy(&sections.stdout).contains(".kernel.integrated_components");
@@ -971,7 +1315,7 @@ pub fn cargo_build_integrated(
         .map_err(|err| format!("创建 {} 失败: {err}", output_dir.display()))?;
     let output = output_dir.join(format!("{cargo_name}-{target}.integrated.a"));
     remove_if_exists(&output)?;
-    let archive = Command::new("llvm-ar")
+    let archive = Command::new(archive_tool())
         .arg("crs")
         .arg(&output)
         .args(&objects)
@@ -979,7 +1323,7 @@ pub fn cargo_build_integrated(
         .map_err(|err| format!("生成集成组件归档失败: {err}"))?;
     if !archive.status.success() {
         return Err(format!(
-            "llvm-ar 生成集成组件归档失败: {}",
+            "归档工具生成集成组件归档失败: {}",
             String::from_utf8_lossy(&archive.stderr)
         ));
     }
@@ -1050,23 +1394,25 @@ pub fn cargo_check(project: &Path, target: &str, cargo_name: &str) -> Result<(),
     append_kernel_metadata_flags(&mut rustflags, &metadata, &interface)?;
     let (api_profiles, profile_hashes) = kernel_profile_cfg_values(&project_manifest, target)?;
     append_kernel_profile_flags(&mut rustflags, &interface, &api_profiles, &profile_hashes);
-    let status = Command::new("cargo")
-        .current_dir(&project)
-        .env("CARGO_ENCODED_RUSTFLAGS", rustflags.join("\x1f"))
-        .arg("check")
-        .arg("--manifest-path")
-        .arg(project.join("Cargo.toml"))
-        .arg("--bin")
-        .arg(cargo_name)
-        .arg("--no-default-features")
-        .arg("--target")
-        .arg(target)
-        .status()
-        .map_err(|err| format!("启动 cargo check 失败: {err}"))?;
-    if !status.success() {
-        return Err(format!("ELM 检查失败，退出状态 {status}"));
-    }
-    Ok(())
+    with_framework_manifest(&project, || {
+        let status = Command::new("cargo")
+            .current_dir(&project)
+            .env("CARGO_ENCODED_RUSTFLAGS", rustflags.join("\x1f"))
+            .arg("check")
+            .arg("--manifest-path")
+            .arg(project.join("Cargo.toml"))
+            .arg("--bin")
+            .arg(cargo_name)
+            .arg("--no-default-features")
+            .arg("--target")
+            .arg(target)
+            .status()
+            .map_err(|err| format!("启动 cargo check 失败: {err}"))?;
+        if !status.success() {
+            return Err(format!("ELM 检查失败，退出状态 {status}"));
+        }
+        Ok(())
+    })
 }
 
 fn cargo_target_directory(project: &Path) -> PathBuf {
@@ -1079,6 +1425,33 @@ fn cargo_target_directory(project: &Path) -> PathBuf {
     } else {
         project.join(configured)
     }
+}
+
+fn archive_tool() -> &'static str {
+    if command_available("ar") {
+        "ar"
+    } else {
+        "llvm-ar"
+    }
+}
+
+fn target_objdump(target: &str) -> Result<&'static str, String> {
+    let candidates = match target {
+        "loongarch64-unknown-none" => ["loongarch64-linux-gnu-objdump", "objdump", "llvm-objdump"],
+        "riscv64gc-unknown-none-elf" => ["riscv64-linux-gnu-objdump", "objdump", "llvm-objdump"],
+        _ => return Err(format!("不支持为目标 {target} 检查集成组件段表")),
+    };
+    candidates
+        .into_iter()
+        .find(|candidate| command_available(candidate))
+        .ok_or_else(|| format!("缺少 {target} 的 objdump 工具"))
+}
+
+fn command_available(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 fn append_kernel_metadata_flags(
@@ -1862,7 +2235,19 @@ fn elm_features(kind: &str) -> &'static str {
 fn migrate_cargo_manifest(path: &Path, manifest: &ElmProjectManifest) -> Result<(), String> {
     let input =
         fs::read_to_string(path).map_err(|err| format!("读取 {} 失败: {err}", path.display()))?;
-    let mut output = remove_retired_standard_manifest_lines(&input);
+    let output = migrate_cargo_manifest_source(&input, manifest, path)?;
+    if output != input {
+        fs::write(path, output).map_err(|err| format!("迁移 {} 失败: {err}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn migrate_cargo_manifest_source(
+    input: &str,
+    manifest: &ElmProjectManifest,
+    path: &Path,
+) -> Result<String, String> {
+    let mut output = remove_retired_standard_manifest_lines(input);
     output = migrate_standard_root_workspace(&output)?;
     if output.contains("elmmgr") {
         return Err(format!(
@@ -1914,10 +2299,7 @@ fn migrate_cargo_manifest(path: &Path, manifest: &ElmProjectManifest) -> Result<
     output = ensure_integrated_feature(&output, manifest)?;
     output = ensure_profile_dev_abort(&output);
 
-    if output != input {
-        fs::write(path, output).map_err(|err| format!("迁移 {} 失败: {err}", path.display()))?;
-    }
-    Ok(())
+    Ok(output)
 }
 
 fn remove_retired_standard_manifest_lines(input: &str) -> String {
@@ -2394,6 +2776,8 @@ fn reject_unknown_keys(
 
 fn validate_identifier(value: &str, max_len: usize, label: &str) -> Result<(), String> {
     if value.is_empty()
+        || value == "."
+        || value == ".."
         || value.len() > max_len
         || !value.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
@@ -2715,6 +3099,131 @@ uri = "forbidden"
         )
         .unwrap_err();
         assert!(error.contains("未知字段 uri"));
+    }
+
+    #[test]
+    fn published_api_uses_consumer_framework_paths() {
+        let api = TestDirectory::new("published-api-paths");
+        fs::write(
+            api.path().join("Cargo.toml"),
+            r#"[package]
+name = "demo-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+general = { path = "../../../general", default-features = false }
+allocator = { path = "../../../libs/allocator", default-features = false }
+"#,
+        )
+        .unwrap();
+        normalize_published_api_manifest(api.path()).unwrap();
+        let output = fs::read_to_string(api.path().join("Cargo.toml")).unwrap();
+        assert!(output.contains("path = \"../../framework/general\""));
+        assert!(output.contains("path = \"../../framework/allocator\""));
+        assert!(!output.contains("../../../general"));
+    }
+
+    #[test]
+    fn path_dependency_scan_does_not_leave_repository() {
+        let repository = TestDirectory::new("path-dependency-repository");
+        let external = TestDirectory::new("path-dependency-external");
+        let project = repository.path().join("project");
+        let internal = repository.path().join("internal");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&internal).unwrap();
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"project\"\n",
+        )
+        .unwrap();
+        fs::write(
+            internal.join("Cargo.toml"),
+            "[package]\nname = \"internal\"\n",
+        )
+        .unwrap();
+        fs::write(
+            external.path().join("Cargo.toml"),
+            "[package]\nname = \"external\"\n",
+        )
+        .unwrap();
+        let input = format!(
+            "[dependencies]\ninternal = {{ path = {:?} }}\nexternal = {{ path = {:?} }}\n",
+            internal,
+            external.path(),
+        );
+        let repository = repository.path().canonicalize().unwrap();
+        let dependencies =
+            path_dependency_manifests(&project.join("Cargo.toml"), &input, &repository);
+        assert_eq!(dependencies, vec![internal.join("Cargo.toml")]);
+    }
+
+    #[test]
+    fn framework_manifest_guard_restores_every_file_and_cargo_lock() {
+        let directory = TestDirectory::new("framework-manifest-restore");
+        let elm = directory.path().join(".elm");
+        fs::create_dir_all(&elm).unwrap();
+        let first = directory.path().join("Cargo.toml");
+        let second = directory.path().join("nested.toml");
+        let cargo_lock = directory.path().join("Cargo.lock");
+        let lock_path = elm.join(".cargo-elm-manifest.lock");
+        fs::write(&first, "first-original").unwrap();
+        fs::write(&second, "second-original").unwrap();
+        fs::write(&cargo_lock, "lock-original").unwrap();
+        let lock_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .unwrap();
+        let guard = FrameworkManifestGuard {
+            originals: vec![
+                (first.clone(), "first-original".to_string()),
+                (second.clone(), "second-original".to_string()),
+            ],
+            lock_path: lock_path.clone(),
+            lock_file: Some(lock_file),
+            cargo_lock: cargo_lock.clone(),
+            cargo_lock_backup: Some(b"lock-original".to_vec()),
+            active: true,
+        };
+        fs::write(&first, "first-temporary").unwrap();
+        fs::write(&second, "second-temporary").unwrap();
+        fs::write(&cargo_lock, "lock-temporary").unwrap();
+
+        guard.restore().unwrap();
+
+        assert_eq!(fs::read_to_string(first).unwrap(), "first-original");
+        assert_eq!(fs::read_to_string(second).unwrap(), "second-original");
+        assert_eq!(fs::read_to_string(cargo_lock).unwrap(), "lock-original");
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn framework_manifest_guard_removes_generated_cargo_lock() {
+        let directory = TestDirectory::new("framework-manifest-remove-lock");
+        let elm = directory.path().join(".elm");
+        fs::create_dir_all(&elm).unwrap();
+        let lock_path = elm.join(".cargo-elm-manifest.lock");
+        let cargo_lock = directory.path().join("Cargo.lock");
+        fs::write(&cargo_lock, "generated").unwrap();
+        let lock_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .unwrap();
+        let guard = FrameworkManifestGuard {
+            originals: Vec::new(),
+            lock_path: lock_path.clone(),
+            lock_file: Some(lock_file),
+            cargo_lock: cargo_lock.clone(),
+            cargo_lock_backup: None,
+            active: true,
+        };
+
+        guard.restore().unwrap();
+
+        assert!(!cargo_lock.exists());
+        assert!(!lock_path.exists());
     }
 
     #[test]

@@ -24,6 +24,7 @@ drivers/*/.elm/
 drivers/*/dist/
 drivers/*/.cargo/
 drivers/*/Elm.lock
+drivers/*/Cargo.lock
 tests/elm/*/.cargo/
 tests/elm/*/.elm/
 tests/elm/*/dist/

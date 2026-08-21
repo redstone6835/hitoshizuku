@@ -500,7 +500,15 @@ pub fn export_kernel_interface(
             .to_string();
         metadata.insert(spec.name.to_string(), file);
     }
-    let metadata_rlibs = exact_dependency_rlibs(&deps, &interface_rlibs)?;
+    let fingerprint_root = deps
+        .parent()
+        .ok_or_else(|| format!("依赖目录缺少 profile 根: {}", deps.display()))?
+        .join(".fingerprint");
+    let kernel_unit = active_kernel_unit_manifest(&deps, &fingerprint_root, kernel, &kernel_bytes)?;
+    let kernel_input = fs::read_to_string(&kernel_unit)
+        .map_err(|error| format!("读取 {} 失败: {error}", kernel_unit.display()))?;
+    let kernel_dependencies = parse_kernel_dependency_fingerprints(&kernel_input)?;
+    let metadata_rlibs = exact_dependency_rlibs(&deps, &interface_rlibs, &kernel_dependencies)?;
     let public_api_abis = scan_repository_api_abis(repository, &symbols)?;
     populate_link_aliases(target, &interface_rlibs, &public_api_abis, &mut symbols)?;
     let interface_hash = kernel_api_profile_hash(target, profile, &symbols);
@@ -1458,42 +1466,68 @@ fn populate_link_aliases(
 ) -> Result<(), String> {
     let nm = target_nm(target)?;
     let mut defined = BTreeSet::new();
+    let mut demangled = BTreeMap::<String, BTreeSet<String>>::new();
     for rlib in rlibs {
-        let output = Command::new(nm)
-            .arg("-j")
-            .arg("-g")
-            .arg("--defined-only")
-            .arg(rlib)
-            .output()
-            .map_err(|error| format!("执行 {nm} 读取 {} 失败: {error}", rlib.display()))?;
-        if !output.status.success() {
-            return Err(format!(
-                "{nm} 无法读取 {}: {}",
-                rlib.display(),
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|_| format!("{nm} 对 {} 的输出不是 UTF-8", rlib.display()))?;
-        defined.extend(
-            stdout
+        let read_symbols = |demangle: bool| -> Result<Vec<String>, String> {
+            let mut command = Command::new(nm);
+            // 禁止排序，确保原始与解码输出按同一符号表顺序逐项对应。
+            command.arg("-j").arg("-g").arg("--defined-only").arg("-p");
+            if demangle {
+                command.arg("-C");
+            }
+            let output = command
+                .arg(rlib)
+                .output()
+                .map_err(|error| format!("执行 {nm} 读取 {} 失败: {error}", rlib.display()))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "{nm} 无法读取 {}: {}",
+                    rlib.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            let stdout = String::from_utf8(output.stdout)
+                .map_err(|_| format!("{nm} 对 {} 的输出不是 UTF-8", rlib.display()))?;
+            Ok(stdout
                 .lines()
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
-                .map(str::to_string),
-        );
+                .map(str::to_string)
+                .collect())
+        };
+        let raw = read_symbols(false)?;
+        let pretty = read_symbols(true)?;
+        if raw.len() != pretty.len() {
+            return Err(format!(
+                "{nm} 对 {} 的原始与解码符号数量不一致：{} != {}",
+                rlib.display(),
+                raw.len(),
+                pretty.len()
+            ));
+        }
+        for (raw_name, pretty_name) in raw.into_iter().zip(pretty) {
+            defined.insert(raw_name.clone());
+            demangled.entry(pretty_name).or_default().insert(raw_name);
+        }
     }
 
     for symbol in symbols {
         let prefix = legacy_mangled_prefix(&symbol.api_path);
-        let matches = defined
+        let mut matches = defined
             .iter()
             .filter(|name| {
                 name.strip_prefix(&prefix)
                     .is_some_and(is_legacy_rust_hash_suffix)
             })
             .cloned()
-            .collect::<Vec<_>>();
+            .collect::<BTreeSet<_>>();
+        if public_api_abis.contains_key(&symbol.api_path)
+            && let Some(expected) = inherent_method_demangled_name(&symbol.api_path)
+            && let Some(names) = demangled.get(&expected)
+        {
+            matches.extend(names.iter().filter(|name| name.starts_with("_R")).cloned());
+        }
+        let matches = matches.into_iter().collect::<Vec<_>>();
         match matches.as_slice() {
             [] => {}
             [alias] if alias != &symbol.link_name => {
@@ -1522,6 +1556,11 @@ fn populate_link_aliases(
         }
     }
     Ok(())
+}
+
+fn inherent_method_demangled_name(api_path: &str) -> Option<String> {
+    let (owner, method) = api_path.rsplit_once('.')?;
+    Some(format!("<{}>::{method}", owner.replace('.', "::")))
 }
 
 fn is_legacy_rust_hash_suffix(suffix: &str) -> bool {
@@ -1617,8 +1656,6 @@ fn build_rust_support_library(
     let nm = target_nm(target)?;
     let objcopy = target_objcopy(target)?;
     let linker = target_ld(target)?;
-    let mut support_rlibs = rlibs.to_vec();
-    support_rlibs.extend(target_rust_support_rlibs(target)?);
     let temporary = output.with_extension(format!("support.tmp.{}", std::process::id()));
     remove_path(&temporary)?;
     fs::create_dir_all(&temporary)
@@ -1626,14 +1663,14 @@ fn build_rust_support_library(
     let result = (|| {
         let mut global_definitions = BTreeSet::new();
         let mut input_objects = Vec::new();
-        for (rlib_index, rlib) in support_rlibs.iter().enumerate() {
+        for (rlib_index, rlib) in rlibs.iter().enumerate() {
             let source = rlib
                 .canonicalize()
                 .map_err(|error| format!("定位 {} 失败: {error}", rlib.display()))?;
             let extract = temporary.join(format!("archive-{rlib_index:04}"));
             fs::create_dir_all(&extract)
                 .map_err(|error| format!("创建 rlib 解包目录失败: {error}"))?;
-            let unpack = Command::new("ar")
+            let unpack = Command::new(archive_tool())
                 .current_dir(&extract)
                 .arg("x")
                 .arg(&source)
@@ -1742,7 +1779,7 @@ fn build_rust_support_library(
                 String::from_utf8_lossy(&filter.stderr)
             ));
         }
-        let archive = Command::new("ar")
+        let archive = Command::new(archive_tool())
             .arg("crs")
             .arg(output)
             .arg(&filtered)
@@ -1814,56 +1851,6 @@ fn v0_symbol_crate(name: &str) -> Option<&str> {
     (crate_name == "core" || crate_name == "alloc").then_some(crate_name)
 }
 
-fn target_rust_support_rlibs(target: &str) -> Result<Vec<PathBuf>, String> {
-    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-    let output = Command::new(rustc)
-        .arg("--print")
-        .arg("target-libdir")
-        .arg("--target")
-        .arg(target)
-        .output()
-        .map_err(|error| format!("查询 {target} 的 Rust target-libdir 失败: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "rustc 无法查询 {target} 的 target-libdir: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let directory = PathBuf::from(
-        String::from_utf8(output.stdout)
-            .map_err(|_| "rustc target-libdir 输出不是 UTF-8".to_string())?
-            .trim(),
-    );
-    let mut support = Vec::new();
-    for crate_name in ["core", "alloc"] {
-        let prefix = format!("lib{crate_name}-");
-        let mut matches = fs::read_dir(&directory)
-            .map_err(|error| {
-                format!(
-                    "读取 Rust target-libdir {} 失败: {error}",
-                    directory.display()
-                )
-            })?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".rlib"))
-            })
-            .collect::<Vec<_>>();
-        matches.sort();
-        let Some(path) = matches.pop() else {
-            return Err(format!(
-                "Rust target-libdir {} 缺少 {crate_name} rlib",
-                directory.display()
-            ));
-        };
-        support.push(path);
-    }
-    Ok(support)
-}
-
 fn target_nm(target: &str) -> Result<&'static str, String> {
     match target {
         "loongarch64-unknown-none" => Ok("loongarch64-linux-gnu-nm"),
@@ -1915,6 +1902,14 @@ fn command_available(command: &str) -> bool {
         .arg("--version")
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+fn archive_tool() -> &'static str {
+    if command_available("ar") {
+        "ar"
+    } else {
+        "llvm-ar"
+    }
 }
 
 fn target_ld(target: &str) -> Result<&'static str, String> {
@@ -2221,30 +2216,86 @@ fn parse_cargo_fingerprint(value: &str) -> Result<u64, String> {
 fn exact_dependency_rlibs(
     directory: &Path,
     root_rlibs: &[PathBuf],
+    root_dependencies: &BTreeMap<String, u64>,
 ) -> Result<Vec<PathBuf>, String> {
-    // Stable rustc has no replacement for the old `-Z ls=root` query. Cargo's
-    // target/profile deps directory is isolated, so retaining all rlibs there
-    // keeps the metadata closure conservative without selecting a toolchain.
+    // 稳定版 rustc 没有旧 `-Z ls=root` 的替代项。根据 Cargo fingerprint JSON
+    // 重建依赖闭包，避免复制共享 target 中无关驱动或陈旧构建的全部 rlib。
+    let fingerprint_root = directory
+        .parent()
+        .ok_or_else(|| format!("依赖目录缺少 profile 根: {}", directory.display()))?
+        .join(".fingerprint");
     let mut files = root_rlibs.iter().cloned().collect::<BTreeSet<_>>();
-    let entries = fs::read_dir(directory).map_err(|error| {
-        format!(
-            "读取 Rust metadata 目录 {} 失败: {error}",
-            directory.display()
-        )
-    })?;
-    for entry in entries {
-        let path = entry
-            .map_err(|error| format!("读取 Rust metadata 目录项失败: {error}"))?
-            .path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "rlib")
-        {
-            files.insert(path);
+    let mut pending = root_dependencies
+        .iter()
+        .map(|(name, fingerprint)| (name.clone(), *fingerprint))
+        .collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    while let Some((name, expected)) = pending.pop() {
+        if !visited.insert((name.clone(), expected)) {
+            continue;
         }
+        let mut candidates = Vec::new();
+        for entry in fs::read_dir(&fingerprint_root).map_err(|error| {
+            format!(
+                "读取 Rust fingerprint 目录 {} 失败: {error}",
+                fingerprint_root.display()
+            )
+        })? {
+            let entry = entry.map_err(|error| format!("读取 Cargo 指纹目录项失败: {error}"))?;
+            let entry_name = entry.file_name();
+            let entry_name = entry_name.to_string_lossy();
+            let normalized_name = name.replace('_', "-");
+            let suffix = entry_name
+                .strip_prefix(&format!("{name}-"))
+                .or_else(|| entry_name.strip_prefix(&format!("{normalized_name}-")));
+            let Some(suffix) = suffix else { continue };
+            let marker = entry.path().join(format!("lib-{name}"));
+            if !marker.is_file() {
+                continue;
+            }
+            let value = fs::read_to_string(&marker)
+                .map_err(|error| format!("读取 {} 失败: {error}", marker.display()))?;
+            if parse_cargo_fingerprint(value.trim()).ok() == Some(expected) {
+                candidates.push((entry.path(), suffix.to_string()));
+            }
+        }
+        candidates
+            .retain(|(_, suffix)| directory.join(format!("lib{name}-{suffix}.rlib")).is_file());
+        if candidates.len() > 1 {
+            return Err(format!(
+                "Cargo 指纹 {}={} 对应多个构建单元: {}",
+                name,
+                expected,
+                candidates
+                    .iter()
+                    .map(|(path, _)| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let Some((fingerprint, suffix)) = candidates.pop() else {
+            // build script 与 proc-macro 没有目标 rlib，外部 ELM 也不需要其元数据。
+            continue;
+        };
+        let rlib = directory.join(format!("lib{name}-{suffix}.rlib"));
+        if !rlib.is_file() {
+            continue;
+        }
+        files.insert(rlib);
+        let manifest = fingerprint.join(format!("lib-{name}.json"));
+        if !manifest.is_file() {
+            continue;
+        }
+        let input = fs::read_to_string(&manifest)
+            .map_err(|error| format!("读取 {} 失败: {error}", manifest.display()))?;
+        let dependencies = parse_kernel_dependency_fingerprints(&input)?;
+        pending.extend(dependencies);
     }
     if files.iter().any(|path| !path.is_file()) {
         return Err("精确 Rust 元数据依赖闭包包含不存在的 rlib".to_string());
+    }
+    if files.is_empty() {
+        return Err("精确 Rust 元数据依赖闭包为空".to_string());
     }
     Ok(files.into_iter().collect())
 }
@@ -2260,12 +2311,24 @@ fn copy_metadata_rlibs(sources: &[PathBuf], destination: &Path) -> Result<(), St
 }
 
 fn write_metadata_only_rlib(source: &Path, destination: &Path) -> Result<(), String> {
-    let output = Command::new("ar")
+    if !source.is_file() {
+        return Err(format!(
+            "读取 rlib 元数据 {} 失败: 文件不存在",
+            source.display()
+        ));
+    }
+    let archive = archive_tool();
+    let output = Command::new(archive)
         .arg("p")
         .arg(source)
         .arg("lib.rmeta")
         .output()
-        .map_err(|error| format!("读取 rlib 元数据 {} 失败: {error}", source.display()))?;
+        .map_err(|error| {
+            format!(
+                "使用 {archive} 读取 rlib 元数据 {} 失败: {error}",
+                source.display()
+            )
+        })?;
     if !output.status.success() || output.stdout.is_empty() {
         return Err(format!(
             "rlib {} 不包含可用的 lib.rmeta: {}",
@@ -3098,8 +3161,22 @@ mod tests {
             "_RNvMs2_NtCsbi9dd3sP7A_5alloc7raw_vec4grow"
         ));
         assert!(is_rust_support_symbol("_ZN4core3fmt5write17h00000000E"));
-        assert!(is_rust_support_symbol("_ZN5alloc6string6String3new17h00000000E"));
+        assert!(is_rust_support_symbol(
+            "_ZN5alloc6string6String3new17h00000000E"
+        ));
         assert!(!is_rust_support_symbol("_RNvNtCabc_7general4dev4pnp3new"));
+    }
+
+    #[test]
+    fn inherent_api_paths_match_nm_demangled_methods() {
+        assert_eq!(
+            inherent_method_demangled_name("general.dev.pnp.PnpDevice.register_function"),
+            Some("<general::dev::pnp::PnpDevice>::register_function".to_string())
+        );
+        assert_eq!(
+            inherent_method_demangled_name("allocator.KernelMemorySubsystem.try_free_physical"),
+            Some("<allocator::KernelMemorySubsystem>::try_free_physical".to_string())
+        );
     }
 
     #[test]

@@ -261,7 +261,9 @@ where
         command.env(name, value);
     }
     run_command(command).map_err(|error| {
-        format!("cargo-elm failed; install it with `cargo install --path tools/elm-tools`: {error}")
+        format!(
+            "cargo-elm failed; update the installed subcommand with `cargo install --path tools/elm-tools --force` before retrying: {error}"
+        )
     })
 }
 
@@ -280,7 +282,9 @@ where
         command.env(name, value);
     }
     run_command(command).map_err(|error| {
-        format!("cargo-elm failed; install it with `cargo install --path tools/elm-tools`: {error}")
+        format!(
+            "cargo-elm failed; update the installed subcommand with `cargo install --path tools/elm-tools --force` before retrying: {error}"
+        )
     })
 }
 
