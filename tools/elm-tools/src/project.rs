@@ -510,14 +510,12 @@ fn has_kernel_source_dependencies(input: &str) -> bool {
         || input.contains("path = \"../../libs/elm\"")
 }
 
+fn has_elm_framework_dependencies(input: &str) -> bool {
+    input.contains(".elm/framework/")
+}
+
 fn framework_manifest_source(input: &str) -> String {
     let mut output = input.to_string();
-    // 根驱动通常位于仓库下两级；嵌套 VirtIO API crate 由下方路径感知逻辑处理。
-    for spec in kernel_api_crates() {
-        let source = format!("path = \"../../{}\"", spec.repository_path);
-        let facade = format!("path = \".elm/framework/{}\"", spec.name);
-        output = output.replace(&source, &facade);
-    }
     // 驱动同时属于根 workspace；将本次 ELM 调用隔离，避免 Cargo 合并 facade
     // 与根 workspace 中同名的源码包。
     if !output.lines().any(|line| line.trim() == "[workspace]") {
@@ -567,18 +565,43 @@ fn rewrite_kernel_manifest_paths(
     repository: &Path,
     framework: &Path,
 ) -> Result<String, String> {
-    let sources = kernel_api_crates()
-        .iter()
-        .map(|spec| {
-            let source = repository
-                .join(spec.repository_path)
+    let shared_framework = std::env::var_os("ELM_SHARED_FRAMEWORK_ROOT").is_some();
+    let mut sources = Vec::with_capacity(kernel_api_crates().len() + 1);
+    for spec in kernel_api_crates() {
+        let source = repository
+            .join(spec.repository_path)
+            .canonicalize()
+            .map_err(|err| format!("定位内核 crate {} 失败: {err}", spec.repository_path))?;
+        let facade = framework.join(spec.name);
+        let replacement = if shared_framework {
+            facade
                 .canonicalize()
-                .map_err(|err| format!("定位内核 crate {} 失败: {err}", spec.repository_path))?;
-            let facade = framework.join(spec.name);
-            let relative = relative_path(manifest_dir, &facade)?;
-            Ok::<_, String>((source, relative))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+                .map_err(|err| format!("定位共享 framework {} 失败: {err}", facade.display()))?
+                .to_string_lossy()
+                .replace('\\', "/")
+        } else {
+            relative_path(manifest_dir, &facade)?
+        };
+        sources.push((source, spec.name, replacement));
+    }
+    // `elm` 不在 kernel-api-crates.txt 的 ABI facade 列表中，但 ELM 模块
+    // 仍必须使用接口包中的同一份 crate，否则每个模块会重新编译它。
+    let elm_source = repository
+        .join("libs/elm")
+        .canonicalize()
+        .map_err(|err| format!("定位内核 crate libs/elm 失败: {err}"))?;
+    let elm_facade = framework.join("elm");
+    let elm_replacement = if shared_framework {
+        elm_facade
+            .canonicalize()
+            .map_err(|err| format!("定位共享 framework {} 失败: {err}", elm_facade.display()))?
+            .to_string_lossy()
+            .replace('\\', "/")
+    } else {
+        relative_path(manifest_dir, &elm_facade)?
+    };
+    sources.push((elm_source, "elm", elm_replacement));
+
     let mut output = input.to_string();
     let mut cursor = 0;
     while let Some(found) = output[cursor..].find("path = \"") {
@@ -589,10 +612,29 @@ fn rewrite_kernel_manifest_paths(
         let value_end = value_start + value_end;
         let value = &output[value_start..value_end];
         let candidate = manifest_dir.join(value);
-        if let Ok(candidate) = candidate.canonicalize()
-            && let Some((_, replacement)) = sources.iter().find(|(source, _)| *source == candidate)
-        {
-            output.replace_range(value_start..value_end, replacement);
+        let replacement = candidate
+            .canonicalize()
+            .ok()
+            .and_then(|candidate| {
+                sources
+                    .iter()
+                    .find(|(source, _, _)| *source == candidate)
+                    .map(|(_, _, replacement)| replacement.clone())
+            })
+            // 兼容先前中断留下的 `.elm/framework/*` 临时 manifest。按 crate
+            // 名称重定向到共享 facade，避免单个模块绕过 build-set 缓存。
+            .or_else(|| {
+                let marker = ".elm/framework/";
+                let name = value
+                    .find(marker)
+                    .and_then(|offset| value[offset + marker.len()..].split('/').next())?;
+                sources
+                    .iter()
+                    .find(|(_, source_name, _)| *source_name == name)
+                    .map(|(_, _, replacement)| replacement.clone())
+            });
+        if let Some(replacement) = replacement {
+            output.replace_range(value_start..value_end, &replacement);
             cursor = value_start + replacement.len();
         } else {
             cursor = value_end + 1;
@@ -723,7 +765,7 @@ where
 {
     let repository = framework_source_root()?;
     let manifests = reachable_cargo_manifests(project, &repository)?;
-    let framework = project.join(".elm/framework");
+    let framework = configured_framework_root(project)?;
     let mut originals = Vec::new();
     let mut changed = Vec::new();
     for path in manifests {
@@ -746,11 +788,15 @@ where
     }
     if changed.is_empty()
         && !fs::read_to_string(project.join("Cargo.toml"))
-            .map(|input| has_kernel_source_dependencies(&input))
+            .map(|input| {
+                has_kernel_source_dependencies(&input) || has_elm_framework_dependencies(&input)
+            })
             .unwrap_or(false)
     {
         return operation();
     }
+
+    let shared_cargo_lock = configured_shared_cargo_lock()?;
 
     // 同一工程的 ELM 构建会临时改写多个 manifest；使用原子创建锁拒绝并发
     // 调用，避免两个进程互相覆盖并恢复对方的内容。
@@ -791,7 +837,21 @@ where
         cargo_lock_backup,
         active: true,
     };
-    if guard.cargo_lock_backup.is_some()
+    if let Some(shared) = &shared_cargo_lock {
+        // build-set 内后续模块复用第一个模块解析出的锁；若共享锁尚未
+        // 创建，则保留当前模块已有锁作为首个解析输入。
+        if shared.is_file() {
+            let lock = fs::read(shared)
+                .map_err(|err| format!("读取共享 Cargo.lock {} 失败: {err}", shared.display()))?;
+            if let Err(error) = fs::write(&guard.cargo_lock, lock) {
+                let restore = guard.restore();
+                return Err(match restore {
+                    Ok(()) => format!("安装模块共享 Cargo.lock 失败: {error}"),
+                    Err(restore) => format!("安装模块共享 Cargo.lock 失败: {error}；{restore}"),
+                });
+            }
+        }
+    } else if guard.cargo_lock_backup.is_some()
         && let Err(error) = fs::remove_file(&guard.cargo_lock)
     {
         let restore = guard.restore();
@@ -813,12 +873,32 @@ where
         }
     }
     let result = operation();
+    let shared_result = if result.is_ok() {
+        if let Some(shared) = &shared_cargo_lock {
+            if guard.cargo_lock.is_file() {
+                publish_shared_cargo_lock(&guard.cargo_lock, shared)
+            } else {
+                Err(format!(
+                    "Cargo 构建成功但没有生成 {}",
+                    guard.cargo_lock.display()
+                ))
+            }
+        } else {
+            Ok(())
+        }
+    } else {
+        Ok(())
+    };
     let restore = guard.restore();
-    match (result, restore) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(restore)) => Err(restore),
-        (Err(error), Err(restore)) => Err(format!("{error}；{restore}")),
+    match (result, shared_result, restore) {
+        (Ok(value), Ok(()), Ok(())) => Ok(value),
+        (Err(error), Ok(()), Ok(())) => Err(error),
+        (Ok(_), Err(shared), Ok(())) => Err(shared),
+        (Ok(_), Ok(()), Err(restore)) => Err(restore),
+        (Err(error), Err(shared), Ok(())) => Err(format!("{error}；{shared}")),
+        (Err(error), Ok(()), Err(restore)) => Err(format!("{error}；{restore}")),
+        (Ok(_), Err(shared), Err(restore)) => Err(format!("{shared}；{restore}")),
+        (Err(error), Err(shared), Err(restore)) => Err(format!("{error}；{shared}；{restore}")),
     }
 }
 
@@ -1111,7 +1191,7 @@ pub fn cargo_build(project: &Path, target: &str, cargo_name: &str) -> Result<Pat
     prepare_target_interface(&project, target)?;
     let project_manifest = ElmProjectManifest::load(&project)?;
     write_elm_lock(&project, &project_manifest)?;
-    let interface_root = project.join(".elm/kernel-interface").join(target);
+    let interface_root = target_interface_root(&project, target)?;
     let manifest = interface_root.join("manifest.txt");
     let interface = KernelInterfaceManifest::load(&manifest)?;
     let import_library = interface_root.join(&interface.import_library);
@@ -1128,10 +1208,8 @@ pub fn cargo_build(project: &Path, target: &str, cargo_name: &str) -> Result<Pat
             import_library.display()
         ));
     }
-    let mut rustflags = vec![
+    let rustc_args = vec![
         "-Clink-arg=-Telm.ld".to_string(),
-        "-Crelocation-model=pic".to_string(),
-        "-Ccode-model=small".to_string(),
         "-Clink-arg=-pie".to_string(),
         "-Clink-arg=-z".to_string(),
         "-Clink-arg=notext".to_string(),
@@ -1141,20 +1219,25 @@ pub fn cargo_build(project: &Path, target: &str, cargo_name: &str) -> Result<Pat
         "-Clink-arg=--no-as-needed".to_string(),
         format!("-Clink-arg={}", import_library.display()),
     ];
+    let mut rustflags = vec![
+        "-Crelocation-model=pic".to_string(),
+        "-Ccode-model=small".to_string(),
+    ];
     let metadata = interface_root.join("metadata");
     rustflags.push(format!("-Ldependency={}", metadata.display()));
     append_kernel_metadata_flags(&mut rustflags, &metadata, &interface)?;
     let (api_profiles, profile_hashes) = kernel_profile_cfg_values(&project_manifest, target)?;
     append_kernel_profile_flags(&mut rustflags, &interface, &api_profiles, &profile_hashes);
+    let mut rustc_args = rustc_args;
     if target == "loongarch64-unknown-none" {
-        rustflags.push("-Anamed_asm_labels".to_string());
+        rustc_args.push("-Anamed_asm_labels".to_string());
     }
     with_framework_manifest(&project, || {
         let mut command = Command::new("cargo");
         command
             .current_dir(&project)
             .env("CARGO_ENCODED_RUSTFLAGS", rustflags.join("\x1f"))
-            .arg("build")
+            .arg("rustc")
             .arg("--manifest-path")
             .arg(project.join("Cargo.toml"))
             .arg("--bin")
@@ -1165,8 +1248,10 @@ pub fn cargo_build(project: &Path, target: &str, cargo_name: &str) -> Result<Pat
             .arg("--target")
             .arg(target)
             .arg("--release")
+            .arg("--")
+            .args(&rustc_args)
             .status()
-            .map_err(|err| format!("启动 cargo build 失败: {err}"))?;
+            .map_err(|err| format!("启动 cargo rustc 失败: {err}"))?;
         if !status.success() {
             return Err(format!("ELM Rust 构建失败，退出状态 {status}"));
         }
@@ -1189,18 +1274,22 @@ pub fn cargo_build_integrated(
     prepare_target_interface(&project, target)?;
     let project_manifest = ElmProjectManifest::load(&project)?;
     write_elm_lock(&project, &project_manifest)?;
-    let interface_root = project.join(".elm/kernel-interface").join(target);
+    let interface_root = target_interface_root(&project, target)?;
     let interface = KernelInterfaceManifest::load(&interface_root.join("manifest.txt"))?;
     let metadata = interface_root.join("metadata");
-    let mut rustflags = vec![format!("-Ldependency={}", metadata.display())];
+    let mut rustflags = vec![
+        "-Crelocation-model=pic".to_string(),
+        "-Ccode-model=small".to_string(),
+        format!("-Ldependency={}", metadata.display()),
+    ];
     append_kernel_metadata_flags(&mut rustflags, &metadata, &interface)?;
     let (api_profiles, profile_hashes) = kernel_profile_cfg_values(&project_manifest, target)?;
     append_kernel_profile_flags(&mut rustflags, &interface, &api_profiles, &profile_hashes);
-    rustflags.push(format!(
+    let mut rustc_args = vec![format!(
         "--cfg=elm_integrated_phase=\"{}\"",
         project_manifest.integrated_phase.as_str()
-    ));
-    rustflags
+    )];
+    rustc_args
         .push("--check-cfg=cfg(elm_integrated_phase,values(\"device\",\"runtime\"))".to_string());
     with_framework_manifest(&project, || {
         let mut command = Command::new("cargo");
@@ -1223,6 +1312,7 @@ pub fn cargo_build_integrated(
             .arg(target)
             .arg("--release")
             .arg("--")
+            .args(&rustc_args)
             .arg("--emit=link")
             .status()
             .map_err(|err| format!("启动集成组件 cargo rustc 失败: {err}"))?;
@@ -1387,10 +1477,14 @@ pub fn cargo_check(project: &Path, target: &str, cargo_name: &str) -> Result<(),
     prepare_target_interface(&project, target)?;
     let project_manifest = ElmProjectManifest::load(&project)?;
     write_elm_lock(&project, &project_manifest)?;
-    let interface_root = project.join(".elm/kernel-interface").join(target);
+    let interface_root = target_interface_root(&project, target)?;
     let interface = KernelInterfaceManifest::load(&interface_root.join("manifest.txt"))?;
     let metadata = interface_root.join("metadata");
-    let mut rustflags = vec![format!("-Ldependency={}", metadata.display())];
+    let mut rustflags = vec![
+        "-Crelocation-model=pic".to_string(),
+        "-Ccode-model=small".to_string(),
+        format!("-Ldependency={}", metadata.display()),
+    ];
     append_kernel_metadata_flags(&mut rustflags, &metadata, &interface)?;
     let (api_profiles, profile_hashes) = kernel_profile_cfg_values(&project_manifest, target)?;
     append_kernel_profile_flags(&mut rustflags, &interface, &api_profiles, &profile_hashes);
@@ -1578,6 +1672,69 @@ fn framework_source_root() -> Result<PathBuf, String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     root.canonicalize()
         .map_err(|err| format!("定位 ELM 框架源码失败: {err}"))
+}
+
+/// 返回 build-set 级别共享的 ELM framework。独立执行 `cargo elm build` 时
+/// 没有该变量，继续使用工程自己的 `.elm/framework`；模块集合构建则把所有
+/// 模块指向同一份接口包 framework，避免 Cargo 按模块路径生成重复 fingerprint。
+fn configured_framework_root(project: &Path) -> Result<PathBuf, String> {
+    let root = std::env::var_os("ELM_SHARED_FRAMEWORK_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project.join(".elm/framework"));
+    root.canonicalize()
+        .map_err(|err| format!("定位 ELM framework {} 失败: {err}", root.display()))
+}
+
+fn configured_shared_cargo_lock() -> Result<Option<PathBuf>, String> {
+    let Some(path) = std::env::var_os("ELM_SHARED_CARGO_LOCK") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("共享 Cargo.lock 路径无父目录: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("创建共享 Cargo.lock 目录 {} 失败: {err}", parent.display()))?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|err| format!("定位共享 Cargo.lock 目录 {} 失败: {err}", parent.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("共享 Cargo.lock 路径缺少文件名: {}", path.display()))?;
+    Ok(Some(parent.join(name)))
+}
+
+fn publish_shared_cargo_lock(source: &Path, destination: &Path) -> Result<(), String> {
+    let bytes = fs::read(source)
+        .map_err(|err| format!("读取模块 Cargo.lock {} 失败: {err}", source.display()))?;
+    let temporary = destination.with_file_name(format!(
+        ".{}.tmp.{}",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Cargo.lock"),
+        std::process::id()
+    ));
+    fs::write(&temporary, bytes)
+        .map_err(|err| format!("写入共享 Cargo.lock {} 失败: {err}", temporary.display()))?;
+    if let Err(error) = fs::rename(&temporary, destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "安装共享 Cargo.lock {} 失败: {error}",
+            destination.display()
+        ));
+    }
+    Ok(())
+}
+
+fn target_interface_root(project: &Path, target: &str) -> Result<PathBuf, String> {
+    let root = project.join(".elm/kernel-interface").join(target);
+    root.canonicalize().map_err(|err| {
+        format!(
+            "定位目标 {target} 的接口缓存 {} 失败: {err}",
+            root.display()
+        )
+    })
 }
 
 fn packaged_framework_root(manifest: &ElmProjectManifest) -> Result<Option<PathBuf>, String> {

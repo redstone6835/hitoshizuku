@@ -71,10 +71,22 @@ pub fn build_set(
     }
     fs::create_dir_all(output)
         .map_err(|err| format!("创建模块输出目录 {} 失败: {err}", output.display()))?;
+    let output = output
+        .canonicalize()
+        .map_err(|err| format!("规范化模块输出目录 {} 失败: {err}", output.display()))?;
     let api_repository = output.join(".apis");
     fs::create_dir_all(&api_repository).map_err(|err| format!("创建 API 仓库失败: {err}"))?;
+    let cargo_cache = output.join(".cargo-cache");
+    fs::create_dir_all(&cargo_cache)
+        .map_err(|err| format!("创建共享 Cargo 缓存目录失败: {err}"))?;
+    let shared_cargo_lock = cargo_cache.join("Cargo.lock");
 
     let interface = selected_interface(target)?;
+    // 所有模块共享同一个接口包根。除了避免重复复制接口文件，这个稳定的
+    // 绝对路径还会进入 Cargo 的 rustflags/fingerprint，必须在整个 build-set
+    // 生命周期内保持一致，Cargo 才能复用公共 facade 和内核 crate。
+    let interface_root = interface_repository_root(&interface)?;
+    let framework_root = interface_root.join("framework");
     let arch = target_arch_name(target)?;
     let executable =
         std::env::current_exe().map_err(|err| format!("定位 cargo-elm 可执行文件失败: {err}"))?;
@@ -105,10 +117,9 @@ pub fn build_set(
             .arg(arch)
             .env("ELM_BUILD_MODE_OVERRIDE", mode.as_str())
             .env("ELM_DEPENDENCY_API_ROOT", &api_repository)
-            .env(
-                "ELM_KERNEL_INTERFACE_ROOT",
-                interface_repository_root(&interface)?,
-            );
+            .env("ELM_KERNEL_INTERFACE_ROOT", &interface_root)
+            .env("ELM_SHARED_FRAMEWORK_ROOT", &framework_root)
+            .env("ELM_SHARED_CARGO_LOCK", &shared_cargo_lock);
         if mode == ElmBuildMode::Managed {
             command.arg("--unsigned");
         }
@@ -178,8 +189,8 @@ pub fn build_set(
         }
     }
 
-    write_build_manifest(output, target, &interface.manifest, &managed)?;
-    write_integrated_archives(output, &integrated)?;
+    write_build_manifest(&output, target, &interface.manifest, &managed)?;
+    write_integrated_archives(&output, &integrated)?;
     Ok(())
 }
 
@@ -561,12 +572,14 @@ fn selected_interface(target: &str) -> Result<crate::project::KernelInterfaceBun
 fn interface_repository_root(
     interface: &crate::project::KernelInterfaceBundle,
 ) -> Result<PathBuf, String> {
-    if !interface.root.join("manifest.txt").is_file()
-        || !interface.root.join("framework/Cargo.toml").is_file()
-    {
+    let root = interface
+        .root
+        .canonicalize()
+        .map_err(|err| format!("定位接口包 {} 失败: {err}", interface.root.display()))?;
+    if !root.join("manifest.txt").is_file() || !root.join("framework/Cargo.toml").is_file() {
         return Err("接口包目录缺少 manifest.txt 或 framework/Cargo.toml".to_string());
     }
-    Ok(interface.root.clone())
+    Ok(root)
 }
 
 fn inspect_managed_module(
