@@ -146,7 +146,7 @@ EFI 启动辅助代码还需要目标架构的 C 编译器；host 侧 `soyo-link
 安装外部 ELM 工具。通过 `xtask` 构建时会自动传入当前内核 checkout：
 
 ```sh
-cargo install --git https://github.com/redstone6835/hitoshizuku-elm-tools cargo-elm
+cargo install --locked --git https://github.com/redstone6835/hitoshizuku-elm-tools cargo-elm
 ```
 
 仅在其他目录直接运行 `cargo elm` 时，才需要设置

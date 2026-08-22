@@ -7,8 +7,8 @@ Native runtime 和性能分析使用独立仓库及固定版本依赖，不通�
 | 仓库 | 内容 | 集成方式 |
 | --- | --- | --- |
 | [`hitoshizuku`](https://github.com/redstone6835/hitoshizuku) | 内核、紧耦合驱动、ELM/Native ABI crate、核心中文文档 | Cargo workspace，`kernel` 为默认成员 |
-| [`hitoshizuku-elm-tools`](https://github.com/redstone6835/hitoshizuku-elm-tools) | `cargo-elm` 和 ELM 工程工具 | `cargo install --git`；用 `HITOSHIZUKU_KERNEL_ROOT` 选择内核 checkout |
-| [`hitoshizuku-soyo-linker`](https://github.com/redstone6835/hitoshizuku-soyo-linker) | `soyo-ld`、`soyo-verify`、`soyo-inspect` | `cargo install --git`；依赖固定内核 revision 的 ABI crate |
+| [`hitoshizuku-elm-tools`](https://github.com/redstone6835/hitoshizuku-elm-tools) | `cargo-elm` 和 ELM 工程工具 | `cargo install --locked --git`；用 `HITOSHIZUKU_KERNEL_ROOT` 选择内核 checkout |
+| [`hitoshizuku-soyo-linker`](https://github.com/redstone6835/hitoshizuku-soyo-linker) | `soyo-ld`、`soyo-verify`、`soyo-inspect` | `cargo install --locked --git`；依赖固定内核 revision 的 ABI crate |
 | [`hitoshizuku-native`](https://github.com/redstone6835/hitoshizuku-native) | MRT、Ranalib、Anonlib、C/Rust 示例和测试 | Native 自己的 workspace；通过 `SOYO_LD` 接入链接器 |
 | [`hitoshizuku-bench`](https://github.com/redstone6835/hitoshizuku-bench) | QEMU 插件、画像脚本、统计学习模型和工作负载 | 消费带提交标识的内核产物与外部输入镜像 |
 | `hitoshizuku-initramfs`（未来） | BusyBox、rootfs、CPIO 和镜像组装 | 作为 `cargo xtask build --initramfs` 的外部输入 |

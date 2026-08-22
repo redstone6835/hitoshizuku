@@ -1422,7 +1422,7 @@ ELM_INTEGRATED_ARCHIVES=../demo-hello/dist/demo-hello-riscv64gc-unknown-none-elf
 创建一个独立仓库：
 
 ```sh
-cargo install --git https://github.com/redstone6835/hitoshizuku-elm-tools cargo-elm
+cargo install --locked --git https://github.com/redstone6835/hitoshizuku-elm-tools cargo-elm
 export HITOSHIZUKU_KERNEL_ROOT="$PWD"
 cargo elm new ../demo-hello \
   --name demo.hello \
