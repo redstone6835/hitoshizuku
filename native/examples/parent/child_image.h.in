@@ -1,7 +1,0 @@
-#ifndef MYGO_PARENT_CHILD_IMAGE_H
-#define MYGO_PARENT_CHILD_IMAGE_H
-
-extern const unsigned char mygo_child_image_start[];
-extern const unsigned char mygo_child_image_end[];
-
-#endif

@@ -14,7 +14,7 @@ else
     exit 1
 fi
 
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/mygo-kcsan-codegen.XXXXXX")
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/hitoshizuku-kcsan-codegen.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
 cat >"$tmp/probe.rs" <<'EOF'

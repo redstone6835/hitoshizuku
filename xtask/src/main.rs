@@ -271,13 +271,17 @@ where
     S: AsRef<std::ffi::OsStr>,
 {
     let mut command = Command::new("cargo");
-    command.current_dir(root).arg("elm").args(args);
+    command
+        .current_dir(root)
+        .env("HITOSHIZUKU_KERNEL_ROOT", root)
+        .arg("elm")
+        .args(args);
     if let Some((name, value)) = env_var {
         command.env(name, value);
     }
     run_command(command).map_err(|error| {
         format!(
-            "cargo-elm failed; update the installed subcommand with `cargo install --path tools/elm-tools --force` before retrying: {error}"
+            "cargo-elm failed; install `cargo-elm` from https://github.com/redstone6835/hitoshizuku-elm-tools before retrying: {error}"
         )
     })
 }
@@ -292,13 +296,17 @@ where
     S: AsRef<std::ffi::OsStr>,
 {
     let mut command = Command::new("cargo");
-    command.current_dir(root).arg("elm").args(args);
+    command
+        .current_dir(root)
+        .env("HITOSHIZUKU_KERNEL_ROOT", root)
+        .arg("elm")
+        .args(args);
     for (name, value) in env_vars {
         command.env(name, value);
     }
     run_command(command).map_err(|error| {
         format!(
-            "cargo-elm failed; update the installed subcommand with `cargo install --path tools/elm-tools --force` before retrying: {error}"
+            "cargo-elm failed; install `cargo-elm` from https://github.com/redstone6835/hitoshizuku-elm-tools before retrying: {error}"
         )
     })
 }

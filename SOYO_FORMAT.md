@@ -581,7 +581,7 @@ metadata 或 required 外部引用。
 | --- | --- |
 | `libs/soyo` | no_std 解析、解码、结构校验、信任和映射规划。 |
 | `libs/soyo/wire-abi.registry` | 当前 Wire profile 的唯一机器可读线格式来源。 |
-| `tools/soyo-linker` | 主机端 ELF 到 SOYO Wire profile 的链接和检查工具。 |
+| [`hitoshizuku-soyo-linker`](https://github.com/redstone6835/hitoshizuku-soyo-linker) | 主机端 ELF 到 SOYO Wire profile 的链接和检查工具。 |
 | `kernel` | 在显式启用相应 projector/profile 后装载对象，不根据文件扩展名猜测语义。 |
 
 ## 20. 迁移说明
@@ -821,7 +821,7 @@ Wire signature entry 为 `key_id[32]`、`signature[64]`、`flags:u32` 和 28 字
 1. 先修改本文件中对应的线布局和兼容性说明；
 2. 修改 `libs/soyo/wire-abi.registry` 或 Core 编解码器；
 3. 更新 `libs/soyo` 的拒绝测试、编码测试、信任测试和 linker 集成测试；
-4. 更新 `tools/soyo-linker/README.md`、`ELM.md` 及相关 schema/projector 文档；
+4. 更新 `hitoshizuku-soyo-linker` README、`ELM.md` 及相关 schema/projector 文档；
 5. 对改变 on-disk 语义的修改提升 Core、schema、projector ABI 或 target protocol 版本。
 
 SOYO 文件不得通过文件扩展名决定执行权限。解析器先验证结构，调用方再选择显式支持

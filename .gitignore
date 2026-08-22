@@ -19,7 +19,7 @@ AGENTS.md
 
 __pycache__/
 
-# Generated ELM module/interface data
+# 生成的 ELM 模块和接口数据
 drivers/*/.elm/
 drivers/*/dist/
 drivers/*/.cargo/
@@ -30,5 +30,3 @@ tests/elm/*/.elm/
 tests/elm/*/dist/
 tests/elm/*/elm.ld
 tests/elm/*/rust-toolchain.toml
-bench/results/*
-!bench/results/.gitignore

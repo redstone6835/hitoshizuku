@@ -1,12 +1,12 @@
-# 项目脚本
+# KCSAN 辅助脚本
 
-这些脚本是源码，不是 Cargo 依赖。项目拆分为多个职责明确的仓库期间，源码
-暂时保留在此处：
+内核仓库只保留 KCSAN 编译包装器、符号定位器和对应的代码生成测试。性能画像、QEMU
+插件、系统调用比较和机器学习模型位于独立的
+[`hitoshizuku-bench`](https://github.com/redstone6835/hitoshizuku-bench) 仓库。
 
-- 内核构建和 KCSAN 辅助脚本留在内核工具中；
-- 性能分析、QEMU 插件和分析脚本迁移到 `hitoshizuku-bench`；
-- BusyBox、rootfs、镜像和 initramfs 辅助脚本迁移到未来的
-  `hitoshizuku-initramfs` 仓库。
+脚本从内核仓库根目录运行，并使用同一次构建生成的 map/符号文件。
 
-不再恢复旧的根目录编排。内核构建使用 `cargo xtask`；仍调用旧流程的脚本
-列入未来负责仓库的迁移任务。
+```sh
+scripts/test-kcsan-codegen.sh
+python3 -m unittest scripts.tests.test_kcsan_symbolize
+```

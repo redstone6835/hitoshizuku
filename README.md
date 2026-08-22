@@ -13,7 +13,7 @@
 </p>
 
 > 项目标识为 `hitoshizuku`。Hitoshizuku OS 是去 OSComp 化、去除比赛、测评和镜像耦合后的 MyGO!!!!! OS。这里保留项目自身的
-> Rust 内核、ELM、驱动、网络栈和测试工具。
+> Rust 内核、ELM、驱动和网络栈；Native、链接器和测试工具按职责独立维护。
 
 ## 先看这里
 
@@ -92,10 +92,9 @@ generation 切换时旧执行者自动失效。报文只有在完整 sidecar、�
 - **系统调用归因**：把指令成本模型回填到 syscall 画像，报告中心估计、上下界、严格归因
   比例和未定价指令比例；质量不足时显式拒绝生成看似精确的结果。
 
-这些方法只服务测试、画像和回归比较，不进入内核运行时决策。实现入口位于
-[`scripts/rv_instruction_weight_model.py`](scripts/rv_instruction_weight_model.py)、
-[`scripts/rv_instruction_microbench_model.py`](scripts/rv_instruction_microbench_model.py)
-和 [`scripts/analyze-riscv-syscall-model.py`](scripts/analyze-riscv-syscall-model.py)。
+这些方法只服务测试、画像和回归比较，不进入内核运行时决策。实现位于独立的
+[`hitoshizuku-bench`](https://github.com/redstone6835/hitoshizuku-bench) 仓库；内核仓库
+只保留 KCSAN 诊断辅助脚本。
 
 ## 核心架构
 
@@ -129,7 +128,7 @@ drivers/    项目自有硬件驱动与 ELM；由 Modules.toml 选择集成方�
 - `riscv64gc-unknown-none-elf`
 
 驱动、ELM 和内核 ABI 保持在同一 Cargo workspace；`cargo-elm`、`soyo-linker`、native
-runtime、性能工具和文档可以独立发布。更完整的仓库边界见
+runtime 和性能工具分别在独立仓库发布。更完整的仓库边界见
 [`REPOSITORY_LAYOUT.md`](REPOSITORY_LAYOUT.md)。
 
 ## 快速开始
@@ -143,6 +142,15 @@ rustup target add riscv64gc-unknown-none-elf
 
 EFI 启动辅助代码还需要目标架构的 C 编译器；host 侧 `soyo-linker` 的 C 集成测试需要
 `clang`。这些是系统依赖，不是 Rust 工具链覆盖。
+
+安装外部 ELM 工具。通过 `xtask` 构建时会自动传入当前内核 checkout：
+
+```sh
+cargo install --git https://github.com/redstone6835/hitoshizuku-elm-tools cargo-elm
+```
+
+仅在其他目录直接运行 `cargo elm` 时，才需要设置
+`HITOSHIZUKU_KERNEL_ROOT=/path/to/hitoshizuku`。
 
 默认构建 LoongArch64 内核：
 
@@ -185,6 +193,10 @@ cargo xtask modules --target loongarch64-unknown-none
 - [安全报告](SECURITY_REPORT.md)：并发、资源、装载和 ABI 风险记录。
 - [贡献指南](CONTRIBUTING.md) 与 [代码风格](STYLES.md)。
 - [仓库布局](REPOSITORY_LAYOUT.md)：独立仓库和迁移边界。
+- [ELM 工具](https://github.com/redstone6835/hitoshizuku-elm-tools) 与
+  [SOYO 链接器](https://github.com/redstone6835/hitoshizuku-soyo-linker)：主机端工具。
+- [性能与分析工具](https://github.com/redstone6835/hitoshizuku-bench) 与
+  [Native runtime](https://github.com/redstone6835/hitoshizuku-native)：独立项目边界。
 
 ## 许可
 

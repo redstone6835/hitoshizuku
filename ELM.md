@@ -1293,7 +1293,7 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 
 仓库提供以下管理入口：
 
-- `tools/elm-tools/`：`cargo-elm` 的源码目录。安装后以 Cargo 子命令 `cargo elm` 使用，提供 `new`、`sync`、`check`、`test`、`doctor`、`profile-export`、`symbol-probe`、`build`、`inspect` 与 `image-*`。工具自身使用宿主目标构建；外部 ELM 的目标架构由命令显式选择。
+- [`hitoshizuku-elm-tools`](https://github.com/redstone6835/hitoshizuku-elm-tools)：`cargo-elm` 主机端子命令。安装后以 `cargo elm` 使用，提供 `new`、`sync`、`check`、`test`、`doctor`、`profile-export`、`symbol-probe`、`build`、`inspect` 与 `image-*`；通过 `HITOSHIZUKU_KERNEL_ROOT` 选择目标内核 checkout。
 - 内核控制 ABI：管理器查询、快照、生命周期、provider 和事件操作通过内核暴露的稳定 Rust/C ABI 进入；具体客户端可在独立仓库实现。
 
 ### elmapi v1 与单一 API 根
@@ -1422,7 +1422,8 @@ ELM_INTEGRATED_ARCHIVES=../demo-hello/dist/demo-hello-riscv64gc-unknown-none-elf
 创建一个独立仓库：
 
 ```sh
-cargo install --path tools/elm-tools --target x86_64-unknown-linux-gnu
+cargo install --git https://github.com/redstone6835/hitoshizuku-elm-tools cargo-elm
+export HITOSHIZUKU_KERNEL_ROOT="$PWD"
 cargo elm new ../demo-hello \
   --name demo.hello \
   --kind service \
