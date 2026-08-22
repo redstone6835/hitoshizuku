@@ -3384,6 +3384,26 @@ allocator = { path = "../../../libs/allocator", default-features = false }
     }
 
     #[test]
+    fn framework_manifest_wrapper_does_not_change_source_manifest() {
+        let source = r#"[package]
+name = "demo-module"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+acpi = { path = "../../libs/acpi", default-features = false }
+"#;
+        let original = source.to_string();
+        let temporary = framework_manifest_source(source);
+
+        assert_eq!(source, original);
+        assert!(temporary.starts_with("[workspace]\nresolver = \"2\""));
+        assert!(temporary.ends_with(source));
+        assert!(!source.contains("[workspace]"));
+        assert!(!source.contains(".elm/framework/"));
+    }
+
+    #[test]
     fn scaffolds_single_framework_for_service_and_manager_projects() {
         let service = TestDirectory::new("service-project");
         scaffold_project(service.path(), "demo.service", "service", "local.test").unwrap();

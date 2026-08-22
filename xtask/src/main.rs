@@ -143,7 +143,22 @@ fn build_kernel(root: &Path, args: &[String]) -> Result<(), String> {
         environment.push(("ELM_BUILD_BOUND_MANIFEST", manifest.into_os_string()));
     }
     if archives.is_file() {
-        environment.push(("ELM_INTEGRATED_ARCHIVES", archives.into_os_string()));
+        let archive_paths = std::fs::read_to_string(&archives)
+            .map_err(|error| format!("read {}: {error}", archives.display()))?
+            .lines()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        if archive_paths.is_empty() {
+            return Err(format!(
+                "integrated archive list {} is empty",
+                archives.display()
+            ));
+        }
+        let archive_value = env::join_paths(archive_paths)
+            .map_err(|error| format!("encode integrated archive paths: {error}"))?;
+        environment.push(("ELM_INTEGRATED_ARCHIVES", archive_value));
     }
     if let Some(initramfs) = options.initramfs {
         environment.push(("INITRAMFS", initramfs.into()));
