@@ -3,7 +3,7 @@ name = "kernel.random"
 version = "0.1.0"
 kind = "driver"
 source = "kernel-tree:drivers.random"
-mode = "m"
+mode = "y"
 integrated_phase = "device"
 
 [[profiles]]

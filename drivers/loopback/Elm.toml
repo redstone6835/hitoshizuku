@@ -3,7 +3,7 @@ name = "net.loopback"
 version = "0.1.0"
 kind = "network"
 source = "kernel-tree:drivers.loopback"
-mode = "m"
+mode = "y"
 integrated_phase = "runtime"
 
 [[profiles]]
