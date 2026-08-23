@@ -126,6 +126,10 @@ fn build_kernel(root: &Path, args: &[String]) -> Result<(), String> {
     let target = options.target.as_deref().unwrap_or(DEFAULT_TARGET);
     let arch = target_arch(target)?;
     let config = options.config.as_deref().unwrap_or(".config");
+    let target_dir = options
+        .target_dir
+        .clone()
+        .unwrap_or_else(|| format!("target/{arch}"));
     ensure_config(root, config)?;
 
     let module_output = options
@@ -163,6 +167,7 @@ fn build_kernel(root: &Path, args: &[String]) -> Result<(), String> {
     if let Some(initramfs) = options.initramfs {
         environment.push(("INITRAMFS", initramfs.into()));
     }
+    environment.push(("CARGO_TARGET_DIR", root.join(target_dir).into_os_string()));
 
     let mut command: Vec<OsString> = vec![
         "build".into(),
