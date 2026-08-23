@@ -133,30 +133,75 @@ runtime 和性能工具分别在独立仓库发布。更完整的仓库边界见
 
 ## 快速开始
 
-项目使用系统默认 Rust 工具链。按需安装目标架构标准库：
+下面的流程从一个全新的 checkout 开始，使用系统默认 Rust 工具链。内核、ELM 工具和
+Native/性能仓库彼此独立；只有内核编译需要进入本仓库。
+
+### 1. 准备源码和工具链
 
 ```sh
+mkdir -p ~/src
+git clone https://github.com/redstone6835/hitoshizuku.git ~/src/hitoshizuku
+cd ~/src/hitoshizuku
 rustup target add loongarch64-unknown-none
 rustup target add riscv64gc-unknown-none-elf
+cargo install --locked --git \
+  https://github.com/redstone6835/hitoshizuku-elm-tools cargo-elm
 ```
 
-EFI 启动辅助代码还需要目标架构的 C 编译器；host 侧 `soyo-linker` 的 C 集成测试需要
-`clang`。这些是系统依赖，不是 Rust 工具链覆盖。
+不要在仓库中创建或提交 `rust-toolchain.toml`；Rust 版本由开发者的默认工具链管理。
+EFI 辅助代码需要目标架构的 C 编译器，SOYO 的 C header 集成测试需要 `clang`。
 
-安装外部 ELM 工具。通过 `xtask` 构建时会自动传入当前内核 checkout：
+需要 Native 示例或 SOYO 镜像工具时，再安装并初始化对应的 sibling 仓库：
 
 ```sh
-cargo install --locked --git https://github.com/redstone6835/hitoshizuku-elm-tools cargo-elm
+git clone https://github.com/redstone6835/hitoshizuku-soyo-linker.git ~/src/hitoshizuku-soyo-linker
+git clone https://github.com/redstone6835/hitoshizuku-native.git ~/src/hitoshizuku-native
+cd ~/src/hitoshizuku-native
+git submodule update --init --recursive
+cargo install --locked --path ../hitoshizuku-soyo-linker
 ```
 
-仅在其他目录直接运行 `cargo elm` 时，才需要设置
-`HITOSHIZUKU_KERNEL_ROOT=/path/to/hitoshizuku`。
+性能画像工具位于 `hitoshizuku-bench`，它是可选的测试工程，不是内核构建前置依赖。
 
-默认构建 LoongArch64 内核：
+### 2. 检查 workspace
 
 ```sh
+cargo metadata --no-deps --format-version 1
+cargo check --workspace --lib --target loongarch64-unknown-none
+```
+
+如果在其他目录直接调用 `cargo elm`，显式指定内核源码：
+
+```sh
+export HITOSHIZUKU_KERNEL_ROOT=$HOME/src/hitoshizuku
+```
+
+### 3. 选择驱动并构建
+
+```sh
+cargo xtask defconfig
+cargo xtask config
+cargo xtask modules --target loongarch64-unknown-none
 cargo xtask build --target loongarch64-unknown-none
 ```
+
+`xtask build` 会自动构建 kernel、导出 Kernel API Profile，并复用
+`target/loongarch64` 与 `build/elm-interface/loongarch64` 的共享缓存。最终镜像位于：
+
+```text
+target/loongarch64/loongarch64-unknown-none/release/kernel
+```
+
+### 4. 运行测试和外部工具
+
+```sh
+cargo test -p socket --target x86_64-unknown-linux-gnu
+LLVM_NM=/usr/bin/nm scripts/test-kcsan-codegen.sh
+```
+
+Native、SOYO 和性能工具使用独立 checkout；它们的安装和环境变量约定见
+[`REPOSITORY_LAYOUT.md`](REPOSITORY_LAYOUT.md)。initramfs、BusyBox、rootfs 和磁盘镜像
+不是本仓库的构建输入，需由外部工程提供。
 
 其他常用命令：
 
@@ -188,6 +233,7 @@ cargo xtask modules --target loongarch64-unknown-none
 ## 文档入口
 
 - [架构设计](ARCHITECTURE.md)：crate 依赖、驱动边界和构建产物。
+- [设备抽象](DEVICE_ABSTRACTION.md)：PnP、DeviceFunction、资源租约、驱动匹配和热拔契约。
 - [ELM 设计](ELM.md)：单元、端口、租约、DeviceFunction 和 EBI。
 - [SOYO 文件标准](SOYO_FORMAT.md)：Core 对象容器与 Wire profile。
 - [安全报告](SECURITY_REPORT.md)：并发、资源、装载和 ABI 风险记录。

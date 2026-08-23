@@ -29,6 +29,10 @@ xtask/      内核 Cargo 编排入口
 `cargo-elm`；`xtask` 自动传入当前内核根目录，直接从其他目录调用工具时使用
 `HITOSHIZUKU_KERNEL_ROOT`。工具仓库使用固定 Git revision；ABI 版本化后再切换为发布 crate。
 
+核心目录的入口说明位于各目录的 `README.md`；设备对象、驱动资源和热拔顺序见
+[`DEVICE_ABSTRACTION.md`](DEVICE_ABSTRACTION.md)。目录 README 只解释源码边界和本地
+检查命令，不重复维护 Cargo manifest 或生成文件清单。
+
 ## 内核工作流
 
 ```sh

@@ -22,3 +22,17 @@ VirtIO 协议类型位于 `virtio/api`。它的 ELM provider 和 consumer 绑定
 
 普通内核构建不会编译所有驱动。选中的配置会通过内核 feature 启用内建驱动，
 或者把 `m` 条目作为独立包构建，供后续 initramfs 或模块装载使用。
+
+## 当前驱动目录
+
+| 目录 | 作用 |
+| --- | --- |
+| `firmware-bus`、`fw-cfg` | 固件总线与 fw_cfg 设备 |
+| `uart16550`、`syscon`、`plic`、`loongson-irq` | 控制台、系统控制器和中断控制器 |
+| `ls7a-rtc`、`goldfish-rtc`、`random`、`cfi-flash` | 平台时钟、随机源和闪存 |
+| `virtio`、`virtio-blk`、`virtio-net` | VirtIO framework、块设备和网络设备 |
+| `net-stack`、`loopback` | 网络栈 ELM 与回环设备 |
+
+驱动 crate 的 `src/main.rs` 同时作为 ELM 模块入口和 workspace library target，这是
+为了让 `cargo-elm` 能在集成和独立模块两种模式下复用同一份实现。`Elm.toml`、
+`Elm.lock` 和 `elm.ld` 是模块 ABI 元数据，不是 Cargo 依赖缓存。
