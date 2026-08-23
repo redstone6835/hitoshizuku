@@ -13,6 +13,7 @@
 pub mod backend;
 pub mod ids;
 pub mod request;
+pub mod resource;
 pub mod status;
 pub mod validation;
 pub mod wire;
@@ -20,6 +21,7 @@ pub mod wire;
 pub use backend::*;
 pub use ids::*;
 pub use request::*;
+pub use resource::*;
 pub use status::*;
 pub use validation::{LanguageValidationError, ValidationResult};
 pub use wire::{LanguageWire, LanguageWireError, decode, encode};

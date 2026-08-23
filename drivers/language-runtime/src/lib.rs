@@ -8,12 +8,55 @@ use elm_language_abi::{
     LanguageBackendCompleteRequestV1, LanguageBackendDescriptorV1, LanguageBackendNextRequestV1,
     LanguageBackendRequestV1, LanguageBackendWorkV1, LanguageCancelRequestV1,
     LanguageDrainRequestV1, LanguageDrainResponseV1, LanguageHandle,
-    LanguageInstanceCloseRequestV1, LanguageInstanceDescriptorV1, LanguageOwnerV1,
-    LanguagePollRequestV1, LanguagePollResponseV1, LanguageRequestState,
-    LanguageRequestSubmitResponseV1, LanguageRequestV1, LanguageRuntimeCatalogV1,
+    LanguageInstanceCloseRequestV1, LanguageInstanceDescriptorV1, LanguageKernelCallRequestV1,
+    LanguageKernelCallResponseV1, LanguageOwnerV1, LanguagePollRequestV1, LanguagePollResponseV1,
+    LanguageRequestState, LanguageRequestSubmitResponseV1, LanguageRequestV1,
+    LanguageResourceRequestV1, LanguageResourceResponseV1, LanguageRuntimeCatalogV1,
     LanguageRuntimeFlags, LanguageRuntimeStatus,
 };
 use spin::Mutex;
+
+#[elm::kernel_symbol(
+    name = "general.dev.language.resource.dispatch",
+    contract = "kernel.language.resource@1",
+    version = 1,
+    abi = "fn(LanguageResourceRequestV1)->LanguageResourceResponseV1"
+)]
+static KERNEL_RESOURCE_DISPATCH: elm::DirectImport<
+    fn(LanguageResourceRequestV1) -> LanguageResourceResponseV1,
+> = elm::DirectImport::new();
+
+#[elm::kernel_symbol(
+    name = "general.dev.language.resource.revoke_owner",
+    contract = "kernel.language.resource@1",
+    version = 1,
+    abi = "fn(LanguageOwnerV1)->i32"
+)]
+static KERNEL_RESOURCE_REVOKE_OWNER: elm::DirectImport<fn(LanguageOwnerV1) -> i32> =
+    elm::DirectImport::new();
+
+#[elm::kernel_symbol(
+    name = "general.dev.language.resource.reset",
+    contract = "kernel.language.resource@1",
+    version = 1,
+    abi = "fn()->i32"
+)]
+static KERNEL_RESOURCE_RESET: elm::DirectImport<fn() -> i32> = elm::DirectImport::new();
+
+#[elm::kernel_symbol(
+    name = "general.dev.language.kernel.call",
+    contract = "kernel.language.call@1",
+    version = 1,
+    abi = "fn(LanguageKernelCallRequestV1)->LanguageKernelCallResponseV1"
+)]
+static KERNEL_CALL: elm::DirectImport<
+    fn(LanguageKernelCallRequestV1) -> LanguageKernelCallResponseV1,
+> = elm::DirectImport::new();
+
+#[cfg(test)]
+static TEST_RESOURCE_DISPATCH: spin::Mutex<
+    Option<fn(LanguageResourceRequestV1) -> LanguageResourceResponseV1>,
+> = spin::Mutex::new(None);
 
 /// 全局后端数量上限。
 pub const MAX_BACKENDS: usize = 32;
@@ -643,7 +686,137 @@ pub fn drain(
     owner: LanguageOwnerV1,
     request: LanguageDrainRequestV1,
 ) -> Result<LanguageDrainResponseV1, LanguageRuntimeStatus> {
-    REGISTRY.lock().drain(owner, request)
+    let summary = REGISTRY.lock().drain(owner, request)?;
+    let resource_status = revoke_resources(owner);
+    if resource_status != LanguageRuntimeStatus::OK {
+        return Err(resource_status);
+    }
+    Ok(summary)
+}
+
+/// 将语言无关资源请求转交给内核的稳定 kernel symbol。
+///
+/// 资源请求的 owner 由 `ManagedRequest` 提供，不能由 payload 自行伪造。直接 import 未
+/// 绑定时只返回 `UNSUPPORTED`，不会把一个零值槽当作函数地址调用。
+pub fn resource_request(
+    owner: LanguageOwnerV1,
+    request: LanguageResourceRequestV1,
+) -> LanguageResourceResponseV1 {
+    if request.validate_for_owner(owner).is_err() {
+        return LanguageResourceResponseV1::empty(
+            owner,
+            request.request_id,
+            LanguageRuntimeStatus::OWNER_MISMATCH,
+        );
+    }
+    // Safety: DirectImport 仅由 ELM loader 在 kernel symbol 名称、contract、版本和 ABI
+    // 摘要全部匹配后填充；未绑定槽位由 get() 返回 None。
+    let Some(dispatch) = (unsafe { KERNEL_RESOURCE_DISPATCH.get() }) else {
+        #[cfg(test)]
+        if let Some(test_dispatch) = *TEST_RESOURCE_DISPATCH.lock() {
+            return test_dispatch(request);
+        }
+        return LanguageResourceResponseV1::empty(
+            owner,
+            request.request_id,
+            LanguageRuntimeStatus::UNSUPPORTED,
+        );
+    };
+    let response = dispatch(request);
+    if response.validate_for_owner(owner).is_err() || response.request_id != request.request_id {
+        return LanguageResourceResponseV1::empty(
+            owner,
+            request.request_id,
+            LanguageRuntimeStatus::FAULT,
+        );
+    }
+    response
+}
+
+#[cfg(test)]
+fn install_test_resource_dispatch(
+    dispatch: fn(LanguageResourceRequestV1) -> LanguageResourceResponseV1,
+) {
+    *TEST_RESOURCE_DISPATCH.lock() = Some(dispatch);
+}
+
+#[cfg(test)]
+fn clear_test_resource_dispatch() {
+    *TEST_RESOURCE_DISPATCH.lock() = None;
+}
+
+/// 在 owner 卸载时撤销其内核资源。
+pub fn revoke_resources(owner: LanguageOwnerV1) -> LanguageRuntimeStatus {
+    if !owner.is_valid() {
+        return LanguageRuntimeStatus::INVALID_ARGUMENT;
+    }
+    // Safety: 见 [`resource_request`] 的 DirectImport 说明。
+    let Some(revoke) = (unsafe { KERNEL_RESOURCE_REVOKE_OWNER.get() }) else {
+        return LanguageRuntimeStatus::OK;
+    };
+    let status = LanguageRuntimeStatus::from_raw(revoke(owner));
+    if status.raw() == LanguageRuntimeStatus::OK.raw() {
+        LanguageRuntimeStatus::OK
+    } else {
+        status
+    }
+}
+
+/// 在 runtime finalize 时清空内核资源表。
+pub fn reset_resources() -> LanguageRuntimeStatus {
+    // Safety: 见 [`resource_request`] 的 DirectImport 说明。
+    let Some(reset) = (unsafe { KERNEL_RESOURCE_RESET.get() }) else {
+        return LanguageRuntimeStatus::OK;
+    };
+    let status = LanguageRuntimeStatus::from_raw(reset());
+    if status.raw() == LanguageRuntimeStatus::OK.raw() {
+        LanguageRuntimeStatus::OK
+    } else {
+        status
+    }
+}
+
+/// 将 EKI operation 调用转交给 kernel operation registry。
+pub fn kernel_call(
+    owner: LanguageOwnerV1,
+    request: LanguageKernelCallRequestV1,
+) -> LanguageKernelCallResponseV1 {
+    if request.validate_for_owner(owner).is_err() {
+        return LanguageKernelCallResponseV1::new(
+            owner,
+            request.operation_id,
+            request.call_id,
+            LanguageRuntimeStatus::OWNER_MISMATCH,
+            &[],
+        )
+        .expect("固定 owner mismatch 回复必须有效");
+    }
+    // Safety: loader 只在 EKI 名称、版本、capability 和 ABI 摘要全部匹配后填槽。
+    let Some(call) = (unsafe { KERNEL_CALL.get() }) else {
+        return LanguageKernelCallResponseV1::new(
+            owner,
+            request.operation_id,
+            request.call_id,
+            LanguageRuntimeStatus::UNSUPPORTED,
+            &[],
+        )
+        .expect("固定未绑定回复必须有效");
+    };
+    let response = call(request);
+    if response.validate_for_owner(owner).is_err()
+        || response.operation_id != request.operation_id
+        || response.call_id != request.call_id
+    {
+        return LanguageKernelCallResponseV1::new(
+            owner,
+            request.operation_id,
+            request.call_id,
+            LanguageRuntimeStatus::FAULT,
+            &[],
+        )
+        .expect("固定故障回复必须有效");
+    }
+    response
 }
 
 #[cfg(test)]
@@ -771,6 +944,72 @@ mod tests {
         assert_eq!(
             registry.open_instance(OWNER, LanguageBackendRequestV1::new(OWNER, 7)),
             Err(LanguageRuntimeStatus::BUSY)
+        );
+    }
+
+    #[test]
+    fn fake_backend_covers_cancel_unload_and_resource_reclaim() {
+        let mut registry = RuntimeRegistry::new();
+        registry.initialize();
+        registry.register_backend(OWNER, backend()).unwrap();
+        let instance = registry
+            .open_instance(OWNER, LanguageBackendRequestV1::new(OWNER, 7))
+            .unwrap();
+        let request = LanguageRequestV1::new(
+            OWNER.cell_id,
+            OWNER.generation,
+            7,
+            instance.handle,
+            99,
+            1,
+            b"fake",
+        )
+        .unwrap();
+        registry.submit(OWNER, request).unwrap();
+        let canceled = registry
+            .cancel(
+                OWNER,
+                LanguageCancelRequestV1::new(OWNER.cell_id, OWNER.generation, 99, 1),
+            )
+            .unwrap();
+        assert_eq!(canceled.state_kind(), Some(LanguageRequestState::Canceled));
+        registry
+            .release(
+                OWNER,
+                LanguagePollRequestV1::new(OWNER.cell_id, OWNER.generation, 99),
+            )
+            .unwrap();
+
+        fn fake_resource(request: LanguageResourceRequestV1) -> LanguageResourceResponseV1 {
+            LanguageResourceResponseV1::empty(
+                request.owner(),
+                request.request_id,
+                LanguageRuntimeStatus::OK,
+            )
+        }
+        install_test_resource_dispatch(fake_resource);
+        let resource_frame = LanguageResourceRequestV1::empty(
+            OWNER,
+            LanguageHandle::INVALID,
+            LanguageHandle::INVALID,
+            100,
+            elm_language_abi::LANGUAGE_RESOURCE_OPCODE_BUFFER_CREATE,
+        );
+        assert_eq!(
+            resource_request(OWNER, resource_frame).status,
+            LanguageRuntimeStatus::OK.raw()
+        );
+        let summary = registry
+            .drain(
+                OWNER,
+                LanguageDrainRequestV1::new(OWNER.cell_id, OWNER.generation),
+            )
+            .unwrap();
+        assert_eq!(summary.backend_count, 1);
+        clear_test_resource_dispatch();
+        assert_eq!(
+            resource_request(OWNER, resource_frame).status,
+            LanguageRuntimeStatus::UNSUPPORTED.raw()
         );
     }
 }

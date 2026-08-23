@@ -1,0 +1,11 @@
+[package]
+name = "hitoshizuku-rust-language-sdk-example"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+
+[workspace]
+
+[dependencies]
+elm-language-abi = { path = "../../libs/elm-language-abi", default-features = false }

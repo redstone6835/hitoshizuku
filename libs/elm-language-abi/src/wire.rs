@@ -209,6 +209,16 @@ impl<'a> Reader<'a> {
         })
     }
 
+    fn padding4(&mut self) -> Result<(), LanguageWireError> {
+        if self.array::<4>()? == [0; 4] {
+            Ok(())
+        } else {
+            Err(LanguageWireError::Invalid(
+                LanguageValidationError::Reserved,
+            ))
+        }
+    }
+
     fn finish(self) -> Result<(), LanguageWireError> {
         if self.offset == self.input.len() {
             Ok(())
@@ -747,6 +757,326 @@ impl_language_wire!(
             reserved0: reader.u16()?,
             reserved1: reader.u32()?,
             result: reader.array()?,
+        }
+    }
+);
+
+impl_language_wire!(
+    LanguageCapabilityV1,
+    |value: &LanguageCapabilityV1| value.validate(),
+    |value, writer| {
+        writer.handle(value.handle)?;
+        writer.u64(value.rights)?;
+        writer.u64(value.owner_cell_id)?;
+        writer.u64(value.owner_generation)?;
+    },
+    |reader| {
+        LanguageCapabilityV1 {
+            handle: reader.handle()?,
+            rights: reader.u64()?,
+            owner_cell_id: reader.u64()?,
+            owner_generation: reader.u64()?,
+        }
+    }
+);
+
+impl_language_wire!(
+    LanguageResourceHandleV1,
+    |value: &LanguageResourceHandleV1| value.validate(),
+    |value, writer| {
+        writer.handle(value.handle)?;
+        writer.u32(value.kind)?;
+        writer.u32(value.flags)?;
+        writer.u64(value.owner_cell_id)?;
+        writer.u64(value.owner_generation)?;
+    },
+    |reader| {
+        LanguageResourceHandleV1 {
+            handle: reader.handle()?,
+            kind: reader.u32()?,
+            flags: reader.u32()?,
+            owner_cell_id: reader.u64()?,
+            owner_generation: reader.u64()?,
+        }
+    }
+);
+
+impl_language_wire!(
+    LanguageMmioMapPayloadV1,
+    |value: &LanguageMmioMapPayloadV1| value.validate(),
+    |value, writer| {
+        writer.u64(value.physical_base)?;
+        writer.u64(value.length)?;
+        writer.u32(value.access_flags)?;
+        writer.u32(value.cache_mode)?;
+        writer.u64(value.reserved)?;
+    },
+    |reader| {
+        LanguageMmioMapPayloadV1 {
+            physical_base: reader.u64()?,
+            length: reader.u64()?,
+            access_flags: reader.u32()?,
+            cache_mode: reader.u32()?,
+            reserved: reader.u64()?,
+        }
+    }
+);
+
+impl_language_wire!(
+    LanguageMmioAccessPayloadV1,
+    |value: &LanguageMmioAccessPayloadV1| value.validate(),
+    |value, writer| {
+        writer.u64(value.offset)?;
+        writer.u64(value.value)?;
+        writer.u32(value.width)?;
+        writer.u32(value.flags)?;
+        writer.u64(value.reserved)?;
+    },
+    |reader| {
+        LanguageMmioAccessPayloadV1 {
+            offset: reader.u64()?,
+            value: reader.u64()?,
+            width: reader.u32()?,
+            flags: reader.u32()?,
+            reserved: reader.u64()?,
+        }
+    }
+);
+
+impl_language_wire!(
+    LanguageDmaAllocatePayloadV1,
+    |value: &LanguageDmaAllocatePayloadV1| value.validate(),
+    |value, writer| {
+        writer.u64(value.length)?;
+        writer.u32(value.alignment)?;
+        writer.u32(value.direction)?;
+        writer.u32(value.flags)?;
+        writer.u32(value.reserved)?;
+    },
+    |reader| {
+        LanguageDmaAllocatePayloadV1 {
+            length: reader.u64()?,
+            alignment: reader.u32()?,
+            direction: reader.u32()?,
+            flags: reader.u32()?,
+            reserved: reader.u32()?,
+        }
+    }
+);
+
+impl_language_wire!(
+    LanguageDmaSyncPayloadV1,
+    |value: &LanguageDmaSyncPayloadV1| value.validate(),
+    |value, writer| {
+        writer.u64(value.offset)?;
+        writer.u64(value.length)?;
+        writer.u32(value.direction)?;
+        writer.u32(value.reserved)?;
+    },
+    |reader| {
+        LanguageDmaSyncPayloadV1 {
+            offset: reader.u64()?,
+            length: reader.u64()?,
+            direction: reader.u32()?,
+            reserved: reader.u32()?,
+        }
+    }
+);
+
+impl_language_wire!(
+    LanguageBufferLeasePayloadV1,
+    |value: &LanguageBufferLeasePayloadV1| value.validate(),
+    |value, writer| {
+        writer.handle(value.buffer_handle)?;
+        writer.u64(value.offset)?;
+        writer.u64(value.length)?;
+        writer.u32(value.access_flags)?;
+        writer.u32(value.reserved)?;
+    },
+    |reader| {
+        LanguageBufferLeasePayloadV1 {
+            buffer_handle: reader.handle()?,
+            offset: reader.u64()?,
+            length: reader.u64()?,
+            access_flags: reader.u32()?,
+            reserved: reader.u32()?,
+        }
+    }
+);
+
+impl_language_wire!(
+    LanguageBufferIoPayloadV1,
+    |value: &LanguageBufferIoPayloadV1| value.validate(),
+    |value, writer| {
+        writer.u64(value.offset)?;
+        writer.u16(value.data_len)?;
+        writer.u16(value.reserved0)?;
+        writer.u32(value.reserved1)?;
+        writer.bytes(&value.data)?;
+    },
+    |reader| {
+        LanguageBufferIoPayloadV1 {
+            offset: reader.u64()?,
+            data_len: reader.u16()?,
+            reserved0: reader.u16()?,
+            reserved1: reader.u32()?,
+            data: reader.array()?,
+        }
+    }
+);
+
+impl_language_wire!(
+    LanguageResourceRequestV1,
+    |value: &LanguageResourceRequestV1| value.validate(),
+    |value, writer| {
+        writer.u16(value.abi_version)?;
+        writer.u16(value.struct_size)?;
+        writer.u32(value.flags)?;
+        writer.u64(value.owner_cell_id)?;
+        writer.u64(value.owner_generation)?;
+        writer.handle(value.capability_handle)?;
+        writer.handle(value.resource_handle)?;
+        writer.u64(value.request_id)?;
+        writer.u32(value.opcode)?;
+        writer.u16(value.payload_len)?;
+        writer.u16(value.reserved0)?;
+        writer.bytes(&value.payload)?;
+        writer.u64(value.reserved1)?;
+    },
+    |reader| {
+        LanguageResourceRequestV1 {
+            abi_version: reader.u16()?,
+            struct_size: reader.u16()?,
+            flags: reader.u32()?,
+            owner_cell_id: reader.u64()?,
+            owner_generation: reader.u64()?,
+            capability_handle: reader.handle()?,
+            resource_handle: reader.handle()?,
+            request_id: reader.u64()?,
+            opcode: reader.u32()?,
+            payload_len: reader.u16()?,
+            reserved0: reader.u16()?,
+            payload: reader.array()?,
+            reserved1: reader.u64()?,
+        }
+    }
+);
+
+impl_language_wire!(
+    LanguageResourceResponseV1,
+    |value: &LanguageResourceResponseV1| value.validate(),
+    |value, writer| {
+        writer.u16(value.abi_version)?;
+        writer.u16(value.struct_size)?;
+        writer.u32(value.flags)?;
+        writer.i32(value.status)?;
+        writer.u32(value.reserved0)?;
+        writer.u64(value.owner_cell_id)?;
+        writer.u64(value.owner_generation)?;
+        writer.u64(value.request_id)?;
+        writer.handle(value.resource_handle)?;
+        writer.u32(value.resource_kind)?;
+        writer.u16(value.payload_len)?;
+        writer.u16(value.reserved1)?;
+        writer.bytes(&value.payload)?;
+        writer.u64(value.reserved2)?;
+    },
+    |reader| {
+        LanguageResourceResponseV1 {
+            abi_version: reader.u16()?,
+            struct_size: reader.u16()?,
+            flags: reader.u32()?,
+            status: reader.i32()?,
+            reserved0: reader.u32()?,
+            owner_cell_id: reader.u64()?,
+            owner_generation: reader.u64()?,
+            request_id: reader.u64()?,
+            resource_handle: reader.handle()?,
+            resource_kind: reader.u32()?,
+            payload_len: reader.u16()?,
+            reserved1: reader.u16()?,
+            payload: reader.array()?,
+            reserved2: reader.u64()?,
+        }
+    }
+);
+
+impl_language_wire!(
+    LanguageKernelCallRequestV1,
+    |value: &LanguageKernelCallRequestV1| value.validate(),
+    |value, writer| {
+        writer.u16(value.abi_version)?;
+        writer.u16(value.struct_size)?;
+        writer.u32(value.flags)?;
+        writer.u64(value.owner_cell_id)?;
+        writer.u64(value.owner_generation)?;
+        writer.handle(value.capability_handle)?;
+        writer.u64(value.operation_id)?;
+        writer.u64(value.call_id)?;
+        writer.u16(value.input_len)?;
+        writer.u16(value.reserved0)?;
+        writer.bytes(&value.input)?;
+        writer.bytes(&[0; 4])?;
+        writer.u64(value.reserved1)?;
+    },
+    |reader| {
+        LanguageKernelCallRequestV1 {
+            abi_version: reader.u16()?,
+            struct_size: reader.u16()?,
+            flags: reader.u32()?,
+            owner_cell_id: reader.u64()?,
+            owner_generation: reader.u64()?,
+            capability_handle: reader.handle()?,
+            operation_id: reader.u64()?,
+            call_id: reader.u64()?,
+            input_len: reader.u16()?,
+            reserved0: reader.u16()?,
+            input: reader.array()?,
+            reserved1: {
+                reader.padding4()?;
+                reader.u64()?
+            },
+        }
+    }
+);
+
+impl_language_wire!(
+    LanguageKernelCallResponseV1,
+    |value: &LanguageKernelCallResponseV1| value.validate(),
+    |value, writer| {
+        writer.u16(value.abi_version)?;
+        writer.u16(value.struct_size)?;
+        writer.u32(value.flags)?;
+        writer.i32(value.status)?;
+        writer.u32(value.reserved0)?;
+        writer.u64(value.owner_cell_id)?;
+        writer.u64(value.owner_generation)?;
+        writer.u64(value.operation_id)?;
+        writer.u64(value.call_id)?;
+        writer.u16(value.output_len)?;
+        writer.u16(value.reserved1)?;
+        writer.bytes(&value.output)?;
+        writer.bytes(&[0; 4])?;
+        writer.u64(value.reserved2)?;
+    },
+    |reader| {
+        LanguageKernelCallResponseV1 {
+            abi_version: reader.u16()?,
+            struct_size: reader.u16()?,
+            flags: reader.u32()?,
+            status: reader.i32()?,
+            reserved0: reader.u32()?,
+            owner_cell_id: reader.u64()?,
+            owner_generation: reader.u64()?,
+            operation_id: reader.u64()?,
+            call_id: reader.u64()?,
+            output_len: reader.u16()?,
+            reserved1: reader.u16()?,
+            output: reader.array()?,
+            reserved2: {
+                reader.padding4()?;
+                reader.u64()?
+            },
         }
     }
 );

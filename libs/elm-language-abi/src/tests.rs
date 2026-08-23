@@ -9,6 +9,14 @@ const HANDLE: LanguageHandle = LanguageHandle {
     slot: 7,
     generation: 2,
 };
+const CAPABILITY_HANDLE: LanguageHandle = LanguageHandle {
+    slot: 8,
+    generation: 4,
+};
+const RESOURCE_HANDLE: LanguageHandle = LanguageHandle {
+    slot: 9,
+    generation: 5,
+};
 
 #[test]
 fn fixed_layouts_are_architecture_independent() {
@@ -32,6 +40,233 @@ fn fixed_layouts_are_architecture_independent() {
     assert_eq!(size_of::<LanguageDrainResponseV1>(), 32);
     assert_eq!(align_of::<LanguageRequestV1>(), 8);
     assert_eq!(align_of::<LanguagePollResponseV1>(), 8);
+    assert_eq!(size_of::<LanguageCapabilityV1>(), 32);
+    assert_eq!(size_of::<LanguageResourceHandleV1>(), 32);
+    assert_eq!(size_of::<LanguageMmioMapPayloadV1>(), 32);
+    assert_eq!(size_of::<LanguageMmioAccessPayloadV1>(), 32);
+    assert_eq!(size_of::<LanguageDmaAllocatePayloadV1>(), 24);
+    assert_eq!(size_of::<LanguageDmaSyncPayloadV1>(), 24);
+    assert_eq!(size_of::<LanguageBufferLeasePayloadV1>(), 32);
+    assert_eq!(
+        size_of::<LanguageBufferIoPayloadV1>(),
+        LANGUAGE_FRAME_PAYLOAD_LEN
+    );
+    assert_eq!(
+        size_of::<LanguageResourceRequestV1>(),
+        LANGUAGE_MANAGED_FRAME_LEN
+    );
+    assert_eq!(
+        size_of::<LanguageResourceResponseV1>(),
+        LANGUAGE_MANAGED_FRAME_LEN
+    );
+    assert_eq!(
+        size_of::<LanguageKernelCallRequestV1>(),
+        LANGUAGE_MANAGED_FRAME_LEN
+    );
+    assert_eq!(
+        size_of::<LanguageKernelCallResponseV1>(),
+        LANGUAGE_MANAGED_FRAME_LEN
+    );
+}
+
+#[test]
+fn resource_capability_and_handles_validate_owner_and_rights() {
+    let rights = LANGUAGE_CAPABILITY_MMIO_MAP | LANGUAGE_CAPABILITY_MMIO_READ;
+    let capability = LanguageCapabilityV1::new(CAPABILITY_HANDLE, rights, OWNER);
+    assert_eq!(capability.validate(), Ok(()));
+    assert!(capability.grants(LANGUAGE_CAPABILITY_MMIO_READ));
+    assert!(!capability.grants(LANGUAGE_CAPABILITY_MMIO_WRITE));
+    assert_eq!(capability.validate_for_owner(OWNER), Ok(()));
+
+    let mut invalid = capability;
+    invalid.rights = 1 << 63;
+    assert_eq!(invalid.validate(), Err(LanguageValidationError::Capability));
+
+    let resource = LanguageResourceHandleV1::new(
+        RESOURCE_HANDLE,
+        LanguageResourceKind::Mmio,
+        LANGUAGE_RESOURCE_FLAG_OWNED | LANGUAGE_RESOURCE_FLAG_READ,
+        OWNER,
+    );
+    assert_eq!(resource.validate(), Ok(()));
+    assert_eq!(resource.kind(), Some(LanguageResourceKind::Mmio));
+
+    let mut invalid_kind = resource;
+    invalid_kind.kind = 99;
+    assert_eq!(
+        invalid_kind.validate(),
+        Err(LanguageValidationError::ResourceKind)
+    );
+}
+
+#[test]
+fn resource_payloads_reject_empty_overflow_and_unknown_modes() {
+    let map = LanguageMmioMapPayloadV1 {
+        physical_base: 0x1000,
+        length: 0x1000,
+        access_flags: LANGUAGE_MMIO_ACCESS_READ | LANGUAGE_MMIO_ACCESS_VOLATILE,
+        cache_mode: LanguageMmioCacheMode::Device as u32,
+        reserved: 0,
+    };
+    assert_eq!(map.validate(), Ok(()));
+
+    let mut map_overflow = map;
+    map_overflow.physical_base = u64::MAX;
+    assert_eq!(map_overflow.validate(), Err(LanguageValidationError::Range));
+    let mut map_mode = map;
+    map_mode.cache_mode = 99;
+    assert_eq!(map_mode.validate(), Err(LanguageValidationError::CacheMode));
+
+    let access = LanguageMmioAccessPayloadV1 {
+        offset: 8,
+        value: 0,
+        width: 4,
+        flags: 0,
+        reserved: 0,
+    };
+    assert_eq!(access.validate(), Ok(()));
+    let mut unaligned = access;
+    unaligned.offset = 2;
+    assert_eq!(
+        unaligned.validate(),
+        Err(LanguageValidationError::Alignment)
+    );
+
+    let dma = LanguageDmaAllocatePayloadV1 {
+        length: 4096,
+        alignment: 4096,
+        direction: LanguageDmaDirection::Bidirectional as u32,
+        flags: LANGUAGE_DMA_FLAG_COHERENT,
+        reserved: 0,
+    };
+    assert_eq!(dma.validate(), Ok(()));
+    let mut bad_alignment = dma;
+    bad_alignment.alignment = 3;
+    assert_eq!(
+        bad_alignment.validate(),
+        Err(LanguageValidationError::Alignment)
+    );
+    let mut bad_direction = dma;
+    bad_direction.direction = 0;
+    assert_eq!(
+        bad_direction.validate(),
+        Err(LanguageValidationError::Direction)
+    );
+
+    let sync = LanguageDmaSyncPayloadV1 {
+        offset: 16,
+        length: 64,
+        direction: LanguageDmaDirection::ToDevice as u32,
+        reserved: 0,
+    };
+    assert_eq!(sync.validate(), Ok(()));
+    let mut sync_overflow = sync;
+    sync_overflow.offset = u64::MAX;
+    assert_eq!(
+        sync_overflow.validate(),
+        Err(LanguageValidationError::Range)
+    );
+
+    let lease = LanguageBufferLeasePayloadV1 {
+        buffer_handle: RESOURCE_HANDLE,
+        offset: 0,
+        length: 128,
+        access_flags: LANGUAGE_BUFFER_LEASE_READ | LANGUAGE_BUFFER_LEASE_WRITE,
+        reserved: 0,
+    };
+    assert_eq!(lease.validate(), Ok(()));
+    let mut no_access = lease;
+    no_access.access_flags = 0;
+    assert_eq!(no_access.validate(), Err(LanguageValidationError::Access));
+
+    let io = LanguageBufferIoPayloadV1::new(4, b"hello").unwrap();
+    assert_eq!(io.data().unwrap(), b"hello");
+    let mut io_overflow = io;
+    io_overflow.offset = u64::MAX;
+    assert_eq!(io_overflow.validate(), Err(LanguageValidationError::Range));
+    let oversized = [0_u8; LanguageBufferIoPayloadV1::DATA_CAPACITY + 1];
+    assert_eq!(
+        LanguageBufferIoPayloadV1::new(0, &oversized),
+        Err(LanguageValidationError::PayloadLength)
+    );
+}
+
+#[test]
+fn resource_frames_bind_optional_handles_and_owner() {
+    let payload = [0xa5; 32];
+    let request = LanguageResourceRequestV1::new(
+        OWNER,
+        CAPABILITY_HANDLE,
+        RESOURCE_HANDLE,
+        41,
+        LANGUAGE_RESOURCE_OPCODE_MMIO_READ,
+        &payload,
+    )
+    .unwrap();
+    assert_eq!(request.validate(), Ok(()));
+    assert_eq!(request.validate_for_owner(OWNER), Ok(()));
+    assert_eq!(request.payload().unwrap(), payload);
+
+    let mut missing_flag = request;
+    missing_flag.flags &= !LANGUAGE_RESOURCE_REQUEST_FLAG_HAS_RESOURCE;
+    assert_eq!(missing_flag.validate(), Err(LanguageValidationError::Flags));
+
+    let resource = LanguageResourceHandleV1::new(
+        RESOURCE_HANDLE,
+        LanguageResourceKind::Mmio,
+        LANGUAGE_RESOURCE_FLAG_OWNED | LANGUAGE_RESOURCE_FLAG_READ,
+        OWNER,
+    );
+    let response = LanguageResourceResponseV1::with_resource(
+        OWNER,
+        41,
+        LanguageRuntimeStatus::OK,
+        resource,
+        b"ok",
+    )
+    .unwrap();
+    assert_eq!(response.validate(), Ok(()));
+    assert_eq!(response.payload().unwrap(), b"ok");
+    assert_eq!(response.validate_for_owner(OWNER), Ok(()));
+
+    let mut bad_response = response;
+    bad_response.resource_kind = 99;
+    assert_eq!(
+        bad_response.validate(),
+        Err(LanguageValidationError::ResourceKind)
+    );
+}
+
+#[test]
+fn kernel_call_frames_validate_operation_identity_and_owner() {
+    let request =
+        LanguageKernelCallRequestV1::new(OWNER, CAPABILITY_HANDLE, 0x1234, 41, b"input").unwrap();
+    assert_eq!(request.validate(), Ok(()));
+    assert_eq!(request.validate_for_owner(OWNER), Ok(()));
+    assert_eq!(request.input().unwrap(), b"input");
+
+    let mut bad_flags = request;
+    bad_flags.flags = 1 << 31;
+    assert_eq!(bad_flags.validate(), Err(LanguageValidationError::Flags));
+    let mut bad_operation = request;
+    bad_operation.operation_id = 0;
+    assert_eq!(
+        bad_operation.validate(),
+        Err(LanguageValidationError::Identifier)
+    );
+
+    let response =
+        LanguageKernelCallResponseV1::new(OWNER, 0x1234, 41, LanguageRuntimeStatus::OK, b"output")
+            .unwrap();
+    assert_eq!(response.validate(), Ok(()));
+    assert_eq!(response.validate_for_owner(OWNER), Ok(()));
+    assert_eq!(response.output().unwrap(), b"output");
+    let mut bad_owner = response;
+    bad_owner.owner_generation += 1;
+    assert_eq!(
+        bad_owner.validate_for_owner(OWNER),
+        Err(LanguageValidationError::Owner)
+    );
 }
 
 #[test]
@@ -395,6 +630,74 @@ fn every_v1_wire_structure_round_trips_without_host_layout_copy() {
     let drain_reply = LanguageDrainResponseV1::new(1, 2, 3);
     let submit_reply = LanguageRequestSubmitResponseV1::queued(41);
     let poll_reply = LanguagePollResponseV1::pending(11, 3, 2, HANDLE, 41);
+    let capability = LanguageCapabilityV1::new(
+        CAPABILITY_HANDLE,
+        LANGUAGE_CAPABILITY_MMIO_MAP | LANGUAGE_CAPABILITY_MMIO_READ,
+        OWNER,
+    );
+    let resource = LanguageResourceHandleV1::new(
+        RESOURCE_HANDLE,
+        LanguageResourceKind::Mmio,
+        LANGUAGE_RESOURCE_FLAG_OWNED | LANGUAGE_RESOURCE_FLAG_READ,
+        OWNER,
+    );
+    let mmio_map = LanguageMmioMapPayloadV1 {
+        physical_base: 0x1000,
+        length: 0x1000,
+        access_flags: LANGUAGE_MMIO_ACCESS_READ,
+        cache_mode: LanguageMmioCacheMode::Uncached as u32,
+        reserved: 0,
+    };
+    let mmio_access = LanguageMmioAccessPayloadV1 {
+        offset: 0,
+        value: 0x55,
+        width: 4,
+        flags: 0,
+        reserved: 0,
+    };
+    let dma_allocate = LanguageDmaAllocatePayloadV1 {
+        length: 4096,
+        alignment: 4096,
+        direction: LanguageDmaDirection::ToDevice as u32,
+        flags: 0,
+        reserved: 0,
+    };
+    let dma_sync = LanguageDmaSyncPayloadV1 {
+        offset: 0,
+        length: 64,
+        direction: LanguageDmaDirection::ToDevice as u32,
+        reserved: 0,
+    };
+    let lease = LanguageBufferLeasePayloadV1 {
+        buffer_handle: RESOURCE_HANDLE,
+        offset: 0,
+        length: 64,
+        access_flags: LANGUAGE_BUFFER_LEASE_READ,
+        reserved: 0,
+    };
+    let buffer_io = LanguageBufferIoPayloadV1::new(0, b"payload").unwrap();
+    let resource_request = LanguageResourceRequestV1::new(
+        OWNER,
+        CAPABILITY_HANDLE,
+        RESOURCE_HANDLE,
+        41,
+        LANGUAGE_RESOURCE_OPCODE_MMIO_READ,
+        b"request",
+    )
+    .unwrap();
+    let resource_response = LanguageResourceResponseV1::with_resource(
+        OWNER,
+        41,
+        LanguageRuntimeStatus::OK,
+        resource,
+        b"ok",
+    )
+    .unwrap();
+    let kernel_request =
+        LanguageKernelCallRequestV1::new(OWNER, CAPABILITY_HANDLE, 0x1234, 41, b"input").unwrap();
+    let kernel_response =
+        LanguageKernelCallResponseV1::new(OWNER, 0x1234, 41, LanguageRuntimeStatus::OK, b"output")
+            .unwrap();
 
     round_trip(LanguageId::from_raw(1));
     round_trip(BackendId::from_raw(2));
@@ -418,6 +721,18 @@ fn every_v1_wire_structure_round_trips_without_host_layout_copy() {
     round_trip(drain_reply);
     round_trip(submit_reply);
     round_trip(poll_reply);
+    round_trip(capability);
+    round_trip(resource);
+    round_trip(mmio_map);
+    round_trip(mmio_access);
+    round_trip(dma_allocate);
+    round_trip(dma_sync);
+    round_trip(lease);
+    round_trip(buffer_io);
+    round_trip(resource_request);
+    round_trip(resource_response);
+    round_trip(kernel_request);
+    round_trip(kernel_response);
 }
 
 #[test]
@@ -450,6 +765,18 @@ fn wire_rejects_short_long_and_semantically_malformed_input() {
     backend_wire[backend_wire.len() - 1] = 1;
     assert_eq!(
         LanguageBackendDescriptorV1::decode_wire(&backend_wire),
+        Err(LanguageWireError::Invalid(
+            LanguageValidationError::Reserved
+        ))
+    );
+
+    let kernel =
+        LanguageKernelCallRequestV1::new(OWNER, CAPABILITY_HANDLE, 0x1234, 41, b"input").unwrap();
+    let mut kernel_wire = [0_u8; <LanguageKernelCallRequestV1 as LanguageWire>::WIRE_SIZE];
+    kernel.encode_wire(&mut kernel_wire).unwrap();
+    kernel_wire[244] = 1;
+    assert_eq!(
+        LanguageKernelCallRequestV1::decode_wire(&kernel_wire),
         Err(LanguageWireError::Invalid(
             LanguageValidationError::Reserved
         ))

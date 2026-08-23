@@ -24,6 +24,7 @@ kernel/     最终镜像、系统调用、进程、ELM 管理和网络 host
 libs/       allocator、sched、net、socket、vfs、elm、language ABI、soyo 等共享 crate
 drivers/    项目自有硬件驱动与 ELM 服务；由 Modules.toml 选择 y/m/n
 xtask/      内核 Cargo 编排入口
+examples/   独立 Cargo workspace 的 Rust SDK 与 fake transport 示例
 ```
 
 旧版单仓库中的 `tools/`、`native/`、`bench/` 已从内核 checkout 拆分。需要构建模块时先安装

@@ -436,10 +436,10 @@ pub fn import(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// 作者不应直接使用此 attribute。内核与 ELM 必须通过同一工具链、目标特性和 ABI 指纹校验；
 /// 错误签名转换属于未定义行为，因此符号目录与投影必须由同一份接口定义生成。
 ///
-/// 每个槽使用确定名称的内部链接和独立 `.data.elm_imports.<slot>` 输入段。接口投影必须启用
-/// nightly `linkage` feature，并以非内联薄包装引用槽；链接器因此只保留业务代码实际调用的
-/// 槽。`.elm.meta` 可以保存完整接口目录，但 `cargo elm` 只把最终 ELF 中仍存在的槽投影为
-/// EBI import，避免“依赖一个接口 crate 就获得整组符号”的权限扩张。
+/// 每个槽使用确定名称和独立 `.data.elm_imports.<slot>` 输入段，并通过 `#[used]` 保留到
+/// 最终目标文件；这条实现不依赖 nightly-only 的 `linkage` 属性，普通默认 Rust 工具链
+/// 也能编译接口投影。`.elm.meta` 可以保存完整接口目录，但 `cargo elm` 只把最终 ELF 中
+/// 仍存在的槽投影为 EBI import，避免“依赖一个接口 crate 就获得整组符号”的权限扩张。
 ///
 /// ```ignore
 /// #[elm::kernel_symbol(
@@ -1507,7 +1507,11 @@ fn kernel_symbol_impl(attr: TokenStream2, mut item: ItemStatic) -> syn::Result<T
         ident.to_string().to_ascii_lowercase()
     );
     validate_symbol(&symbol, "kernel symbol slot")?;
-    item.attrs.push(syn::parse_quote!(#[linkage = "internal"]));
+    // `linkage = "internal"` is nightly-only and makes ordinary Cargo users unable to
+    // compile a bridge crate with the default toolchain.  The ELM import section and
+    // metadata already provide the loader identity; a retained, exported zero slot is
+    // sufficient for the loader to patch before activation.
+    item.attrs.push(syn::parse_quote!(#[used]));
     item.attrs
         .push(syn::parse_quote!(#[unsafe(export_name = #symbol)]));
     item.attrs

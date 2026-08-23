@@ -36,6 +36,8 @@ backend、instance 和异步 request 的有界注册表，把 ELM 的 cell/gener
 | `language.runtime.request.cancel@1` | owner、request ID 与原因，返回取消后的状态 |
 | `language.runtime.request.release@1` | owner 与 request ID，仅终态可删除 |
 | `language.runtime.drain@1` | owner，返回 backend/instance/request 回收计数 |
+| `language.runtime.resource@1` | capability、MMIO、DMA 和 buffer lease 的固定资源帧 |
+| `language.runtime.kernel.call@1` | EKI operation ID、owner 和有界输入/输出帧 |
 
 所有携带 owner 的 wire 输入都不可信。managed export 必须从 `ManagedRequest` 取得真实调用方
 cell/generation，再与输入结构逐项比较；只校验 payload 中自报的 owner 不构成授权。
@@ -49,6 +51,17 @@ cell/generation，再与输入结构逐项比较；只校验 payload 中自报�
 模块初始化和恢复时接受新对象；pause/quiesce 时停止接受新对象并使未完成请求过期；
 finalize 清空注册表。语言 backend 卸载前应停止 `next`、处理已领取工作并调用 `drain`，
 consumer 卸载前应停止 submit、释放终态请求并关闭 instance。
+
+`drain` 在清理运行时注册表后还会调用 `general.dev.language.resource.revoke_owner`，因此
+同一个 ELM generation 的 capability、DMA handle 和 buffer lease 不会在 runtime 对象清空后
+继续存活。`finalize` 调用 `general.dev.language.resource.reset`；内核侧 handler 会释放
+语言资源表中的拥有对象。未安装对应 kernel symbol 时返回 `UNSUPPORTED`，不会把空的
+`DirectImport` 槽当作函数地址调用。
+
+资源帧的统一定义位于 `elm-language-abi`。当前内核已接通 capability 与 DMA allocate/sync/
+release；MMIO 和受管 buffer 的 wire、权限、范围及 lease 生命周期已经固定，具体硬件映射
+能力在对应 General resource provider 注册前保持 `UNSUPPORTED`。这让 SDK 可以先稳定发布，
+而不会把未审核的物理地址操作伪装成可用能力。
 
 ## `y` 模式限制
 
@@ -67,3 +80,7 @@ cargo check -p language-runtime --lib --target loongarch64-unknown-none
 cargo check -p language-runtime --lib --target riscv64gc-unknown-none-elf
 cargo xtask modules --target loongarch64-unknown-none
 ```
+
+语言无关的 `LanguagePackage.toml`、`LanguageBridge.toml`、schema 和 Rust SDK 由独立
+`cargo-elm` 工具生成。一个不引入新语言的调用示例见
+[`examples/rust-language-sdk`](../../examples/rust-language-sdk)。

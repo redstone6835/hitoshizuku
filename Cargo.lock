@@ -290,6 +290,7 @@ dependencies = [
  "allocator",
  "efi",
  "elm",
+ "elm-language-abi",
  "errno",
  "extfs",
  "fatfs",
@@ -359,6 +360,7 @@ dependencies = [
  "efi",
  "elf",
  "elm",
+ "elm-language-abi",
  "elm-loader",
  "errno",
  "extfs",
@@ -377,6 +379,7 @@ dependencies = [
  "sha2",
  "socket",
  "soyo",
+ "spin",
  "vfs",
 ]
 

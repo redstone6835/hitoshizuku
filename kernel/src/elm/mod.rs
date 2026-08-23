@@ -121,6 +121,7 @@ mod executor;
 mod journal;
 mod kernel_mixin;
 mod kernel_symbols;
+mod language_resources;
 mod menu;
 mod mgr_channel;
 mod native;
@@ -160,6 +161,15 @@ pub(crate) fn init_builtin_mgr() {
     let _ = extfs::kernel_symbol_catalog_anchor();
     let _ = fatfs::kernel_symbol_catalog_anchor();
     let _ = general::kernel_symbol_catalog_anchor();
+    if !general::dev::language::install(
+        language_resources::dispatch,
+        language_resources::revoke_owner,
+        language_resources::reset,
+    ) {
+        log::error!("[elm] 语言资源 kernel bridge 重复安装");
+        return;
+    }
+    let _ = general::dev::language::install_kernel_call(language_resources::kernel_call);
     let _ = hal::kernel_symbol_catalog_anchor();
     let _ = mm::kernel_symbol_catalog_anchor();
     let _ = net::kernel_symbol_catalog_anchor();

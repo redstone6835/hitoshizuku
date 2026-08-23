@@ -30,6 +30,20 @@ pub enum LanguageValidationError {
     Name = 10,
     /// 容量字段为零或超过协议上限。
     Capacity = 11,
+    /// capability 位掩码为空或设置了未定义位。
+    Capability = 12,
+    /// 资源种类值未知。
+    ResourceKind = 13,
+    /// 地址和长度构成了空或溢出的范围。
+    Range = 14,
+    /// 对齐或访问宽度不满足协议约束。
+    Alignment = 15,
+    /// 访问权限为空或不满足操作要求。
+    Access = 16,
+    /// cache mode 值未知。
+    CacheMode = 17,
+    /// DMA direction 值未知。
+    Direction = 18,
 }
 
 /// ABI 结构校验的结果别名。
@@ -50,6 +64,13 @@ impl LanguageValidationError {
             Self::State => LanguageRuntimeStatus::BAD_STATE,
             Self::Name => LanguageRuntimeStatus::INVALID_ARGUMENT,
             Self::Capacity => LanguageRuntimeStatus::NO_CAPACITY,
+            Self::Capability
+            | Self::ResourceKind
+            | Self::Range
+            | Self::Alignment
+            | Self::CacheMode
+            | Self::Direction => LanguageRuntimeStatus::INVALID_ARGUMENT,
+            Self::Access => LanguageRuntimeStatus::FLAGS_INVALID,
         }
     }
 }
@@ -150,6 +171,15 @@ pub const fn validate_payload_length(length: u16, capacity: usize) -> Validation
         Ok(())
     } else {
         Err(LanguageValidationError::PayloadLength)
+    }
+}
+
+/// 验证一个非空且不溢出的地址/长度范围。
+pub const fn validate_range(base: u64, length: u64) -> ValidationResult {
+    if length == 0 || base.checked_add(length).is_none() {
+        Err(LanguageValidationError::Range)
+    } else {
+        Ok(())
     }
 }
 

@@ -19,6 +19,7 @@ acpi = { path = "../libs/acpi", default-features = false }
 allocator = { path = "../libs/allocator" }
 efi = { path = "../libs/efi" }
 elm_model = { package = "elm", path = "../libs/elm" }
+elm-language-abi = { path = "../libs/elm-language-abi", default-features = false }
 errno = { path = "../libs/errno" }
 extfs = { path = "../libs/extfs" }
 fatfs = { path = "../libs/fatfs" }

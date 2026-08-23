@@ -22,7 +22,7 @@
 
 ELM managed call 的总载荷上限为 256 字节。V1 为请求头保留空间，因此单个请求或结果的
 业务内联载荷上限是 `LANGUAGE_FRAME_PAYLOAD_LEN`（192 字节）；完整的最大轮询回复仍恰好是
-256 字节。需要传递更大对象时应在后续 ABI 中引入受管 buffer handle，而不是传递地址。
+256 字节。需要传递更大对象时应使用受管 buffer handle/lease，而不是传递地址。
 
 ## 稳定合约
 
@@ -41,7 +41,12 @@ language.runtime.request.poll@1
 language.runtime.request.cancel@1
 language.runtime.request.release@1
 language.runtime.drain@1
+language.runtime.resource@1
+language.runtime.kernel.call@1
 ```
+
+最后两个是资源扩展 contract，不改变旧目录的 12 个基础 contract 计数；支持资源面的
+消费者应显式检查 `LANGUAGE_RUNTIME_RESOURCE_CONTRACTS`。
 
 `LanguageBackendDescriptorV1` 描述后端，`LanguageInstanceDescriptorV1` 描述 owner 绑定的
 实例，`LanguageRequestV1`、`LanguagePollRequestV1`、`LanguageCancelRequestV1` 和
@@ -56,10 +61,34 @@ Rust 代码通过密封的 `LanguageWire` trait 编解码这些结构。实现�
 `repr(C)` 内存做转置或裸指针复制；解码要求精确长度并自动调用结构校验。语言 SDK 应实现
 同一字段顺序与校验规则，不应把 Rust 内存布局当成序列化格式。
 
+## 资源边界
+
+`resource@1` 是语言无关的 capability 和资源控制面。`LanguageCapabilityV1` 表示由内核
+授予的 capability 位集合，`LanguageResourceHandleV1` 表示带 owner/generation 的 opaque
+资源句柄。句柄永远不是地址，运行时必须在每次使用时检查 owner、generation、资源种类和
+权限 flags。
+
+资源请求与回复分别使用 `LanguageResourceRequestV1` 和 `LanguageResourceResponseV1`，两者
+固定为 256 字节，内联 payload 上限仍为 192 字节。操作编号覆盖 capability acquire/revoke、
+MMIO map/read/write/unmap、DMA allocate/sync/release、buffer create/lease/read/write/release。
+
+具体参数类型包括：
+
+- `LanguageMmioMapPayloadV1`：物理范围、访问权限、cache mode；范围必须非空且不溢出；
+- `LanguageMmioAccessPayloadV1`：1/2/4/8 字节对齐访问；
+- `LanguageDmaAllocatePayloadV1` 与 `LanguageDmaSyncPayloadV1`：长度、二次幂对齐、方向和
+  cache 同步范围；
+- `LanguageBufferLeasePayloadV1`：受限 buffer handle、偏移、长度和读写权限；
+- `LanguageBufferIoPayloadV1`：最多 176 字节的内联读写数据，较大传输必须拆分。
+
+这些结构只描述安全边界，不会自动授予权限，也不替代 EKI import、ELM trust policy 或内核
+capability mask。资源 owner 撤销后，所有关联 handle 和 lease 都必须视为 stale。
+
 ## 当前范围
 
-V1 不包含语言 SDK、编译器后端、JIT、解释器、GC、反射、MMIO、DMA、IRQ、PCI 或共享
-内存。后续语言实现只能通过普通 ELM 和这里定义的边界接入。
+V1 不包含语言 SDK、编译器后端、JIT、解释器、GC、反射、IRQ 或 PCI 驱动实现。MMIO、DMA
+和共享 buffer 只在上述 resource contract 中定义了固定 wire 边界，具体执行仍由内核和
+`language-runtime` 提供。
 
 完整架构、安全边界和当前 `y` 集成限制见
 [`LANGUAGE_RUNTIME.md`](../../LANGUAGE_RUNTIME.md)。该 crate 定义协议不等于已有任何外语

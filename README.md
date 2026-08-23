@@ -263,6 +263,8 @@ cargo xtask modules --target loongarch64-unknown-none
 - [设备抽象](DEVICE_ABSTRACTION.md)：PnP、DeviceFunction、资源租约、驱动匹配和热拔契约。
 - [ELM 设计](ELM.md)：单元、端口、租约、DeviceFunction 和 EBI。
 - [Language Runtime](LANGUAGE_RUNTIME.md)：通用外语 ELM 底层 ABI、所有权、安全与仓库边界。
+- [Rust SDK 示例](examples/rust-language-sdk/README.md)：只使用 `elm-language-abi` 的
+  opaque capability、DMA handle 和 fake transport 示例。
 - [SOYO 文件标准](SOYO_FORMAT.md)：Core 对象容器与 Wire profile。
 - [安全报告](SECURITY_REPORT.md)：并发、资源、装载和 ABI 风险记录。
 - [贡献指南](CONTRIBUTING.md) 与 [代码风格](STYLES.md)。

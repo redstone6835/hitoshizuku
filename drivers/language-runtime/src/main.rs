@@ -11,8 +11,9 @@ use elm::{
 use elm_language_abi::{
     LanguageBackendCompleteRequestV1, LanguageBackendDescriptorV1, LanguageBackendNextRequestV1,
     LanguageBackendRequestV1, LanguageCancelRequestV1, LanguageDrainRequestV1,
-    LanguageInstanceCloseRequestV1, LanguagePollRequestV1, LanguageRequestReleaseV1,
-    LanguageRequestV1, LanguageRuntimeStatus, LanguageWire,
+    LanguageInstanceCloseRequestV1, LanguageKernelCallRequestV1, LanguagePollRequestV1,
+    LanguageRequestReleaseV1, LanguageRequestV1, LanguageResourceRequestV1,
+    LanguageResourceResponseV1, LanguageRuntimeStatus, LanguageWire,
 };
 
 use allocator as _;
@@ -40,6 +41,17 @@ fn encode<T: LanguageWire>(value: &T) -> Result<ProviderReply, HookError> {
         .encode_wire(&mut bytes)
         .map_err(|error| HookError::new(error.status().raw()))?;
     ProviderReply::bytes(LanguageRuntimeStatus::OK.raw(), &bytes[..length]).map_err(|_| invalid())
+}
+
+fn encode_status<T: LanguageWire>(
+    status: LanguageRuntimeStatus,
+    value: &T,
+) -> Result<ProviderReply, HookError> {
+    let mut bytes = [0; elm::ELM_FRAME_PAYLOAD_LEN];
+    let length = value
+        .encode_wire(&mut bytes)
+        .map_err(|error| HookError::new(error.status().raw()))?;
+    ProviderReply::bytes(status.raw(), &bytes[..length]).map_err(|_| invalid())
 }
 
 fn empty_or_status(result: Result<(), LanguageRuntimeStatus>) -> ManagedResult {
@@ -76,6 +88,7 @@ impl ElmModule for LanguageRuntimeElm {
     }
 
     fn finalize(&mut self, _context: &LifecycleContext) -> HookResult {
+        let _ = language_runtime::reset_resources();
         language_runtime::finalize();
         Ok(())
     }
@@ -246,6 +259,31 @@ fn drain(request: &ManagedRequest) -> ManagedResult {
         Ok(reply) => encode(&reply),
         Err(error) => Ok(ProviderReply::empty(error.raw())),
     }
+}
+
+#[elm::export(
+    name = "language.runtime.resource",
+    contract = "language.runtime.resource@1",
+    version = 1,
+    visibility = "dependency"
+)]
+fn resource(request: &ManagedRequest) -> ManagedResult {
+    let input: LanguageResourceRequestV1 = decode(request.payload())?;
+    let output: LanguageResourceResponseV1 =
+        language_runtime::resource_request(owner(request), input);
+    encode_status(LanguageRuntimeStatus::from_raw(output.status), &output)
+}
+
+#[elm::export(
+    name = "language.runtime.kernel.call",
+    contract = "language.runtime.kernel.call@1",
+    version = 1,
+    visibility = "dependency"
+)]
+fn kernel_call(request: &ManagedRequest) -> ManagedResult {
+    let input: LanguageKernelCallRequestV1 = decode(request.payload())?;
+    let output = language_runtime::kernel_call(owner(request), input);
+    encode_status(LanguageRuntimeStatus::from_raw(output.status), &output)
 }
 
 #[cfg(all(not(feature = "elm-integrated"), not(test)))]

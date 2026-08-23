@@ -1,8 +1,9 @@
 # Language Runtime 底层框架
 
-本文定义 Hitoshizuku OS 用于承接非 Rust 语言 ELM 的通用底层边界。当前实现只提供
-语言无关的 ABI、owner 隔离、后端与实例登记、有界异步请求队列和生命周期回收；它不是
-某种外语运行时，也不表示 C、C++、C# 或其它语言已经可以直接编写 ELM。
+本文定义 Hitoshizuku OS 用于承接非 Rust 语言 ELM 的通用底层边界。当前实现提供语言无关
+ABI、owner 隔离、后端与实例登记、有界异步请求队列、真实 kernel symbol bridge、资源
+capability/DMA 生命周期和 Rust fake backend；它不是某种外语运行时，也不表示 C、C++、C#
+或其它语言已经可以直接编写 ELM。
 
 ## 设计结论
 
@@ -10,10 +11,10 @@
 managed contract、cell 和 generation，不认识语言名称、对象模型、GC、异常或编译产物。
 以后增加一种语言，应由该语言自己的外部仓库提供：
 
-1. 一个普通的语言支持 ELM，负责注册 backend 并执行该语言的代码；
-2. 一个符合该语言生态习惯的 SDK，生成固定 wire 结构和 ELM 描述；
+1. 一个普通的语言支持 ELM，负责注册 backend、调用资源 bridge 并执行该语言的代码；
+2. 一个符合该语言生态习惯的 SDK，生成固定 wire 结构、package manifest 和 ELM 描述；
 3. 该语言需要的 AOT runtime、符号导出、对象模型和安全策略；
-4. 对 `language.runtime.*@1` 的适配与兼容性测试。
+4. 对 `language.runtime.*@1`、`resource@1` 和 `kernel.call@1` 的适配与兼容性测试。
 
 满足这些条件不应要求为每种语言修改 loader。若通用 ELM 绑定机制尚不能覆盖某种部署
 组合，应改进一次语言无关的绑定能力，而不是在 loader 中增加 `if language == ...` 分支。
@@ -21,7 +22,8 @@ managed contract、cell 和 generation，不认识语言名称、对象模型、
 ```mermaid
 flowchart LR
     C[调用方 ELM] -->|固定 managed frame| R[language.runtime<br/>默认 y]
-    R --> Q[有界请求队列]
+    R --> Q[有界请求队列与资源租约]
+    R --> K[ELM kernel symbols<br/>resource/kernel.call]
     B[语言支持 ELM<br/>外部仓库] -->|backend.register / next| R
     B -->|backend.complete| R
     S[该语言 SDK<br/>外部仓库] --> C
@@ -35,15 +37,19 @@ flowchart LR
 | 组件 | 所在位置 | 职责 |
 | --- | --- | --- |
 | 通用 wire ABI | [`libs/elm-language-abi`](libs/elm-language-abi/) | `no_std` 固定布局类型、状态码、校验和 contract 名称 |
-| 通用运行时服务 | [`drivers/language-runtime`](drivers/language-runtime/) | backend、instance、request 的登记、隔离、调度和回收 |
+| 通用运行时服务 | [`drivers/language-runtime`](drivers/language-runtime/) | backend、instance、request 的登记、隔离、调度、资源 bridge 和回收 |
 | ELM Core 与 loader | `libs/elm`、`kernel` | 通用 ELM 装载、generation、managed binding 和生命周期，不解释语言 |
+| 内核资源处理器 | `general/src/dev/language.rs`、`kernel/src/elm/language_resources.rs` | ELM kernel symbol 入口、owner 撤销、capability 和 DMA 资源表 |
+| package/schema/SDK 工具 | [`hitoshizuku-elm-tools`](https://github.com/redstone6835/hitoshizuku-elm-tools) | 从 EKI manifest 生成语言无关 schema、Rust bridge 与 SDK 描述 |
 | 某种语言的支持 ELM | 未来的外部仓库 | AOT runtime、对象模型、执行循环、GC/反射等语言语义 |
 | 某种语言的 SDK | 未来的外部仓库或同一语言仓库 | 用该语言的构建习惯生成 ELM 工程、wire 调用和安全封装 |
 
 `language.runtime` 不转发任意内核符号，也不把完整 Kernel API Profile 重新包装成一套跨语言
-ABI。语言支持 ELM 本身仍是 ELM，可以使用经过审核的内核 API；它向子 ELM 暴露哪些符号、
-以何种对象模型暴露，由该语言后端负责。这样外语 API 导出留在语言支持 ELM 内，loader
-无需理解每种语言的 FFI。
+ABI。资源和 operation 请求只能通过登记过的 `general.dev.language.*` kernel symbols 进入
+内核；每个入口都重新检查 owner、generation、capability、句柄和回复关联 ID。语言支持
+ELM 本身仍是 ELM，可以使用经过审核的内核 API；它向子 ELM 暴露哪些符号、以何种对象模型
+暴露，由该语言后端负责。这样外语 API 导出留在语言支持 ELM 内，loader 无需理解每种语言
+的 FFI。
 
 ## 可拓展的语言范围
 
@@ -99,6 +105,8 @@ V1 wire 边界只允许固定宽度整数、定长字节数组、状态码和 op
 | `language.runtime.request.cancel@1` | request owner | 按 backend 能力取消排队或运行中的请求 |
 | `language.runtime.request.release@1` | request owner | 在请求进入终态后删除记录并回收队列容量 |
 | `language.runtime.drain@1` | 当前 generation owner | 撤销该 owner 的 backend、instance 和 request |
+| `language.runtime.resource@1` | 语言支持 ELM | 通过 capability handle 请求 MMIO、DMA 和 buffer lease 资源 |
+| `language.runtime.kernel.call@1` | 语言支持 ELM | 通过 schema 中的 operation ID 调用审核过的 kernel operation |
 
 `catalog` 报告的是实现上限，不是为调用方预留的配额。V1 当前实现最多登记 32 个 backend、
 256 个 instance、1024 个总请求，并把单个 owner 的未释放请求限制为 64；运行时最多保留
@@ -118,7 +126,8 @@ backend 在注册时绑定语言支持 ELM 的 owner；只有同一 owner 可以
 
 owner generation 发生变化后，旧句柄、请求 ID 和载荷内 owner 都不能授权新 generation。
 `drain` 既回收调用方直接拥有的对象，也撤销由该调用方 backend 派生的状态，以免 backend
-卸载后留下不能完成的工作。
+卸载后留下不能完成的工作。资源 bridge 的 revoke 入口会继续撤销该 owner 的 capability、
+DMA handle 和 lease；`finalize` 会清空全部语言资源表。
 
 ### 请求状态机
 
@@ -159,8 +168,10 @@ stateDiagram-v2
 | owner `drain` | 只撤销当前调用方 generation 及其 backend 派生状态，返回回收计数 |
 
 语言支持 ELM 在自己的 `quiesce/finalize` 中应先停止领取新工作，再完成或取消已领取请求，
-关闭由其持有的内核资源，最后调用 `drain`。consumer 应先停止提交，处理或释放终态请求，
-再关闭 instance。生命周期回调不能让语言异常、panic 或 GC safepoint 越过 ELM trampoline。
+关闭由其持有的内核资源，最后调用 `drain`。`language-runtime` 的 `drain` 会在运行时
+注册表回收后调用内核 `revoke_owner`；`finalize` 会调用内核 `reset`。consumer 应先停止
+提交，处理或释放终态请求，再关闭 instance。生命周期回调不能让语言异常、panic 或 GC
+safepoint 越过 ELM trampoline。
 
 ## 安全模型
 
@@ -168,8 +179,10 @@ stateDiagram-v2
 
 内核驱动确实需要 MMIO、DMA、IRQ 和某些危险内存操作，但危险性不能通过在公共 ABI 中
 传递裸地址来解决。未来语言后端应从经过审核的 Kernel API Profile 获取资源，再向子 ELM
-发放带 owner、generation、范围和权限的语言侧 capability。实际解引用集中在语言支持 ELM
-中经过审核的窄入口，SDK 默认只暴露边界检查后的类型。
+发放带 owner、generation、范围和权限的语言侧 capability。当前 `elm-language-abi` 已定义
+统一的 capability、MMIO、DMA、buffer lease wire；内核已实现 capability 和 DMA 的分配、
+同步、释放，MMIO 与受管 buffer 在对应 General provider 注册前明确返回 `UNSUPPORTED`。
+实际解引用集中在语言支持 ELM 中经过审核的窄入口，SDK 默认只暴露边界检查后的类型。
 
 对 C/C++ 来说，这意味着可以保留明确标注的 `unsafe`/privileged 逃生口，但必须同时满足：
 
@@ -203,8 +216,11 @@ AOT：语言仓库在主机侧完成编译、验证和链接，内核只装载�
 
 ## 仓库和版本管理
 
-内核仓库只保留通用且与 ELM Core 紧耦合的两个 crate。每种语言的后端、SDK、编译器适配、
-运行库和示例应在独立仓库维护，按发布 tag 或精确 revision 消费，不作为主仓库 submodule。
+内核仓库只保留通用且与 ELM Core 紧耦合的 ABI/runtime crate。每种语言的后端、SDK、编译器
+适配、运行库和示例应在独立仓库维护，按发布 tag 或精确 revision 消费，不作为主仓库
+submodule。主机端 `cargo-elm` 提供 `interface-schema`、`sdk`、`bridge` 和 `package-check`
+四个命令，输入 EKI manifest、`LanguagePackage.toml` 和 `LanguageBridge.toml`，输出确定性的
+`interface.schema.json` 与只使用 opaque handle 的 Rust 描述代码。
 一个语言仓库可以采用最符合自身生态的布局，例如：
 
 ```text
@@ -234,8 +250,10 @@ crate 版本；语言 SDK、编译器和 runtime 使用各自生态的版本。�
 `language.runtime` 默认采用 `y` 模式。当前 `elm-integrated` 构建会移除动态 EKI 的 managed
 trampoline 和 `.elm.meta`，因此 V1 API 目前同时承担两种角色：
 
-- [`elm-language-abi`](libs/elm-language-abi/) 提供稳定 contract 名称和 wire 元数据；
-- 集成到内核的 Rust consumer 可以通过 `language-runtime` crate 的普通 Rust 入口直接调用。
+- [`elm-language-abi`](libs/elm-language-abi/) 提供稳定 contract 名称、资源 wire 和校验；
+- [`general.dev.language.*`](general/src/dev/language.rs) 是唯一的 kernel symbol bridge；
+- 集成到内核的 Rust consumer 可以通过 `language-runtime` crate 的普通 Rust 入口直接调用；
+- 独立 Rust SDK 示例位于 [`examples/rust-language-sdk`](examples/rust-language-sdk/)。
 
 不能据此声称动态 `m` consumer 已能绑定到这个 `y` provider，也不能声称外语 ELM 已经
 可用。未来动态语言 ELM 接入前，必须先让 ELM 的通用 binding 能力明确支持这种
@@ -248,7 +266,8 @@ trampoline 和 `.elm.meta`，因此 V1 API 目前同时承担两种角色：
 
 - C、C++、C# 或其它语言的 SDK、编译器和示例 ELM；
 - JIT、WebAssembly 后端、解释器、GC、反射、异常 runtime 或线程 runtime；
-- MMIO、DMA、IRQ、PCI、设备枚举或任意 Kernel API 的外语包装；
+- IRQ、PCI、设备枚举或任意未登记 Kernel API 的外语包装；资源 ABI 已定义 MMIO、DMA、buffer
+  lease，但未实现的 MMIO/buffer provider 必须返回 `UNSUPPORTED`；
 - raw pointer、共享堆、跨语言对象布局或动态 linker ABI；
 - 为某种语言修改 loader、内核热路径或现有 Rust 驱动。
 
@@ -259,4 +278,5 @@ cargo test -p elm-language-abi --locked
 cargo test -p language-runtime --lib --locked
 cargo check -p elm-language-abi --target loongarch64-unknown-none
 cargo check -p language-runtime --lib --target riscv64gc-unknown-none-elf
+cargo test --manifest-path examples/rust-language-sdk/Cargo.toml --locked
 ```
