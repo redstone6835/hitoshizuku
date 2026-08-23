@@ -5,8 +5,8 @@ use core::ptr::read_volatile;
 
 use general::dev::irq::{self, IrqError, IrqHandle};
 use general::dev::net::{
-    NetQueueIrqBinding, net_function, queue_irq_control, queue_irq_handler,
-    virtio_mmio_queue_irq, virtio_mmio_queue_irq_event_idx,
+    NetQueueIrqBinding, net_function, queue_irq_control, queue_irq_handler, virtio_mmio_queue_irq,
+    virtio_mmio_queue_irq_event_idx,
 };
 use general::dev::platform::{PlatformDeviceInfo, PlatformIrqRegistrationError};
 use general::dev::pnp::{
@@ -15,8 +15,8 @@ use general::dev::pnp::{
 };
 use virtio::virtio_mmio::{
     VIRTIO_F_RING_EVENT_IDX, VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
-    VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK,
-    VirtioMmioTransport, detect as detect_virtio_mmio,
+    VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK, VirtioMmioTransport,
+    detect as detect_virtio_mmio,
 };
 use virtio::{SplitVirtQueue, choose_split_queue_size};
 
@@ -79,7 +79,7 @@ fn setup_queue(
     } else {
         SplitVirtQueue::new_in(context, size)
     })
-        .map_err(|_| "VirtIO-net MMIO queue DMA 分配失败")?;
+    .map_err(|_| "VirtIO-net MMIO queue DMA 分配失败")?;
     transport.configure_queue_addresses(
         queue.desc_dma_addr() as u64,
         queue.avail_dma_addr() as u64,
@@ -253,10 +253,11 @@ impl PnpDriver for VirtioMmioNetDriver {
             .first_mmio()
             .ok_or_else(|| PnpError::missing(PnpResourceKind::Mmio, "virtio-net MMIO missing"))?;
         let base = (self.device_mmio_to_virt)(physical);
-        let (queue, irq_binding, mac, mtu) = probe_queue(base, info.dma_context()).map_err(|error| {
-            log::error!("[virtio-net] MMIO probe 失败: {}", error);
-            PnpError::hardware_failure("virtio-net MMIO init failed")
-        })?;
+        let (queue, irq_binding, mac, mtu) =
+            probe_queue(base, info.dma_context()).map_err(|error| {
+                log::error!("[virtio-net] MMIO probe 失败: {}", error);
+                PnpError::hardware_failure("virtio-net MMIO init failed")
+            })?;
         let irq_handle = register_irq(info, &irq_binding)?;
         if let Err(kind) = install_active(
             queue,
@@ -264,8 +265,7 @@ impl PnpDriver for VirtioMmioNetDriver {
             queue_irq_control(&irq_binding),
             mac,
             mtu,
-        )
-        {
+        ) {
             let _ = irq::unregister_irq_handler(irq_handle);
             log::error!("[virtio-net] 注册网络设备失败: {:?}", kind);
             return Err(PnpError::registration_failed(
@@ -289,7 +289,13 @@ impl PnpDriver for VirtioMmioNetDriver {
         }
         log::printk!(
             "[virtio-net] MMIO attached eth0 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} mtu={}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], mtu
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5],
+            mtu
         );
         Ok(())
     }

@@ -21,15 +21,13 @@ use general::dev::pnp::{
 };
 use virtio::{
     SplitVirtQueue, VIRTIO_F_RING_EVENT_IDX, VIRTIO_F_VERSION_1, VIRTIO_MSI_NO_VECTOR,
-    VIRTIO_PCI_RESET_SPIN_LIMIT, VIRTQ_DESC_F_WRITE, VirtqDescUpdate,
-    VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
-    VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK, VirtioPciCap, VirtioPciFunction,
-    VirtioPciTransport, choose_split_queue_size, parse_virtio_pci_caps,
+    VIRTIO_PCI_RESET_SPIN_LIMIT, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
+    VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK, VIRTQ_DESC_F_WRITE,
+    VirtioPciCap, VirtioPciFunction, VirtioPciTransport, VirtqDescUpdate, choose_split_queue_size,
+    parse_virtio_pci_caps,
 };
 
-use super::common::{
-    VirtioNetQueue, VirtioNetTransport, install_active, install_active_queues,
-};
+use super::common::{VirtioNetQueue, VirtioNetTransport, install_active, install_active_queues};
 
 const VIRTIO_PCI_FUNCTION_NETWORK: VirtioPciFunction =
     VirtioPciFunction::new("network", 0x1000, 0x1041);
@@ -88,8 +86,8 @@ fn setup_queue(
         return Err("VirtIO-net PCI queue 过小");
     }
     transport.set_selected_queue_size(size);
-    let queue = SplitVirtQueue::new_in(context, size)
-        .map_err(|_| "VirtIO-net PCI queue DMA 分配失败")?;
+    let queue =
+        SplitVirtQueue::new_in(context, size).map_err(|_| "VirtIO-net PCI queue DMA 分配失败")?;
     transport.set_selected_queue_addresses(
         queue.desc_dma_addr() as u64,
         queue.avail_dma_addr() as u64,
@@ -214,8 +212,8 @@ fn build_multi_queue_candidate(
     pair_count: u16,
 ) -> Result<MultiQueueProbe, &'static str> {
     let capabilities = parse_virtio_pci_caps(pci).ok_or("VirtIO-net PCI capability 缺失")?;
-    let transport = VirtioPciTransport::new(capabilities)
-        .map_err(|_| "VirtIO-net PCI capability 无效")?;
+    let transport =
+        VirtioPciTransport::new(capabilities).map_err(|_| "VirtIO-net PCI capability 无效")?;
     transport.add_status(VIRTIO_STATUS_ACKNOWLEDGE);
     transport.add_status(VIRTIO_STATUS_DRIVER);
     let offered = transport.device_features();
@@ -330,8 +328,8 @@ fn probe_queue(
     pci.try_enable_bus_master()
         .map_err(|_| "VirtIO-net PCI 无法启用 bus master")?;
     let capabilities = parse_virtio_pci_caps(pci).ok_or("VirtIO-net PCI capability 缺失")?;
-    let transport = VirtioPciTransport::new(capabilities)
-        .map_err(|_| "VirtIO-net PCI capability 无效")?;
+    let transport =
+        VirtioPciTransport::new(capabilities).map_err(|_| "VirtIO-net PCI capability 无效")?;
     if !transport.reset_wait(VIRTIO_PCI_RESET_SPIN_LIMIT) {
         return Err("VirtIO-net PCI reset 超时");
     }
@@ -504,12 +502,7 @@ fn try_probe_multi_queue(
         return Ok(None);
     }
     pci.disable_interrupts();
-    if let Err(error) = attach_msix_pnp_resource(
-        dev,
-        pci.clone(),
-        msix,
-        "virtio-net-pci-mq-msix",
-    ) {
+    if let Err(error) = attach_msix_pnp_resource(dev, pci.clone(), msix, "virtio-net-pci-mq-msix") {
         unregister_irq_handles(&mut irq_handles);
         probe.transport.set_status(0);
         return Err(error);
@@ -576,12 +569,9 @@ fn register_irq(
             match irq::register_irq_handler(line, Arc::clone(&handler)) {
                 Ok(irq_handle) if pci.try_enable_configured_msix(&msix).is_ok() => {
                     pci.disable_interrupts();
-                    if let Err(error) = attach_msix_pnp_resource(
-                        dev,
-                        pci.clone(),
-                        msix,
-                        "virtio-net-pci-msix",
-                    ) {
+                    if let Err(error) =
+                        attach_msix_pnp_resource(dev, pci.clone(), msix, "virtio-net-pci-msix")
+                    {
                         let _ = irq::unregister_irq_handler(irq_handle);
                         return Err(error);
                     }
@@ -656,10 +646,9 @@ fn register_irq(
         PnpError::registration_failed(PnpResourceKind::Irq, "virtio-net PCI INTx")
     })?;
     pci.enable_interrupts();
-    if let Err(error) = dev.own_resource(irq::irq_handler_pnp_resource(
-        handle,
-        "virtio-net-pci-intx",
-    )) {
+    if let Err(error) =
+        dev.own_resource(irq::irq_handler_pnp_resource(handle, "virtio-net-pci-intx"))
+    {
         let _ = irq::unregister_irq_handler(handle);
         pci.disable_interrupts();
         return Err(error);
@@ -682,11 +671,9 @@ impl PnpDriver for VirtioPciNetDriver {
         let PnpId::Pci { .. } = id else {
             return false;
         };
-        info.as_any()
-            .downcast_ref::<PciInfo>()
-            .is_some_and(|info| {
-                VIRTIO_PCI_FUNCTION_NETWORK.matches_pci_ids(info.vendor, info.device_id)
-            })
+        info.as_any().downcast_ref::<PciInfo>().is_some_and(|info| {
+            VIRTIO_PCI_FUNCTION_NETWORK.matches_pci_ids(info.vendor, info.device_id)
+        })
     }
 
     fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
@@ -739,8 +726,7 @@ impl PnpDriver for VirtioPciNetDriver {
             queue_irq_control(&irq_binding),
             mac,
             mtu,
-        )
-        {
+        ) {
             log::error!("[virtio-net] 注册网络设备失败: {:?}", kind);
             return Err(PnpError::registration_failed(
                 PnpResourceKind::Function,
@@ -754,7 +740,13 @@ impl PnpDriver for VirtioPciNetDriver {
         }
         log::printk!(
             "[virtio-net] PCI attached eth0 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} mtu={}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], mtu
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5],
+            mtu
         );
         Ok(())
     }

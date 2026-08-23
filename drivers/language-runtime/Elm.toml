@@ -1,0 +1,11 @@
+[elm]
+name = "language.runtime"
+version = "0.1.0"
+kind = "service"
+source = "kernel-tree:drivers.language-runtime"
+mode = "y"
+integrated_phase = "runtime"
+
+[[profiles]]
+id = "hitoshizuku-default"
+priority = "100"

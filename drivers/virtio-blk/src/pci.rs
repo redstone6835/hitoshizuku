@@ -485,7 +485,10 @@ impl BlockDriver for VirtioBlkPciIo {
         // Only poll if new IRQs arrived since last poll (IRQ-gated completion check)
         let current_irq = self.driver.inner.irq_count.load(Ordering::Relaxed);
         if current_irq != self.driver.inner.poll_irq_mark.load(Ordering::Relaxed) {
-            self.driver.inner.poll_irq_mark.store(current_irq, Ordering::Relaxed);
+            self.driver
+                .inner
+                .poll_irq_mark
+                .store(current_irq, Ordering::Relaxed);
             self.driver.poll();
         }
         let mut queue = self.driver.inner.queue.lock();

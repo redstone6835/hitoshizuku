@@ -97,6 +97,13 @@ prompt = "本地回环网络驱动"
 default = "y"
 
 [[modules]]
+name = "language.runtime"
+path = "language-runtime"
+config = "CONFIG_LANGUAGE_RUNTIME"
+prompt = "语言无关 ELM 运行时基础服务"
+default = "y"
+
+[[modules]]
 name = "virtio.framework"
 path = "virtio"
 config = "CONFIG_VIRTIO"

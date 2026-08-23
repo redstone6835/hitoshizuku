@@ -6,12 +6,13 @@ Native runtime 和性能分析使用独立仓库及固定版本依赖，不通�
 
 | 仓库 | 内容 | 集成方式 |
 | --- | --- | --- |
-| [`hitoshizuku`](https://github.com/redstone6835/hitoshizuku) | 内核、紧耦合驱动、ELM/Native ABI crate、核心中文文档 | Cargo workspace，`kernel` 为默认成员 |
+| [`hitoshizuku`](https://github.com/redstone6835/hitoshizuku) | 内核、紧耦合驱动、ELM/Native/language ABI crate、核心中文文档 | Cargo workspace，`kernel` 为默认成员 |
 | [`hitoshizuku-elm-tools`](https://github.com/redstone6835/hitoshizuku-elm-tools) | `cargo-elm` 和 ELM 工程工具 | `cargo install --locked --git`；用 `HITOSHIZUKU_KERNEL_ROOT` 选择内核 checkout |
 | [`hitoshizuku-soyo-linker`](https://github.com/redstone6835/hitoshizuku-soyo-linker) | `soyo-ld`、`soyo-verify`、`soyo-inspect` | `cargo install --locked --git`；依赖固定内核 revision 的 ABI crate |
 | [`hitoshizuku-native`](https://github.com/redstone6835/hitoshizuku-native) | MRT、Ranalib、Anonlib、C/Rust 示例和测试 | Native 自己的 workspace；通过 `SOYO_LD` 接入链接器 |
 | [`hitoshizuku-bench`](https://github.com/redstone6835/hitoshizuku-bench) | QEMU 插件、画像脚本、统计学习模型和工作负载 | 消费带提交标识的内核产物与外部输入镜像 |
 | 外部 initramfs 工程 | BusyBox、rootfs、CPIO 和镜像组装 | 产出 CPIO，再作为 `cargo xtask build --initramfs` 的显式输入 |
+| 未来的语言支持仓库 | 某种语言的 backend ELM、SDK、AOT runtime 与测试 | 按 tag/revision 引入，不作为内核 submodule；只依赖版本化 `language.runtime.*` ABI |
 
 ## 内核 workspace
 
@@ -20,8 +21,8 @@ arch/       启动、异常、中断、页表和架构上下文
 hal/        时间、中断、用户地址访问和 CPU 控制抽象
 general/    PnP、DeviceFunction、VFS、固件和通用设备设施
 kernel/     最终镜像、系统调用、进程、ELM 管理和网络 host
-libs/       allocator、sched、net、socket、vfs、elm、soyo 等共享 crate
-drivers/    项目自有硬件驱动与 ELM；由 Modules.toml 选择 y/m/n
+libs/       allocator、sched、net、socket、vfs、elm、language ABI、soyo 等共享 crate
+drivers/    项目自有硬件驱动与 ELM 服务；由 Modules.toml 选择 y/m/n
 xtask/      内核 Cargo 编排入口
 ```
 
@@ -34,6 +35,11 @@ xtask/      内核 Cargo 编排入口
 核心目录的入口说明位于各目录的 `README.md`；设备对象、驱动资源和热拔顺序见
 [`DEVICE_ABSTRACTION.md`](DEVICE_ABSTRACTION.md)。目录 README 只解释源码边界和本地
 检查命令，不重复维护 Cargo manifest 或生成文件清单。
+
+通用外语接入只在内核仓库保留 `elm-language-abi` 和默认 `y` 的 `language.runtime` 服务。
+各语言的 backend、SDK、编译器适配、runtime 和示例应独立发布；loader 只处理通用 ELM
+绑定，不按语言分支。ABI、安全约束和当前集成限制见
+[`LANGUAGE_RUNTIME.md`](LANGUAGE_RUNTIME.md)。
 
 ## 内核工作流
 

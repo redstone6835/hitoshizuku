@@ -1,0 +1,11 @@
+[package]
+name = "elm-language-abi"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+test = true
+doctest = true
+bench = false
+
+[dependencies]

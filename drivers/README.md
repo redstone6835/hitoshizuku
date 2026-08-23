@@ -21,7 +21,8 @@ platform bus + PnP core          general/src/dev
         +-- VirtIO provider      virtio + virtio/{api,provider-api,consumer-api}
         +-- VirtIO consumer      virtio-blk、virtio-net
         +-- 网络设备执行面       loopback、virtio-net
-        `-- 网络协议执行面       net-stack
+        +-- 网络协议执行面       net-stack
+        `-- 通用 ELM 服务        language-runtime
 ```
 
 驱动只拥有自己申请的 MMIO、IRQ、DMA、队列和 function。探测成功后，硬件能力以
@@ -39,9 +40,9 @@ ownership，`net-stack` 处理 flow shard 的协议状态。
 - `n`：不参与本次构建。
 
 默认策略按职责而不是目录名划分。基础、通用且启动后持续使用的
-`platform.firmware-bus`、`platform.uart16550`、`kernel.random`、`net.stack` 和
-`net.loopback` 使用 `y`；板级或架构特定的中断控制器、RTC，以及可选的 syscon、
-fw_cfg、CFI Flash 和 VirtIO 设备链使用 `m`。`m` 模块仍按 `after` 与 `depends` 顺序
+`platform.firmware-bus`、`platform.uart16550`、`kernel.random`、`net.stack`、
+`net.loopback`、`language.runtime` 使用 `y`；板级或架构特定的中断控制器、RTC，以及可选的
+syscon、fw_cfg、CFI Flash 和 VirtIO 设备链使用 `m`。`m` 模块仍按 `after` 与 `depends` 顺序
 装载，不代表它们是不受支持的次级实现。
 
 从仓库根目录生成默认配置、调整选项并构建当前模块集合：
@@ -84,6 +85,7 @@ cargo check -p virtio-block --lib --target riscv64gc-unknown-none-elf
 | [`random`](random/) | `kernel.random` | 内核随机服务与熵输入 |
 | [`net-stack`](net-stack/) | `net.stack` | 分片、单写者的网络协议执行面 |
 | [`loopback`](loopback/) | `net.loopback` | 本地批量回环网络设备 |
+| [`language-runtime`](language-runtime/) | `language.runtime` | 语言无关的 backend、instance 与有界请求调度基础服务 |
 | [`virtio`](virtio/) | `virtio.framework` | VirtIO provider 与版本化公共契约 |
 | [`virtio-blk`](virtio-blk/) | `virtio.block` | VirtIO MMIO/PCI 块设备 consumer |
 | [`virtio-net`](virtio-net/) | `net.virtio` | VirtIO MMIO/PCI 网络设备 consumer |
@@ -93,6 +95,11 @@ VirtIO framework 还包含三个不单独部署的契约 crate：
 - [`virtio/api`](virtio/api/)：provider 与 consumer 共用的协议类型和 split virtqueue；
 - [`virtio/provider-api`](virtio/provider-api/)：framework 侧导出契约；
 - [`virtio/consumer-api`](virtio/consumer-api/)：consumer 侧导入契约。
+
+`language-runtime` 不是硬件驱动，但与 ELM 生命周期和内核构建紧耦合，因此作为可部署服务
+留在 `drivers/`。它的固定 wire 类型位于 [`libs/elm-language-abi`](../libs/elm-language-abi/)，
+完整边界见 [`LANGUAGE_RUNTIME.md`](../LANGUAGE_RUNTIME.md)。具体语言 backend 和 SDK 不应
+继续堆入本目录，而应由外部仓库按版本引入。
 
 ## 可部署 crate 的目录约定
 

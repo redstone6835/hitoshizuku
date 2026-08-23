@@ -13,27 +13,23 @@ use elm::{ElmModule, HookError, HookResult, LifecycleContext};
 #[cfg(not(feature = "elm-integrated"))]
 use net::stack::PinnedNetStackShardTurnEndpoint;
 use net::stack::{
-    NET_STACK_ADDRESS_FAMILY_IPV4, NET_STACK_ADDRESS_FAMILY_IPV6,
-    NET_STACK_DROP_IPV4_CHECKSUM,
+    NET_STACK_ADDRESS_FAMILY_IPV4, NET_STACK_ADDRESS_FAMILY_IPV6, NET_STACK_DROP_IPV4_CHECKSUM,
     NET_STACK_DROP_IPV6_EXTENSION_LIMIT, NET_STACK_DROP_MALFORMED_ARP,
     NET_STACK_DROP_MALFORMED_IPV4, NET_STACK_DROP_MALFORMED_IPV6, NET_STACK_DROP_MALFORMED_TCP,
     NET_STACK_DROP_MALFORMED_UDP, NET_STACK_DROP_NOT_LOCAL, NET_STACK_DROP_TCP_CHECKSUM,
-    NET_STACK_DROP_UDP_CHECKSUM,
-    NET_STACK_DROP_UNSUPPORTED_IP_PROTOCOL, NET_STACK_ETHERNET_ACCEPTED,
-    NET_STACK_ETHERNET_TRUNCATED, NET_STACK_ETHERNET_UNSUPPORTED,
+    NET_STACK_DROP_UDP_CHECKSUM, NET_STACK_DROP_UNSUPPORTED_IP_PROTOCOL,
+    NET_STACK_ETHERNET_ACCEPTED, NET_STACK_ETHERNET_TRUNCATED, NET_STACK_ETHERNET_UNSUPPORTED,
     NET_STACK_ETHERNET_VLAN_UNSUPPORTED, NET_STACK_NETWORK_ARP, NET_STACK_NETWORK_DROP,
     NET_STACK_NETWORK_FLAG_FRAGMENT, NET_STACK_NETWORK_FLAG_IPV6_PROBLEM,
     NET_STACK_NETWORK_FLAG_MORE_FRAGMENTS, NET_STACK_NETWORK_FLAG_SUPPRESS_MULTICAST,
     NET_STACK_NETWORK_IP, NET_STACK_SHARD_TURN_STATUS_BUSY, NET_STACK_SHARD_TURN_STATUS_INVALID,
-    NET_STACK_SHARD_TURN_STATUS_OK,
-    NET_STACK_TCP_OPTION_MSS, NET_STACK_TCP_OPTION_SACK_PERMITTED,
+    NET_STACK_SHARD_TURN_STATUS_OK, NET_STACK_TCP_OPTION_MSS, NET_STACK_TCP_OPTION_SACK_PERMITTED,
     NET_STACK_TCP_OPTION_TIMESTAMP, NET_STACK_TCP_OPTION_WINDOW_SCALE, NET_STACK_TRANSPORT_DROP,
     NET_STACK_TRANSPORT_ICMP, NET_STACK_TRANSPORT_RAW, NET_STACK_TRANSPORT_SKIPPED,
-    NET_STACK_TRANSPORT_TCP, NET_STACK_TRANSPORT_UDP, NetStackEthernet,
-    NetStackControlPlane, NetStackHandle, NetStackLocalAddress, NetStackLocalTurn, NetStackNetwork,
-    NetStackShardTurn,
-    NetStackRegisterErrorKind, NetStackRegistration, NetStackRemoveError, NetStackTcpOptions,
-    NetStackTransport,
+    NET_STACK_TRANSPORT_TCP, NET_STACK_TRANSPORT_UDP, NetStackControlPlane, NetStackEthernet,
+    NetStackHandle, NetStackLocalAddress, NetStackLocalTurn, NetStackNetwork,
+    NetStackRegisterErrorKind, NetStackRegistration, NetStackRemoveError, NetStackShardTurn,
+    NetStackTcpOptions, NetStackTransport,
 };
 use net::{FlowExecution, FlowExecutorKind, FlowShard, ShardId};
 use sched::sync::Spinlock;
@@ -1164,9 +1160,11 @@ fn initialize_flow_shards(boot: net::boot::NetStackBootConfig, generation: u64) 
         }
         // Safety: 每个槽位在 generation 激活前只初始化一次。
         unsafe {
-            *FLOW_SHARDS[index].0.get() = Some(ManuallyDrop::new(
-                net::stack::create_flow_shard(ShardId(index as u16), boot, now_ns),
-            ));
+            *FLOW_SHARDS[index].0.get() = Some(ManuallyDrop::new(net::stack::create_flow_shard(
+                ShardId(index as u16),
+                boot,
+                now_ns,
+            )));
         }
     }
     *CONTROL_PLANE.lock() = Some(Arc::new(Spinlock::new(ManuallyDrop::new(
@@ -1214,12 +1212,9 @@ fn parse_packet_batch_command(
         return false;
     }
     let (ethernet, network, transport) = packet_parse_sidecars(&turn);
-    let Some(frontend) = net::stack::parse_frontend_packet_batch(
-        &mut input_batch,
-        ethernet,
-        network,
-        transport,
-    ) else {
+    let Some(frontend) =
+        net::stack::parse_frontend_packet_batch(&mut input_batch, ethernet, network, transport)
+    else {
         *input = Some(input_batch);
         return false;
     };
@@ -1274,11 +1269,7 @@ fn drain_reassembly_command(
         }
         let (ethernet, network, transport) = packet_parse_sidecars(&turn);
         let _ = net::stack::flow_shard_parse_reassembled_batch(
-            shard,
-            input,
-            ethernet,
-            network,
-            transport,
+            shard, input, ethernet, network, transport,
         );
         while let Some(packet) = net::stack::flow_shard_take_reassembled(shard) {
             packets.push(packet);
@@ -1351,13 +1342,7 @@ fn dispatch_shard_turn(call: &mut NetStackShardTurn) -> i32 {
                 interface,
                 config,
                 output,
-            } => parse_packet_batch_command(
-                call.generation,
-                input,
-                *interface,
-                *config,
-                output,
-            ),
+            } => parse_packet_batch_command(call.generation, input, *interface, *config, output),
             net::stack::NetStackFlowCommand::DrainReassembly {
                 interface,
                 config,
@@ -1423,7 +1408,11 @@ fn destroy_generation_state() {
             "销毁协议 generation 时仍有执行者持有 shard 租约"
         );
         // Safety: quiesce 已在销毁 generation 前停止全部 owner 调用。
-        let state = unsafe { (*slot.0.get()).take().map(|mut shard| ManuallyDrop::take(&mut shard)) };
+        let state = unsafe {
+            (*slot.0.get())
+                .take()
+                .map(|mut shard| ManuallyDrop::take(&mut shard))
+        };
         if let Some(state) = state {
             net::stack::destroy_flow_shard(state);
         }
@@ -1501,11 +1490,9 @@ impl ElmModule for NetStackElm {
                 .ok_or(HookError::new(-22))?
         };
         #[cfg(feature = "elm-integrated")]
-        let registration = NetStackRegistration::integrated_with_local(
-            net_stack_shard_turn,
-            net_stack_local_turn,
-        )
-        .ok_or(HookError::new(-22))?;
+        let registration =
+            NetStackRegistration::integrated_with_local(net_stack_shard_turn, net_stack_local_turn)
+                .ok_or(HookError::new(-22))?;
         let handle = match net::stack::register_stack(registration) {
             Ok(handle) => handle,
             Err(error) => {

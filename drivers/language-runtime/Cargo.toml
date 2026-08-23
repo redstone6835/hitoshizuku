@@ -1,0 +1,27 @@
+[package]
+name = "language-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "language-runtime"
+path = "src/main.rs"
+test = false
+bench = false
+
+[lib]
+name = "language_runtime"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false
+
+[features]
+default = []
+elm-integrated = []
+
+[dependencies]
+allocator = { path = "../../libs/allocator", default-features = false }
+elm = { path = "../../libs/elm", default-features = false, features = ["module", "macros"] }
+elm-language-abi = { path = "../../libs/elm-language-abi", default-features = false }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }

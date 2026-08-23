@@ -10,14 +10,14 @@ use net::buf::{
     CompletionBatch, CompletionToken, NetBufPoolOwner, PacketBatch, PacketLayout, PacketMetadata,
     RxRefillBatch, TxBatch,
 };
+#[cfg(not(feature = "elm-integrated"))]
+use net::device::PinnedNetQueueEndpoint;
 use net::device::{
     NET_QUEUE_CALL_STATUS_INVALID, NET_QUEUE_CALL_STATUS_OK, NET_QUEUE_OP_HAS_PENDING,
     NET_QUEUE_OP_POLL_RX, NET_QUEUE_OP_QUIESCE, NET_QUEUE_OP_RECLAIM_TX, NET_QUEUE_OP_REFILL_RX,
     NET_QUEUE_OP_SUBMIT_TX, NetDeviceHandle, NetDeviceRegisterErrorKind, NetDeviceRegistration,
     NetDeviceRemoveError, NetQueueRegistration,
 };
-#[cfg(not(feature = "elm-integrated"))]
-use net::device::PinnedNetQueueEndpoint;
 use net::queue::{
     NetQueueCaps, NetQueuePair, QueueFatalError, RxBudget, RxPollResult, RxRefillResult,
     TxReclaimResult, TxSubmitResult,

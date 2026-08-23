@@ -23,6 +23,7 @@
 | 设备抽象 | `PnP -> DeviceFunction -> 可选投影`，设备功能可以被 ELM 认领、审计、撤销和重新绑定。 |
 | ELM | 以单元、枢纽端口、能力绑定、资源租约和 generation 管理运行时拓展，不复刻 Linux 模块 ABI。 |
 | 网络栈 | `net.stack` ELM 按协议 shard 固定 owner worker；每份协议状态由 `FlowExecution` generation 租约保证单写者。 |
+| 语言拓展 | 默认集成 `language.runtime`，以固定 ABI、owner generation 和有界异步队列承接未来外部语言 backend；loader 不识别语言。 |
 | 测试方法 | RISC-V QEMU 画像结合配对微基准、Huber IRLS、分层 ridge、moving-block bootstrap 和 blocked CV。 |
 | 目标架构 | LoongArch64 与 RISC-V64；构建使用系统默认 Rust 工具链，不提交或强制指定 `rust-toolchain.toml`。 |
 
@@ -238,8 +239,9 @@ cargo fmt --all -- --check
 模块配置位于 [`drivers/Modules.toml`](drivers/Modules.toml)：`y` 表示集成进内核，`m`
 表示生成受 `elm-mgr` 管理的 EKI，`n` 表示禁用。配置和模块构建入口为：
 
-默认配置把固件总线、通用串口、随机服务、网络栈和回环设备集成进内核；架构或板级中断
-控制器、RTC、syscon、QEMU 辅助设备、Flash 与 VirtIO 设备链保持受管模块。这个划分按
+默认配置把固件总线、通用串口、随机服务、网络栈、回环设备和通用 `language.runtime`
+集成进内核；架构或板级中断控制器、RTC、syscon、QEMU 辅助设备、Flash 与 VirtIO 设备链保持
+受管模块。这个划分按
 通用性和启动期职责决定，并不等同于 `platform.*` 名称分类。
 
 ```sh
@@ -260,6 +262,7 @@ cargo xtask modules --target loongarch64-unknown-none
 - [架构设计](ARCHITECTURE.md)：crate 依赖、驱动边界和构建产物。
 - [设备抽象](DEVICE_ABSTRACTION.md)：PnP、DeviceFunction、资源租约、驱动匹配和热拔契约。
 - [ELM 设计](ELM.md)：单元、端口、租约、DeviceFunction 和 EBI。
+- [Language Runtime](LANGUAGE_RUNTIME.md)：通用外语 ELM 底层 ABI、所有权、安全与仓库边界。
 - [SOYO 文件标准](SOYO_FORMAT.md)：Core 对象容器与 Wire profile。
 - [安全报告](SECURITY_REPORT.md)：并发、资源、装载和 ABI 风险记录。
 - [贡献指南](CONTRIBUTING.md) 与 [代码风格](STYLES.md)。

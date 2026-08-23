@@ -23,6 +23,7 @@ members = [
     "libs/elm",
     "libs/elm/macros",
     "libs/elm-loader",
+    "libs/elm-language-abi",
     "libs/kernel-symbols",
     "libs/kernel-symbols/macros",
     "libs/kcsan",

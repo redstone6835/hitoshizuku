@@ -215,6 +215,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "elm-language-abi"
+version = "0.1.0"
+
+[[package]]
 name = "elm-loader"
 version = "0.1.0"
 dependencies = [
@@ -438,6 +442,16 @@ name = "ktest-mock"
 version = "0.1.0"
 dependencies = [
  "ktest",
+ "spin",
+]
+
+[[package]]
+name = "language-runtime"
+version = "0.1.0"
+dependencies = [
+ "allocator",
+ "elm",
+ "elm-language-abi",
  "spin",
 ]
 

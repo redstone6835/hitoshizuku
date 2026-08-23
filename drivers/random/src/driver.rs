@@ -39,9 +39,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use alloc::sync::Arc;
 
 use crate::dev::char::CharIoError;
-use crate::dev::random::{
-    RandomBackend, RandomBackendHandle, RandomReadMode, RandomServiceError,
-};
+use crate::dev::random::{RandomBackend, RandomBackendHandle, RandomReadMode, RandomServiceError};
 use sched::WaitQueue;
 
 // ──────────────────────── 时间戳 / 启动期熵源 ──────────────────────────────
@@ -240,7 +238,6 @@ impl EntropyPool {
             .saturating_add(bits)
             .min(POOL_BITS);
     }
-
 }
 
 // ──────────────────────── ChaCha20 CSPRNG ─────────────────────────────────
@@ -661,9 +658,7 @@ impl RandomBackend for RandomBackendImpl {
         match mode {
             RandomReadMode::Secure { blocking } => random_core().read_secure(output, blocking),
             RandomReadMode::Insecure => Ok(random_core().read_nonblocking(output)),
-            RandomReadMode::Entropy { blocking } => {
-                random_core().read_blocking(output, blocking)
-            }
+            RandomReadMode::Entropy { blocking } => random_core().read_blocking(output, blocking),
         }
     }
 
