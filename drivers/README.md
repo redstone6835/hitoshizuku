@@ -1,38 +1,115 @@
 # 内核驱动
 
-本目录包含项目自有的内核驱动。每个驱动都是普通 Cargo 包，也是仓库
-workspace 的成员；不需要生成 `.elm/framework` 目录，也不需要为驱动单独
-指定 Rust 工具链。
+`drivers/` 保存 Hitoshizuku OS 自有的硬件驱动、设备服务和网络执行模块。它们与
+`general` 中的设备核心、`hal` 中的架构无关接口以及 `libs/*` 中的共享协议类型一起
+演进，因此留在内核 Cargo workspace 中，不通过 Git submodule 引入。
 
-使用默认 Rust 工具链构建或检查单个驱动：
+每个可部署驱动都是普通 Cargo package，同时具有一份 `Elm.toml` 模块描述。Cargo
+负责依赖解析和 Rust 编译；`cargo-elm` 负责 ELM ABI、接口 Profile、模块镜像和装载顺序；
+根目录 `xtask` 把两者编排成完整内核构建。设备对象、PnP 和 `DeviceFunction` 的公共约束
+见 [`DEVICE_ABSTRACTION.md`](../DEVICE_ABSTRACTION.md)。
 
-```sh
-cargo check -p platform-uart16550
-cargo build -p virtio-block --target riscv64gc-unknown-none-elf
+## 分层
+
+```text
+固件描述 / PCI 枚举
+        |
+        v
+platform bus + PnP core          general/src/dev
+        |
+        +-- 平台驱动             firmware-bus、PLIC、UART、RTC、syscon ...
+        +-- VirtIO provider      virtio + virtio/{api,provider-api,consumer-api}
+        +-- VirtIO consumer      virtio-blk、virtio-net
+        +-- 网络设备执行面       loopback、virtio-net
+        `-- 网络协议执行面       net-stack
 ```
 
-`Modules.toml` 是声明式驱动清单，由 `cargo xtask config` 和
-`cargo xtask modules` 消费。它把类似 Linux 的 `CONFIG_*` 符号映射到驱动包，
-并记录依赖关系和目标限制。ELM 清单与链接脚本仍放在驱动目录中，因为它们
-描述驱动的模块 ABI；只有生成可加载 ELM 模块时才会消费这些文件。
+驱动只拥有自己申请的 MMIO、IRQ、DMA、队列和 function。探测成功后，硬件能力以
+`DeviceFunction` 或专用 registrar 投影给常驻内核；卸载时先停止新工作、撤销公开入口，
+再按资源所有权回收底层对象。网络设备与网络协议栈有意分离：网卡驱动处理队列和 buffer
+ownership，`net-stack` 处理 flow shard 的协议状态。
 
-VirtIO 协议类型位于 `virtio/api`。它的 ELM provider 和 consumer 绑定分别位于
-`virtio-provider` 与 `virtio-consumer` 包中，因此 workspace 构建不会把两个
-互斥的 Cargo feature 角色合并到一起。
+## 配置与构建
 
-普通内核构建不会编译所有驱动。选中的配置会通过内核 feature 启用内建驱动，
-或者把 `m` 条目作为独立包构建，供后续 initramfs 或模块装载使用。
+[`Modules.toml`](Modules.toml) 是驱动集合的声明源，记录 `CONFIG_*` 名称、默认模式、
+目标限制和依赖顺序。根目录 `.config` 只选择部署方式，不改写 crate 源码：
 
-## 当前驱动目录
+- `y`：以 `elm-integrated` 方式集成到内核镜像；
+- `m`：构建为受 ELM 管理的独立 EKI；
+- `n`：不参与本次构建。
 
-| 目录 | 作用 |
-| --- | --- |
-| `firmware-bus`、`fw-cfg` | 固件总线与 fw_cfg 设备 |
-| `uart16550`、`syscon`、`plic`、`loongson-irq` | 控制台、系统控制器和中断控制器 |
-| `ls7a-rtc`、`goldfish-rtc`、`random`、`cfi-flash` | 平台时钟、随机源和闪存 |
-| `virtio`、`virtio-blk`、`virtio-net` | VirtIO framework、块设备和网络设备 |
-| `net-stack`、`loopback` | 网络栈 ELM 与回环设备 |
+默认策略按职责而不是目录名划分。基础、通用且启动后持续使用的
+`platform.firmware-bus`、`platform.uart16550`、`kernel.random`、`net.stack` 和
+`net.loopback` 使用 `y`；板级或架构特定的中断控制器、RTC，以及可选的 syscon、
+fw_cfg、CFI Flash 和 VirtIO 设备链使用 `m`。`m` 模块仍按 `after` 与 `depends` 顺序
+装载，不代表它们是不受支持的次级实现。
 
-驱动 crate 的 `src/main.rs` 同时作为 ELM 模块入口和 workspace library target，这是
-为了让 `cargo-elm` 能在集成和独立模块两种模式下复用同一份实现。`Elm.toml`、
-`Elm.lock` 和 `elm.ld` 是模块 ABI 元数据，不是 Cargo 依赖缓存。
+从仓库根目录生成默认配置、调整选项并构建当前模块集合：
+
+```sh
+cargo xtask defconfig
+cargo xtask config
+cargo xtask modules --target loongarch64-unknown-none
+cargo xtask modules --target riscv64gc-unknown-none-elf
+```
+
+`cargo xtask modules` 会先构建对应架构的内核并导出内核 API Profile，再按依赖顺序调用
+`cargo-elm`。不要手工维护驱动目录中的 `.elm/`、`dist/` 或 `Elm.lock`；它们是可删除并
+重新生成的本地产物，也不能作为 workspace member 或源码依赖路径提交。
+
+只检查某个 crate 的 Rust 源码时，可以直接使用 Cargo：
+
+```sh
+cargo check -p platform-uart16550 --lib --target loongarch64-unknown-none
+cargo check -p net-stack --lib --target riscv64gc-unknown-none-elf
+cargo check -p virtio-block --lib --target riscv64gc-unknown-none-elf
+```
+
+直接 `cargo check` 不会生成 EKI，也不会验证完整模块装载图；发布前仍需执行相应目标的
+`cargo xtask modules`。项目使用调用者的默认 Rust 工具链，不在驱动目录固定 toolchain。
+
+## Crate 索引
+
+| Crate | 模块名 | 目标与职责 |
+| --- | --- | --- |
+| [`firmware-bus`](firmware-bus/) | `platform.firmware-bus` | 从固件描述建立 platform 设备与资源 |
+| [`loongson-irq`](loongson-irq/) | `platform.loongson-irq` | LoongArch64 Loongson 中断控制器 |
+| [`plic`](plic/) | `platform.plic` | RISC-V PLIC 中断域 |
+| [`syscon`](syscon/) | `platform.syscon` | 固件 syscon、电源和复位操作 |
+| [`ls7a-rtc`](ls7a-rtc/) | `platform.ls7a-rtc` | LoongArch64 LS7A RTC |
+| [`goldfish-rtc`](goldfish-rtc/) | `platform.goldfish-rtc` | RISC-V/QEMU Goldfish RTC |
+| [`fw-cfg`](fw-cfg/) | `platform.fw-cfg` | QEMU fw_cfg 数据通道 |
+| [`cfi-flash`](cfi-flash/) | `platform.cfi-flash` | CFI NOR flash 设备 |
+| [`uart16550`](uart16550/) | `platform.uart16550` | NS16550A 兼容串口 |
+| [`random`](random/) | `kernel.random` | 内核随机服务与熵输入 |
+| [`net-stack`](net-stack/) | `net.stack` | 分片、单写者的网络协议执行面 |
+| [`loopback`](loopback/) | `net.loopback` | 本地批量回环网络设备 |
+| [`virtio`](virtio/) | `virtio.framework` | VirtIO provider 与版本化公共契约 |
+| [`virtio-blk`](virtio-blk/) | `virtio.block` | VirtIO MMIO/PCI 块设备 consumer |
+| [`virtio-net`](virtio-net/) | `net.virtio` | VirtIO MMIO/PCI 网络设备 consumer |
+
+VirtIO framework 还包含三个不单独部署的契约 crate：
+
+- [`virtio/api`](virtio/api/)：provider 与 consumer 共用的协议类型和 split virtqueue；
+- [`virtio/provider-api`](virtio/provider-api/)：framework 侧导出契约；
+- [`virtio/consumer-api`](virtio/consumer-api/)：consumer 侧导入契约。
+
+## 可部署 crate 的目录约定
+
+```text
+<driver>/
+├── Cargo.toml       Cargo package、feature 和源码依赖
+├── Elm.toml         模块身份、模式、Profile、provider/consumer 契约
+├── elm.ld           独立 ELM 的链接布局（需要时）
+├── README.md        职责、资源、生命周期和验证入口
+└── src/             唯一实现来源
+```
+
+许多驱动让 `src/main.rs` 同时作为 ELM 模块入口和 workspace library target，以便
+`m` 模式和 `y` 模式复用同一份实现。新增或修改驱动时，应同步检查：
+
+1. `Modules.toml` 中的依赖、`after` 顺序和 `targets` 是否真实反映探测前置条件；
+2. `Elm.toml` 的模块名、契约版本和 `integrated_phase` 是否与源码一致；
+3. `probe` 的失败路径是否回滚已申请资源，`remove/finalize` 是否先停止外部入口；
+4. README 是否说明目标架构、可见 function、非职责边界和验证命令；
+5. 两个受支持目标中相关的 `cargo check` 与 `cargo xtask modules` 是否通过。

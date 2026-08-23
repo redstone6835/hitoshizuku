@@ -10,8 +10,10 @@ cargo metadata --no-deps --format-version 1
 cargo test -p socket --target x86_64-unknown-linux-gnu
 ```
 
-内核模块构建还需要目标架构标准库、`rust-lld` 和 EFI 所需的 C 编译器。性能、Native
-和 SOYO 工具测试分别在对应 sibling repository 执行。
+内核模块构建还需要目标架构标准库、Rust 自带的 `rust-lld` 和 EFI 所需的交叉 C 编译器。
+当前 [`.cargo/config.toml`](.cargo/config.toml) 使用 `loongarch64-linux-gnu-gcc` 与
+`riscv64-linux-gnu-gcc`；这些命令名不需要与 Rust target triple 相同。性能、Native 和
+SOYO 工具测试分别在对应 sibling repository 执行。
 
 ## 分支和提交
 

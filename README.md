@@ -13,7 +13,7 @@
 </p>
 
 > 项目标识为 `hitoshizuku`。Hitoshizuku OS 是去 OSComp 化、去除比赛、测评和镜像耦合后的 MyGO!!!!! OS。这里保留项目自身的
-> Rust 内核、ELM、驱动和网络栈；Native、链接器和测试工具按职责独立维护。
+> Rust 内核、ELM、驱动和网络栈；Native runtime、主机端链接器和性能分析工具按职责在独立仓库维护。
 
 ## 先看这里
 
@@ -127,14 +127,14 @@ drivers/    项目自有硬件驱动与 ELM；由 Modules.toml 选择集成方�
 - `loongarch64-unknown-none`
 - `riscv64gc-unknown-none-elf`
 
-驱动、ELM 和内核 ABI 保持在同一 Cargo workspace；`cargo-elm`、`soyo-linker`、native
-runtime 和性能工具分别在独立仓库发布。更完整的仓库边界见
+驱动、ELM 模型和内核 ABI crate 保持在同一 Cargo workspace；`cargo-elm`、SOYO
+链接器、Native runtime 和性能工具分别在独立仓库发布。更完整的仓库边界见
 [`REPOSITORY_LAYOUT.md`](REPOSITORY_LAYOUT.md)。
 
 ## 快速开始
 
 下面的流程从一个全新的 checkout 开始，使用系统默认 Rust 工具链。内核、ELM 工具和
-Native/性能仓库彼此独立；只有内核编译需要进入本仓库。
+Native/性能仓库彼此独立；构建内核不要求克隆其它项目仓库。
 
 ### 1. 准备源码和工具链
 
@@ -149,7 +149,21 @@ cargo install --locked --git \
 ```
 
 不要在仓库中创建或提交 `rust-toolchain.toml`；Rust 版本由开发者的默认工具链管理。
-EFI 辅助代码需要目标架构的 C 编译器，SOYO 的 C header 集成测试需要 `clang`。
+仓库的 [`.cargo/config.toml`](.cargo/config.toml) 目前分别调用
+`loongarch64-linux-gnu-gcc` 和 `riscv64-linux-gnu-gcc` 编译 EFI 的少量 freestanding C
+辅助代码。C 编译器名称不需要与 Rust target triple 相同；构建 RISC-V 内核不要求把
+`riscv64-unknown-elf-gcc` 伪装或链接成其它命令。SOYO 的 C header 集成测试位于独立
+链接器仓库，需要时再安装 `clang`。
+
+Fedora 可以直接使用发行版签名仓库中的交叉编译器：
+
+```sh
+sudo dnf install gcc-loongarch64-linux-gnu gcc-riscv64-linux-gnu
+```
+
+这两个 Linux-targeted GCC 在本仓库中只编译 freestanding C shim；kernel 的 Rust 链接仍由
+`rust-lld` 完成。真正需要 Newlib 裸机 sysroot 的外部项目应独立安装
+`riscv64-unknown-elf` 工具链，不应改写本仓库的命令名。
 
 需要 Native 示例或 SOYO 镜像工具时，再安装并初始化对应的 sibling 仓库：
 
@@ -163,11 +177,12 @@ cargo install --locked --path ../hitoshizuku-soyo-linker
 
 性能画像工具位于 `hitoshizuku-bench`，它是可选的测试工程，不是内核构建前置依赖。
 
-### 2. 检查 workspace
+### 2. 检查 workspace 与 ELM 工具
 
 ```sh
 cargo metadata --no-deps --format-version 1
 cargo check --workspace --lib --target loongarch64-unknown-none
+cargo elm --version
 ```
 
 如果在其他目录直接调用 `cargo elm`，显式指定内核源码：
@@ -180,13 +195,18 @@ export HITOSHIZUKU_KERNEL_ROOT=$HOME/src/hitoshizuku
 
 ```sh
 cargo xtask defconfig
-cargo xtask config
 cargo xtask modules --target loongarch64-unknown-none
 cargo xtask build --target loongarch64-unknown-none
 ```
 
-`xtask build` 会自动构建 kernel、导出 Kernel API Profile，并复用
-`target/loongarch64` 与 `build/elm-interface/loongarch64` 的共享缓存。最终镜像位于：
+`defconfig` 恢复 [`configs/default.config`](configs/default.config)；需要交互修改时改用
+`cargo xtask config`，已有配置增加新选项时使用 `cargo xtask oldconfig`。配置发生变化后
+应重新运行 `modules`。
+
+`xtask modules` 会先构建用于接口导出的 kernel，生成
+`build/elm-interface/loongarch64` 下的 Kernel API Profile，再按 `.config` 构建 `y/m/n`
+模块集合。`xtask build` 消费已有模块清单和集成归档完成最终链接；仅当对应模块清单尚不
+存在时，它才先补跑 `modules`。两个步骤共用 `target/loongarch64` 缓存。最终镜像位于：
 
 ```text
 target/loongarch64/loongarch64-unknown-none/release/kernel
@@ -200,29 +220,34 @@ LLVM_NM=/usr/bin/nm scripts/test-kcsan-codegen.sh
 ```
 
 Native、SOYO 和性能工具使用独立 checkout；它们的安装和环境变量约定见
-[`REPOSITORY_LAYOUT.md`](REPOSITORY_LAYOUT.md)。initramfs、BusyBox、rootfs 和磁盘镜像
-不是本仓库的构建输入，需由外部工程提供。
+[`REPOSITORY_LAYOUT.md`](REPOSITORY_LAYOUT.md)。本仓库不生成 initramfs、BusyBox、
+rootfs 或磁盘镜像；需要嵌入 initramfs 时，把外部工程生成的 CPIO 显式传给
+`cargo xtask build --initramfs <cpio>`。
 
 其他常用命令：
 
 ```sh
 cargo xtask build --target riscv64gc-unknown-none-elf
 cargo check --workspace --lib --target loongarch64-unknown-none
-cargo check -p platform-uart16550
-cargo build -p virtio-block --target riscv64gc-unknown-none-elf
+cargo check -p platform-uart16550 --lib --target loongarch64-unknown-none
+cargo check -p virtio-block --lib --target riscv64gc-unknown-none-elf
 cargo test -p socket --target x86_64-unknown-linux-gnu
-cargo fmt --all
+cargo fmt --all -- --check
 ```
 
 模块配置位于 [`drivers/Modules.toml`](drivers/Modules.toml)：`y` 表示集成进内核，`m`
 表示生成受 `elm-mgr` 管理的 EKI，`n` 表示禁用。配置和模块构建入口为：
+
+默认配置把固件总线、通用串口、随机服务、网络栈和回环设备集成进内核；架构或板级中断
+控制器、RTC、syscon、QEMU 辅助设备、Flash 与 VirtIO 设备链保持受管模块。这个划分按
+通用性和启动期职责决定，并不等同于 `platform.*` 名称分类。
 
 ```sh
 cargo xtask config
 cargo xtask modules --target loongarch64-unknown-none
 ```
 
-目标、链接脚本和 Rust 编译参数位于 [`.cargo/config.toml`](.cargo/config.toml)；EFI
+目标、链接脚本、交叉 C 编译器和 Rust 编译参数位于 [`.cargo/config.toml`](.cargo/config.toml)；EFI
 路径所需的少量 C 辅助代码由 [`libs/efi/build.rs`](libs/efi/build.rs) 通过 Cargo 编译。
 
 ## Initramfs 边界

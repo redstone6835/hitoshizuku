@@ -11,7 +11,7 @@ Native runtime 和性能分析使用独立仓库及固定版本依赖，不通�
 | [`hitoshizuku-soyo-linker`](https://github.com/redstone6835/hitoshizuku-soyo-linker) | `soyo-ld`、`soyo-verify`、`soyo-inspect` | `cargo install --locked --git`；依赖固定内核 revision 的 ABI crate |
 | [`hitoshizuku-native`](https://github.com/redstone6835/hitoshizuku-native) | MRT、Ranalib、Anonlib、C/Rust 示例和测试 | Native 自己的 workspace；通过 `SOYO_LD` 接入链接器 |
 | [`hitoshizuku-bench`](https://github.com/redstone6835/hitoshizuku-bench) | QEMU 插件、画像脚本、统计学习模型和工作负载 | 消费带提交标识的内核产物与外部输入镜像 |
-| `hitoshizuku-initramfs`（未来） | BusyBox、rootfs、CPIO 和镜像组装 | 作为 `cargo xtask build --initramfs` 的外部输入 |
+| 外部 initramfs 工程 | BusyBox、rootfs、CPIO 和镜像组装 | 产出 CPIO，再作为 `cargo xtask build --initramfs` 的显式输入 |
 
 ## 内核 workspace
 
@@ -25,9 +25,11 @@ drivers/    项目自有硬件驱动与 ELM；由 Modules.toml 选择 y/m/n
 xtask/      内核 Cargo 编排入口
 ```
 
-`tools/`、`native/`、`bench/` 不再位于内核 checkout。需要构建模块时先安装
+旧版单仓库中的 `tools/`、`native/`、`bench/` 已从内核 checkout 拆分。需要构建模块时先安装
 `cargo-elm`；`xtask` 自动传入当前内核根目录，直接从其他目录调用工具时使用
-`HITOSHIZUKU_KERNEL_ROOT`。工具仓库使用固定 Git revision；ABI 版本化后再切换为发布 crate。
+`HITOSHIZUKU_KERNEL_ROOT`。首次 `cargo elm sync` 后，独立 ELM 工程会复用自身
+`.elm/kernel-interface` 中已同步的 Profile；只有发现或刷新接口时才需要再次指定内核根目录。
+工具仓库使用固定 Git revision；ABI 版本化后再切换为发布 crate。
 
 核心目录的入口说明位于各目录的 `README.md`；设备对象、驱动资源和热拔顺序见
 [`DEVICE_ABSTRACTION.md`](DEVICE_ABSTRACTION.md)。目录 README 只解释源码边界和本地
@@ -45,10 +47,12 @@ cargo test -p socket --target x86_64-unknown-linux-gnu
 ```
 
 `drivers/Modules.toml` 是类似 Kconfig 的声明源：`y` 集成进内核，`m` 生成受管 EKI，
-`n` 禁用模块。内核仓库不包含 initramfs、rootfs 或性能输入镜像。
+`n` 禁用模块。硬依赖的模块必须使用相同的 `y/m` 模式；构建工具不会自动继承或改写
+依赖模式。内核仓库不包含 initramfs、rootfs 或性能输入镜像。
 
 ## 依赖和 submodule 原则
 
-项目自有代码使用独立仓库、Cargo Git 依赖和标签管理；不把自有驱动、工具或文档做成本地
-submodule。submodule 只适用于必须固定版本的外部源码，例如 Native 仓库中的 TLSF
-上游快照。所有工具和 runtime 都提交自己的 `Cargo.lock`，内核 workspace 也提交锁文件。
+项目自有代码按耦合程度放入当前 workspace 或独立仓库，并通过 Cargo Git 依赖和标签管理；
+不把自有驱动、工具或文档拼成主仓库 submodule。submodule 只适用于必须固定版本且不由
+项目维护的外部源码，例如 Native 仓库中的 TLSF 上游快照。所有工具和 runtime 都提交
+自己的 `Cargo.lock`，内核 workspace 也提交锁文件。

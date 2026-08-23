@@ -1,113 +1,117 @@
-# 安全报告
+# 安全审查记录
+
+审查基线：2026-08-23，`main` 分支。本文记录源码审计中已经确认的问题和修复状态，
+不是形式化安全证明。行号会随实现变化，因此以函数名和路径为准。
 
 ## 1. 审查范围
 
 | 维度 | 覆盖区域 |
-|------|---------|
-| unsafe 代码与内存安全 | `arch/`、`libs/allocator/`、`libs/mm/`、`general/` |
-| 并发模型与锁正确性 | `libs/sched/`、`kernel/src/syscalls/`、`libs/vfs/` |
-| 系统调用参数校验 | `kernel/src/syscalls/`、`general/src/mm/` |
-| 文件系统与网络输入解析 | `libs/extfs/`、`libs/fatfs/`、`libs/net/` |
-| 架构层硬件交互 | `arch/src/loongarch64/`、`arch/src/riscv64/` |
+| --- | --- |
+| 不安全代码与内存安全 | `arch/`、`libs/allocator/`、`libs/mm/`、`general/` |
+| 并发与内存序 | `libs/sched/`、`general/`、`kernel/src/syscalls/` |
+| 用户指针与系统调用 ABI | `general/src/mm/`、`kernel/src/syscalls/` |
+| 不可信输入解析 | `libs/extfs/`、`libs/fatfs/`、`libs/net/` |
 
-## 2. 总览
+状态含义：**未修复**表示当前源码仍存在所述路径；**已修复**表示实现已经改变，但仍应保留
+回归测试；**设计约束**表示当前实现依赖更窄的内部不变式，后续重构不得放宽该前提。
 
-| 层 | 安全边界 | 已识别风险数 | 关键风险类型 |
-|-----|---------|:---------:|-----------|
-| arch | 汇编入口、CSR 操作、页表激活、上下文切换 | 3 | TLB 刷新屏障缺失、大页标志处理、静态变量别名 |
-| libs (分配器) | 裸指针→引用转换、全局分配器状态 | 2 | slab/buddy 元数据解引用无校验 |
-| libs (调度器) | WaitQueue/Mutex 协议、原子操作、per-CPU 状态 | 2 | static mut 并发读、状态覆盖窗口 |
-| libs (文件系统) | 外部磁盘镜像解析 | 4 | extent 树/FAT 链深度与循环无界、描述符大小误判 |
-| general | 能力注入、固件解析、用户态内存访问 | 1 | 路径字符串 TOCTOU |
-| kernel | syscall 分发、权限检查、资源管理 | 3 | futex 语义偏差、返回值错误、iovec 竞态 |
+## 2. 当前状态
 
-## 3. 详细发现
+| 区域 | 发现 | 状态 |
+| --- | --- | --- |
+| extfs | extent 深度和索引环缺少统一上限 | 未修复 |
+| fatfs | 目录簇链缺少环检测和遍历上限 | 未修复 |
+| extfs | 64-bit 文件系统的零 `s_desc_size` 被当作 32 | 未修复 |
+| allocator | buddy/slab 元数据地址依赖内部来源不变式 | 设计约束 |
+| firmware | `POWER_CONTROLS` 存在无锁读改写 | 未修复 |
+| scheduler | `INIT_TASK` / `ROOT_PID_NS` 的 `static mut` 并发读取 | 已修复 |
+| futex | `FUTEX_CMP_REQUEUE` 比较与迁移不在同一临界区 | 已修复 |
+| user access | C 字符串两次用户内存读取之间可被修改 | 未修复 |
+| syscall | `getcwd` 返回用户缓冲区地址 | 已修复 |
+| syscall | iovec 预扫描与复制之间可被修改 | 未修复 |
+| RISC-V | 修改页表后的切换缺少 PTE store 排序 | 已修复 |
+| LoongArch64 | huge leaf 权限更新不保留 `PTE_HGLOBAL` | 未修复 |
 
-### 3.1 文件系统
+## 3. 未修复项
 
-#### extent 树递归遍历无深度限制
+### 3.1 extfs extent 树边界
 
-- **文件**：`libs/extfs/src/extent.rs:70-208`、`libs/extfs/src/extent_wr.rs:19-119`
-- **根因**：`map_block`、`collect_extents`、`free_tree`、`count_tree_blocks` 四个函数均使用递归下降遍历 extent 索引树。`parse_header` 仅校验魔数 `0xf30a`，不限制 `eh_depth` 字段。ext4 规范定义 depth 为 u16（最大 65535），而内核栈仅 16-64 KiB，depth 约 200 即可导致栈溢出。
-- **触发条件**：挂载恶意构造的 ext4 镜像，其中某个 inode 的 extent 树深度超过约 200。任何读取该文件的操作（`read`、`execve`、`mmap`）或元数据操作（`stat`、`unlink`）均可触发。
+`libs/extfs/src/extent.rs` 的 `map_block` 迭代下降但不记录已访问块，`collect_extents` 仍
+递归访问子树；`libs/extfs/src/extent_wr.rs` 的 `free_tree` 和 `count_tree_blocks` 也仍为
+递归实现。恶意 extent 索引可以构造过深树或祖先环，造成栈耗尽、无限遍历或重复释放。
 
-#### extent 树索引节点循环导致死循环
+修复要求：统一验证 header 中的 depth、entries 和节点容量；下降路径设置与文件系统块数
+一致的硬上限，并记录当前路径上的块号。释放路径还必须在执行副作用前完成完整预检，避免
+发现环时只释放了半棵树。
 
-- **文件**：`libs/extfs/src/extent.rs:106-133`
-- **根因**：`map_block` 沿 extent 索引节点下降的过程使用 `loop { ... current = next; }` 模式，不追踪已访问节点的块号。若某索引节点的子块指针（`ei_leaf_lo`/`ei_leaf_hi`）指向自身或其祖先节点，循环永不终止。
-- **触发条件**：挂载恶意 ext4 镜像，其中某个 inode 的 extent 树包含环。`read` 系统调用进入 `map_block` 即可触发，内核永久挂死。
+### 3.2 FAT 目录簇链环
 
-#### FAT 目录簇链遍历无环检测
+`libs/fatfs/src/dir.rs::scan_dir_sectors_with_scratch` 沿 `next_cluster` 遍历目录链，目前仅在
+遇到 EOC 时结束，`cluster_index` 饱和也不会停止。循环 FAT 链可使目录查询永久占用 CPU。
 
-- **文件**：`libs/fatfs/src/dir.rs:178-208`
-- **根因**：`scan_dir_sectors_with_scratch` 在 `ChainFromCluster` 分支中通过 `state.fat.next_cluster()` 逐簇沿 FAT 链表推进。循环内无步数上限、无环检测（如龟兔赛跑或已访问集合）、无基于 `total_clusters` 的 bound 检查。`cluster_index` 使用 `saturating_add` 在 `u32::MAX` 饱和，但不中断循环。
-- **触发条件**：挂载恶意 FAT 镜像，其中某目录的 FAT 簇链形成环（如簇 5→10→5）。任何访问该目录的操作（`open`、`stat`、`getdents64`、`chdir`）均可触发。
+修复要求：以数据区总簇数为最大步数，并加入环检测；所有沿 FAT 链读取目录的入口必须复用
+同一验证器。
 
-#### INCOMPAT_64BIT 置位且 s_desc_size=0 时描述符大小误判
+### 3.3 ext4 group descriptor 默认大小
 
-- **文件**：`libs/extfs/src/sb.rs:117-119`
-- **根因**：超级块解析逻辑中，当 `INCOMPAT_64BIT` 特性位置位且 `s_desc_size` 字段（偏移 254）为零时，代码使用 `desc_size = 32`。但 ext4 规范规定：若 `INCOMPAT_64BIT` 存在且 `s_desc_size` 为零，应默认使用 64 字节描述符。32 字节描述符下，`block_bitmap_hi`、`inode_bitmap_hi`、`inode_table_hi` 等所有高 32 位字段从错误偏移量读取，后续块/inode 分配操作使用垃圾物理地址。
-- **触发条件**：挂载设置了 `INCOMPAT_64BIT` 但 `s_desc_size` 为零的 ext4 镜像（可通过手工修改超级块构造）。任何分配/释放块或 inode 的操作均受影响。
+`libs/extfs/src/sb.rs` 在 `INCOMPAT_64BIT` 置位且 `s_desc_size == 0` 时仍选择 32 字节。
+兼容 ext4 的读取规则应采用 64 字节或直接拒绝该组合，不能按 32 字节继续解析高位字段。
 
-### 3.2 内存管理
+### 3.4 固件电源控制并发发布
 
-#### slab 与 buddy 分配器元数据解引用无校验
+`general/src/firmware/power.rs` 使用 `AtomicBool` 发布 `static mut POWER_CONTROLS`，但
+`install_one` 的读取、合并和写回没有互斥。并发安装 shutdown/reboot 后端会覆盖另一侧更新；
+读取与写入同一非原子对象也不满足 Rust 并发访问规则。
 
-- **文件**：`libs/allocator/src/slab.rs:1483-1485`、`libs/allocator/src/buddy.rs:2160`
-- **根因**：`slab_node_mut(addr: usize) -> &'static mut SlabNode` 和 `node_mut(addr: usize) -> &'static mut BlockNode` 将任意 `usize` 值直接转换为可变引用，不对地址是否在分配器管理的物理内存范围内做任何校验。这些函数被内部链表遍历路径调用——若链表中相邻节点的指针因堆溢出被破坏，伪造的地址将直接解引用。
-- **触发条件**：分配器管理的某个对象发生堆越界写入，覆盖相邻 slab 节点的 `header`/`avail_list` 或 buddy 节点的链表指针。后续分配/释放操作遍历破坏后的链表时触发。
+修复要求：将完整结构放入锁或使用不可变快照原子替换；`clear`、`install`、`install_one`
+和 `load_controls` 必须遵循同一同步协议。
 
-### 3.3 并发
+### 3.5 用户字符串 TOCTOU
 
-#### static mut POWER_CONTROLS 无锁读-改-写竞争
+`general/src/mm/user_access.rs::copy_cstr_from_user` 先执行 `strnlen_user`，再按所得长度复制。
+另一线程可以在两次读取之间修改字节。架构 fixup 能处理缺页和非法地址，但不能保证两次读取
+看到同一内容。
 
-- **文件**：`general/src/firmware/power.rs:119-209`
-- **根因**：`install_one` 函数执行「读取 `static mut POWER_CONTROLS` → 修改字段 → 写回」序列，无互斥锁保护。在 SMP 环境下，两个 CPU 同时调用 `install_one`（分别来自 ACPI 和 DTB 初始化路径）会产生经典的 TOCTOU 竞争——后完成的写入会静默覆盖先完成的安装。
-- **触发条件**：多核启动，ACPI 与 DTB 电源控制初始化路径并行执行。
+对路径类系统调用应把用户内存视为不稳定输入：一次有界复制到内核缓冲区，再在内核副本中
+查找 NUL、校验 UTF-8 和长度。不要通过锁定任意用户页来建立隐式 ABI。
 
-#### static mut INIT_TASK / ROOT_PID_NS 并发读取
+### 3.6 iovec 两轮读取
 
-- **文件**：`libs/sched/src/scheduler.rs:167-169`
-- **根因**：`static mut INIT_TASK: Option<Arc<Task>>` 和 `static mut ROOT_PID_NS` 由 BSP 在 `INIT_READY` 标志 Release 之前初始化写入，之后所有 CPU 通过 `root_task()` 等函数读取。然而 Rust 内存模型规定 `static mut` 在任何时刻最多被单一线程访问——多核同时读取即构成未定义行为（即使读取的是不可变引用）。当前实现依赖 `INIT_READY` 的 Release/Acquire 同步写侧，但读侧缺乏相应的原子保护。
-- **触发条件**：SMP 环境下 AP 启动后调用 `root_task()`。
+`kernel/src/syscalls/fs.rs::copy_send_iovecs` 先调用 `iov_total_len_capped` 计算容量，随后再次
+读取每个 iovec。用户线程可在两轮之间修改 base 或 len，使实际发送内容与预扫描不同。
+当前复制长度仍受已分配缓冲区限制，因此主要风险是调用语义不一致，而不是直接越界写。
 
-### 3.4 系统调用
+修复要求：先一次性复制并验证 iovec 描述符数组，再依据内核副本计算长度和复制 payload；
+接收路径也应使用同一快照规则。
 
-#### FUTEX_CMP_REQUEUE 锁外值比较违反 Linux 语义
+### 3.7 LoongArch64 huge leaf global 位
 
-- **状态**：已于 2026-07-20 修复。传统 futex 与 futex2 入口都会先在锁外完成 fault-in，再在 `FUTEX_TABLE` 锁内通过 nofault 原子读取重新比较；只有比较成功才在同一临界区迁移等待者。2026-07-21 又补齐了 WAIT/WAITV 的比较-登记事务，以及 WAKE_OP/PI 用户字的 CAS 更新。
-- **文件**：`kernel/src/syscalls/process.rs:2581-2669`、`kernel/src/syscalls/process.rs:2891-2916`、`kernel/src/syscalls/process.rs:3105-3129`、`general/src/mm/vm_space.rs:1131-1162`
-- **根因**：`FUTEX_CMP_REQUEUE` 的实现分两步：(1) 在获取 futex bucket 锁之前，通过 `copy_from_user` 读取 `uaddr` 处的用户值并与 `val3` 比较；(2) 匹配后获取 bucket 锁，调用 `futex_requeue_key` 将等待者从源 futex 转移到目标 futex。但第二步不再重新检查 `uaddr` 处的值。Linux 规范要求条件比较必须在锁内进行——线程 A 可在第一步和第二步之间修改 `uaddr`，使唤醒条件不再成立，导致等待者被错误转移，在 pthread 条件变量语义下可能永久阻塞。
-- **触发条件**：多线程程序使用 `pthread_cond_broadcast`（内部依赖 `FUTEX_CMP_REQUEUE`），同时另一线程修改条件变量关联的 futex 字。
+`arch/src/loongarch64/paging.rs::flags_global` 只检查普通 leaf 的 `PTE_G`，而目录级 huge leaf
+使用 `PTE_HGLOBAL`。`mprotect` 重建 huge leaf 时可能丢失 global 属性，造成不必要的 TLB
+失效和语义偏差。
 
-#### copy_cstr_from_user 的 strnlen 与 copy 间 TOCTOU 窗口
+修复要求：权限抽象必须携带 leaf level，或在重建 PTE 时直接根据原 PTE 类型同时保留
+`PTE_G` / `PTE_HGLOBAL`；补充 2 MiB 和 1 GiB 映射回归测试。
 
-- **文件**：`general/src/mm/user_access.rs:101-113`
-- **根因**：`copy_path_from_user` 调用的 `copy_cstr_from_user` 先通过 `strnlen_user` 在用户态页面中定位 NUL 终止符确定长度，再通过 `copy_from_user` 将等长数据拷贝到内核缓冲区。两次用户态内存访问之间存在窗口——另一线程可在此期间修改路径缓冲区内容（如将路径中间的一个字符改为 NUL，或扩展路径长度超出已确认的范围）。此问题属于 POSIX API 的固有缺陷（Linux 同样存在），但本实现中两个操作之间无任何锁定或重确认机制。
-- **触发条件**：多线程程序中的线程 A 调用 `openat` 等路径类系统调用，线程 B 并发修改同一路径缓冲区。
+## 4. 设计约束
 
-#### sys_getcwd 返回值与 Linux ABI 不一致
+`libs/allocator` 的 buddy `node_mut` 和 slab `slab_node` 会把内部保存的地址还原为引用。
+当前安全性依赖节点地址只来自永不提前释放、满足布局与对齐要求的 metadata allocator，且
+链表操作始终在相应 allocator 锁内。它们不是接受任意地址的公共 API。
 
-- **文件**：`kernel/src/syscalls/fs.rs:380`
-- **根因**：Linux `getcwd` 系统调用成功时返回写入用户缓冲区的字符串长度（含 NUL 终止符），而此实现返回 `Ok(user)`——即用户缓冲区指针的值。glibc 等 libc 实现会检查返回值：若为负则视为 errno 取反，若为正则用作长度。返回一个高地址指针值（如 `0x0000004000800000`）将被 libc 误判。
-- **触发条件**：任何 `getcwd(buf, size)` 调用。
+后续若允许从磁盘、用户态、ELM 或未受同一锁保护的结构恢复节点地址，必须先加入管理范围、
+对齐、节点状态和所属 allocator 校验；不能把当前内部来源不变式扩展成外部信任边界。
 
-#### sendmsg/recvmsg iovec 数组两轮扫描间的竞态
+## 5. 已修复项与回归要求
 
-- **文件**：`kernel/src/syscalls/fs.rs:3867-3916`
-- **根因**：`sendmsg` 处理流程中，`iov_total_len_capped` 先遍历 `iovec` 数组计算总数据长度并据此预分配内核缓冲区，随后 `copy_send_iovecs` 再次遍历 `iovec` 数组逐一执行 `copy_from_user` 拷贝数据。两轮遍历之间，用户态另一线程可修改 `iovec` 数组内容（`iov_base`/`iov_len`），导致分配的内核缓冲区大小与实际拷贝数据量不匹配。`copy_from_user` 自身的缺页修复机制限制了越界写风险，但可导致发送数据内容与调用者预期不一致。
-- **触发条件**：多线程程序中的线程 A 调用 `sendmsg`/`writev`，线程 B 并发修改同一 `iovec` 数组。
+- 调度器全局锚点已改为持有永久 `Arc` 强引用的 `AtomicPtr`，读取时使用 Acquire 并克隆
+  `Arc`；不得退回并发读取 `static mut Option<Arc<_>>`。
+- futex compare-requeue 已在 fault-in 后于 futex 表临界区内重新读取并比较用户字；WAIT、
+  WAITV、WAKE_OP 和 PI 路径需要继续保持比较/登记或更新的事务边界。
+- `sys_getcwd` 已返回包含结尾 NUL 的字节数 `needed`，不再返回用户缓冲区地址。
+- RISC-V 地址空间切换通过 `needs_page_table_fence` 跟踪未排序的页表修改，并在需要时执行
+  ASID 定向 `sfence.vma`；ASID generation 复用和远程 shootdown 测试必须覆盖该标志。
 
-### 3.5 架构层
-
-#### RISC-V sfence.vma 前缺少页表写屏障
-
-- **文件**：`arch/src/riscv64/paging.rs:137-160`
-- **根因**：`activate_with_asid` 函数在写入 `satp` CSR 后执行 `sfence.vma` 刷新 TLB。但在写入 `satp` 之前，未执行 `fence w,w` 来保证此前对页表内存的存储操作已全局可见。RISC-V 规范不保证 `csrw satp` 隐含任何存储屏障——在弱排序实现上，页表写入可能被推迟到 `satp` 切换之后，此时 TLB 硬件遍历可能读取到旧（无效）页表项。LoongArch64 对应代码（`paging.rs:170`）有 `dbar 0` 屏障。
-- **触发条件**：弱内存排序的 RISC-V 硬件实现上频繁切换地址空间（如 `execve` 或 `fork` 后的 COW 页表更新）。
-
-#### LoongArch64 大页 protect 路径 global 标志丢失
-
-- **文件**：`arch/src/loongarch64/mm/user_pgd.rs:248-257`
-- **根因**：`protect` 函数在重建 PTE 时调用 `flags_global(old_flags)` 判断是否需要保留 global 属性。该函数检查 `PTE_G`（bit 6），但 2MiB/1GiB 大页的 global 位位于 `PTE_HGLOBAL`（bit 12）。因此通过 `mprotect` 修改大页的权限时，global 标志会被清零，大页降级为非 global 映射，每次上下文切换后 TLB 失效需重新填充。
-- **触发条件**：对通过 `mmap` 以 2MiB 或 1GiB 大页映射的区域调用 `mprotect` 修改权限位。
+安全修复应同时增加最小拒绝测试或并发回归测试，并更新本文件状态。涉及 ELM 镜像、直接
+内核符号或设备资源的变更还应检查 [ELM.md](ELM.md) 和
+[DEVICE_ABSTRACTION.md](DEVICE_ABSTRACTION.md) 中的生命周期约束。

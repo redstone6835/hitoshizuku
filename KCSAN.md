@@ -4,14 +4,21 @@ KCSAN 是面向调试内核的采样式数据竞争检测器。编译器为普�
 
 ## 构建与运行
 
-使用当前系统的默认 Rust 工具链，并通过 Cargo 显式启用 KCSAN：
+使用当前系统的默认 Rust 工具链。`kcsan` feature 只把运行时链接进 kernel；编译器插桩还
+必须通过仓库提供的 wrapper 显式启用：
 
 ```sh
-cargo xtask build --target loongarch64-unknown-none --features kcsan
-cargo xtask build --target riscv64gc-unknown-none-elf --features kcsan
+RUSTC_WRAPPER="$PWD/scripts/kcsan-rustc-wrapper.sh" \
+  cargo xtask build --target loongarch64-unknown-none --features kcsan
+RUSTC_WRAPPER="$PWD/scripts/kcsan-rustc-wrapper.sh" \
+  cargo xtask build --target riscv64gc-unknown-none-elf --features kcsan
 ```
 
-产物位于 Cargo 的目标目录 `target/<target>/release/kernel`，构建快照和符号表位于 `build/kcsan/<arch>/kernel` 与 `kernel.map`。RISC-V 快照是 ELF，LoongArch 快照与启动镜像一样是手工 PE。KCSAN 构建会显著改变时序和性能，不得用于性能基准或发布镜像。
+`xtask` 使用按架构隔离的 Cargo 目录，产物分别位于
+`target/loongarch64/loongarch64-unknown-none/release/kernel` 和
+`target/riscv64/riscv64gc-unknown-none-elf/release/kernel`。RISC-V 产物是带调试信息的
+ELF；LoongArch64 启动镜像是 PE。当前构建入口不会自动生成 `kernel.map` 或 KCSAN
+快照目录。KCSAN 构建会显著改变时序和性能，不得用于性能基准或发布镜像。
 
 例如 LoongArch64 可将普通 QEMU 命令中的 `-kernel` 参数替换为对应 KCSAN 构建产物，保留 `-smp 8`。慢宿主复现可在运行环境中限制 CPU 数量。
 
@@ -26,11 +33,14 @@ cargo xtask build --target riscv64gc-unknown-none-elf --features kcsan
 必须使用与运行镜像同一次构建的符号产物解析两个 PC。RISC-V64 镜像是保留符号的 ELF，可直接执行：
 
 ```sh
-riscv64-linux-gnu-addr2line -e target/riscv64gc-unknown-none-elf/release/kernel -f -C -p \
+riscv64-linux-gnu-addr2line \
+    -e target/riscv64/riscv64gc-unknown-none-elf/release/kernel -f -C -p \
     0xFIRST_PC 0xSECOND_PC
 ```
 
-也可使用 `llvm-addr2line`；当前 LLVM 版本可能对部分 DWARF range 发出警告，但仍能给出函数和源码行。LoongArch64 的可启动产物是只含 `.text`/`.data` 的 PE，不能直接交给 `addr2line`；使用同次构建且经过 manifest 哈希校验的 map 做函数级定位：
+也可使用 `llvm-addr2line`；当前 LLVM 版本可能对部分 DWARF range 发出警告，但仍能给出
+函数和源码行。LoongArch64 的可启动产物是 PE，不能直接交给常见的 `addr2line`。若调用方
+在同一次链接中另行保存了 LLD map、kernel 副本及哈希清单，可用仓库脚本做函数级定位：
 
 ```sh
 scripts/kcsan-symbolize.py build/kcsan/loongarch64/kernel.map \
@@ -38,6 +48,14 @@ scripts/kcsan-symbolize.py build/kcsan/loongarch64/kernel.map \
 ```
 
 保留原始 PC，以便后续配合 DWARF sidecar 做行号定位。
+
+wrapper 自身的代码生成约束可以独立验证；该测试要求 `llvm-nm`，也可通过环境变量指定
+兼容的 `nm`：
+
+```sh
+LLVM_NM=/usr/bin/nm scripts/test-kcsan-codegen.sh
+python3 -m unittest scripts.tests.test_kcsan_symbolize
+```
 
 `report ring overwritten` 表示报告产生速度超过 100 ms 排空速度；`report publication busy` 表示多个 CPU 同时提交报告时，为保证检测器不阻塞而丢弃了少量报告。两者都应优先处理已保留的报告，再缩小负载或拆分复现阶段。
 

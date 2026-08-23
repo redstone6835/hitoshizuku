@@ -13,10 +13,11 @@
 5. `libs` 保存可独立复用的内核子系统与数据结构，例如 allocator、VFS、调度、AF_UNIX、IP 网络、ELM、ELF 和文件系统实现。
 6. `drivers` 保存具体硬件驱动。每个驱动都是独立 ELM 工程，由统一模块清单决定集成、受管装载或禁用。
 
-IP 协议栈位于 `libs/net`，INET 套接字数据路径由 `libs/vfs` 接入；AF_UNIX 本地 IPC
-继续由 `libs/socket` 和 `libs/vfs` 提供。loopback 位于 `drivers/loopback`，
-VirtIO block/net 位于 `drivers/virtio-blk` 和 `drivers/virtio-net`，均通过
-`drivers/Modules.toml` 选择集成方式。
+协议执行状态机位于 `drivers/net-stack` 的 `net.stack` ELM；`libs/net` 提供 host 与 ELM
+共享的缓冲区、队列、flow shard、单写者执行和协议契约，kernel 负责设备队列与 worker
+调度。INET 套接字数据路径由 `libs/vfs` 接入；AF_UNIX 本地 IPC 继续由 `libs/socket` 和
+`libs/vfs` 提供。loopback 位于 `drivers/loopback`，VirtIO block/net 位于
+`drivers/virtio-blk` 和 `drivers/virtio-net`，均通过 `drivers/Modules.toml` 选择集成方式。
 
 ## 2. 编译期层级
 
@@ -87,8 +88,9 @@ ISA 专属汇编和 CSR/寄存器操作必须留在 `arch`。通用状态机、�
 - `allocator`、`sched`、`vfs`、`socket`、`net` 等提供可直接由内核和 ELM 使用的 Rust API；
 - `kernel-symbols` 为审核后的 API 生成稳定导出描述符和 Mixin 站点；
 - `elm` 与 `elm-loader` 定义运行时模型、EBI 和装载协议；
-- `socket` 提供 AF_UNIX，`net` 提供 IP/TCP/UDP 协议栈与 `NetDriver` 设备契约；
-- 内部 smoltcp 协议引擎是 `net` 的实现细节，不作为独立 Kernel API 暴露。
+- `socket` 提供 AF_UNIX；`net` 提供网络设备契约、packet/flow 类型、队列和单写者执行原语；
+- `drivers/net-stack` 实现 Ethernet、ARP、IPv4/IPv6、ICMP、TCP 与 UDP 的协议 shard turn，
+  通过直接固定端点与 kernel host 协作。
 
 跨 crate 依赖必须保持无环。全局能力需要后端时，优先使用明确的注册接口、trait 或函数指针，不允许通过依赖 `kernel` 获取实现。
 
@@ -96,11 +98,18 @@ ISA 专属汇编和 CSR/寄存器操作必须留在 `arch`。通用状态机、�
 
 `drivers/Modules.toml` 是驱动集合的配置与依赖图。每个条目声明模块名、工程路径、配置键、适用目标和 ELM 依赖：
 
-- `y`：编译为集成归档并链接进内核镜像；运行时不经过动态调用封装，但仍保留 ELM 身份和生命周期登记。
+- `y`：编译为集成归档并链接进内核镜像；按集成组件 initcall 初始化，不创建 ELM cell，
+  也不具有 generation、动态暂停或热替换语义。
 - `m`：编译为受管 EKI，写入 `build/<arch>/modules`，由 `elm-mgr` 在运行时校验和装载。
 - `n`：不构建，也不进入最终依赖图。
 
-模块之间的功能依赖必须写入 ELM 清单，不能用隐藏的 Cargo path dependency 代替。例如 `virtio.block` 依赖 `virtio.framework`，构建工具必须在依赖被禁用时直接拒绝配置。
+默认部署策略只把基础且通用的固件总线、UART、随机服务、协议栈与回环设备设为 `y`；
+架构或板级中断控制器以及其它可选硬件驱动设为 `m`。这里的选择表达部署边界，不改变
+`general` 中的 PnP、资源所有权或 `DeviceFunction` 抽象。
+
+模块之间的功能依赖必须同时写入模块集合清单和 ELM 清单，不能用隐藏的 Cargo path
+dependency 代替。例如 `virtio.block` 依赖 `virtio.framework`，构建工具不仅会在依赖被
+禁用时拒绝配置，也要求硬依赖两端具有相同的 `y` 或 `m` 模式。
 
 驱动源码通过 Kernel API Profile 使用与内核相同路径的 Rust API。配置为 `y` 和 `m` 的源码保持一致，差异只存在于构建、链接、装载和生命周期管理阶段。
 
@@ -151,8 +160,15 @@ Kernel API Profile（内核 API 配置）同时包含目标专属 Rust metadata�
 - `cargo xtask config`：交互式选择驱动和 ELM 模式；
 - `cargo xtask oldconfig`：保留现有选择并补齐新增项；
 - `cargo xtask defconfig`：恢复默认配置；
-- `cargo xtask modules --target <triple>`：构建当前配置选择的模块集合；
-- `cargo xtask build --target <triple> --initramfs <cpio>`：在调用方提供镜像时嵌入 initramfs。
+- `cargo xtask modules --target <triple>`：构建用于接口导出的 kernel、导出该目标的
+  Kernel API Profile，再构建当前配置选择的模块集合；
+- `cargo xtask build --target <triple>`：消费模块清单与集成归档完成最终 kernel 链接；
+  对应清单不存在时先补跑 `modules`；
+- `cargo xtask build --target <triple> --initramfs <cpio>`：在调用方提供镜像时启用
+  `embedded-initramfs` 并嵌入该 CPIO。
+
+`modules` 与 `build` 默认分别复用 `target/<arch>` 和 `build/<arch>/modules`。切换目标、
+配置或接口后应显式重新运行 `modules`，不要依赖旧的 `modules.manifest` 自动失效。
 
 initramfs 生成、用户态 rootfs 和镜像装配属于独立工程，不是内核构建的隐式步骤。
 
