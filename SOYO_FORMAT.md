@@ -143,6 +143,10 @@ String Table 是一段字节串，偏移 `0` 必须为 NUL。所有非零偏移�
 Core 不注册任何执行 profile。未知 identifier 可以被检查器展示，但装载器和 projector
 不得根据字符串前缀猜测其语义。常见 identifier 示例：
 
+`mygo.*` 前缀属于历史兼容的 Wire/ABI 标识，已经冻结，不代表当前项目品牌。新协议和
+文档优先使用 Hitoshizuku 名称，但不得重命名既有字段、schema、契约或符号；需要变更时
+必须增加新的版本化标识并保留兼容路径。
+
 | 类别 | 示例 |
 | --- | --- |
 | 对象类型 | `mygo.elm.unit` |
