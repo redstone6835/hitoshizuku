@@ -10,6 +10,8 @@ use crate::validation::{
 
 /// language-runtime ABI 的主版本。
 pub const LANGUAGE_RUNTIME_ABI_VERSION: u16 = 1;
+/// 带 package/artifact 身份的实例协议版本。
+pub const LANGUAGE_RUNTIME_ABI_VERSION_V2: u16 = 2;
 /// 后端描述符使用的 ABI 版本。
 pub const LANGUAGE_BACKEND_ABI_VERSION: u16 = LANGUAGE_RUNTIME_ABI_VERSION;
 /// 运行时目录使用的 ABI 版本。
@@ -37,8 +39,16 @@ pub const LANGUAGE_RUNTIME_BACKEND_UNREGISTER_CONTRACT: &str =
 pub const LANGUAGE_RUNTIME_BACKEND_NEXT_CONTRACT: &str = "language.runtime.backend.next@1";
 /// `language.runtime.backend.complete@1` 合约。
 pub const LANGUAGE_RUNTIME_BACKEND_COMPLETE_CONTRACT: &str = "language.runtime.backend.complete@1";
+/// `language.runtime.backend.cancel.next@1` 合约。
+pub const LANGUAGE_RUNTIME_BACKEND_CANCEL_NEXT_CONTRACT: &str =
+    "language.runtime.backend.cancel.next@1";
+/// `language.runtime.backend.cancel.ack@1` 合约。
+pub const LANGUAGE_RUNTIME_BACKEND_CANCEL_ACK_CONTRACT: &str =
+    "language.runtime.backend.cancel.ack@1";
 /// `language.runtime.instance.open@1` 合约。
 pub const LANGUAGE_RUNTIME_INSTANCE_OPEN_CONTRACT: &str = "language.runtime.instance.open@1";
+/// 带 package/artifact 构建身份的 `language.runtime.instance.open@2` 合约。
+pub const LANGUAGE_RUNTIME_INSTANCE_OPEN_V2_CONTRACT: &str = "language.runtime.instance.open@2";
 /// `language.runtime.instance.close@1` 合约。
 pub const LANGUAGE_RUNTIME_INSTANCE_CLOSE_CONTRACT: &str = "language.runtime.instance.close@1";
 /// `language.runtime.request.submit@1` 合约。
@@ -69,6 +79,18 @@ pub const LANGUAGE_RUNTIME_CONTRACTS: &[&str] = &[
     LANGUAGE_RUNTIME_REQUEST_RELEASE_CONTRACT,
     LANGUAGE_RUNTIME_DRAIN_CONTRACT,
 ];
+
+/// 不改变 V1 目录计数的生命周期扩展合约。
+///
+/// 消费者必须显式检查这些合约，不能仅凭 [`LANGUAGE_RUNTIME_CONTRACT_COUNT`] 推断支持。
+pub const LANGUAGE_RUNTIME_LIFECYCLE_CONTRACTS: &[&str] = &[
+    LANGUAGE_RUNTIME_BACKEND_CANCEL_NEXT_CONTRACT,
+    LANGUAGE_RUNTIME_BACKEND_CANCEL_ACK_CONTRACT,
+    LANGUAGE_RUNTIME_INSTANCE_OPEN_V2_CONTRACT,
+];
+
+/// SHA-256 构建身份的固定字节数。
+pub const LANGUAGE_ARTIFACT_DIGEST_LEN: usize = 32;
 
 /// 后端描述符 flags。
 pub const LANGUAGE_BACKEND_FLAG_NONE: u32 = 0;
@@ -381,6 +403,245 @@ impl LanguageInstanceDescriptorV1 {
     }
 }
 
+/// package、AOT artifact 与接口 schema 的不可变构建身份。
+///
+/// 该结构只把 loader 已经验证的身份绑定到实例生命周期；它本身不替代包签名、来源验证或
+/// trust policy。三个 digest 都是原始 SHA-256 字节，不能传入十六进制文本。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanguageArtifactIdentityV2 {
+    /// 结构遵循的 ABI 版本，固定为 2。
+    pub abi_version: u16,
+    /// 结构的完整字节数。
+    pub struct_size: u16,
+    /// V2 必须为零。
+    pub flags: u32,
+    /// package manifest 分配的稳定非零编号。
+    pub package_id: u64,
+    /// 当前目标 artifact 的稳定非零编号。
+    pub artifact_id: u64,
+    /// 规范化 package manifest 的 SHA-256。
+    pub package_digest: [u8; LANGUAGE_ARTIFACT_DIGEST_LEN],
+    /// 实际 AOT/ELM artifact 的 SHA-256。
+    pub artifact_digest: [u8; LANGUAGE_ARTIFACT_DIGEST_LEN],
+    /// 该 artifact 使用的语言无关接口 schema SHA-256。
+    pub interface_digest: [u8; LANGUAGE_ARTIFACT_DIGEST_LEN],
+    /// V2 必须为零。
+    pub reserved: u64,
+}
+
+impl LanguageArtifactIdentityV2 {
+    /// 返回当前结构的 ABI 尺寸。
+    pub const SIZE: usize = size_of::<Self>();
+
+    /// 构造一个完整的构建身份。
+    pub const fn new(
+        package_id: u64,
+        artifact_id: u64,
+        package_digest: [u8; LANGUAGE_ARTIFACT_DIGEST_LEN],
+        artifact_digest: [u8; LANGUAGE_ARTIFACT_DIGEST_LEN],
+        interface_digest: [u8; LANGUAGE_ARTIFACT_DIGEST_LEN],
+    ) -> Self {
+        Self {
+            abi_version: LANGUAGE_RUNTIME_ABI_VERSION_V2,
+            struct_size: Self::SIZE as u16,
+            flags: 0,
+            package_id,
+            artifact_id,
+            package_digest,
+            artifact_digest,
+            interface_digest,
+            reserved: 0,
+        }
+    }
+
+    /// 验证编号、digest、flags 与保留字段。
+    pub fn validate(&self) -> ValidationResult {
+        validate_header(
+            self.abi_version,
+            self.struct_size,
+            LANGUAGE_RUNTIME_ABI_VERSION_V2,
+            Self::SIZE,
+        )?;
+        validate_flags(self.flags, 0)?;
+        validate_identifier(self.package_id)?;
+        validate_identifier(self.artifact_id)?;
+        if self.package_digest.iter().all(|byte| *byte == 0)
+            || self.artifact_digest.iter().all(|byte| *byte == 0)
+            || self.interface_digest.iter().all(|byte| *byte == 0)
+        {
+            return Err(LanguageValidationError::Identifier);
+        }
+        validate_reserved(self.reserved)
+    }
+}
+
+/// `instance.open@2` 的 owner 绑定输入。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanguageInstanceOpenRequestV2 {
+    /// 结构遵循的 ABI 版本，固定为 2。
+    pub abi_version: u16,
+    /// 结构的完整字节数。
+    pub struct_size: u16,
+    /// V2 必须为零。
+    pub flags: u32,
+    /// consumer owner cell。
+    pub owner_cell_id: u64,
+    /// consumer owner generation。
+    pub owner_generation: u64,
+    /// 目标语言后端编号。
+    pub backend_id: u64,
+    /// package、artifact 与接口 schema 构建身份。
+    pub artifact: LanguageArtifactIdentityV2,
+    /// V2 必须为零。
+    pub reserved: u64,
+}
+
+impl LanguageInstanceOpenRequestV2 {
+    /// 返回当前结构的 ABI 尺寸。
+    pub const SIZE: usize = size_of::<Self>();
+
+    /// 构造带构建身份的实例创建请求。
+    pub const fn new(
+        owner: LanguageOwnerV1,
+        backend_id: u64,
+        artifact: LanguageArtifactIdentityV2,
+    ) -> Self {
+        Self {
+            abi_version: LANGUAGE_RUNTIME_ABI_VERSION_V2,
+            struct_size: Self::SIZE as u16,
+            flags: 0,
+            owner_cell_id: owner.cell_id,
+            owner_generation: owner.generation,
+            backend_id,
+            artifact,
+            reserved: 0,
+        }
+    }
+
+    /// 验证 owner、后端、构建身份和保留字段。
+    pub fn validate(&self) -> ValidationResult {
+        validate_header(
+            self.abi_version,
+            self.struct_size,
+            LANGUAGE_RUNTIME_ABI_VERSION_V2,
+            Self::SIZE,
+        )?;
+        validate_flags(self.flags, 0)?;
+        validate_owner(self.owner_cell_id, self.owner_generation)?;
+        validate_identifier(self.backend_id)?;
+        self.artifact.validate()?;
+        validate_reserved(self.reserved)
+    }
+
+    /// 返回请求中的 consumer owner。
+    pub const fn owner(&self) -> LanguageOwnerV1 {
+        LanguageOwnerV1::new(self.owner_cell_id, self.owner_generation)
+    }
+
+    /// 验证请求 owner 与受信任 managed call 上下文一致。
+    pub fn validate_for_owner(&self, expected: LanguageOwnerV1) -> ValidationResult {
+        self.validate()?;
+        crate::validation::validate_expected_owner(
+            self.owner_cell_id,
+            self.owner_generation,
+            expected.cell_id,
+            expected.generation,
+        )
+    }
+}
+
+/// 带 package/artifact 构建身份的 V2 实例描述符。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanguageInstanceDescriptorV2 {
+    /// 结构遵循的 ABI 版本，固定为 2。
+    pub abi_version: u16,
+    /// 结构的完整字节数。
+    pub struct_size: u16,
+    /// 实例当前状态 flags。
+    pub flags: u32,
+    /// 实例所属语言编号。
+    pub language_id: u64,
+    /// 实例所属后端编号。
+    pub backend_id: u64,
+    /// 实例编号。
+    pub instance_id: u64,
+    /// consumer owner cell。
+    pub owner_cell_id: u64,
+    /// consumer owner generation。
+    pub owner_generation: u64,
+    /// 实例 opaque 句柄。
+    pub handle: LanguageHandle,
+    /// package、artifact 与接口 schema 构建身份。
+    pub artifact: LanguageArtifactIdentityV2,
+    /// V2 必须为零。
+    pub reserved: u64,
+}
+
+impl LanguageInstanceDescriptorV2 {
+    /// 返回当前结构的 ABI 尺寸。
+    pub const SIZE: usize = size_of::<Self>();
+
+    /// 从已经分配的 V1 实例记录构造 V2 回复。
+    pub const fn from_v1(
+        instance: LanguageInstanceDescriptorV1,
+        artifact: LanguageArtifactIdentityV2,
+    ) -> Self {
+        Self {
+            abi_version: LANGUAGE_RUNTIME_ABI_VERSION_V2,
+            struct_size: Self::SIZE as u16,
+            flags: instance.flags,
+            language_id: instance.language_id,
+            backend_id: instance.backend_id,
+            instance_id: instance.instance_id,
+            owner_cell_id: instance.owner_cell_id,
+            owner_generation: instance.owner_generation,
+            handle: instance.handle,
+            artifact,
+            reserved: 0,
+        }
+    }
+
+    /// 验证实例、owner、句柄、构建身份和保留字段。
+    pub fn validate(&self) -> ValidationResult {
+        validate_header(
+            self.abi_version,
+            self.struct_size,
+            LANGUAGE_RUNTIME_ABI_VERSION_V2,
+            Self::SIZE,
+        )?;
+        validate_flags(self.flags, LANGUAGE_INSTANCE_FLAGS_MASK)?;
+        if self.flags.count_ones() != 1 {
+            return Err(LanguageValidationError::State);
+        }
+        validate_identifier(self.language_id)?;
+        validate_identifier(self.backend_id)?;
+        validate_identifier(self.instance_id)?;
+        validate_owner(self.owner_cell_id, self.owner_generation)?;
+        crate::validation::validate_handle(self.handle)?;
+        self.artifact.validate()?;
+        validate_reserved(self.reserved)
+    }
+
+    /// 返回 consumer owner 快照。
+    pub const fn owner(&self) -> LanguageOwnerV1 {
+        LanguageOwnerV1::new(self.owner_cell_id, self.owner_generation)
+    }
+
+    /// 验证描述符 owner 与受信任调用上下文一致。
+    pub fn validate_for_owner(&self, expected: LanguageOwnerV1) -> ValidationResult {
+        self.validate()?;
+        crate::validation::validate_expected_owner(
+            self.owner_cell_id,
+            self.owner_generation,
+            expected.cell_id,
+            expected.generation,
+        )
+    }
+}
+
 /// `language.runtime.catalog@1` 返回的运行时能力目录。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -448,6 +709,9 @@ impl LanguageRuntimeCatalogV1 {
 // 固定布局的尺寸应在编译期失败，而不是等到某个架构第一次装载时才失败。
 const _: () = assert!(size_of::<LanguageBackendDescriptorV1>() == 80);
 const _: () = assert!(size_of::<LanguageInstanceDescriptorV1>() == 64);
+const _: () = assert!(size_of::<LanguageArtifactIdentityV2>() == 128);
+const _: () = assert!(size_of::<LanguageInstanceOpenRequestV2>() == 168);
+const _: () = assert!(size_of::<LanguageInstanceDescriptorV2>() == 192);
 const _: () = assert!(size_of::<LanguageRuntimeCatalogV1>() == 32);
 
 /// 注销后端以及创建实例时使用的 owner 绑定请求。

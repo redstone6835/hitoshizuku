@@ -40,6 +40,223 @@ use crate::module_wire::{
 /// 每个由 Rust 框架构建的原生 ELM 都包含此槽。打包器把它投影为受运行时管理的特殊重定位，
 /// 装载器在执行任何模块代码前写入 [`ElmApiRootV1`] 地址。模块不得自行定义同名符号。
 pub const ELM_API_ROOT_SLOT_SYMBOL: &str = "__elm_api_root_slot_v1";
+/// 集成组件 managed export 描述符的固定魔数。
+pub const ELM_INTEGRATED_MANAGED_EXPORT_MAGIC: u64 = u64::from_le_bytes(*b"ELMEXP01");
+/// 集成组件 managed export 描述符 ABI 版本。
+pub const ELM_INTEGRATED_MANAGED_EXPORT_ABI_V1: u16 = 1;
+/// 集成 provider 名称的固定缓冲区长度。
+pub const ELM_INTEGRATED_PROVIDER_NAME_LEN: usize = 128;
+/// 集成 provider 版本的固定缓冲区长度。
+pub const ELM_INTEGRATED_PROVIDER_VERSION_LEN: usize = 64;
+/// 集成 managed export 名称的固定缓冲区长度。
+pub const ELM_INTEGRATED_EXPORT_NAME_LEN: usize = 128;
+/// 集成 managed export 契约的固定缓冲区长度。
+pub const ELM_INTEGRATED_EXPORT_CONTRACT_LEN: usize = 64;
+
+const ELM_INTEGRATED_EXPORT_FLAG_MANAGED: u32 = 1 << 0;
+const ELM_INTEGRATED_EXPORT_FLAG_DIRECT_PINNED: u32 = 1 << 1;
+const ELM_INTEGRATED_EXPORT_FLAG_PRIVATE: u32 = 1 << 2;
+const ELM_INTEGRATED_EXPORT_FLAG_DEPENDENCY: u32 = 1 << 3;
+const ELM_INTEGRATED_EXPORT_FLAG_SUBTREE: u32 = 1 << 4;
+const ELM_INTEGRATED_EXPORT_FLAGS_MASK: u32 = ELM_INTEGRATED_EXPORT_FLAG_MANAGED
+    | ELM_INTEGRATED_EXPORT_FLAG_DIRECT_PINNED
+    | ELM_INTEGRATED_EXPORT_FLAG_PRIVATE
+    | ELM_INTEGRATED_EXPORT_FLAG_DEPENDENCY
+    | ELM_INTEGRATED_EXPORT_FLAG_SUBTREE;
+
+/// 常驻集成组件处理 managed export 调用的固定 ABI 入口。
+pub type ElmIntegratedManagedExportInvoke =
+    unsafe extern "C" fn(*mut ElmNativeManagedCallV1) -> i32;
+/// 查询常驻集成组件实例是否已经初始化并可接受调用。
+///
+/// 返回非零表示就绪。使用固定宽度整数而不是 Rust `bool`，确保描述符可以由任意支持
+/// C ABI 的工具链生成。
+pub type ElmIntegratedManagedExportInitialized = extern "C" fn() -> u32;
+
+/// 由 `y` 模式组件发布到内核链接段的语言无关 managed export 描述符。
+///
+/// 描述符只携带稳定标量、固定字符串和 C ABI 调用门。内核把 provider 投影为 builtin ELM
+/// cell 后，仍按普通 EBI import 的名称、契约、版本、可见性和 cell policy 完成绑定；回调地址
+/// 不会直接写入动态 consumer。
+#[repr(C, align(8))]
+#[derive(Debug, Clone, Copy)]
+pub struct ElmIntegratedManagedExportV1 {
+    /// 固定魔数。
+    pub magic: u64,
+    /// 描述符 ABI 版本。
+    pub abi_version: u16,
+    /// 当前结构完整长度。
+    pub struct_size: u16,
+    /// provider 名称有效字节数。
+    pub provider_name_len: u16,
+    /// provider 版本有效字节数。
+    pub provider_version_len: u16,
+    /// export 名称有效字节数。
+    pub name_len: u16,
+    /// export 契约有效字节数。
+    pub contract_len: u16,
+    /// EBI export 版本。
+    pub version: u32,
+    /// EBI managed export 与可见性标志。
+    pub flags: u32,
+    /// provider 规范名称。
+    pub provider_name: [u8; ELM_INTEGRATED_PROVIDER_NAME_LEN],
+    /// provider 版本。
+    pub provider_version: [u8; ELM_INTEGRATED_PROVIDER_VERSION_LEN],
+    /// export 名称。
+    pub name: [u8; ELM_INTEGRATED_EXPORT_NAME_LEN],
+    /// export 契约。
+    pub contract: [u8; ELM_INTEGRATED_EXPORT_CONTRACT_LEN],
+    /// 常驻 C ABI trampoline。
+    pub invoke: ElmIntegratedManagedExportInvoke,
+    /// 组件实例初始化状态查询入口。
+    pub initialized: ElmIntegratedManagedExportInitialized,
+}
+
+impl ElmIntegratedManagedExportV1 {
+    /// 使用已经规范化的 provider 名称构造描述符。
+    pub const fn new(
+        provider_name: &str,
+        provider_version: &str,
+        name: &str,
+        contract: &str,
+        version: u32,
+        flags: u32,
+        invoke: ElmIntegratedManagedExportInvoke,
+        initialized: ElmIntegratedManagedExportInitialized,
+    ) -> Self {
+        let (provider_name, provider_name_len) =
+            integrated_fixed_field::<ELM_INTEGRATED_PROVIDER_NAME_LEN>(provider_name, false);
+        let (provider_version, provider_version_len) =
+            integrated_fixed_field::<ELM_INTEGRATED_PROVIDER_VERSION_LEN>(provider_version, false);
+        let (name, name_len) =
+            integrated_fixed_field::<ELM_INTEGRATED_EXPORT_NAME_LEN>(name, false);
+        let (contract, contract_len) =
+            integrated_fixed_field::<ELM_INTEGRATED_EXPORT_CONTRACT_LEN>(contract, false);
+        Self {
+            magic: ELM_INTEGRATED_MANAGED_EXPORT_MAGIC,
+            abi_version: ELM_INTEGRATED_MANAGED_EXPORT_ABI_V1,
+            struct_size: core::mem::size_of::<Self>() as u16,
+            provider_name_len,
+            provider_version_len,
+            name_len,
+            contract_len,
+            version,
+            flags,
+            provider_name,
+            provider_version,
+            name,
+            contract,
+            invoke,
+            initialized,
+        }
+    }
+
+    /// 按 Cargo ELM 命名约定把包名中的第一个 `-` 转成命名空间分隔符。
+    pub const fn from_cargo_package(
+        package_name: &str,
+        package_version: &str,
+        name: &str,
+        contract: &str,
+        version: u32,
+        flags: u32,
+        invoke: ElmIntegratedManagedExportInvoke,
+        initialized: ElmIntegratedManagedExportInitialized,
+    ) -> Self {
+        let (provider_name, provider_name_len) =
+            integrated_fixed_field::<ELM_INTEGRATED_PROVIDER_NAME_LEN>(package_name, true);
+        let mut value = Self::new(
+            "placeholder",
+            package_version,
+            name,
+            contract,
+            version,
+            flags,
+            invoke,
+            initialized,
+        );
+        value.provider_name = provider_name;
+        value.provider_name_len = provider_name_len;
+        value
+    }
+
+    /// 校验固定头部、字符串边界、模式标志和回调入口。
+    pub fn valid(&self) -> bool {
+        let visibility = self.flags
+            & (ELM_INTEGRATED_EXPORT_FLAG_PRIVATE
+                | ELM_INTEGRATED_EXPORT_FLAG_DEPENDENCY
+                | ELM_INTEGRATED_EXPORT_FLAG_SUBTREE);
+        self.magic == ELM_INTEGRATED_MANAGED_EXPORT_MAGIC
+            && self.abi_version == ELM_INTEGRATED_MANAGED_EXPORT_ABI_V1
+            && self.struct_size as usize == core::mem::size_of::<Self>()
+            && self.version != 0
+            && self.flags & !ELM_INTEGRATED_EXPORT_FLAGS_MASK == 0
+            && self.flags
+                & (ELM_INTEGRATED_EXPORT_FLAG_MANAGED | ELM_INTEGRATED_EXPORT_FLAG_DIRECT_PINNED)
+                == ELM_INTEGRATED_EXPORT_FLAG_MANAGED
+            && visibility.count_ones() <= 1
+            && self.provider_name().is_some_and(|value| !value.is_empty())
+            && self
+                .provider_version()
+                .is_some_and(|value| !value.is_empty())
+            && self.name().is_some_and(|value| !value.is_empty())
+            && self.contract().is_some_and(|value| !value.is_empty())
+            && self.invoke as usize != 0
+            && self.initialized as usize != 0
+    }
+
+    /// 返回 provider 规范名称。
+    pub fn provider_name(&self) -> Option<&str> {
+        integrated_fixed_str(&self.provider_name, self.provider_name_len)
+    }
+
+    /// 返回 provider 版本。
+    pub fn provider_version(&self) -> Option<&str> {
+        integrated_fixed_str(&self.provider_version, self.provider_version_len)
+    }
+
+    /// 返回 export 名称。
+    pub fn name(&self) -> Option<&str> {
+        integrated_fixed_str(&self.name, self.name_len)
+    }
+
+    /// 返回 export 契约。
+    pub fn contract(&self) -> Option<&str> {
+        integrated_fixed_str(&self.contract, self.contract_len)
+    }
+}
+
+const fn integrated_fixed_field<const N: usize>(
+    value: &str,
+    normalize_package_name: bool,
+) -> ([u8; N], u16) {
+    let bytes = value.as_bytes();
+    if bytes.len() > N {
+        return ([0; N], u16::MAX);
+    }
+    let mut output = [0; N];
+    let mut index = 0;
+    let mut namespace_separator_written = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if normalize_package_name && !namespace_separator_written && byte == b'-' {
+            output[index] = b'.';
+            namespace_separator_written = true;
+        } else {
+            output[index] = byte;
+        }
+        index += 1;
+    }
+    (output, bytes.len() as u16)
+}
+
+fn integrated_fixed_str(bytes: &[u8], length: u16) -> Option<&str> {
+    let length = usize::from(length);
+    if length == 0 || length > bytes.len() || bytes[length..].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    core::str::from_utf8(&bytes[..length]).ok()
+}
 /// 启用 mixin 的 ingress 阶段，即原始函数执行前的输入补缀。
 pub const ELM_MIXIN_STAGE_INGRESS: u32 = 1 << 0;
 /// 启用 mixin 的 substitute 阶段，该阶段可替换帧并跳过原始函数。
@@ -306,6 +523,12 @@ impl<T: ElmModule> ModuleSlot<T> {
     /// 所有回调；模块内部的可变状态应自行使用锁或原子类型同步。
     pub fn with_active<R>(&self, callback: impl FnOnce(&T) -> R) -> Result<R, HookError> {
         self.active_ref().map(callback)
+    }
+
+    #[doc(hidden)]
+    /// 返回 attribute 生成的集成 export 是否可以进入当前模块实例。
+    pub fn is_active(&self) -> bool {
+        self.state.load(Ordering::Acquire) == MODULE_SLOT_ACTIVE
     }
 
     fn transitioning_mut(&self) -> &mut T {

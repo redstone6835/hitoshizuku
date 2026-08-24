@@ -316,6 +316,7 @@ pub struct AllocationAccountingOps {
 static ALLOCATION_ACCOUNTING_OPS: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATION_ACCOUNTING_SUSPEND_DEPTH: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(0) }; MAX_CPUS];
+static ALLOCATION_ACCOUNTING_OWNER: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// 暂停当前 CPU 上由执行上下文推导出的隐式分配计量。
 ///
@@ -348,6 +349,32 @@ pub fn suspend_implicit_allocation_accounting() -> Option<AllocationAccountingSu
         })
         .ok()?;
     Some(AllocationAccountingSuspension { cpu_id })
+}
+
+/// 将当前不可迁移临界区内的隐式分配计量绑定到指定 ELM owner。
+///
+/// 集成 provider 代 consumer 调用资源 bridge 时，调用栈的当前 ELM 是 provider，
+/// 但 buffer、descriptor 和 operation scratch 应由 consumer 预算承担。该守卫只影响
+/// 没有显式 `accounting_owner` 的分配；嵌套使用会在 drop 时恢复上一层 owner。
+#[must_use = "分配计量 owner 守卫必须保持到临界区结束"]
+pub struct AllocationAccountingOwner {
+    cpu_id: usize,
+    previous: u64,
+}
+
+impl Drop for AllocationAccountingOwner {
+    fn drop(&mut self) {
+        ALLOCATION_ACCOUNTING_OWNER[self.cpu_id].store(self.previous, Ordering::Release);
+    }
+}
+
+pub fn account_implicit_allocations_to(owner: u64) -> Option<AllocationAccountingOwner> {
+    if owner == 0 {
+        return None;
+    }
+    let cpu_id = KERNEL_ALLOCATOR.current_cpu_id().min(MAX_CPUS - 1);
+    let previous = ALLOCATION_ACCOUNTING_OWNER[cpu_id].swap(owner, Ordering::AcqRel);
+    Some(AllocationAccountingOwner { cpu_id, previous })
 }
 
 /// 安装唯一的外部分配计量后端。
@@ -446,6 +473,10 @@ fn resolve_accounting_owner(explicit: Option<u64>) -> u64 {
     let cpu_id = KERNEL_ALLOCATOR.current_cpu_id().min(MAX_CPUS - 1);
     if ALLOCATION_ACCOUNTING_SUSPEND_DEPTH[cpu_id].load(Ordering::Acquire) != 0 {
         return 0;
+    }
+    let override_owner = ALLOCATION_ACCOUNTING_OWNER[cpu_id].load(Ordering::Acquire);
+    if override_owner != 0 {
+        return override_owner;
     }
     allocation_accounting_ops()
         .map(|ops| (ops.current_owner)())

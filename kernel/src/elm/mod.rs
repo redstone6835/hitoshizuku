@@ -164,7 +164,6 @@ pub(crate) fn init_builtin_mgr() {
     if !general::dev::language::install(
         language_resources::dispatch,
         language_resources::revoke_owner,
-        language_resources::reset,
     ) {
         log::error!("[elm] 语言资源 kernel bridge 重复安装");
         return;
@@ -226,6 +225,13 @@ pub(crate) fn init_builtin_mgr() {
             journal_info.last_error
         );
     }
+    let integrated_exports = match crate::integrated_components::managed_exports() {
+        Ok(exports) => exports,
+        Err(error) => {
+            log::error!("[elm] 集成 managed export 链接表无效: {}", error);
+            return;
+        }
+    };
     match core::with_core(|core| {
         if core.initialized() {
             return Ok(0);
@@ -248,7 +254,7 @@ pub(crate) fn init_builtin_mgr() {
                 None => {}
             }
         }
-        core.init_builtin_mgr()?;
+        core.init_builtin_mgr_with_integrated_exports(integrated_exports)?;
         core.mark_global_runtime_scope();
         Ok::<usize, elm_model::ElmError>(configured_anchor_count)
     }) {

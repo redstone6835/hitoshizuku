@@ -46,6 +46,17 @@ pub const LANGUAGE_REQUEST_OPCODE_REQUEST_RELEASE: u32 = 10;
 pub const LANGUAGE_REQUEST_OPCODE_BACKEND_NEXT: u32 = 11;
 /// 后端提交完成帧的操作编号。
 pub const LANGUAGE_REQUEST_OPCODE_BACKEND_COMPLETE: u32 = 12;
+/// 后端观察下一项取消通知的操作编号。
+pub const LANGUAGE_REQUEST_OPCODE_BACKEND_CANCEL_NEXT: u32 = 13;
+/// 后端确认一项取消通知的操作编号。
+pub const LANGUAGE_REQUEST_OPCODE_BACKEND_CANCEL_ACK: u32 = 14;
+
+/// owner 主动请求取消时使用的默认原因。
+pub const LANGUAGE_CANCEL_REASON_REQUESTED: u32 = 1;
+/// owner 或运行时进入排空流程时使用的原因。
+pub const LANGUAGE_CANCEL_REASON_DRAIN: u32 = 2;
+/// 整个 language-runtime 进入 quiesce 时使用的原因。
+pub const LANGUAGE_CANCEL_REASON_QUIESCE: u32 = 3;
 
 /// 运行时请求状态机的稳定状态编码。
 #[repr(u32)]
@@ -311,6 +322,196 @@ impl LanguageBackendCompleteRequestV1 {
     }
 
     /// 在结构校验后确认后端 owner 与受信任 managed call 上下文一致。
+    pub fn validate_for_owner(
+        &self,
+        expected_cell_id: u64,
+        expected_generation: u64,
+    ) -> ValidationResult {
+        self.validate()?;
+        crate::validation::validate_expected_owner(
+            self.owner_cell_id,
+            self.owner_generation,
+            expected_cell_id,
+            expected_generation,
+        )
+    }
+}
+
+/// `backend.cancel.next@1` 返回给后端的取消通知。
+///
+/// 运行中的请求只有在后端读取该通知并通过 [`LanguageBackendCancelAckV1`] 确认停止后才能
+/// 进入终态。该通知不携带授权；后端身份仍必须来自受信任 managed call 上下文。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanguageBackendCancelWorkV1 {
+    /// 结构遵循的 ABI 版本。
+    pub abi_version: u16,
+    /// 结构的完整字节数。
+    pub struct_size: u16,
+    /// V1 必须为零。
+    pub flags: u32,
+    /// 原请求 consumer owner cell。
+    pub owner_cell_id: u64,
+    /// 原请求 consumer owner generation。
+    pub owner_generation: u64,
+    /// 目标后端编号。
+    pub backend_id: u64,
+    /// 目标实例句柄。
+    pub instance_handle: LanguageHandle,
+    /// 请求关联编号。
+    pub request_id: u64,
+    /// 取消原因；只用于后端诊断与退出策略，不构成授权。
+    pub reason: u32,
+    /// 后端确认后应进入的终态，只能是 `Canceled` 或 `Expired`。
+    pub terminal_state: u32,
+    /// V1 必须为零。
+    pub reserved: u64,
+}
+
+impl LanguageBackendCancelWorkV1 {
+    /// 返回当前结构的 ABI 尺寸。
+    pub const SIZE: usize = size_of::<Self>();
+
+    /// 构造运行时已经鉴权的取消通知。
+    pub const fn new(
+        owner_cell_id: u64,
+        owner_generation: u64,
+        backend_id: u64,
+        instance_handle: LanguageHandle,
+        request_id: u64,
+        reason: u32,
+        terminal_state: LanguageRequestState,
+    ) -> Self {
+        Self {
+            abi_version: LANGUAGE_REQUEST_ABI_VERSION,
+            struct_size: Self::SIZE as u16,
+            flags: 0,
+            owner_cell_id,
+            owner_generation,
+            backend_id,
+            instance_handle,
+            request_id,
+            reason,
+            terminal_state: terminal_state as u32,
+            reserved: 0,
+        }
+    }
+
+    /// 返回确认后应进入的终态。
+    pub const fn terminal_state_kind(&self) -> Option<LanguageRequestState> {
+        LanguageRequestState::from_raw(self.terminal_state)
+    }
+
+    /// 验证 owner、目标、原因和终态。
+    pub fn validate(&self) -> ValidationResult {
+        validate_header(
+            self.abi_version,
+            self.struct_size,
+            LANGUAGE_REQUEST_ABI_VERSION,
+            Self::SIZE,
+        )?;
+        validate_flags(self.flags, 0)?;
+        validate_owner(self.owner_cell_id, self.owner_generation)?;
+        validate_identifier(self.backend_id)?;
+        validate_handle(self.instance_handle)?;
+        validate_identifier(self.request_id)?;
+        if self.reason == 0 {
+            return Err(LanguageValidationError::Identifier);
+        }
+        if !matches!(
+            self.terminal_state_kind(),
+            Some(LanguageRequestState::Canceled | LanguageRequestState::Expired)
+        ) {
+            return Err(LanguageValidationError::State);
+        }
+        validate_reserved(self.reserved)
+    }
+}
+
+/// `backend.cancel.ack@1` 提交给运行时的停止确认。
+///
+/// `owner_*` 是后端 provider owner，而非原请求 consumer owner。确认成功意味着该请求已经
+/// 不会再执行、访问资源或产生异步回调。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanguageBackendCancelAckV1 {
+    /// 结构遵循的 ABI 版本。
+    pub abi_version: u16,
+    /// 结构的完整字节数。
+    pub struct_size: u16,
+    /// V1 必须为零。
+    pub flags: u32,
+    /// 后端 provider owner cell。
+    pub owner_cell_id: u64,
+    /// 后端 provider owner generation。
+    pub owner_generation: u64,
+    /// 后端编号。
+    pub backend_id: u64,
+    /// 目标实例句柄。
+    pub instance_handle: LanguageHandle,
+    /// 请求关联编号。
+    pub request_id: u64,
+    /// 已确认的终态，必须与取消通知一致。
+    pub terminal_state: u32,
+    /// 取消结果状态，V1 必须为 `CANCELED`。
+    pub status: i32,
+    /// V1 必须为零。
+    pub reserved: u64,
+}
+
+impl LanguageBackendCancelAckV1 {
+    /// 返回当前结构的 ABI 尺寸。
+    pub const SIZE: usize = size_of::<Self>();
+
+    /// 从后端 owner 与已观察的通知构造确认帧。
+    pub const fn new(
+        backend_owner: crate::LanguageOwnerV1,
+        notice: LanguageBackendCancelWorkV1,
+    ) -> Self {
+        Self {
+            abi_version: LANGUAGE_REQUEST_ABI_VERSION,
+            struct_size: Self::SIZE as u16,
+            flags: 0,
+            owner_cell_id: backend_owner.cell_id,
+            owner_generation: backend_owner.generation,
+            backend_id: notice.backend_id,
+            instance_handle: notice.instance_handle,
+            request_id: notice.request_id,
+            terminal_state: notice.terminal_state,
+            status: LanguageRuntimeStatus::CANCELED.raw(),
+            reserved: 0,
+        }
+    }
+
+    /// 返回确认的终态。
+    pub const fn terminal_state_kind(&self) -> Option<LanguageRequestState> {
+        LanguageRequestState::from_raw(self.terminal_state)
+    }
+
+    /// 验证后端 owner、目标、终态与状态码。
+    pub fn validate(&self) -> ValidationResult {
+        validate_header(
+            self.abi_version,
+            self.struct_size,
+            LANGUAGE_REQUEST_ABI_VERSION,
+            Self::SIZE,
+        )?;
+        validate_flags(self.flags, 0)?;
+        validate_owner(self.owner_cell_id, self.owner_generation)?;
+        validate_identifier(self.backend_id)?;
+        validate_handle(self.instance_handle)?;
+        validate_identifier(self.request_id)?;
+        if !matches!(
+            self.terminal_state_kind(),
+            Some(LanguageRequestState::Canceled | LanguageRequestState::Expired)
+        ) || self.status != LanguageRuntimeStatus::CANCELED.raw()
+        {
+            return Err(LanguageValidationError::State);
+        }
+        validate_reserved(self.reserved)
+    }
+
+    /// 确认后端 owner 与受信任 managed call 上下文一致。
     pub fn validate_for_owner(
         &self,
         expected_cell_id: u64,
@@ -916,6 +1117,8 @@ impl LanguagePollResponseV1 {
 // 这些尺寸是 ABI 的一部分；跨架构构建必须保持一致，并能装入一个 managed call。
 const _: () = assert!(size_of::<LanguageBackendWorkV1>() == LANGUAGE_MANAGED_FRAME_LEN);
 const _: () = assert!(size_of::<LanguageBackendCompleteRequestV1>() == LANGUAGE_MANAGED_FRAME_LEN);
+const _: () = assert!(size_of::<LanguageBackendCancelWorkV1>() == 64);
+const _: () = assert!(size_of::<LanguageBackendCancelAckV1>() == 64);
 const _: () = assert!(size_of::<LanguageRequestV1>() == 248);
 const _: () = assert!(size_of::<LanguagePollRequestV1>() == 40);
 const _: () = assert!(size_of::<LanguageCancelRequestV1>() == 48);

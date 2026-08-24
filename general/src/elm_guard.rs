@@ -998,6 +998,8 @@ mod tests {
         ElmCurrentContext {
             cell_id: ElmId(cell),
             parent_id: None,
+            caller_id: None,
+            caller_generation: None,
             generation: Generation::FIRST,
             state: ElmState::Active,
             phase: ElmLifecyclePhase::Resume,

@@ -169,7 +169,8 @@ stateDiagram-v2
 
 语言支持 ELM 在自己的 `quiesce/finalize` 中应先停止领取新工作，再完成或取消已领取请求，
 关闭由其持有的内核资源，最后调用 `drain`。`language-runtime` 的 `drain` 会在运行时
-注册表回收后调用内核 `revoke_owner`；`finalize` 会调用内核 `reset`。consumer 应先停止
+注册表回收后调用内核 `revoke_owner`；`finalize` 由内核 finalize hook 清理资源表。全局
+reset 是 kernel-only 操作，不是普通 ELM 可导入的符号。consumer 应先停止
 提交，处理或释放终态请求，再关闭 instance。生命周期回调不能让语言异常、panic 或 GC
 safepoint 越过 ELM trampoline。
 
@@ -266,8 +267,8 @@ trampoline 和 `.elm.meta`，因此 V1 API 目前同时承担两种角色：
 
 - C、C++、C# 或其它语言的 SDK、编译器和示例 ELM；
 - JIT、WebAssembly 后端、解释器、GC、反射、异常 runtime 或线程 runtime；
-- IRQ、PCI、设备枚举或任意未登记 Kernel API 的外语包装；资源 ABI 已定义 MMIO、DMA、buffer
-  lease，但未实现的 MMIO/buffer provider 必须返回 `UNSUPPORTED`；
+- PCI、设备枚举或任意未登记 Kernel API 的外语包装；资源 ABI 已定义 MMIO、DMA、buffer
+  lease 和 IRQ event，未注册设备资源窗口或 provider 的操作必须返回 `UNSUPPORTED`；
 - raw pointer、共享堆、跨语言对象布局或动态 linker ABI；
 - 为某种语言修改 loader、内核热路径或现有 Rust 驱动。
 

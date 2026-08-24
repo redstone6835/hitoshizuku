@@ -1,12 +1,14 @@
 //! 直接链接进内核的集成组件执行器。
 //!
-//! 集成组件不是 ELM cell，不进入 elm-mgr。设备阶段在固件设备枚举前执行，运行时
-//! 阶段在调度器基础环境建立后执行；已经成功初始化的组件始终按描述符逆序终结。
+//! 集成组件本体不是 ELM cell。设备阶段在固件设备枚举前执行，运行时阶段在调度器基础
+//! 环境建立后执行；已经成功初始化的组件始终按描述符逆序终结。组件发布的 managed export
+//! 会另行投影为受保护的 builtin provider cell，以复用 elm-mgr 的绑定和调用策略。
 
 use core::mem::{align_of, size_of};
 use core::slice;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use elm_model::ElmIntegratedManagedExportV1;
 use kernel_symbols::{
     KERNEL_INTEGRATED_PHASE_DEVICE, KERNEL_INTEGRATED_PHASE_RUNTIME, KernelIntegratedComponentV1,
 };
@@ -14,9 +16,12 @@ use kernel_symbols::{
 unsafe extern "C" {
     static __kernel_integrated_components_start: u8;
     static __kernel_integrated_components_end: u8;
+    static __kernel_integrated_managed_exports_start: u8;
+    static __kernel_integrated_managed_exports_end: u8;
 }
 
 const MAX_INTEGRATED_COMPONENTS: usize = 256;
+const MAX_INTEGRATED_MANAGED_EXPORTS: usize = 1024;
 const INITIALIZED_WORDS: usize = MAX_INTEGRATED_COMPONENTS / u64::BITS as usize;
 
 static INITIALIZED: [AtomicU64; INITIALIZED_WORDS] =
@@ -64,6 +69,26 @@ fn descriptors() -> Result<&'static [KernelIntegratedComponentV1], &'static str>
     }
     // Safety: 链接脚本提供同一只读段的起止符号，上面已验证顺序、对齐和完整元素长度。
     Ok(unsafe { slice::from_raw_parts(start as *const KernelIntegratedComponentV1, count) })
+}
+
+/// 返回链接进内核的语言无关 resident managed export 描述符。
+pub(crate) fn managed_exports() -> Result<&'static [ElmIntegratedManagedExportV1], &'static str> {
+    let start = core::ptr::addr_of!(__kernel_integrated_managed_exports_start) as usize;
+    let end = core::ptr::addr_of!(__kernel_integrated_managed_exports_end) as usize;
+    let bytes = end
+        .checked_sub(start)
+        .ok_or("集成 managed export 链接区范围倒置")?;
+    if start % align_of::<ElmIntegratedManagedExportV1>() != 0
+        || bytes % size_of::<ElmIntegratedManagedExportV1>() != 0
+    {
+        return Err("集成 managed export 链接区未按完整描述符对齐");
+    }
+    let count = bytes / size_of::<ElmIntegratedManagedExportV1>();
+    if count > MAX_INTEGRATED_MANAGED_EXPORTS {
+        return Err("集成 managed export 数量超过运行时容量");
+    }
+    // Safety: 链接脚本提供同一只读段的起止符号，上面已验证顺序、对齐和完整元素长度。
+    Ok(unsafe { slice::from_raw_parts(start as *const ElmIntegratedManagedExportV1, count) })
 }
 
 fn is_initialized(index: usize) -> bool {

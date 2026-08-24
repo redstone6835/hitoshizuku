@@ -177,16 +177,20 @@ pub use ctl::{
     ELM_CTL_MAGIC, ElmCoreInfo, ElmCtlCommand, ElmCtlHeader, ElmCtlStatus,
 };
 pub use developer::{
-    DeviceIrqResult, DirectImport, ELM_API_ROOT_SLOT_SYMBOL, ELM_MIXIN_STAGE_EGRESS,
-    ELM_MIXIN_STAGE_INGRESS, ELM_MIXIN_STAGE_OBSERVE, ELM_MIXIN_STAGE_SUBSTITUTE,
-    ELM_MIXIN_STAGES_ALL, ELM_MODULE_DESCRIPTOR_ABI_VERSION, ELM_MODULE_DESCRIPTOR_FLAGS_MASK,
-    ELM_MODULE_DESCRIPTOR_MAGIC, ELM_MODULE_DESCRIPTOR_SYMBOL, ElmModule, ElmModuleDescriptorV1,
-    ElmModuleEntryV1, ElmModuleLifecycleEntryV1, ElmModuleMigrationEntryV1, ElmPayload,
-    EntryContext, EntryResult, HookError, HookResult, LifecycleContext, ManagedImport,
-    ManagedReply, ManagedRequest, ManagedResult, MigrationContext, MigrationExportResult,
-    MixinControl, MixinPointDescriptor, ModuleSlot, PayloadError, PointResult, ProviderReply,
-    ProviderRequest, ProviderResult, RuntimeApiError, SnapshotReply, SnapshotRequest,
-    SnapshotResult, run_mixin_point,
+    DeviceIrqResult, DirectImport, ELM_API_ROOT_SLOT_SYMBOL, ELM_INTEGRATED_EXPORT_CONTRACT_LEN,
+    ELM_INTEGRATED_EXPORT_NAME_LEN, ELM_INTEGRATED_MANAGED_EXPORT_ABI_V1,
+    ELM_INTEGRATED_MANAGED_EXPORT_MAGIC, ELM_INTEGRATED_PROVIDER_NAME_LEN,
+    ELM_INTEGRATED_PROVIDER_VERSION_LEN, ELM_MIXIN_STAGE_EGRESS, ELM_MIXIN_STAGE_INGRESS,
+    ELM_MIXIN_STAGE_OBSERVE, ELM_MIXIN_STAGE_SUBSTITUTE, ELM_MIXIN_STAGES_ALL,
+    ELM_MODULE_DESCRIPTOR_ABI_VERSION, ELM_MODULE_DESCRIPTOR_FLAGS_MASK,
+    ELM_MODULE_DESCRIPTOR_MAGIC, ELM_MODULE_DESCRIPTOR_SYMBOL,
+    ElmIntegratedManagedExportInitialized, ElmIntegratedManagedExportInvoke,
+    ElmIntegratedManagedExportV1, ElmModule, ElmModuleDescriptorV1, ElmModuleEntryV1,
+    ElmModuleLifecycleEntryV1, ElmModuleMigrationEntryV1, ElmPayload, EntryContext, EntryResult,
+    HookError, HookResult, LifecycleContext, ManagedImport, ManagedReply, ManagedRequest,
+    ManagedResult, MigrationContext, MigrationExportResult, MixinControl, MixinPointDescriptor,
+    ModuleSlot, PayloadError, PointResult, ProviderReply, ProviderRequest, ProviderResult,
+    RuntimeApiError, SnapshotReply, SnapshotRequest, SnapshotResult, run_mixin_point,
 };
 #[cfg(any(feature = "runtime-model", feature = "management"))]
 pub use ebi_wire::{

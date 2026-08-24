@@ -618,6 +618,16 @@ pub fn register_irq_request(request: IrqRequest) -> Result<IrqHandle, IrqError> 
     Ok(handle)
 }
 
+/// 为内核语言资源注册一个由资源表显式管理的 IRQ handler。
+///
+/// 该入口故意不写入当前 ELM 的生命周期资源表：托管调用发生在 provider 上下文，
+/// 但 IRQ 的真实 owner 是请求中的 consumer。资源表会在 consumer generation 撤销时
+/// 显式注销，避免 provider 卸载先一步删除 handler。
+#[doc(hidden)]
+pub fn register_irq_request_untracked(request: IrqRequest) -> Result<IrqHandle, IrqError> {
+    IRQ_REGISTRY.register_request(request)
+}
+
 #[kernel_symbols::export(
     name = "general.dev.irq.unregister_irq_handler",
     contract = "kernel.general.irq-handler@1",

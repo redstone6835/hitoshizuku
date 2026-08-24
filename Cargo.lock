@@ -455,6 +455,7 @@ dependencies = [
  "allocator",
  "elm",
  "elm-language-abi",
+ "general",
  "spin",
 ]
 

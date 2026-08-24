@@ -25,12 +25,23 @@ fn fixed_layouts_are_architecture_independent() {
     assert_eq!(size_of::<LanguageOwnedHandleV1>(), 24);
     assert_eq!(size_of::<LanguageBackendDescriptorV1>(), 80);
     assert_eq!(size_of::<LanguageInstanceDescriptorV1>(), 64);
+    assert_eq!(size_of::<LanguageArtifactIdentityV2>(), 128);
+    assert_eq!(size_of::<LanguageInstanceOpenRequestV2>(), 168);
+    assert_eq!(size_of::<LanguageInstanceDescriptorV2>(), 192);
     assert_eq!(size_of::<LanguageRuntimeCatalogV1>(), 32);
     assert_eq!(size_of::<LanguageBackendRequestV1>(), 40);
     assert_eq!(size_of::<LanguageInstanceCloseRequestV1>(), 48);
     assert_eq!(size_of::<LanguageRequestV1>(), 248);
+    assert_eq!(size_of::<LanguageDelegationPolicyV1>(), 32);
+    assert_eq!(size_of::<LanguageRequestV2>(), LANGUAGE_MANAGED_FRAME_LEN);
+    assert_eq!(
+        size_of::<LanguageBackendWorkV2>(),
+        LANGUAGE_MANAGED_FRAME_LEN
+    );
     assert_eq!(size_of::<LanguagePollRequestV1>(), 40);
     assert_eq!(size_of::<LanguageCancelRequestV1>(), 48);
+    assert_eq!(size_of::<LanguageBackendCancelWorkV1>(), 64);
+    assert_eq!(size_of::<LanguageBackendCancelAckV1>(), 64);
     assert_eq!(size_of::<LanguageDrainRequestV1>(), 32);
     assert_eq!(size_of::<LanguageRequestSubmitResponseV1>(), 32);
     assert_eq!(
@@ -51,6 +62,9 @@ fn fixed_layouts_are_architecture_independent() {
         size_of::<LanguageBufferIoPayloadV1>(),
         LANGUAGE_FRAME_PAYLOAD_LEN
     );
+    assert_eq!(size_of::<LanguageIrqSubscribePayloadV1>(), 32);
+    assert_eq!(size_of::<LanguageIrqPollPayloadV1>(), 16);
+    assert_eq!(size_of::<LanguageIrqEventStateV1>(), 40);
     assert_eq!(
         size_of::<LanguageResourceRequestV1>(),
         LANGUAGE_MANAGED_FRAME_LEN
@@ -60,11 +74,19 @@ fn fixed_layouts_are_architecture_independent() {
         LANGUAGE_MANAGED_FRAME_LEN
     );
     assert_eq!(
+        size_of::<LanguageDelegatedResourceRequestV2>(),
+        LANGUAGE_MANAGED_FRAME_LEN
+    );
+    assert_eq!(
         size_of::<LanguageKernelCallRequestV1>(),
         LANGUAGE_MANAGED_FRAME_LEN
     );
     assert_eq!(
         size_of::<LanguageKernelCallResponseV1>(),
+        LANGUAGE_MANAGED_FRAME_LEN
+    );
+    assert_eq!(
+        size_of::<LanguageDelegatedKernelCallRequestV2>(),
         LANGUAGE_MANAGED_FRAME_LEN
     );
 }
@@ -192,6 +214,57 @@ fn resource_payloads_reject_empty_overflow_and_unknown_modes() {
 }
 
 #[test]
+fn irq_payloads_are_bounded_and_never_describe_a_hardware_line() {
+    let subscribe = LanguageIrqSubscribePayloadV1 {
+        source_id: 0x42,
+        max_pending: 32,
+        flags: LANGUAGE_IRQ_SUBSCRIBE_FLAG_NONE,
+        reserved0: 0,
+        reserved1: 0,
+    };
+    assert_eq!(subscribe.validate(), Ok(()));
+
+    let mut missing_source = subscribe;
+    missing_source.source_id = 0;
+    assert_eq!(
+        missing_source.validate(),
+        Err(LanguageValidationError::Identifier)
+    );
+    let mut unbounded = subscribe;
+    unbounded.max_pending = LANGUAGE_IRQ_MAX_PENDING_LIMIT + 1;
+    assert_eq!(unbounded.validate(), Err(LanguageValidationError::Capacity));
+
+    assert!(!LanguageIrqPollPayloadV1::poll().is_take());
+    assert!(LanguageIrqPollPayloadV1::take().is_take());
+    let mut invalid_poll = LanguageIrqPollPayloadV1::poll();
+    invalid_poll.flags = 1 << 31;
+    assert_eq!(invalid_poll.validate(), Err(LanguageValidationError::Flags));
+
+    let state = LanguageIrqEventStateV1 {
+        source_id: subscribe.source_id,
+        sequence: 35,
+        pending: 32,
+        overflow: 3,
+        capacity: subscribe.max_pending,
+        flags: LANGUAGE_IRQ_EVENT_FLAG_ACTIVE | LANGUAGE_IRQ_EVENT_FLAG_OVERFLOW,
+        reserved: 0,
+    };
+    assert_eq!(state.validate(), Ok(()));
+    let mut impossible_pending = state;
+    impossible_pending.pending = state.capacity + 1;
+    assert_eq!(
+        impossible_pending.validate(),
+        Err(LanguageValidationError::Capacity)
+    );
+    let mut missing_overflow_flag = state;
+    missing_overflow_flag.flags &= !LANGUAGE_IRQ_EVENT_FLAG_OVERFLOW;
+    assert_eq!(
+        missing_overflow_flag.validate(),
+        Err(LanguageValidationError::Flags)
+    );
+}
+
+#[test]
 fn resource_frames_bind_optional_handles_and_owner() {
     let payload = [0xa5; 32];
     let request = LanguageResourceRequestV1::new(
@@ -267,6 +340,90 @@ fn kernel_call_frames_validate_operation_identity_and_owner() {
         bad_owner.validate_for_owner(OWNER),
         Err(LanguageValidationError::Owner)
     );
+}
+
+#[test]
+fn delegation_frames_are_scoped_tokenized_and_wire_stable() {
+    let opcode_mask =
+        language_delegation_resource_opcode_bit(LANGUAGE_RESOURCE_OPCODE_BUFFER_CREATE).unwrap();
+    let policy = LanguageDelegationPolicyV1::new(
+        LANGUAGE_DELEGATION_FLAG_RESOURCE | LANGUAGE_DELEGATION_FLAG_KERNEL_CALL,
+        LANGUAGE_CAPABILITY_BUFFER_READ | LANGUAGE_CAPABILITY_BUFFER_WRITE,
+        opcode_mask,
+        0x1234,
+    );
+    assert_eq!(policy.validate(), Ok(()));
+    assert!(policy.allows_resource(
+        LANGUAGE_RESOURCE_OPCODE_BUFFER_CREATE,
+        LANGUAGE_CAPABILITY_BUFFER_READ | LANGUAGE_CAPABILITY_BUFFER_WRITE,
+    ));
+    assert!(!policy.allows_resource(
+        LANGUAGE_RESOURCE_OPCODE_MMIO_READ,
+        LANGUAGE_CAPABILITY_MMIO_READ,
+    ));
+    assert!(policy.allows_kernel_operation(0x1234));
+    assert!(!policy.allows_kernel_operation(0x1235));
+
+    let request = LanguageRequestV2::new(OWNER, 2, HANDLE, 41, 7, policy, b"work").unwrap();
+    let token = LanguageHandle::new(0x55, 0xaa).unwrap();
+    let work = LanguageBackendWorkV2::from_request(&request, token).unwrap();
+    assert_eq!(work.owner(), OWNER);
+    assert_eq!(work.delegation_handle, token);
+    assert_eq!(work.payload().unwrap(), b"work");
+
+    let resource = LanguageResourceRequestV1::new(
+        OWNER,
+        CAPABILITY_HANDLE,
+        LanguageHandle::INVALID,
+        1,
+        LANGUAGE_RESOURCE_OPCODE_BUFFER_CREATE,
+        &64_u64.to_le_bytes(),
+    )
+    .unwrap();
+    let delegated_resource =
+        LanguageDelegatedResourceRequestV2::from_request(resource, token).unwrap();
+    assert_eq!(delegated_resource.consumer_request(), resource);
+
+    let kernel =
+        LanguageKernelCallRequestV1::new(OWNER, CAPABILITY_HANDLE, 0x1234, 1, b"input").unwrap();
+    let delegated_kernel =
+        LanguageDelegatedKernelCallRequestV2::from_request(kernel, token).unwrap();
+    assert_eq!(delegated_kernel.consumer_request(), kernel);
+
+    for (wire_size, encoded_len) in [
+        (
+            <LanguageRequestV2 as LanguageWire>::WIRE_SIZE,
+            encode(&request, &mut [0; LANGUAGE_MANAGED_FRAME_LEN]).unwrap(),
+        ),
+        (
+            <LanguageBackendWorkV2 as LanguageWire>::WIRE_SIZE,
+            encode(&work, &mut [0; LANGUAGE_MANAGED_FRAME_LEN]).unwrap(),
+        ),
+        (
+            <LanguageDelegatedResourceRequestV2 as LanguageWire>::WIRE_SIZE,
+            encode(&delegated_resource, &mut [0; LANGUAGE_MANAGED_FRAME_LEN]).unwrap(),
+        ),
+        (
+            <LanguageDelegatedKernelCallRequestV2 as LanguageWire>::WIRE_SIZE,
+            encode(&delegated_kernel, &mut [0; LANGUAGE_MANAGED_FRAME_LEN]).unwrap(),
+        ),
+    ] {
+        assert_eq!(wire_size, LANGUAGE_MANAGED_FRAME_LEN);
+        assert_eq!(encoded_len, wire_size);
+    }
+    let mut bytes = [0; LANGUAGE_MANAGED_FRAME_LEN];
+    encode(&delegated_resource, &mut bytes).unwrap();
+    assert_eq!(decode(&bytes), Ok(delegated_resource));
+    encode(&delegated_kernel, &mut bytes).unwrap();
+    assert_eq!(decode(&bytes), Ok(delegated_kernel));
+
+    let mut empty = LanguageDelegationPolicyV1::new(0, 0, 0, 0);
+    assert_eq!(empty.validate(), Err(LanguageValidationError::Flags));
+    empty.flags = LANGUAGE_DELEGATION_FLAG_RESOURCE;
+    assert_eq!(empty.validate(), Err(LanguageValidationError::Capability));
+    let mut forged = delegated_resource;
+    forged.delegation_handle = LanguageHandle::INVALID;
+    assert_eq!(forged.validate(), Err(LanguageValidationError::Handle));
 }
 
 #[test]
@@ -365,6 +522,25 @@ fn catalog_and_instance_bind_capacity_and_owner() {
     assert_eq!(
         conflicting_state.validate(),
         Err(LanguageValidationError::State)
+    );
+}
+
+#[test]
+fn v2_instance_binds_package_artifact_and_interface_identity() {
+    let artifact = LanguageArtifactIdentityV2::new(17, 19, [1; 32], [2; 32], [3; 32]);
+    assert_eq!(artifact.validate(), Ok(()));
+    let request = LanguageInstanceOpenRequestV2::new(OWNER, 2, artifact);
+    assert_eq!(request.validate_for_owner(OWNER), Ok(()));
+    let v1 = LanguageInstanceDescriptorV1::new(1, 2, 3, OWNER, HANDLE);
+    let descriptor = LanguageInstanceDescriptorV2::from_v1(v1, artifact);
+    assert_eq!(descriptor.validate_for_owner(OWNER), Ok(()));
+    assert_eq!(descriptor.artifact, artifact);
+
+    let mut missing_digest = artifact;
+    missing_digest.artifact_digest = [0; 32];
+    assert_eq!(
+        missing_digest.validate(),
+        Err(LanguageValidationError::Identifier)
     );
 }
 
@@ -538,6 +714,33 @@ fn backend_work_and_complete_frames_reject_invalid_terminal_semantics() {
 }
 
 #[test]
+fn backend_cancel_notice_requires_matching_terminal_ack() {
+    let notice = LanguageBackendCancelWorkV1::new(
+        OWNER.cell_id,
+        OWNER.generation,
+        2,
+        HANDLE,
+        41,
+        LANGUAGE_CANCEL_REASON_DRAIN,
+        LanguageRequestState::Expired,
+    );
+    assert_eq!(notice.validate(), Ok(()));
+    let backend_owner = LanguageOwnerV1::new(21, 4);
+    let acknowledgement = LanguageBackendCancelAckV1::new(backend_owner, notice);
+    assert_eq!(
+        acknowledgement.validate_for_owner(backend_owner.cell_id, backend_owner.generation),
+        Ok(())
+    );
+
+    let mut wrong_terminal = acknowledgement;
+    wrong_terminal.terminal_state = LanguageRequestState::Completed as u32;
+    assert_eq!(
+        wrong_terminal.validate(),
+        Err(LanguageValidationError::State)
+    );
+}
+
+#[test]
 fn submit_success_is_always_initially_queued() {
     let response = LanguageRequestSubmitResponseV1::queued(19);
     assert_eq!(response.validate(), Ok(()));
@@ -607,6 +810,9 @@ fn every_v1_wire_structure_round_trips_without_host_layout_copy() {
     )
     .unwrap();
     let instance = LanguageInstanceDescriptorV1::new(1, 2, 3, OWNER, HANDLE);
+    let artifact = LanguageArtifactIdentityV2::new(17, 19, [1; 32], [2; 32], [3; 32]);
+    let open_v2 = LanguageInstanceOpenRequestV2::new(OWNER, 2, artifact);
+    let instance_v2 = LanguageInstanceDescriptorV2::from_v1(instance, artifact);
     let catalog = LanguageRuntimeCatalogV1::new(16, 128, 64);
     let backend_request = LanguageBackendRequestV1::new(OWNER, 2);
     let next_request = LanguageBackendNextRequestV1::new(OWNER, 2);
@@ -624,6 +830,16 @@ fn every_v1_wire_structure_round_trips_without_host_layout_copy() {
         b"done",
     )
     .unwrap();
+    let cancel_notice = LanguageBackendCancelWorkV1::new(
+        11,
+        3,
+        2,
+        HANDLE,
+        41,
+        LANGUAGE_CANCEL_REASON_REQUESTED,
+        LanguageRequestState::Canceled,
+    );
+    let cancel_ack = LanguageBackendCancelAckV1::new(OWNER, cancel_notice);
     let poll = LanguagePollRequestV1::new(11, 3, 41);
     let cancel = LanguageCancelRequestV1::new(11, 3, 41, 1);
     let drain = LanguageDrainRequestV1::new(11, 3);
@@ -676,6 +892,25 @@ fn every_v1_wire_structure_round_trips_without_host_layout_copy() {
         reserved: 0,
     };
     let buffer_io = LanguageBufferIoPayloadV1::new(0, b"payload").unwrap();
+    let irq_subscribe = LanguageIrqSubscribePayloadV1 {
+        source_id: 0x42,
+        max_pending: 32,
+        flags: LANGUAGE_IRQ_SUBSCRIBE_FLAG_NONE,
+        reserved0: 0,
+        reserved1: 0,
+    };
+    let irq_poll = LanguageIrqPollPayloadV1::take();
+    let irq_state = LanguageIrqEventStateV1 {
+        source_id: irq_subscribe.source_id,
+        sequence: 3,
+        pending: 2,
+        overflow: 1,
+        capacity: irq_subscribe.max_pending,
+        flags: LANGUAGE_IRQ_EVENT_FLAG_ACTIVE
+            | LANGUAGE_IRQ_EVENT_FLAG_TAKEN
+            | LANGUAGE_IRQ_EVENT_FLAG_OVERFLOW,
+        reserved: 0,
+    };
     let resource_request = LanguageResourceRequestV1::new(
         OWNER,
         CAPABILITY_HANDLE,
@@ -708,6 +943,9 @@ fn every_v1_wire_structure_round_trips_without_host_layout_copy() {
     round_trip(LanguageOwnedHandleV1::new(HANDLE, OWNER));
     round_trip(backend);
     round_trip(instance);
+    round_trip(artifact);
+    round_trip(open_v2);
+    round_trip(instance_v2);
     round_trip(catalog);
     round_trip(backend_request);
     round_trip(next_request);
@@ -715,6 +953,8 @@ fn every_v1_wire_structure_round_trips_without_host_layout_copy() {
     round_trip(request);
     round_trip(work);
     round_trip(complete);
+    round_trip(cancel_notice);
+    round_trip(cancel_ack);
     round_trip(poll);
     round_trip(cancel);
     round_trip(drain);
@@ -729,6 +969,9 @@ fn every_v1_wire_structure_round_trips_without_host_layout_copy() {
     round_trip(dma_sync);
     round_trip(lease);
     round_trip(buffer_io);
+    round_trip(irq_subscribe);
+    round_trip(irq_poll);
+    round_trip(irq_state);
     round_trip(resource_request);
     round_trip(resource_response);
     round_trip(kernel_request);
@@ -777,6 +1020,23 @@ fn wire_rejects_short_long_and_semantically_malformed_input() {
     kernel_wire[244] = 1;
     assert_eq!(
         LanguageKernelCallRequestV1::decode_wire(&kernel_wire),
+        Err(LanguageWireError::Invalid(
+            LanguageValidationError::Reserved
+        ))
+    );
+
+    let irq = LanguageIrqSubscribePayloadV1 {
+        source_id: 1,
+        max_pending: 8,
+        flags: 0,
+        reserved0: 0,
+        reserved1: 0,
+    };
+    let mut irq_wire = [0_u8; <LanguageIrqSubscribePayloadV1 as LanguageWire>::WIRE_SIZE];
+    irq.encode_wire(&mut irq_wire).unwrap();
+    irq_wire[24] = 1;
+    assert_eq!(
+        LanguageIrqSubscribePayloadV1::decode_wire(&irq_wire),
         Err(LanguageWireError::Invalid(
             LanguageValidationError::Reserved
         ))

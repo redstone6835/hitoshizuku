@@ -1397,18 +1397,54 @@ fn export_impl(attr: TokenStream2, mut function: ItemFn) -> syn::Result<TokenStr
         })
     } else {
         let abi_ident = format_ident!("__elm_abi_export_{}", ident);
+        let initialized_ident = format_ident!("__elm_integrated_export_initialized_{}", ident);
+        let descriptor_ident = format_ident!("__ELM_INTEGRATED_MANAGED_EXPORT_{}", ident);
         Ok(quote! {
             #function
 
             #[doc(hidden)]
-            #[cfg(not(feature = "elm-integrated"))]
-            #[unsafe(export_name = #name)]
-            #[unsafe(link_section = ".text.elm.abi")]
+            #[cfg_attr(not(feature = "elm-integrated"), unsafe(export_name = #name))]
+            #[cfg_attr(not(feature = "elm-integrated"), unsafe(link_section = ".text.elm.abi"))]
             pub unsafe extern "C" fn #abi_ident(
                 frame: *mut ::elm::ElmNativeManagedCallV1,
             ) -> i32 {
                 unsafe { ::elm::__private::managed_trampoline(frame, #ident) }
             }
+
+            #[doc(hidden)]
+            #[cfg(feature = "elm-integrated")]
+            extern "C" fn #initialized_ident() -> u32 {
+                u32::from(__ELM_MODULE_SLOT_V1.is_active())
+            }
+
+            #[doc(hidden)]
+            #[cfg(feature = "elm-integrated")]
+            #[used]
+            #[allow(non_upper_case_globals)]
+            #[unsafe(link_section = ".kernel.integrated_managed_exports")]
+            static #descriptor_ident: ::elm::ElmIntegratedManagedExportV1 =
+                match option_env!("ELM_INTEGRATED_COMPONENT_NAME") {
+                    Some(provider_name) => ::elm::ElmIntegratedManagedExportV1::new(
+                        provider_name,
+                        env!("CARGO_PKG_VERSION"),
+                        #name,
+                        #contract,
+                        #version,
+                        #flags,
+                        #abi_ident,
+                        #initialized_ident,
+                    ),
+                    None => ::elm::ElmIntegratedManagedExportV1::from_cargo_package(
+                        env!("CARGO_PKG_NAME"),
+                        env!("CARGO_PKG_VERSION"),
+                        #name,
+                        #contract,
+                        #version,
+                        #flags,
+                        #abi_ident,
+                        #initialized_ident,
+                    ),
+                };
 
             #metadata
         })
@@ -2954,6 +2990,33 @@ mod tests {
 
         assert_eq!(tokens.matches("elm-integrated").count(), 2);
         assert!(tokens.contains(".elm.meta"));
+    }
+
+    #[test]
+    fn integrated_managed_export_publishes_resident_descriptor() {
+        let function: ItemFn = syn::parse_quote! {
+            fn echo(_request: &::elm::ManagedRequest) -> ::elm::ManagedResult {
+                Ok(::elm::ProviderReply::ok())
+            }
+        };
+        let tokens = export_impl(
+            quote! {
+                name = "demo.echo",
+                contract = "demo.echo@1",
+                version = 1,
+                visibility = "dependency"
+            },
+            function,
+        )
+        .unwrap()
+        .to_string();
+
+        assert!(tokens.contains(".kernel.integrated_managed_exports"));
+        assert!(tokens.contains("ElmIntegratedManagedExportV1"));
+        assert!(tokens.contains("__elm_integrated_export_initialized_echo"));
+        assert!(tokens.contains("__ELM_MODULE_SLOT_V1 . is_active"));
+        assert!(tokens.contains("ELM_INTEGRATED_COMPONENT_NAME"));
+        assert!(tokens.contains("from_cargo_package"));
     }
 
     #[test]

@@ -9,6 +9,7 @@ use core::mem::size_of;
 
 use crate::backend::{
     LANGUAGE_FRAME_PAYLOAD_LEN, LANGUAGE_MANAGED_FRAME_LEN, LANGUAGE_RUNTIME_ABI_VERSION,
+    LANGUAGE_RUNTIME_ABI_VERSION_V2,
 };
 use crate::ids::LanguageHandle;
 use crate::status::LanguageRuntimeStatus;
@@ -20,6 +21,8 @@ use crate::validation::{
 
 /// 资源 contract 的 ABI 版本。
 pub const LANGUAGE_RESOURCE_ABI_VERSION: u16 = LANGUAGE_RUNTIME_ABI_VERSION;
+/// 携带 delegation token 的资源与 kernel-call 帧版本。
+pub const LANGUAGE_RESOURCE_ABI_VERSION_V2: u16 = LANGUAGE_RUNTIME_ABI_VERSION_V2;
 
 /// 语言运行时资源 contract。
 pub const LANGUAGE_RUNTIME_RESOURCE_CONTRACT: &str = "language.runtime.resource@1";
@@ -58,6 +61,10 @@ pub const LANGUAGE_CAPABILITY_DMA_SYNC: u64 = 1 << 5;
 pub const LANGUAGE_CAPABILITY_BUFFER_READ: u64 = 1 << 6;
 /// capability 位掩码：允许写入受管 buffer。
 pub const LANGUAGE_CAPABILITY_BUFFER_WRITE: u64 = 1 << 7;
+/// capability 位掩码：允许订阅设备层预授权的 IRQ source。
+pub const LANGUAGE_CAPABILITY_IRQ_SUBSCRIBE: u64 = 1 << 8;
+/// capability 位掩码：允许查询或取走 IRQ event 的有界计数。
+pub const LANGUAGE_CAPABILITY_IRQ_CONSUME: u64 = 1 << 9;
 /// V1 定义的全部 capability 位。
 pub const LANGUAGE_CAPABILITY_FLAGS_MASK: u64 = LANGUAGE_CAPABILITY_DEVICE_DISCOVERY
     | LANGUAGE_CAPABILITY_MMIO_MAP
@@ -66,7 +73,9 @@ pub const LANGUAGE_CAPABILITY_FLAGS_MASK: u64 = LANGUAGE_CAPABILITY_DEVICE_DISCO
     | LANGUAGE_CAPABILITY_DMA_ALLOCATE
     | LANGUAGE_CAPABILITY_DMA_SYNC
     | LANGUAGE_CAPABILITY_BUFFER_READ
-    | LANGUAGE_CAPABILITY_BUFFER_WRITE;
+    | LANGUAGE_CAPABILITY_BUFFER_WRITE
+    | LANGUAGE_CAPABILITY_IRQ_SUBSCRIBE
+    | LANGUAGE_CAPABILITY_IRQ_CONSUME;
 
 /// 资源请求没有可选行为。
 pub const LANGUAGE_RESOURCE_REQUEST_FLAG_NONE: u32 = 0;
@@ -109,6 +118,12 @@ pub const LANGUAGE_RESOURCE_OPCODE_BUFFER_READ: u32 = 12;
 pub const LANGUAGE_RESOURCE_OPCODE_BUFFER_WRITE: u32 = 13;
 /// 释放 buffer 或 lease 操作编号。
 pub const LANGUAGE_RESOURCE_OPCODE_BUFFER_RELEASE: u32 = 14;
+/// 订阅一个设备层预授权的 IRQ source。
+pub const LANGUAGE_RESOURCE_OPCODE_IRQ_SUBSCRIBE: u32 = 15;
+/// 非阻塞查询或取走一个 IRQ event 的有界计数。
+pub const LANGUAGE_RESOURCE_OPCODE_IRQ_POLL: u32 = 16;
+/// 注销 IRQ event 并释放其内核 IRQ handler。
+pub const LANGUAGE_RESOURCE_OPCODE_IRQ_RELEASE: u32 = 17;
 
 /// 资源种类。该枚举值会写入 wire，未知值必须拒绝。
 #[repr(u32)]
@@ -124,6 +139,8 @@ pub enum LanguageResourceKind {
     Buffer = 4,
     /// buffer 的受限 lease。
     BufferLease = 5,
+    /// 内核 IRQ registry 中的受管事件订阅。
+    IrqEvent = 6,
 }
 
 impl LanguageResourceKind {
@@ -135,6 +152,7 @@ impl LanguageResourceKind {
             3 => Some(Self::Dma),
             4 => Some(Self::Buffer),
             5 => Some(Self::BufferLease),
+            6 => Some(Self::IrqEvent),
             _ => None,
         }
     }
@@ -597,6 +615,165 @@ impl LanguageBufferIoPayloadV1 {
     }
 }
 
+/// 单个 IRQ event 允许积压的最大事件数。
+///
+/// 该上限防止 wire 中的容量请求把内核计数器变成无界队列；内核实现可以按 owner policy
+/// 进一步收紧，但不能接受更大的值。
+pub const LANGUAGE_IRQ_MAX_PENDING_LIMIT: u32 = 65_535;
+
+/// IRQ subscribe 没有可选行为。
+pub const LANGUAGE_IRQ_SUBSCRIBE_FLAG_NONE: u32 = 0;
+/// V1 认可的 IRQ subscribe flags 掩码。
+pub const LANGUAGE_IRQ_SUBSCRIBE_FLAGS_MASK: u32 = LANGUAGE_IRQ_SUBSCRIBE_FLAG_NONE;
+
+/// `irq.subscribe` 的固定 payload。
+///
+/// `source_id` 是设备层为特定 owner/generation 预登记的 opaque 标识，不是硬件 IRQ
+/// 编号。ABI 消费者不能通过该字段选择任意硬件 IRQ line；
+/// 内核只接受与预授权 grant 完全匹配的值。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LanguageIrqSubscribePayloadV1 {
+    /// owner 范围内的 opaque IRQ source ID。
+    pub source_id: u64,
+    /// 最多保留的待消费事件数，必须位于 `1..=LANGUAGE_IRQ_MAX_PENDING_LIMIT`。
+    pub max_pending: u32,
+    /// subscribe 行为 flags；V1 必须为零。
+    pub flags: u32,
+    /// 保留字段，V1 必须为零。
+    pub reserved0: u64,
+    /// 保留字段，V1 必须为零。
+    pub reserved1: u64,
+}
+
+impl LanguageIrqSubscribePayloadV1 {
+    /// 当前 payload 的 wire 尺寸。
+    pub const SIZE: usize = size_of::<Self>();
+
+    /// 验证 opaque source、容量、flags 和保留字段。
+    pub fn validate(&self) -> ValidationResult {
+        validate_identifier(self.source_id)?;
+        if self.max_pending == 0 || self.max_pending > LANGUAGE_IRQ_MAX_PENDING_LIMIT {
+            return Err(LanguageValidationError::Capacity);
+        }
+        validate_flags(self.flags, LANGUAGE_IRQ_SUBSCRIBE_FLAGS_MASK)?;
+        validate_reserved(self.reserved0)?;
+        validate_reserved(self.reserved1)
+    }
+}
+
+/// IRQ poll 只读取快照，不消费事件。
+pub const LANGUAGE_IRQ_POLL_FLAG_NONE: u32 = 0;
+/// IRQ poll 原子取走当前 pending/overflow 计数。
+pub const LANGUAGE_IRQ_POLL_FLAG_TAKE: u32 = 1 << 0;
+/// V1 认可的 IRQ poll flags 掩码。
+pub const LANGUAGE_IRQ_POLL_FLAGS_MASK: u32 = LANGUAGE_IRQ_POLL_FLAG_TAKE;
+
+/// `irq.poll` 的固定请求 payload。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LanguageIrqPollPayloadV1 {
+    /// [`LANGUAGE_IRQ_POLL_FLAG_TAKE`] 或零。
+    pub flags: u32,
+    /// 保留字段，V1 必须为零。
+    pub reserved0: u32,
+    /// 保留字段，V1 必须为零。
+    pub reserved1: u64,
+}
+
+impl LanguageIrqPollPayloadV1 {
+    /// 当前 payload 的 wire 尺寸。
+    pub const SIZE: usize = size_of::<Self>();
+
+    /// 构造只读 poll。
+    pub const fn poll() -> Self {
+        Self {
+            flags: LANGUAGE_IRQ_POLL_FLAG_NONE,
+            reserved0: 0,
+            reserved1: 0,
+        }
+    }
+
+    /// 构造消费当前计数的 take。
+    pub const fn take() -> Self {
+        Self {
+            flags: LANGUAGE_IRQ_POLL_FLAG_TAKE,
+            reserved0: 0,
+            reserved1: 0,
+        }
+    }
+
+    /// 判断本次操作是否消费计数。
+    pub const fn is_take(self) -> bool {
+        self.flags & LANGUAGE_IRQ_POLL_FLAG_TAKE != 0
+    }
+
+    /// 验证 flags 和保留字段。
+    pub fn validate(&self) -> ValidationResult {
+        validate_flags(self.flags, LANGUAGE_IRQ_POLL_FLAGS_MASK)?;
+        validate_reserved(self.reserved0 as u64)?;
+        validate_reserved(self.reserved1)
+    }
+}
+
+/// IRQ event 仍处于内核 IRQ registry 中。
+pub const LANGUAGE_IRQ_EVENT_FLAG_ACTIVE: u32 = 1 << 0;
+/// 本回复由 take 操作产生，`pending` 和 `overflow` 已从订阅中取走。
+pub const LANGUAGE_IRQ_EVENT_FLAG_TAKEN: u32 = 1 << 1;
+/// 在当前快照或 take 批次中至少发生过一次容量溢出。
+pub const LANGUAGE_IRQ_EVENT_FLAG_OVERFLOW: u32 = 1 << 2;
+/// V1 认可的 IRQ event 状态 flags 掩码。
+pub const LANGUAGE_IRQ_EVENT_FLAGS_MASK: u32 = LANGUAGE_IRQ_EVENT_FLAG_ACTIVE
+    | LANGUAGE_IRQ_EVENT_FLAG_TAKEN
+    | LANGUAGE_IRQ_EVENT_FLAG_OVERFLOW;
+
+/// `irq.subscribe`/`irq.poll` 返回的固定事件状态。
+///
+/// `sequence` 是该订阅观察到的单调高水位；`pending` 是有界、可消费的合并事件计数，
+/// `overflow` 表示计数已满后额外到达的事件数（饱和于 `u32::MAX`）。该 ABI 不传递回调
+/// 地址，也不暴露内核 IRQ handle。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LanguageIrqEventStateV1 {
+    /// 与设备层 grant 对应的 opaque source ID。
+    pub source_id: u64,
+    /// 事件序列高水位；尚未收到事件时为零。
+    pub sequence: u64,
+    /// 当前快照或 take 批次包含的有界事件数。
+    pub pending: u32,
+    /// 因 pending 达到容量而合并掉的事件数。
+    pub overflow: u32,
+    /// 该订阅的 pending 容量。
+    pub capacity: u32,
+    /// 活跃、take 和 overflow 状态 flags。
+    pub flags: u32,
+    /// 保留字段，V1 必须为零。
+    pub reserved: u64,
+}
+
+impl LanguageIrqEventStateV1 {
+    /// 当前 payload 的 wire 尺寸。
+    pub const SIZE: usize = size_of::<Self>();
+
+    /// 验证 source、计数边界、flags 和保留字段。
+    pub fn validate(&self) -> ValidationResult {
+        validate_identifier(self.source_id)?;
+        if self.capacity == 0
+            || self.capacity > LANGUAGE_IRQ_MAX_PENDING_LIMIT
+            || self.pending > self.capacity
+        {
+            return Err(LanguageValidationError::Capacity);
+        }
+        validate_flags(self.flags, LANGUAGE_IRQ_EVENT_FLAGS_MASK)?;
+        if self.flags & LANGUAGE_IRQ_EVENT_FLAG_ACTIVE == 0
+            || (self.overflow != 0) != (self.flags & LANGUAGE_IRQ_EVENT_FLAG_OVERFLOW != 0)
+        {
+            return Err(LanguageValidationError::Flags);
+        }
+        validate_reserved(self.reserved)
+    }
+}
+
 /// 统一资源请求帧。完整 wire 尺寸固定为 256 字节。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -740,6 +917,115 @@ impl LanguageResourceRequestV1 {
     }
 }
 
+/// backend 代表 consumer 发起资源操作的 V2 请求帧。
+///
+/// 该结构与 V1 一样固定为 256 字节，并把 V1 尾部保留字段替换为 opaque delegation token。
+/// `owner_*` 必须填写原 consumer，而 managed caller 必须是 token 绑定的 backend provider。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanguageDelegatedResourceRequestV2 {
+    /// 结构遵循的 ABI 版本，固定为 2。
+    pub abi_version: u16,
+    /// 结构完整字节数。
+    pub struct_size: u16,
+    /// 资源请求 flags。
+    pub flags: u32,
+    /// 原 consumer owner cell。
+    pub owner_cell_id: u64,
+    /// 原 consumer owner generation。
+    pub owner_generation: u64,
+    /// consumer 拥有的 capability handle。
+    pub capability_handle: LanguageHandle,
+    /// consumer 拥有的目标资源 handle。
+    pub resource_handle: LanguageHandle,
+    /// backend 为该 token 分配的严格递增调用编号。
+    pub request_id: u64,
+    /// 资源操作编号。
+    pub opcode: u32,
+    /// `payload` 有效字节数。
+    pub payload_len: u16,
+    /// V2 必须为零。
+    pub reserved0: u16,
+    /// 资源操作 payload。
+    pub payload: [u8; LANGUAGE_FRAME_PAYLOAD_LEN],
+    /// `backend.next@2` 返回的 opaque delegation token。
+    pub delegation_handle: LanguageHandle,
+}
+
+impl LanguageDelegatedResourceRequestV2 {
+    /// 当前结构的固定尺寸。
+    pub const SIZE: usize = size_of::<Self>();
+
+    /// 从 consumer 语义的 V1 请求与 token 构造 delegated 请求。
+    pub fn from_request(
+        request: LanguageResourceRequestV1,
+        delegation_handle: LanguageHandle,
+    ) -> Result<Self, LanguageValidationError> {
+        request.validate()?;
+        validate_handle(delegation_handle)?;
+        let output = Self {
+            abi_version: LANGUAGE_RESOURCE_ABI_VERSION_V2,
+            struct_size: Self::SIZE as u16,
+            flags: request.flags,
+            owner_cell_id: request.owner_cell_id,
+            owner_generation: request.owner_generation,
+            capability_handle: request.capability_handle,
+            resource_handle: request.resource_handle,
+            request_id: request.request_id,
+            opcode: request.opcode,
+            payload_len: request.payload_len,
+            reserved0: 0,
+            payload: request.payload,
+            delegation_handle,
+        };
+        output.validate()?;
+        Ok(output)
+    }
+
+    /// 返回原 consumer owner。
+    pub const fn owner(&self) -> crate::LanguageOwnerV1 {
+        crate::LanguageOwnerV1::new(self.owner_cell_id, self.owner_generation)
+    }
+
+    /// 转成供受信任 kernel symbol 使用的 consumer V1 请求。
+    pub const fn consumer_request(&self) -> LanguageResourceRequestV1 {
+        LanguageResourceRequestV1 {
+            abi_version: LANGUAGE_RESOURCE_ABI_VERSION,
+            struct_size: LanguageResourceRequestV1::SIZE as u16,
+            flags: self.flags,
+            owner_cell_id: self.owner_cell_id,
+            owner_generation: self.owner_generation,
+            capability_handle: self.capability_handle,
+            resource_handle: self.resource_handle,
+            request_id: self.request_id,
+            opcode: self.opcode,
+            payload_len: self.payload_len,
+            reserved0: 0,
+            payload: self.payload,
+            reserved1: 0,
+        }
+    }
+
+    /// 返回有效 payload。
+    pub fn payload(&self) -> Result<&[u8], LanguageValidationError> {
+        validate_payload_length(self.payload_len, LANGUAGE_FRAME_PAYLOAD_LEN)?;
+        Ok(&self.payload[..self.payload_len as usize])
+    }
+
+    /// 验证 consumer 帧与 opaque token；backend caller 绑定由 runtime 另行验证。
+    pub fn validate(&self) -> ValidationResult {
+        validate_header(
+            self.abi_version,
+            self.struct_size,
+            LANGUAGE_RESOURCE_ABI_VERSION_V2,
+            Self::SIZE,
+        )?;
+        validate_handle(self.delegation_handle)?;
+        validate_reserved(self.reserved0 as u64)?;
+        self.consumer_request().validate()
+    }
+}
+
 /// 统一资源回复帧。完整 wire 尺寸固定为 256 字节。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -873,6 +1159,8 @@ impl LanguageResourceResponseV1 {
 // 资源帧必须能够直接放入一个 ELM managed call。
 const _: () = assert!(size_of::<LanguageResourceRequestV1>() == LANGUAGE_MANAGED_FRAME_LEN);
 const _: () = assert!(size_of::<LanguageResourceResponseV1>() == LANGUAGE_MANAGED_FRAME_LEN);
+const _: () =
+    assert!(size_of::<LanguageDelegatedResourceRequestV2>() == LANGUAGE_MANAGED_FRAME_LEN);
 const _: () = assert!(size_of::<LanguageCapabilityV1>() == 32);
 const _: () = assert!(size_of::<LanguageResourceHandleV1>() == 32);
 const _: () = assert!(size_of::<LanguageMmioMapPayloadV1>() <= LANGUAGE_FRAME_PAYLOAD_LEN);
@@ -881,6 +1169,9 @@ const _: () = assert!(size_of::<LanguageDmaAllocatePayloadV1>() <= LANGUAGE_FRAM
 const _: () = assert!(size_of::<LanguageDmaSyncPayloadV1>() <= LANGUAGE_FRAME_PAYLOAD_LEN);
 const _: () = assert!(size_of::<LanguageBufferLeasePayloadV1>() <= LANGUAGE_FRAME_PAYLOAD_LEN);
 const _: () = assert!(size_of::<LanguageBufferIoPayloadV1>() == LANGUAGE_FRAME_PAYLOAD_LEN);
+const _: () = assert!(size_of::<LanguageIrqSubscribePayloadV1>() <= LANGUAGE_FRAME_PAYLOAD_LEN);
+const _: () = assert!(size_of::<LanguageIrqPollPayloadV1>() <= LANGUAGE_FRAME_PAYLOAD_LEN);
+const _: () = assert!(size_of::<LanguageIrqEventStateV1>() <= LANGUAGE_FRAME_PAYLOAD_LEN);
 
 /// `kernel.call@1` 的语言无关请求帧。
 ///
@@ -988,6 +1279,108 @@ impl LanguageKernelCallRequestV1 {
             expected.cell_id,
             expected.generation,
         )
+    }
+}
+
+/// backend 代表 consumer 调用固定 kernel operation 的 V2 请求帧。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanguageDelegatedKernelCallRequestV2 {
+    /// 结构遵循的 ABI 版本，固定为 2。
+    pub abi_version: u16,
+    /// 结构完整字节数。
+    pub struct_size: u16,
+    /// kernel-call flags。
+    pub flags: u32,
+    /// 原 consumer owner cell。
+    pub owner_cell_id: u64,
+    /// 原 consumer owner generation。
+    pub owner_generation: u64,
+    /// consumer 拥有的 capability handle。
+    pub capability_handle: LanguageHandle,
+    /// EKI/schema operation ID。
+    pub operation_id: u64,
+    /// backend 为该 token 分配的严格递增调用编号。
+    pub call_id: u64,
+    /// `input` 有效字节数。
+    pub input_len: u16,
+    /// V2 必须为零。
+    pub reserved0: u16,
+    /// kernel operation 输入。
+    pub input: [u8; LANGUAGE_FRAME_PAYLOAD_LEN],
+    /// `backend.next@2` 返回的 opaque delegation token。
+    pub delegation_handle: LanguageHandle,
+}
+
+impl LanguageDelegatedKernelCallRequestV2 {
+    /// 当前结构的固定尺寸。
+    pub const SIZE: usize = size_of::<Self>();
+
+    /// 从 consumer 语义的 V1 kernel call 与 token 构造 delegated 请求。
+    pub fn from_request(
+        request: LanguageKernelCallRequestV1,
+        delegation_handle: LanguageHandle,
+    ) -> Result<Self, LanguageValidationError> {
+        request.validate()?;
+        validate_handle(delegation_handle)?;
+        let output = Self {
+            abi_version: LANGUAGE_RESOURCE_ABI_VERSION_V2,
+            struct_size: Self::SIZE as u16,
+            flags: request.flags,
+            owner_cell_id: request.owner_cell_id,
+            owner_generation: request.owner_generation,
+            capability_handle: request.capability_handle,
+            operation_id: request.operation_id,
+            call_id: request.call_id,
+            input_len: request.input_len,
+            reserved0: 0,
+            input: request.input,
+            delegation_handle,
+        };
+        output.validate()?;
+        Ok(output)
+    }
+
+    /// 返回原 consumer owner。
+    pub const fn owner(&self) -> crate::LanguageOwnerV1 {
+        crate::LanguageOwnerV1::new(self.owner_cell_id, self.owner_generation)
+    }
+
+    /// 转成供受信任 kernel symbol 使用的 consumer V1 请求。
+    pub const fn consumer_request(&self) -> LanguageKernelCallRequestV1 {
+        LanguageKernelCallRequestV1 {
+            abi_version: LANGUAGE_RESOURCE_ABI_VERSION,
+            struct_size: LanguageKernelCallRequestV1::SIZE as u16,
+            flags: self.flags,
+            owner_cell_id: self.owner_cell_id,
+            owner_generation: self.owner_generation,
+            capability_handle: self.capability_handle,
+            operation_id: self.operation_id,
+            call_id: self.call_id,
+            input_len: self.input_len,
+            reserved0: 0,
+            input: self.input,
+            reserved1: 0,
+        }
+    }
+
+    /// 返回有效输入。
+    pub fn input(&self) -> Result<&[u8], LanguageValidationError> {
+        validate_payload_length(self.input_len, LANGUAGE_FRAME_PAYLOAD_LEN)?;
+        Ok(&self.input[..self.input_len as usize])
+    }
+
+    /// 验证 consumer 帧与 opaque token；backend caller 绑定由 runtime 另行验证。
+    pub fn validate(&self) -> ValidationResult {
+        validate_header(
+            self.abi_version,
+            self.struct_size,
+            LANGUAGE_RESOURCE_ABI_VERSION_V2,
+            Self::SIZE,
+        )?;
+        validate_handle(self.delegation_handle)?;
+        validate_reserved(self.reserved0 as u64)?;
+        self.consumer_request().validate()
     }
 }
 
@@ -1101,3 +1494,5 @@ impl LanguageKernelCallResponseV1 {
 
 const _: () = assert!(size_of::<LanguageKernelCallRequestV1>() == LANGUAGE_MANAGED_FRAME_LEN);
 const _: () = assert!(size_of::<LanguageKernelCallResponseV1>() == LANGUAGE_MANAGED_FRAME_LEN);
+const _: () =
+    assert!(size_of::<LanguageDelegatedKernelCallRequestV2>() == LANGUAGE_MANAGED_FRAME_LEN);

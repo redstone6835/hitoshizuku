@@ -48,7 +48,6 @@ pub fn kernel_symbol_catalog_anchor() -> usize {
         ^ dev::dma::set_dma_ops as usize
         ^ dev::language::dispatch as usize
         ^ dev::language::revoke_owner as usize
-        ^ dev::language::reset as usize
         ^ dev::language::call as usize
         ^ dev::irq::register_irq_request as usize
         ^ dev::irq::register_irq_domain as usize

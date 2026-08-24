@@ -471,13 +471,45 @@ impl DmaBuffer {
         align: usize,
         direction: DmaDirection,
     ) -> Result<Self, &'static str> {
+        Self::new_in_with_accounting_owner(context, len, align, direction, None)
+    }
+
+    /// 使用指定的 allocator accounting owner 分配 DMA 缓冲区。
+    ///
+    /// 语言资源桥在 provider 上下文中执行，但资源实际属于 consumer；因此内核必须把
+    /// consumer owner 显式传入，不能让 allocator 从当前 provider 上下文隐式记账。
+    pub fn new_in_for_owner(
+        context: DmaContext,
+        len: usize,
+        align: usize,
+        direction: DmaDirection,
+        accounting_owner: u64,
+    ) -> Result<Self, &'static str> {
+        if accounting_owner == 0 {
+            return Err("DMA accounting owner must be non-zero");
+        }
+        Self::new_in_with_accounting_owner(context, len, align, direction, Some(accounting_owner))
+    }
+
+    fn new_in_with_accounting_owner(
+        context: DmaContext,
+        len: usize,
+        align: usize,
+        direction: DmaDirection,
+        accounting_owner: Option<u64>,
+    ) -> Result<Self, &'static str> {
         if !align.is_power_of_two() {
             return Err("DMA alignment must be a non-zero power of two");
         }
 
         let alloc_len = len.max(1);
+        let request = PhysicalAllocRequest::new(alloc_len, align);
+        let request = match accounting_owner {
+            Some(owner) => request.with_accounting_owner(owner),
+            None => request,
+        };
         let allocation = KERNEL_ALLOCATOR
-            .allocate_physical(PhysicalAllocRequest::new(alloc_len, align))
+            .allocate_physical(request)
             .map_err(|_| "failed to allocate DMA buffer")?;
         let Some(phys_to_virt) = KERNEL_ALLOCATOR.load_phys_to_virt() else {
             let _ = KERNEL_ALLOCATOR.free_physical(allocation);
@@ -585,6 +617,24 @@ impl DmaBuffer {
         self.sync_handle().sync_for_cpu();
     }
 
+    /// 只同步缓冲区中的一个有界区间。
+    pub fn sync_for_device_range(&self, offset: usize, len: usize) -> bool {
+        let Some(region) = self.range_region(offset, len) else {
+            return false;
+        };
+        self.context.sync_handle(region).sync_for_device();
+        true
+    }
+
+    /// 只同步缓冲区中的一个有界区间。
+    pub fn sync_for_cpu_range(&self, offset: usize, len: usize) -> bool {
+        let Some(region) = self.range_region(offset, len) else {
+            return false;
+        };
+        self.context.sync_handle(region).sync_for_cpu();
+        true
+    }
+
     pub(crate) fn sync_handle(&self) -> DmaSyncHandle {
         self.context.sync_handle(self.sync_region())
     }
@@ -596,6 +646,19 @@ impl DmaBuffer {
             len: self.len(),
             direction: self.direction(),
         }
+    }
+
+    fn range_region(&self, offset: usize, len: usize) -> Option<DmaSyncRegion> {
+        let end = offset.checked_add(len)?;
+        if end > self.len {
+            return None;
+        }
+        Some(DmaSyncRegion {
+            paddr: self.paddr.checked_add(offset)?,
+            vaddr: self.vaddr.checked_add(offset)?,
+            len,
+            direction: self.direction,
+        })
     }
 }
 

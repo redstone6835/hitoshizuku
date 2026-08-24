@@ -72,6 +72,8 @@ pub enum ElmLifecyclePhase {
 pub struct ElmContext {
     cell_id: ElmId,
     parent_id: Option<ElmId>,
+    caller_id: Option<ElmId>,
+    caller_generation: Option<Generation>,
     generation: Generation,
     state: ElmState,
     phase: ElmLifecyclePhase,
@@ -96,6 +98,8 @@ impl ElmContext {
         Self {
             cell_id,
             parent_id,
+            caller_id: None,
+            caller_generation: None,
             generation,
             state,
             phase,
@@ -113,6 +117,26 @@ impl ElmContext {
     /// 返回父 ELM 单元标识符；没有父单元时返回 `None`。
     pub const fn parent_id(&self) -> Option<ElmId> {
         self.parent_id
+    }
+
+    /// 返回发起当前托管调用的 consumer cell；普通生命周期/直接调用没有该字段。
+    pub const fn caller_id(&self) -> Option<ElmId> {
+        self.caller_id
+    }
+
+    /// 返回发起当前托管调用的 consumer generation。
+    pub const fn caller_generation(&self) -> Option<Generation> {
+        self.caller_generation
+    }
+
+    /// 绑定已由内核校验的托管调用者身份。
+    ///
+    /// 该身份只用于本次嵌套上下文，不能由 ELM payload 设置；调用方必须使用
+    /// `ManagedRequest` 中已经验证过的 caller cell/generation。
+    pub const fn with_caller(mut self, caller_id: ElmId, caller_generation: Generation) -> Self {
+        self.caller_id = Some(caller_id);
+        self.caller_generation = Some(caller_generation);
+        self
     }
 
     /// 返回用于陈旧引用检测的当前代际。
@@ -176,6 +200,10 @@ pub struct ElmCurrentContext {
     pub cell_id: ElmId,
     /// 父 ELM 单元；根单元为 `None`。
     pub parent_id: Option<ElmId>,
+    /// 发起当前托管调用的 consumer cell；普通上下文为 `None`。
+    pub caller_id: Option<ElmId>,
+    /// 发起当前托管调用的 consumer generation。
+    pub caller_generation: Option<Generation>,
     /// 对象当前代际；用于拒绝热替换前遗留的陈旧引用。
     pub generation: Generation,
     /// 对象或单元的当前状态编码。
@@ -196,6 +224,8 @@ impl ElmCurrentContext {
         Self {
             cell_id: context.cell_id(),
             parent_id: context.parent_id(),
+            caller_id: context.caller_id(),
+            caller_generation: context.caller_generation(),
             generation: context.generation(),
             state: context.state(),
             phase: context.phase(),
@@ -213,6 +243,10 @@ static CURRENT_DEPTH: [AtomicUsize; ELM_CONTEXT_MAX_CPUS] =
 static CURRENT_CELL_ID: [AtomicU64; ELM_CONTEXT_SLOT_COUNT] =
     [const { AtomicU64::new(0) }; ELM_CONTEXT_SLOT_COUNT];
 static CURRENT_PARENT_ID: [AtomicU64; ELM_CONTEXT_SLOT_COUNT] =
+    [const { AtomicU64::new(0) }; ELM_CONTEXT_SLOT_COUNT];
+static CURRENT_CALLER_ID: [AtomicU64; ELM_CONTEXT_SLOT_COUNT] =
+    [const { AtomicU64::new(0) }; ELM_CONTEXT_SLOT_COUNT];
+static CURRENT_CALLER_GENERATION: [AtomicU64; ELM_CONTEXT_SLOT_COUNT] =
     [const { AtomicU64::new(0) }; ELM_CONTEXT_SLOT_COUNT];
 static CURRENT_GENERATION: [AtomicU64; ELM_CONTEXT_SLOT_COUNT] =
     [const { AtomicU64::new(0) }; ELM_CONTEXT_SLOT_COUNT];
@@ -320,9 +354,19 @@ pub fn current_context() -> Option<ElmCurrentContext> {
         0 => None,
         id => Some(ElmId(id)),
     };
+    let caller_id = match CURRENT_CALLER_ID[slot].load(Ordering::Acquire) {
+        0 => None,
+        id => Some(ElmId(id)),
+    };
+    let caller_generation = match CURRENT_CALLER_GENERATION[slot].load(Ordering::Acquire) {
+        0 => None,
+        generation => Some(Generation(generation)),
+    };
     Some(ElmCurrentContext {
         cell_id: ElmId(cell_id),
         parent_id,
+        caller_id,
+        caller_generation,
         generation: Generation(CURRENT_GENERATION[slot].load(Ordering::Acquire)),
         state: state_from_raw(CURRENT_STATE[slot].load(Ordering::Acquire)),
         phase: phase_from_raw(CURRENT_PHASE[slot].load(Ordering::Acquire)),
@@ -391,6 +435,17 @@ fn store_context_slot(slot: usize, context: ElmCurrentContext) {
         context.parent_id.map(|id| id.0).unwrap_or(0),
         Ordering::Release,
     );
+    CURRENT_CALLER_ID[slot].store(
+        context.caller_id.map(|id| id.0).unwrap_or(0),
+        Ordering::Release,
+    );
+    CURRENT_CALLER_GENERATION[slot].store(
+        context
+            .caller_generation
+            .map(|generation| generation.0)
+            .unwrap_or(0),
+        Ordering::Release,
+    );
     CURRENT_GENERATION[slot].store(context.generation.0, Ordering::Release);
     CURRENT_STATE[slot].store(context.state as u32, Ordering::Release);
     CURRENT_PHASE[slot].store(phase_to_raw(context.phase), Ordering::Release);
@@ -403,6 +458,8 @@ fn store_context_slot(slot: usize, context: ElmCurrentContext) {
 fn clear_context_slot(slot: usize) {
     CURRENT_CELL_ID[slot].store(0, Ordering::Release);
     CURRENT_PARENT_ID[slot].store(0, Ordering::Release);
+    CURRENT_CALLER_ID[slot].store(0, Ordering::Release);
+    CURRENT_CALLER_GENERATION[slot].store(0, Ordering::Release);
     CURRENT_GENERATION[slot].store(0, Ordering::Release);
     CURRENT_STATE[slot].store(0, Ordering::Release);
     CURRENT_PHASE[slot].store(0, Ordering::Release);

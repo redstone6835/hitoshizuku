@@ -164,6 +164,10 @@ SECTIONS
         KEEP(*(.kernel.integrated_components .kernel.integrated_components.*))
         PROVIDE(__kernel_integrated_components_end = .);
         . = ALIGN(8);
+        PROVIDE(__kernel_integrated_managed_exports_start = .);
+        KEEP(*(.kernel.integrated_managed_exports .kernel.integrated_managed_exports.*))
+        PROVIDE(__kernel_integrated_managed_exports_end = .);
+        . = ALIGN(8);
         *(.eh_frame_hdr)
         *(.eh_frame)
     }

@@ -1603,7 +1603,8 @@ pub(crate) fn invoke_managed_export(
         ElmLifecyclePhase::Initialize,
         0,
     )
-    .with_allowed_actions(allowed_actions);
+    .with_allowed_actions(allowed_actions)
+    .with_caller(caller, caller_generation);
     let Some(_current) = try_enter_current_context(&elm_context) else {
         return ElmReplyFrame::empty(
             request.binding_id,

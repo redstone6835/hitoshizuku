@@ -4013,3 +4013,37 @@ fn runtime_namespace_descriptor_requires_canonical_identifier_and_policy() {
     );
     assert!(!malformed_namespace.validate());
 }
+
+unsafe extern "C" fn integrated_export_test_handler(
+    _call: *mut crate::ElmNativeManagedCallV1,
+) -> i32 {
+    0
+}
+
+extern "C" fn integrated_export_test_initialized() -> u32 {
+    1
+}
+
+#[test]
+fn integrated_managed_export_descriptor_has_canonical_fixed_layout() {
+    let descriptor = crate::ElmIntegratedManagedExportV1::from_cargo_package(
+        "platform-goldfish-rtc",
+        "0.1.0",
+        "platform.clock.read",
+        "platform.clock.read@1",
+        1,
+        crate::ELM_EBI_EXPORT_FLAG_MANAGED | crate::ELM_EBI_EXPORT_FLAG_DEPENDENCY,
+        integrated_export_test_handler,
+        integrated_export_test_initialized,
+    );
+
+    assert!(descriptor.valid());
+    assert_eq!(descriptor.provider_name(), Some("platform.goldfish-rtc"));
+    assert_eq!(descriptor.provider_version(), Some("0.1.0"));
+    assert_eq!(descriptor.name(), Some("platform.clock.read"));
+    assert_eq!(descriptor.contract(), Some("platform.clock.read@1"));
+    assert_eq!(
+        descriptor.struct_size as usize,
+        core::mem::size_of_val(&descriptor)
+    );
+}

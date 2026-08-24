@@ -43,19 +43,20 @@ use elm_model::{
     ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK,
     ELM_MGR_STATUS_PERMISSION, ELM_MGR_STATUS_TODO, ELM_MGR_STATUS_UNSUPPORTED,
     ELM_MIXIN_REPLY_CONTINUE, ELM_MIXIN_REPLY_DENY, ELM_MIXIN_REPLY_FLAGS_MASK,
-    ELM_MIXIN_REPLY_REPLACE, ELM_MIXIN_REPLY_STOP, ELM_POLICY_BLOCK_ABI_FINGERPRINT,
-    ELM_POLICY_BLOCK_BINDING_NOT_FOUND, ELM_POLICY_BLOCK_BINDING_PROTECTED,
-    ELM_POLICY_BLOCK_BUILTIN_PROTECTED, ELM_POLICY_BLOCK_CALLER_NOT_FOUND,
-    ELM_POLICY_BLOCK_CALLER_STALE, ELM_POLICY_BLOCK_CELL_NOT_FOUND,
-    ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
-    ELM_POLICY_BLOCK_EXTENSION_DUPLICATE, ELM_POLICY_BLOCK_EXTENSION_NOT_FOUND,
-    ELM_POLICY_BLOCK_GRAPH_INCONSISTENT, ELM_POLICY_BLOCK_HAS_CHILDREN,
-    ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS,
-    ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_JOURNAL_UNAVAILABLE,
-    ELM_POLICY_BLOCK_LEASE_BUSY, ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
-    ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, ELM_POLICY_BLOCK_NATIVE_CALL_FAILED,
-    ELM_POLICY_BLOCK_NATIVE_TODO, ELM_POLICY_BLOCK_POLICY_ESCALATION,
-    ELM_POLICY_BLOCK_PORT_NOT_FOUND, ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_BUSY,
+    ELM_MIXIN_REPLY_REPLACE, ELM_MIXIN_REPLY_STOP, ELM_NATIVE_MANAGED_CALL_ABI_VERSION,
+    ELM_POLICY_BLOCK_ABI_FINGERPRINT, ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
+    ELM_POLICY_BLOCK_BINDING_PROTECTED, ELM_POLICY_BLOCK_BUILTIN_PROTECTED,
+    ELM_POLICY_BLOCK_CALLER_NOT_FOUND, ELM_POLICY_BLOCK_CALLER_STALE,
+    ELM_POLICY_BLOCK_CELL_NOT_FOUND, ELM_POLICY_BLOCK_CONTRACT_MISMATCH,
+    ELM_POLICY_BLOCK_DUPLICATE_BINDING, ELM_POLICY_BLOCK_EXTENSION_DUPLICATE,
+    ELM_POLICY_BLOCK_EXTENSION_NOT_FOUND, ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
+    ELM_POLICY_BLOCK_HAS_CHILDREN, ELM_POLICY_BLOCK_HAS_DEPENDENTS,
+    ELM_POLICY_BLOCK_HAS_EXTENSIONS, ELM_POLICY_BLOCK_INVALID_STATE,
+    ELM_POLICY_BLOCK_JOURNAL_UNAVAILABLE, ELM_POLICY_BLOCK_LEASE_BUSY,
+    ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED, ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
+    ELM_POLICY_BLOCK_NATIVE_CALL_FAILED, ELM_POLICY_BLOCK_NATIVE_TODO,
+    ELM_POLICY_BLOCK_POLICY_ESCALATION, ELM_POLICY_BLOCK_PORT_NOT_FOUND,
+    ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_BUSY,
     ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
     ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND, ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL,
     ELM_POLICY_BLOCK_RESOURCE_QUOTA, ELM_POLICY_BLOCK_ROLLBACK_REJECTED,
@@ -70,32 +71,33 @@ use elm_model::{
     ELM_TODO_KIND_RUNTIME, ELM_TODO_KIND_SOURCE, ElmActionInvokeReply, ElmActionInvokeRequest,
     ElmApiContextV1, ElmApiNamespaceDescriptorV1, ElmApiNamespaceV1, ElmApiRootV1, ElmCallFrame,
     ElmContext, ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo, ElmCurrentContext,
-    ElmEbiArch, ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiLifecycleHooks, ElmEbiLoadStatus,
-    ElmEbiProviderPortDecl, ElmEbiSourceKind, ElmEbiTarget, ElmEbiUnit, ElmError, ElmEventRecord,
-    ElmEventSequence, ElmExtensionAttachRequest, ElmExtensionAttachResponse,
+    ElmEbiArch, ElmEbiExportDecl, ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiLifecycleHooks,
+    ElmEbiLoadStatus, ElmEbiProviderPortDecl, ElmEbiSourceKind, ElmEbiTarget, ElmEbiUnit, ElmError,
+    ElmEventRecord, ElmEventSequence, ElmExtensionAttachRequest, ElmExtensionAttachResponse,
     ElmExtensionDetachRequest, ElmExtensionDetachResponse, ElmExtensionDispatchRequest,
     ElmExtensionDispatchResponse, ElmExtensionSnapshotHeader, ElmExtensionSnapshotRecord,
-    ElmFaultDumpHeader, ElmFaultDumpRecord, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePhase,
-    ElmLifecyclePlanRequest, ElmLifecyclePlanResponse, ElmLifecycleResponse, ElmLoadCellResponse,
-    ElmManagementApiV1, ElmManifest, ElmMenuItemKind, ElmMgrApiDescriptor, ElmMgrApiRegistryHeader,
-    ElmMgrAuditHeader, ElmMgrAuditRecord, ElmMgrCallHeader, ElmMgrCallKind,
-    ElmMgrEventSubscribeRequest, ElmMgrEventSubscribeResponse, ElmMgrEventSubscriptionHeader,
-    ElmMgrEventSubscriptionRecord, ElmMgrEventUnsubscribeRequest, ElmMgrEventUnsubscribeResponse,
-    ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord, ElmMgrSubscribedEventReadHeader,
-    ElmMgrSubscribedEventReadRequest, ElmMgrTopologyHeader, ElmMixinMode, ElmName,
-    ElmNativeCapabilityHeader, ElmNativeCapabilityRecord, ElmNexusBindPlanResponse,
-    ElmNexusBindRequest, ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader,
-    ElmNexusUnbindRequest, ElmPortAccessPolicy, ElmPrincipal, ElmPrincipalKind,
-    ElmProviderAsyncCancelRequest, ElmProviderAsyncCancelResponse, ElmProviderAsyncPollRequest,
-    ElmProviderAsyncPollResponse, ElmProviderAsyncState, ElmProviderAsyncSubmitRequest,
-    ElmProviderAsyncSubmitResponse, ElmProviderInvokeRequest, ElmProviderInvokeResponse,
-    ElmProviderPortRecord, ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse,
-    ElmProviderPortStatsHeader, ElmProviderPortStatsRecord, ElmProviderPortUnregisterRequest,
-    ElmProviderQueueStatsHeader, ElmProviderQueueStatsRecord, ElmProviderSnapshotHeader,
-    ElmProviderSnapshotRequest, ElmReplaceCellResponseV1, ElmReplyFrame, ElmResourceBudget,
-    ElmResourceBudgetRequest, ElmResourceBudgetResponse, ElmResourceBudgetUpdateRequest,
-    ElmResourceKind, ElmResourceUsage, ElmResult, ElmRuntimeApiV1, ElmRuntimeEventRequest,
-    ElmRuntimeEventResponse, ElmRuntimeLogRequest, ElmRuntimeLogResponse,
+    ElmFaultDumpHeader, ElmFaultDumpRecord, ElmId, ElmIntegratedManagedExportInitialized,
+    ElmIntegratedManagedExportInvoke, ElmIntegratedManagedExportV1, ElmKind, ElmLifecycleAction,
+    ElmLifecyclePhase, ElmLifecyclePlanRequest, ElmLifecyclePlanResponse, ElmLifecycleResponse,
+    ElmLoadCellResponse, ElmManagementApiV1, ElmManifest, ElmMenuItemKind, ElmMgrApiDescriptor,
+    ElmMgrApiRegistryHeader, ElmMgrAuditHeader, ElmMgrAuditRecord, ElmMgrCallHeader,
+    ElmMgrCallKind, ElmMgrEventSubscribeRequest, ElmMgrEventSubscribeResponse,
+    ElmMgrEventSubscriptionHeader, ElmMgrEventSubscriptionRecord, ElmMgrEventUnsubscribeRequest,
+    ElmMgrEventUnsubscribeResponse, ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord,
+    ElmMgrSubscribedEventReadHeader, ElmMgrSubscribedEventReadRequest, ElmMgrTopologyHeader,
+    ElmMixinMode, ElmName, ElmNativeCapabilityHeader, ElmNativeCapabilityRecord,
+    ElmNativeManagedCallV1, ElmNexusBindPlanResponse, ElmNexusBindRequest, ElmNexusBindingRecord,
+    ElmNexusBindingSnapshotHeader, ElmNexusUnbindRequest, ElmPortAccessPolicy, ElmPrincipal,
+    ElmPrincipalKind, ElmProviderAsyncCancelRequest, ElmProviderAsyncCancelResponse,
+    ElmProviderAsyncPollRequest, ElmProviderAsyncPollResponse, ElmProviderAsyncState,
+    ElmProviderAsyncSubmitRequest, ElmProviderAsyncSubmitResponse, ElmProviderInvokeRequest,
+    ElmProviderInvokeResponse, ElmProviderPortRecord, ElmProviderPortRegisterRequest,
+    ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader, ElmProviderPortStatsRecord,
+    ElmProviderPortUnregisterRequest, ElmProviderQueueStatsHeader, ElmProviderQueueStatsRecord,
+    ElmProviderSnapshotHeader, ElmProviderSnapshotRequest, ElmReplaceCellResponseV1, ElmReplyFrame,
+    ElmResourceBudget, ElmResourceBudgetRequest, ElmResourceBudgetResponse,
+    ElmResourceBudgetUpdateRequest, ElmResourceKind, ElmResourceUsage, ElmResult, ElmRuntimeApiV1,
+    ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest, ElmRuntimeLogResponse,
     ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmRuntimeTraceHeader,
     ElmRuntimeTraceRecord, ElmState, ElmTodoRegistryHeader, ElmTodoRegistryRecord,
     ElmTrustAcceptance, ElmTrustAnchor, ElmTrustError, ElmTrustRuntimeInfoV1, ElmTrustStore,
@@ -137,7 +139,7 @@ use elm_model::{
     ELM_RUST_ABI_TARGET_FEATURE_VECTOR, ELM_TODO_REGISTRY_FLAG_TRUNCATED,
     ELM_TRUST_FLAG_ALLOW_UNSIGNED, ELM_TRUST_FLAG_SEALED, ELM_TRUST_FLAG_UNSIGNED_ACTIVE,
     ElmCellPolicyRequest, ElmCellPolicyV1, ElmKernelProviderRevoke, ElmKernelProviderSpec,
-    ElmPanicStrategy, current_cell, current_context, sha256,
+    ElmPanicStrategy, current_cell, current_context, sha256, try_enter_current_context,
 };
 use sched::sync::Spinlock;
 
@@ -521,6 +523,24 @@ struct NativeExportRuntime {
     rust_abi_hash: [u8; 32],
     address: usize,
     bounds: Option<NativeExecutionBounds>,
+    integrated: Option<IntegratedManagedExportRuntime>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IntegratedManagedExportRuntime {
+    invoke: ElmIntegratedManagedExportInvoke,
+    initialized: ElmIntegratedManagedExportInitialized,
+}
+
+struct PreparedIntegratedManagedExport {
+    declaration: ElmEbiExportDecl,
+    runtime: IntegratedManagedExportRuntime,
+}
+
+struct PreparedIntegratedProvider {
+    name: ElmName,
+    version: ElmVersion,
+    exports: Vec<PreparedIntegratedManagedExport>,
 }
 
 #[derive(Debug, Clone)]
@@ -723,9 +743,20 @@ struct ManagedCallExecutionPlan {
     caller: ManagedCallerReservation,
     callee: CellExecutionToken,
     import_handle: u64,
-    address: usize,
-    bounds: NativeExecutionBounds,
+    target: ManagedCallTarget,
     frame: ElmCallFrame,
+}
+
+#[derive(Clone, Copy)]
+enum ManagedCallTarget {
+    Native {
+        address: usize,
+        bounds: NativeExecutionBounds,
+    },
+    Integrated {
+        runtime: IntegratedManagedExportRuntime,
+        context: ElmContext,
+    },
 }
 
 pub(super) struct PinnedNativeExecutionPlan {
@@ -1017,6 +1048,53 @@ enum OldGenerationExecutionState {
     Quiesced,
     Resumed,
     Compromised,
+}
+
+#[cfg(feature = "kernel-tests")]
+static INTEGRATED_MANAGED_EXPORT_TEST_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+#[cfg(feature = "kernel-tests")]
+extern "C" fn integrated_managed_export_test_initialized() -> u32 {
+    u32::from(INTEGRATED_MANAGED_EXPORT_TEST_READY.load(core::sync::atomic::Ordering::Acquire))
+}
+
+#[cfg(feature = "kernel-tests")]
+extern "C" fn integrated_managed_export_test_uninitialized() -> u32 {
+    0
+}
+
+#[cfg(feature = "kernel-tests")]
+unsafe extern "C" fn integrated_managed_export_test_invoke(
+    raw: *mut ElmNativeManagedCallV1,
+) -> i32 {
+    let Some(call) = (unsafe { raw.as_mut() }) else {
+        return ELM_CALL_STATUS_INVALID;
+    };
+    if call.abi_version != ELM_NATIVE_MANAGED_CALL_ABI_VERSION
+        || call.flags != 0
+        || call.reserved0 != 0
+        || usize::from(call.request.payload_len) > call.request.payload.len()
+    {
+        return ELM_CALL_STATUS_INVALID;
+    }
+    let Some(context) = current_context() else {
+        return ELM_CALL_STATUS_PROVIDER_FAULT;
+    };
+    let mut payload = [0u8; 48];
+    payload[0..8].copy_from_slice(&call.caller_cell_id.to_le_bytes());
+    payload[8..16].copy_from_slice(&call.caller_generation.to_le_bytes());
+    payload[16..24].copy_from_slice(&call.callee_cell_id.to_le_bytes());
+    payload[24..32].copy_from_slice(&call.callee_generation.to_le_bytes());
+    payload[32..40].copy_from_slice(&context.cell_id.0.to_le_bytes());
+    payload[40..48].copy_from_slice(&context.generation.0.to_le_bytes());
+    call.reply = ElmReplyFrame::new(
+        call.request.binding_id,
+        call.request.call_id,
+        ELM_CALL_STATUS_OK,
+        &payload,
+    );
+    0
 }
 
 impl OldGenerationExecutionState {
@@ -2284,6 +2362,13 @@ impl ElmCore {
     }
 
     pub fn init_builtin_mgr(&mut self) -> Result<(), ElmError> {
+        self.init_builtin_mgr_with_integrated_exports(&[])
+    }
+
+    pub(crate) fn init_builtin_mgr_with_integrated_exports(
+        &mut self,
+        integrated_exports: &[ElmIntegratedManagedExportV1],
+    ) -> Result<(), ElmError> {
         if self.initialized {
             return Ok(());
         }
@@ -2453,6 +2538,7 @@ impl ElmCore {
         self.register_builtin_mgr_actions()?;
         self.register_builtin_mgr_api()?;
         self.register_builtin_native_exports()?;
+        self.register_integrated_managed_exports(integrated_exports)?;
         self.initialized = true;
         self.push_journal_trace(
             ELM_MGR_ID,
@@ -9114,9 +9200,54 @@ impl ElmCore {
                     ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
                 );
             }
+            // language-runtime 的全局资源表只能由内核在该 builtin service 完成 finalize
+            // 后清空；它不再作为普通 ELM kernel symbol 暴露。
+            let is_language_runtime = self
+                .cells
+                .iter()
+                .find(|cell| cell.id == id)
+                .is_some_and(|cell| cell.name == "language.runtime");
+            if is_language_runtime && super::language_resources::reset().raw() != 0 {
+                let _ = source_suspension.keep_suspended();
+                self.quarantine_cell_after_hook_failure(id);
+                let response = self.lifecycle_response(
+                    id,
+                    ELM_MGR_STATUS_INVALID,
+                    ELM_LIFECYCLE_REASON_HOOK_FAILED,
+                    0,
+                    0,
+                );
+                return self.finish_lifecycle(
+                    action,
+                    response,
+                    ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
+                );
+            }
             if let Some(cell) = self.cells.iter_mut().find(|cell| cell.id == id) {
                 cell.lifecycle_finalized = true;
             }
+        }
+
+        // Language resources are owned by the consumer cell, not by the optional
+        // language-runtime provider.  Revoke them from the generic detach path as well,
+        // so a crashed or directly unloaded consumer cannot leave MMIO/DMA/buffer/IRQ
+        // records behind when it never reaches the runtime's explicit drain entrypoint.
+        let language_owner = elm_language_abi::LanguageOwnerV1::new(id.0, source_generation.0);
+        let resource_status = super::language_resources::revoke_owner(language_owner);
+        if !resource_status.is_ok() {
+            let _ = source_suspension.keep_suspended();
+            self.quarantine_cell_after_hook_failure(id);
+            return self.finish_lifecycle(
+                action,
+                self.lifecycle_response(
+                    id,
+                    ELM_MGR_STATUS_BUSY,
+                    ELM_LIFECYCLE_REASON_HOOK_FAILED,
+                    0,
+                    0,
+                ),
+                ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
+            );
         }
 
         self.commit_detached_cell(id, source_generation, source_suspension)
@@ -11965,6 +12096,7 @@ impl ElmCore {
             rust_abi_hash: [0; 32],
             address: &ELM_API_ROOT_V1 as *const ElmApiRootV1 as usize,
             bounds: None,
+            integrated: None,
         });
         self.native_exports.push(NativeExportRuntime {
             owner: ELM_MGR_ID,
@@ -11976,8 +12108,162 @@ impl ElmCore {
             rust_abi_hash: [0; 32],
             address: elm_runtime_log_v1 as usize,
             bounds: None,
+            integrated: None,
         });
         Ok(())
+    }
+
+    fn register_integrated_managed_exports(
+        &mut self,
+        descriptors: &[ElmIntegratedManagedExportV1],
+    ) -> Result<usize, ElmError> {
+        if descriptors.is_empty() {
+            return Ok(0);
+        }
+
+        let mut providers: Vec<PreparedIntegratedProvider> = Vec::new();
+        providers
+            .try_reserve(descriptors.len())
+            .map_err(|_| ElmError::LeaseBusy)?;
+        for descriptor in descriptors {
+            if !descriptor.valid() || (descriptor.initialized)() == 0 {
+                return Err(ElmError::InvalidTransition);
+            }
+            let provider_name = descriptor.provider_name().ok_or(ElmError::InvalidName)?;
+            let provider_version = descriptor
+                .provider_version()
+                .ok_or(ElmError::InvalidVersion)?;
+            let name = descriptor.name().ok_or(ElmError::InvalidName)?;
+            let contract = descriptor.contract().ok_or(ElmError::InvalidContract)?;
+            let declaration = ElmEbiExportDecl::new(
+                name,
+                contract,
+                descriptor.version,
+                descriptor.flags,
+                [0; 32],
+            )
+            .map_err(|_| ElmError::InvalidTransition)?;
+
+            if self.native_exports.iter().any(|export| {
+                export.name == declaration.name
+                    && export.contract == declaration.contract
+                    && export.version == declaration.version
+            }) || providers
+                .iter()
+                .flat_map(|provider| &provider.exports)
+                .any(|export| {
+                    export.declaration.name == declaration.name
+                        && export.declaration.contract == declaration.contract
+                        && export.declaration.version == declaration.version
+                })
+            {
+                return Err(ElmError::DuplicateBinding);
+            }
+
+            let runtime = IntegratedManagedExportRuntime {
+                invoke: descriptor.invoke,
+                initialized: descriptor.initialized,
+            };
+            if let Some(provider) = providers
+                .iter_mut()
+                .find(|provider| provider.name.as_str() == provider_name)
+            {
+                if provider.version.as_str() != provider_version {
+                    return Err(ElmError::InvalidVersion);
+                }
+                provider
+                    .exports
+                    .try_reserve(1)
+                    .map_err(|_| ElmError::LeaseBusy)?;
+                provider.exports.push(PreparedIntegratedManagedExport {
+                    declaration,
+                    runtime,
+                });
+                continue;
+            }
+            if self.cell_id_by_name(provider_name).is_some() {
+                return Err(ElmError::DuplicateCell);
+            }
+            providers.push(PreparedIntegratedProvider {
+                name: ElmName::new(provider_name)?,
+                version: ElmVersion::new(provider_version)?,
+                exports: alloc::vec![PreparedIntegratedManagedExport {
+                    declaration,
+                    runtime,
+                }],
+            });
+        }
+
+        self.cells
+            .try_reserve(providers.len())
+            .map_err(|_| ElmError::LeaseBusy)?;
+        self.native_exports
+            .try_reserve(descriptors.len())
+            .map_err(|_| ElmError::LeaseBusy)?;
+
+        let mut registered = 0usize;
+        for provider in providers {
+            if provider
+                .exports
+                .iter()
+                .any(|export| (export.runtime.initialized)() == 0)
+            {
+                return Err(ElmError::InvalidTransition);
+            }
+            let id = self.alloc_cell_id().ok_or(ElmError::LeaseBusy)?;
+            let manifest = ElmManifest::new(
+                provider.name.clone(),
+                provider.version.clone(),
+                ElmKind::Service,
+            );
+            let mut unit = ElmEbiUnit::new(manifest.clone(), ElmEbiTarget::new(ElmEbiArch::Any));
+            for export in &provider.exports {
+                unit.exports.push(export.declaration.clone());
+            }
+            unit.validate(ElmEbiArch::Any)
+                .map_err(|_| ElmError::InvalidTransition)?;
+            if !self.native_exports_available(&unit) {
+                return Err(ElmError::DuplicateBinding);
+            }
+            self.insert_loaded_cell(
+                id,
+                ELM_MGR_ID,
+                ElmResourceBudget::DEFAULT,
+                manifest,
+                provider.name.as_str().to_string(),
+                ElmEbiArch::Any,
+                &unit,
+                ElmEbiSourceKind::Builtin,
+                false,
+            )?;
+            self.activate_loaded_cell(id, &unit, &ResolvedEbiTopology::empty(), None)?;
+            let cell = self.cell_index(id).ok_or(ElmError::CellNotFound)?;
+            self.cells[cell].lifecycle_hooks_declared = true;
+            self.cells[cell].lifecycle_executor_ready = true;
+            self.cells[cell].lifecycle_initialized = true;
+            self.cells[cell].lifecycle_finalized = false;
+
+            for export in provider.exports {
+                self.native_exports.push(NativeExportRuntime {
+                    owner: id,
+                    generation: Generation::FIRST,
+                    name: export.declaration.name,
+                    contract: export.declaration.contract,
+                    version: export.declaration.version,
+                    flags: export.declaration.flags,
+                    rust_abi_hash: [0; 32],
+                    address: export.runtime.invoke as usize,
+                    bounds: None,
+                    integrated: Some(export.runtime),
+                });
+                registered = registered.saturating_add(1);
+            }
+        }
+        log::info!(
+            "[elm] registered {} integrated managed export(s)",
+            registered
+        );
+        Ok(registered)
     }
 
     pub(crate) fn register_kernel_provider_specs(
@@ -12812,7 +13098,7 @@ impl ElmCore {
                 return Err(ElmEbiLoadStatus::RuntimeRejected);
             }
             let managed = native_import_is_managed(import.flags);
-            if managed && export.bounds.is_none() {
+            if managed && export.bounds.is_none() && export.integrated.is_none() {
                 return Err(ElmEbiLoadStatus::RuntimeRejected);
             }
             let handle = if managed {
@@ -12969,6 +13255,7 @@ impl ElmCore {
                 rust_abi_hash: export.rust_abi_hash,
                 address: loaded.export_address(&export.name)?,
                 bounds: Some(bounds),
+                integrated: None,
             });
         }
         Ok(exports)
@@ -13416,7 +13703,22 @@ impl ElmCore {
             })
             .cloned()
             .ok_or(ELM_MGR_STATUS_NOT_FOUND)?;
-        let bounds = export.bounds.ok_or(ELM_MGR_STATUS_INVALID)?;
+        let target = match (export.integrated, export.bounds) {
+            (Some(runtime), None) => {
+                if (runtime.initialized)() == 0 {
+                    return Err(ELM_MGR_STATUS_BUSY);
+                }
+                let context = self
+                    .lifecycle_context(import.provider, ElmLifecyclePhase::Initialize)
+                    .map_err(|_| ELM_MGR_STATUS_INVALID)?;
+                ManagedCallTarget::Integrated { runtime, context }
+            }
+            (None, Some(bounds)) => ManagedCallTarget::Native {
+                address: export.address,
+                bounds,
+            },
+            _ => return Err(ELM_MGR_STATUS_INVALID),
+        };
         if self.cell_state(import.provider) != Some(ElmState::Active)
             || (staged_caller.is_none() && self.cell_state(caller) != Some(ElmState::Active))
         {
@@ -13449,8 +13751,7 @@ impl ElmCore {
             caller: caller_reservation,
             callee: callee_token,
             import_handle,
-            address: export.address,
-            bounds,
+            target,
             frame,
         })
     }
@@ -15413,6 +15714,10 @@ impl ElmCore {
 
     fn is_builtin_cell(&self, id: ElmId) -> bool {
         id.0 < FIRST_DYNAMIC_CELL_ID
+            || self
+                .cells
+                .iter()
+                .any(|cell| cell.id == id && cell.ebi_source == ElmEbiSourceKind::Builtin)
     }
 
     fn live_child_count(&self, id: ElmId) -> usize {
@@ -16418,6 +16723,7 @@ impl ElmCore {
             rust_abi_hash: [0; 32],
             address,
             bounds: None,
+            integrated: None,
         };
         let exports = alloc::vec![export(1, 0x2000), export(3, 0x3000), export(2, 0x2800)];
         let highest = select_managed_export_for_import(provider, &managed_import, &exports)
@@ -16435,6 +16741,251 @@ impl ElmCore {
         let direct_blocks_replace = core.native_direct_pinned_importer_count(provider) == 1;
 
         highest && duplicate_rejected && direct_blocks_replace
+    }
+
+    #[cfg(feature = "kernel-tests")]
+    pub(crate) fn test_integrated_managed_export_binding() -> bool {
+        const PROVIDER_NAME: &str = "test.integrated-provider";
+        const PROVIDER_VERSION: &str = "0.1.0";
+        const EXPORT_NAME: &str = "test.integrated.echo";
+        const EXPORT_CONTRACT: &str = "test.integrated.echo@1";
+        const PRIVATE_NAME: &str = "test.integrated.private";
+        const PRIVATE_CONTRACT: &str = "test.integrated.private@1";
+
+        INTEGRATED_MANAGED_EXPORT_TEST_READY.store(true, core::sync::atomic::Ordering::Release);
+        let mut core = Self::new();
+        if core.init_builtin_mgr().is_err() {
+            return false;
+        }
+        let active = ElmIntegratedManagedExportV1::new(
+            PROVIDER_NAME,
+            PROVIDER_VERSION,
+            EXPORT_NAME,
+            EXPORT_CONTRACT,
+            2,
+            elm_model::ELM_EBI_EXPORT_FLAG_MANAGED | elm_model::ELM_EBI_EXPORT_FLAG_DEPENDENCY,
+            integrated_managed_export_test_invoke,
+            integrated_managed_export_test_initialized,
+        );
+        let private = ElmIntegratedManagedExportV1::new(
+            PROVIDER_NAME,
+            PROVIDER_VERSION,
+            PRIVATE_NAME,
+            PRIVATE_CONTRACT,
+            1,
+            elm_model::ELM_EBI_EXPORT_FLAG_MANAGED | elm_model::ELM_EBI_EXPORT_FLAG_PRIVATE,
+            integrated_managed_export_test_invoke,
+            integrated_managed_export_test_initialized,
+        );
+        let uninitialized = ElmIntegratedManagedExportV1::new(
+            "test.uninitialized-provider",
+            PROVIDER_VERSION,
+            EXPORT_NAME,
+            EXPORT_CONTRACT,
+            2,
+            elm_model::ELM_EBI_EXPORT_FLAG_MANAGED | elm_model::ELM_EBI_EXPORT_FLAG_DEPENDENCY,
+            integrated_managed_export_test_invoke,
+            integrated_managed_export_test_uninitialized,
+        );
+
+        let initial_cell_count = core.cells.len();
+        let initial_export_count = core.native_exports.len();
+        let uninitialized_rejected = matches!(
+            core.register_integrated_managed_exports(&[uninitialized]),
+            Err(ElmError::InvalidTransition)
+        ) && core.cells.len() == initial_cell_count
+            && core.native_exports.len() == initial_export_count;
+        let duplicate_rejected = matches!(
+            core.register_integrated_managed_exports(&[active, active]),
+            Err(ElmError::DuplicateBinding)
+        ) && core.cells.len() == initial_cell_count
+            && core.native_exports.len() == initial_export_count;
+        if !uninitialized_rejected
+            || !duplicate_rejected
+            || core.register_integrated_managed_exports(&[active, private]) != Ok(2)
+        {
+            return false;
+        }
+
+        let Some(provider) = core.cell_id_by_name(PROVIDER_NAME) else {
+            return false;
+        };
+        let provider_generation = core
+            .cells
+            .iter()
+            .find(|cell| cell.id == provider)
+            .map(|cell| cell.generation);
+        let provider_is_protected = provider_generation == Some(Generation::FIRST)
+            && core.cell_state(provider) == Some(ElmState::Active)
+            && core.is_builtin_cell(provider);
+
+        let manifest = match (
+            ElmName::new("test-integrated-consumer"),
+            ElmVersion::new("0.1.0"),
+        ) {
+            (Ok(name), Ok(version)) => ElmManifest::new(name, version, ElmKind::Service),
+            _ => return false,
+        };
+        let import = match elm_model::ElmEbiImportDecl::new_range(
+            EXPORT_NAME,
+            EXPORT_CONTRACT,
+            1,
+            3,
+            ELM_EBI_IMPORT_FLAG_MANAGED,
+            [0; 32],
+        ) {
+            Ok(import) => import,
+            Err(_) => return false,
+        };
+        let dependency = match elm_model::ElmEbiDependencyDecl::new(PROVIDER_NAME, EXPORT_CONTRACT)
+        {
+            Ok(dependency) => dependency,
+            Err(_) => return false,
+        };
+        let without_dependency =
+            ElmEbiUnit::new(manifest.clone(), ElmEbiTarget::new(ElmEbiArch::Any))
+                .with_import(import.clone());
+        let dependency_required = matches!(
+            core.resolve_native_imports(
+                ElmId(u64::MAX - 1),
+                ELM_MGR_ID,
+                Generation(7),
+                ElmEbiArch::Any,
+                &without_dependency,
+            ),
+            Err(ElmEbiLoadStatus::RuntimeRejected)
+        );
+
+        let private_import = match elm_model::ElmEbiImportDecl::new(
+            PRIVATE_NAME,
+            PRIVATE_CONTRACT,
+            1,
+            ELM_EBI_IMPORT_FLAG_MANAGED,
+            [0; 32],
+        ) {
+            Ok(import) => import,
+            Err(_) => return false,
+        };
+        let private_dependency =
+            match elm_model::ElmEbiDependencyDecl::new(PROVIDER_NAME, PRIVATE_CONTRACT) {
+                Ok(dependency) => dependency,
+                Err(_) => return false,
+            };
+        let private_unit = ElmEbiUnit::new(manifest.clone(), ElmEbiTarget::new(ElmEbiArch::Any))
+            .with_dependency(private_dependency)
+            .with_import(private_import);
+        let private_rejected = matches!(
+            core.resolve_native_imports(
+                ElmId(u64::MAX - 1),
+                ELM_MGR_ID,
+                Generation(7),
+                ElmEbiArch::Any,
+                &private_unit,
+            ),
+            Err(ElmEbiLoadStatus::RuntimeRejected)
+        );
+
+        let consumer = ElmId(u64::MAX - 1);
+        let consumer_generation = Generation(7);
+        let unit = ElmEbiUnit::new(manifest, ElmEbiTarget::new(ElmEbiArch::Any))
+            .with_dependency(dependency)
+            .with_import(import);
+        let Ok((values, dependencies, imports, kernel_symbols)) = core.resolve_native_imports(
+            consumer,
+            ELM_MGR_ID,
+            consumer_generation,
+            ElmEbiArch::Any,
+            &unit,
+        ) else {
+            return false;
+        };
+        let resolved_contract = match FlowContract::new(EXPORT_CONTRACT) {
+            Ok(contract) => contract,
+            Err(_) => return false,
+        };
+        let resolved = values.len() == 1
+            && values[0] != 0
+            && dependencies == [(provider, resolved_contract)]
+            && imports.len() == 1
+            && imports[0].selected_version == 2
+            && imports[0].provider == provider
+            && kernel_symbols.is_empty();
+        if !resolved {
+            return false;
+        }
+
+        let mut consumer_cell = match core.cells.iter().find(|cell| cell.id == ELM_EKI_ID) {
+            Some(cell) => cell.clone(),
+            None => return false,
+        };
+        consumer_cell.id = consumer;
+        consumer_cell.parent = Some(ELM_MGR_ID);
+        consumer_cell.generation = consumer_generation;
+        consumer_cell.name = "test-integrated-consumer".to_string();
+        consumer_cell.ebi_source = ElmEbiSourceKind::Memory;
+        consumer_cell.cell_policy.cell_id = consumer.0;
+        consumer_cell.cell_policy.generation = consumer_generation.0;
+        core.cells.push(consumer_cell);
+        core.native_imports.extend(imports);
+
+        let handle = values[0] as u64;
+        let frame = ElmCallFrame::empty(55, 77, 9);
+        let plan = match core.prepare_managed_call(
+            consumer,
+            consumer_generation,
+            ElmLifecyclePhase::Initialize,
+            handle,
+            frame,
+        ) {
+            Ok(plan) => plan,
+            Err(_) => return false,
+        };
+        let raw_reply = execute_managed_call_plan(&plan);
+        let reply = match core.complete_managed_call(plan, raw_reply) {
+            Ok(reply) => reply,
+            Err(_) => return false,
+        };
+        let identity_forwarded = reply.status == ELM_CALL_STATUS_OK
+            && reply.binding_id == frame.binding_id
+            && reply.call_id == frame.call_id
+            && reply.payload_len == 48
+            && reply.payload[0..8] == consumer.0.to_le_bytes()
+            && reply.payload[8..16] == consumer_generation.0.to_le_bytes()
+            && reply.payload[16..24] == provider.0.to_le_bytes()
+            && reply.payload[24..32] == Generation::FIRST.0.to_le_bytes()
+            && reply.payload[32..40] == provider.0.to_le_bytes()
+            && reply.payload[40..48] == Generation::FIRST.0.to_le_bytes();
+
+        INTEGRATED_MANAGED_EXPORT_TEST_READY.store(false, core::sync::atomic::Ordering::Release);
+        let readiness_rechecked = matches!(
+            core.prepare_managed_call(
+                consumer,
+                consumer_generation,
+                ElmLifecyclePhase::Initialize,
+                handle,
+                frame,
+            ),
+            Err(ELM_MGR_STATUS_BUSY)
+        );
+        INTEGRATED_MANAGED_EXPORT_TEST_READY.store(true, core::sync::atomic::Ordering::Release);
+
+        core.native_imports
+            .retain(|candidate| candidate.owner != consumer);
+        core.native_exports
+            .retain(|candidate| candidate.owner != provider);
+        let graph_removed = core.graph.remove_cell(provider).is_ok();
+        core.cells.retain(|candidate| candidate.id != provider);
+        let owner_retired = super::owned_resource::retire_owner(provider, Generation::FIRST);
+        let accounting_retired = super::resource_accounting::retire_cell(provider);
+
+        provider_is_protected
+            && dependency_required
+            && private_rejected
+            && identity_forwarded
+            && readiness_rechecked
+            && graph_removed
+            && owner_retired
+            && accounting_retired
     }
 
     #[cfg(feature = "kernel-tests")]
@@ -16464,6 +17015,7 @@ impl ElmCore {
                 image_start: 0x4000,
                 image_end: 0x6000,
             }),
+            integrated: None,
         });
         let manifest = match (
             ElmName::new("test-direct-consumer"),
@@ -16603,6 +17155,7 @@ impl ElmCore {
                 image_start: 0x1000,
                 image_end: 0x3000,
             }),
+            integrated: None,
         });
         let import = |handle, generation| NativeImportRuntime {
             handle,
@@ -17362,18 +17915,90 @@ fn invoke_managed_unlocked(
             frame,
         )
     })?;
-    let reply = super::native::invoke_managed_export(
-        plan.address,
-        plan.bounds,
-        plan.import_handle,
-        plan.caller.cell(),
-        plan.caller.generation(),
-        plan.callee.cell,
-        plan.callee.generation,
-        plan.frame,
-        plan.callee.allowed_actions,
-    );
+    let reply = execute_managed_call_plan(&plan);
     with_core(|core| core.complete_managed_call(plan, reply))
+}
+
+fn execute_managed_call_plan(plan: &ManagedCallExecutionPlan) -> ElmReplyFrame {
+    match plan.target {
+        ManagedCallTarget::Native { address, bounds } => super::native::invoke_managed_export(
+            address,
+            bounds,
+            plan.import_handle,
+            plan.caller.cell(),
+            plan.caller.generation(),
+            plan.callee.cell,
+            plan.callee.generation,
+            plan.frame,
+            plan.callee.allowed_actions,
+        ),
+        ManagedCallTarget::Integrated { runtime, context } => invoke_integrated_managed_export(
+            runtime,
+            context,
+            plan.import_handle,
+            plan.caller.cell(),
+            plan.caller.generation(),
+            plan.callee.cell,
+            plan.callee.generation,
+            plan.frame,
+        ),
+    }
+}
+
+fn invoke_integrated_managed_export(
+    runtime: IntegratedManagedExportRuntime,
+    context: ElmContext,
+    import_handle: u64,
+    caller: ElmId,
+    caller_generation: Generation,
+    callee: ElmId,
+    callee_generation: Generation,
+    request: ElmCallFrame,
+) -> ElmReplyFrame {
+    if (runtime.initialized)() == 0 {
+        return ElmReplyFrame::empty(request.binding_id, request.call_id, ELM_CALL_STATUS_BUSY);
+    }
+    let context = context.with_caller(caller, caller_generation);
+    let Some(_current) = try_enter_current_context(&context) else {
+        return ElmReplyFrame::empty(
+            request.binding_id,
+            request.call_id,
+            ELM_CALL_STATUS_PROVIDER_FAULT,
+        );
+    };
+    let mut call = ElmNativeManagedCallV1::new(
+        import_handle,
+        caller.0,
+        caller_generation.0,
+        callee.0,
+        callee_generation.0,
+        request,
+    );
+    // Safety: 入口来自经过校验且由链接器保留的 resident 描述符，调用帧在本次调用内有效。
+    let status = unsafe { (runtime.invoke)(&mut call as *mut ElmNativeManagedCallV1) };
+    if status != 0
+        || call.abi_version != ELM_NATIVE_MANAGED_CALL_ABI_VERSION
+        || call.flags != 0
+        || call.reserved0 != 0
+        || call.import_handle != import_handle
+        || call.caller_cell_id != caller.0
+        || call.caller_generation != caller_generation.0
+        || call.callee_cell_id != callee.0
+        || call.callee_generation != callee_generation.0
+        || call.reply.binding_id != request.binding_id
+        || call.reply.call_id != request.call_id
+        || call.reply.flags != 0
+        || call.reply.reserved0 != 0
+        || call.reply.reserved1 != 0
+        || usize::from(call.reply.payload_len) > call.reply.payload.len()
+    {
+        return ElmReplyFrame::empty(
+            request.binding_id,
+            request.call_id,
+            ELM_CALL_STATUS_PROVIDER_FAULT,
+        );
+    }
+    call.reply
 }
 
 fn execute_provider_call_plan(plan: &ProviderCallExecutionPlan) -> Result<ElmReplyFrame, i32> {
@@ -17585,6 +18210,20 @@ fn execute_native_lifecycle_plan(
                         resource_rollback_failed: false,
                     };
                 }
+            }
+            // Language resources belong to the detached cell generation rather than to the
+            // optional runtime provider.  Native ELMs do not pass through the managed detach
+            // path above, so revoke their language leases explicitly before committing detach.
+            let language_owner = elm_language_abi::LanguageOwnerV1::new(owner.0, generation.0);
+            let resource_status = super::language_resources::revoke_owner(language_owner);
+            if !resource_status.is_ok() {
+                return NativeLifecycleExecutionOutcome {
+                    result: Err(ElmError::LeaseBusy),
+                    blockers: ELM_POLICY_BLOCK_LEASE_BUSY | ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
+                    reason: ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                    drained_resources,
+                    resource_rollback_failed: false,
+                };
             }
             NativeLifecycleExecutionOutcome {
                 result: Ok(()),

@@ -9,11 +9,13 @@ use elm::{
     ProviderReply,
 };
 use elm_language_abi::{
-    LanguageBackendCompleteRequestV1, LanguageBackendDescriptorV1, LanguageBackendNextRequestV1,
-    LanguageBackendRequestV1, LanguageCancelRequestV1, LanguageDrainRequestV1,
-    LanguageInstanceCloseRequestV1, LanguageKernelCallRequestV1, LanguagePollRequestV1,
-    LanguageRequestReleaseV1, LanguageRequestV1, LanguageResourceRequestV1,
-    LanguageResourceResponseV1, LanguageRuntimeStatus, LanguageWire,
+    LanguageBackendCancelAckV1, LanguageBackendCompleteRequestV1, LanguageBackendDescriptorV1,
+    LanguageBackendNextRequestV1, LanguageBackendRequestV1, LanguageCancelRequestV1,
+    LanguageDelegatedKernelCallRequestV2, LanguageDelegatedResourceRequestV2,
+    LanguageDrainRequestV1, LanguageInstanceCloseRequestV1, LanguageInstanceOpenRequestV2,
+    LanguageKernelCallRequestV1, LanguagePollRequestV1, LanguageRequestReleaseV1,
+    LanguageRequestV1, LanguageRequestV2, LanguageResourceRequestV1, LanguageResourceResponseV1,
+    LanguageRuntimeStatus, LanguageWire,
 };
 
 use allocator as _;
@@ -67,8 +69,11 @@ impl ElmModule for LanguageRuntimeElm {
         Ok(Self)
     }
 
-    fn initialize(&mut self, _context: &LifecycleContext) -> HookResult {
-        language_runtime::initialize();
+    fn initialize(&mut self, context: &LifecycleContext) -> HookResult {
+        language_runtime::initialize_for_provider(elm_language_abi::LanguageOwnerV1::new(
+            context.cell_id(),
+            context.generation(),
+        ));
         Ok(())
     }
 
@@ -82,15 +87,20 @@ impl ElmModule for LanguageRuntimeElm {
         Ok(())
     }
 
-    fn resume(&mut self, _context: &LifecycleContext) -> HookResult {
-        language_runtime::resume();
+    fn resume(&mut self, context: &LifecycleContext) -> HookResult {
+        language_runtime::resume_for_provider(elm_language_abi::LanguageOwnerV1::new(
+            context.cell_id(),
+            context.generation(),
+        ));
         Ok(())
     }
 
     fn finalize(&mut self, _context: &LifecycleContext) -> HookResult {
-        let _ = language_runtime::reset_resources();
-        language_runtime::finalize();
-        Ok(())
+        language_runtime::finalize().map_err(|status| HookError::new(status.raw()))?;
+        let status = language_runtime::reset_resources();
+        (status == LanguageRuntimeStatus::OK)
+            .then_some(())
+            .ok_or_else(|| HookError::new(status.raw()))
     }
 }
 
@@ -156,6 +166,20 @@ fn backend_next(request: &ManagedRequest) -> ManagedResult {
 }
 
 #[elm::export(
+    name = "language.runtime.backend.next.v2",
+    contract = "language.runtime.backend.next@2",
+    version = 2,
+    visibility = "dependency"
+)]
+fn backend_next_v2(request: &ManagedRequest) -> ManagedResult {
+    let control: LanguageBackendNextRequestV1 = decode(request.payload())?;
+    match language_runtime::next_backend_work_v2(owner(request), control) {
+        Ok(work) => encode(&work),
+        Err(error) => Ok(ProviderReply::empty(error.raw())),
+    }
+}
+
+#[elm::export(
     name = "language.runtime.backend.complete",
     contract = "language.runtime.backend.complete@1",
     version = 1,
@@ -170,6 +194,34 @@ fn backend_complete(request: &ManagedRequest) -> ManagedResult {
 }
 
 #[elm::export(
+    name = "language.runtime.backend.cancel.next",
+    contract = "language.runtime.backend.cancel.next@1",
+    version = 1,
+    visibility = "dependency"
+)]
+fn backend_cancel_next(request: &ManagedRequest) -> ManagedResult {
+    let control: LanguageBackendNextRequestV1 = decode(request.payload())?;
+    match language_runtime::next_backend_cancel(owner(request), control) {
+        Ok(work) => encode(&work),
+        Err(error) => Ok(ProviderReply::empty(error.raw())),
+    }
+}
+
+#[elm::export(
+    name = "language.runtime.backend.cancel.ack",
+    contract = "language.runtime.backend.cancel.ack@1",
+    version = 1,
+    visibility = "dependency"
+)]
+fn backend_cancel_ack(request: &ManagedRequest) -> ManagedResult {
+    let acknowledgement: LanguageBackendCancelAckV1 = decode(request.payload())?;
+    empty_or_status(language_runtime::acknowledge_backend_cancel(
+        owner(request),
+        acknowledgement,
+    ))
+}
+
+#[elm::export(
     name = "language.runtime.instance.open",
     contract = "language.runtime.instance.open@1",
     version = 1,
@@ -178,6 +230,20 @@ fn backend_complete(request: &ManagedRequest) -> ManagedResult {
 fn instance_open(request: &ManagedRequest) -> ManagedResult {
     let control: LanguageBackendRequestV1 = decode(request.payload())?;
     match language_runtime::open_instance(owner(request), control) {
+        Ok(descriptor) => encode(&descriptor),
+        Err(error) => Ok(ProviderReply::empty(error.raw())),
+    }
+}
+
+#[elm::export(
+    name = "language.runtime.instance.open.v2",
+    contract = "language.runtime.instance.open@2",
+    version = 2,
+    visibility = "dependency"
+)]
+fn instance_open_v2(request: &ManagedRequest) -> ManagedResult {
+    let control: LanguageInstanceOpenRequestV2 = decode(request.payload())?;
+    match language_runtime::open_instance_v2(owner(request), control) {
         Ok(descriptor) => encode(&descriptor),
         Err(error) => Ok(ProviderReply::empty(error.raw())),
     }
@@ -203,6 +269,20 @@ fn instance_close(request: &ManagedRequest) -> ManagedResult {
 fn request_submit(request: &ManagedRequest) -> ManagedResult {
     let input: LanguageRequestV1 = decode(request.payload())?;
     match language_runtime::submit(owner(request), input) {
+        Ok(reply) => encode(&reply),
+        Err(error) => Ok(ProviderReply::empty(error.raw())),
+    }
+}
+
+#[elm::export(
+    name = "language.runtime.request.submit.v2",
+    contract = "language.runtime.request.submit@2",
+    version = 2,
+    visibility = "dependency"
+)]
+fn request_submit_v2(request: &ManagedRequest) -> ManagedResult {
+    let input: LanguageRequestV2 = decode(request.payload())?;
+    match language_runtime::submit_v2(owner(request), input) {
         Ok(reply) => encode(&reply),
         Err(error) => Ok(ProviderReply::empty(error.raw())),
     }
@@ -275,6 +355,18 @@ fn resource(request: &ManagedRequest) -> ManagedResult {
 }
 
 #[elm::export(
+    name = "language.runtime.resource.delegated",
+    contract = "language.runtime.resource.delegated@1",
+    version = 1,
+    visibility = "dependency"
+)]
+fn delegated_resource(request: &ManagedRequest) -> ManagedResult {
+    let input: LanguageDelegatedResourceRequestV2 = decode(request.payload())?;
+    let output = language_runtime::delegated_resource_request(owner(request), input);
+    encode_status(LanguageRuntimeStatus::from_raw(output.status), &output)
+}
+
+#[elm::export(
     name = "language.runtime.kernel.call",
     contract = "language.runtime.kernel.call@1",
     version = 1,
@@ -283,6 +375,18 @@ fn resource(request: &ManagedRequest) -> ManagedResult {
 fn kernel_call(request: &ManagedRequest) -> ManagedResult {
     let input: LanguageKernelCallRequestV1 = decode(request.payload())?;
     let output = language_runtime::kernel_call(owner(request), input);
+    encode_status(LanguageRuntimeStatus::from_raw(output.status), &output)
+}
+
+#[elm::export(
+    name = "language.runtime.kernel.call.delegated",
+    contract = "language.runtime.kernel.call.delegated@1",
+    version = 1,
+    visibility = "dependency"
+)]
+fn delegated_kernel_call(request: &ManagedRequest) -> ManagedResult {
+    let input: LanguageDelegatedKernelCallRequestV2 = decode(request.payload())?;
+    let output = language_runtime::delegated_kernel_call(owner(request), input);
     encode_status(LanguageRuntimeStatus::from_raw(output.status), &output)
 }
 

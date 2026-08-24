@@ -6416,6 +6416,11 @@ fn elm_native_replace_selects_highest_unique_managed_export() {
 }
 
 #[ktest]
+fn elm_integrated_managed_export_uses_existing_binding_rules() {
+    assert!(ElmCore::test_integrated_managed_export_binding());
+}
+
+#[ktest]
 fn elm_native_direct_pinned_import_requires_exact_rust_abi() {
     assert!(ElmCore::test_native_direct_pinned_resolution());
 }
