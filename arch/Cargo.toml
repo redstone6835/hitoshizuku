@@ -21,4 +21,5 @@ mm = { path = "../libs/mm" }
 native-abi = { path = "../libs/native-abi" }
 profiling = { path = "../libs/profiling", optional = true }
 sched = { path = "../libs/sched" }
+sbi-rt = { version = "0.0.4", features = ["legacy"] }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
