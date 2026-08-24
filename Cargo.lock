@@ -37,6 +37,7 @@ dependencies = [
  "mm",
  "native-abi",
  "profiling",
+ "sbi-rt",
  "sched",
  "spin",
 ]
@@ -845,6 +846,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "sbi-rt"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48f7bf85822c8b453d7e3fca7de39684032f5c06c1ed338ad8d47f4a79c1d49a"
+dependencies = [
+ "sbi-spec",
+]
+
+[[package]]
+name = "sbi-spec"
+version = "0.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "785b91fcc41c7426fc07510be49ed1db44f002b45d45c175ec7f155c3cd447a9"
+dependencies = [
+ "bitflags",
 ]
 
 [[package]]
