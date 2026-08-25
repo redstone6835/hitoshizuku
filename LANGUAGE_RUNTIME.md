@@ -29,7 +29,7 @@ runtime anchor 和生命周期底座，不是危险内核函数的代理服务�
 ```mermaid
 flowchart TB
     L[ELM loader / Core] -->|通用装载、依赖、ABI、能力| A[language.runtime<br/>y resident anchor]
-    A -->|runtime ABI 与生命周期依赖| S[Kotlin/C#/C++ support ELM]
+    A -->|runtime ABI 与生命周期依赖| S[Kotlin/Go/C#/C++ support ELM]
     S -->|carrier ABI 与运行时依赖| F[外语 ELM]
     F -->|trusted-direct：普通函数调用| C[生成的薄 carrier]
     C -->|审核后的 direct import| K[kernel / general / hal]
@@ -43,7 +43,7 @@ flowchart TB
 
 | 平面 | 默认 | 使用场景 | 运行期开销 |
 | --- | --- | --- | --- |
-| `trusted-direct` | 是 | Kotlin/C#/C/C++ 驱动、网络栈、文件系统和普通内核扩展 | carrier 普通调用；热路径不经过 LR |
+| `trusted-direct` | 是 | Kotlin/Go/C#/C/C++ 驱动、网络栈、文件系统和普通内核扩展 | carrier 普通调用；热路径不经过 LR |
 | `managed` | 否 | 异步服务、宿主测试、fake backend、明确需要排队/取消/委托的执行面 | fixed frame、状态机、owner 和 policy 校验 |
 
 真正不可信的代码必须放入独立地址空间、虚拟机或硬件隔离域。managed dispatcher 能提供
@@ -59,9 +59,10 @@ flowchart TB
 | managed 资源处理器 | `general/src/dev/language.rs`、`kernel/src/elm/language_resources.rs` | 可选 resource/kernel.call 控制面与 owner 撤销 |
 | package/schema 工具 | [`hitoshizuku-elm-tools`](https://github.com/redstone6835/hitoshizuku-elm-tools) | EKI 身份、schema、carrier/SDK 生成、产物校验和签名 |
 | Kotlin 支持 | [`elm-language-kotlin`](https://github.com/redstone6835/elm-language-kotlin) | Kotlin/Native AOT、carrier、SDK、GC、反射、异常、线程与测试 |
+| Go 支持 | [`elm-language-go`](https://github.com/redstone6835/elm-language-go) | TamaGo AOT、`go.support`、carrier、SDK、GC/调度适配与测试 |
 | 其它语言支持 | 独立外部仓库 | 该语言的 AOT runtime、PAL、SDK、carrier 和 conformance tests |
 
-主内核仓库不保存 Kotlin/C# 编译器、语言标准库 fork、NuGet/Gradle 包或语言示例。自有语言
+主内核仓库不保存 Kotlin/C#/Go 编译器、语言标准库 fork、NuGet/Gradle/Go 包或语言示例。自有语言
 仓库之间使用发布 tag 或精确 revision，不使用 submodule，也不加入 Hitoshizuku 根 Cargo
 workspace。
 
@@ -92,8 +93,10 @@ LR 核心不实现以下内容：
 
 ```text
 language.runtime（y，resident framework）
-    └── kotlin.support（语言支持 ELM）
-          └── Kotlin 编写的具体 ELM
+    ├── kotlin.support（语言支持 ELM）
+    │     └── Kotlin 编写的具体 ELM
+    └── go.support（TamaGo 语言支持 ELM）
+          └── Go 编写的具体 ELM
 ```
 
 这里的“附属”表示 framework ABI、构建、装载顺序、generation 和生命周期依赖，不表示每个
@@ -125,7 +128,7 @@ abi = "1"
 
 ## trusted-direct 调用模型
 
-Kotlin/Native、C# NativeAOT 和 C/C++ 不能直接假定 Rust ABI 稳定。正式路径使用生成的薄
+Kotlin/Native、TamaGo、C# NativeAOT 和 C/C++ 不能直接假定 Rust ABI 稳定。正式路径使用生成的薄
 carrier：
 
 ```text
@@ -222,8 +225,15 @@ Kotlin 支持仓库已经建立为
 只提供架构、目录和 carrier ABI 骨架，尚不能生成可装载 Kotlin ELM。Kotlin/Native 的 GC、
 反射、异常、线程和 freestanding PAL 都由该仓库实现，主 loader 与 LR 不包含 Kotlin 分支。
 
+Go 支持仓库已经建立为
+[`redstone6835/elm-language-go`](https://github.com/redstone6835/elm-language-go)。它通过 Go Modules
+和 `go tool tamago` 锁定 TamaGo，不使用 submodule 或 vendored 工具链；当前完成项目分层、
+carrier ABI、`go.support` ELM、SDK 值类型和工具链 pin/摘要校验，RISC-V 64/LoongArch 64 的
+Hitoshizuku TamaGo 目标和可装载 Go ELM 尚未完成。Go GC、goroutine 调度、静态反射和 PAL
+均由该仓库实现，不能进入 LR dispatcher 或内核 loader。
+
 本框架优先支持能够生成 freestanding AOT 原生对象、提供稳定 native FFI、可控制 runtime
-依赖且能在卸载前停止全部执行的语言。Kotlin/Native、NativeAOT 子集、C、C++ 和 Zig 可以
+依赖且能在卸载前停止全部执行的语言。Kotlin/Native、TamaGo、NativeAOT 子集、C、C++ 和 Zig 可以
 按此路线评估；依赖完整 hosted OS、只能使用 JIT、无法枚举根或无法停止线程的实现不在范围内。
 
 ## package、schema 与生成器
@@ -260,7 +270,7 @@ Kotlin 支持仓库已经建立为
 4. 用 Rust fake foreign carrier 验证不注册 backend、不走 resource/kernel.call 也能装载和直调；
 5. 将 loader 中任何针对 `language.runtime` 名称的清理逻辑改成通用资源域生命周期；
 6. 完成 package 的 execution plane、信任根和 direct symbol schema；
-7. 之后才开始 Kotlin/Native freestanding runtime 移植。
+7. 之后分别推进 Kotlin/Native 与 TamaGo 的 freestanding target 移植，不让任一语言改变 loader。
 
 ## 验收标准
 
