@@ -6,6 +6,15 @@ ELM，全称 **Extensible Loadable Module**，中文统一称为 **可拓展内�
 
 ELM 不是 Linux 模块 ABI 的兼容层，也不是传统动态内核模块机制。ELM 的目标是在当前内核中提供一种面向 Rust 的运行时拓展体系：内核提供可信执行底座、资源所有权、状态机、能力边界和可观测拓扑；`elm-mgr` 作为 ELM 外界接口核心和运行时管理器，负责把策略、菜单、依赖选择、事件订阅、运行时 API 和外部管理入口统一收口。外部 ELM 使用目标内核发布的精确 `allocator`、`general`、`log` 和 `sched` Rust metadata，并按与内核源码相同的路径编写普通 Rust 代码；编译器产生的真实函数、固有方法和静态对象引用在打包期映射到由 `#[kernel_symbols::export]` 登记的稳定目录项。名称、契约、版本、规范 Rust ABI、接口源码摘要、能力策略和镜像信任全部通过后，调用就是普通 Rust 调用，不经过 `elm-mgr`、provider、函数表、grant 或 token。只有需要运行时发现、绑定、审计、异步流控或跨单元服务语义的能力才通过 provider 端口进入枢纽连接层。
 
+> **备注：** 除非段落明确说明，本文中的“ELM”“动态
+> ELM”“原生 ELM”、`ElmModule` 以及代码示例都默认指 Rust ELM。其他语言
+> 不另行定义一套 ELM：语言支持仓库通过经过审核的 Rust carrier、AOT
+> runtime 和 SDK，把语言产物映射到本文规定的 EBI、生命周期、依赖、能力与
+> 资源回收语义。外语接入只在备注中说明这种映射及差异，详细分层见
+> [LANGUAGE_RUNTIME.md](LANGUAGE_RUNTIME.md)。本文所说“C/C++ 兼容暂不进入
+> 目标”只限定本篇默认 Rust 开发框架，不表示项目永久排除外语支持；这些备注
+> 是外语实现必须满足的设计约束，也不表示任一外语工具链已经生产可用。
+
 ELM 的基本原则：
 
 - 不兼容 Linux `init_module`、`finit_module`、`delete_module` ABI。
@@ -156,6 +165,12 @@ ELM 的运行模型由五个对象构成：
 ## 5. 枢纽连接层
 
 ELM 不允许扫描未登记符号或按地址猜测内核布局。运行时交互分为三条边界：ELM 自有能力使用 `elm::runtime`/`elm::management`；需要发现、绑定和审计的服务使用枢纽连接层；`direct-pinned` 的 ELM 间导入导出和 `kernel-symbol` 内核导入使用类型化固定槽。`direct-pinned` 会固定目标 ELM generation；`kernel-symbol` 只解析常驻目录中的真实内核实现，不参与 ELM export 选择。二者都在执行模块代码前完成完整 Rust ABI 校验，调用时不再经过 provider 调用帧。
+
+> **备注（外语调用路径）：** 受信任的外语 ELM 在内核中的默认执行语义与
+> Rust ELM 相同。目标代码经装载前校验并由 carrier 完成 ABI 适配后，数据热
+> 路径使用已经解析的直接槽位或内核符号，不逐次经过 `language-runtime`
+> dispatcher。固定帧、请求队列和 dispatcher 只属于可选的 managed/control
+> 路径，不是外语驱动访问 MMIO、DMA、IRQ 或普通内核函数的必经层。
 
 ```text
 内核单元
@@ -399,6 +414,13 @@ Active -> Faulted -> Quarantined -> Detached -> Retired
 
 ELM 不保存裸内核对象指针。所有资源都必须通过资源租约访问。
 
+> **备注（外语资源热路径）：** 对 trusted-direct 外语 ELM，这条规则约束的
+> 是资源的取得、归属、代际校验与卸载回收，而不是要求每次硬件访问都发送
+> managed 请求。carrier 可以在 probe/attach 阶段取得已审核的类型化句柄、
+> 映射或队列，并让语言代码在其有效期内直接操作；这些对象必须是
+> lease-backed 视图，不能脱离 lease 或跨越 owner/generation 保存。对应资源
+> 仍必须登记到该 ELM，确保 quiesce、detach 和失败回滚时可撤销。
+
 资源租约类型：
 
 - `Device`：设备对象租约。
@@ -622,6 +644,13 @@ demo    source=eki
 - 动态原生 ELM 必须实现 `ElmModule` 并导出唯一的 `ElmModuleDescriptorV1`；`create`、`initialize` 和 `finalize` 不允许缺失。
 - 开发侧只写安全 Rust trait 方法。`#[elm::module]` 生成固定机器边界，生命周期入口使用 `ElmNativeHookContextV1` 指针和 `i32` 状态码，迁移和 entry 使用各自固定 frame。
 - 描述符固定头、ABI 版本、结构尺寸、实例布局和所有入口地址都会在执行任何模块代码前校验。模块实例由 `ModuleSlot<T>` 按 generation 管理，不保存在描述符中。
+
+> **备注（外语生命周期适配）：** “实现 `ElmModule`”描述的是默认 Rust
+> 编写入口。外语源码不直接实现 Rust trait；语言支持仓库提供的 carrier 必须
+> 生成同一个 `ElmModuleDescriptorV1`，并把 initialize、quiesce、pause/resume、
+> 迁移、finalize 等入口映射到语言 runtime。资源 drain 仍由 ELM 的 owner 与
+> 资源回收链完成，不是描述符入口。装载器仍只消费通用 EBI 描述符，不增加
+> Kotlin、C# 或其他语言分支。
 
 生命周期执行语义：
 
@@ -1324,6 +1353,12 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 
 固定线协议仍禁止直接放入 `Vec`、`String`、trait object 或 Rust 引用，因此 provider、受管 export、mixin payload 和迁移数据必须使用稳定编码。内核直接符号属于同构 Rust ABI，可以按经审核的真实签名传递 `Arc`、trait object 和其它 Rust 类型；其安全前提是实际导入符号的完整 ABI 摘要与 rustc 要求全部满足，并且长期对象必须在 finalize/detach 前释放或由常驻子系统登记到资源归属链。
 
+> **备注（外语直接内核符号）：** 当前内核符号目录仍以 exact-Rust ABI 为
+> 准。外语 trusted-direct ELM 应由生成的 Rust carrier 导入这些符号，再向 AOT
+> 语言代码暴露与 EKI Profile 和 carrier ABI 版本绑定的 native ABI；适配发生
+> 在符号绑定边界，成功绑定后的热路径仍是普通函数调用。外语 SDK 不得把未
+> 经审核的 Rust 类型布局或任意函数指针直接伪装成跨语言 ABI。
+
 ### 内核符号级 Mixin
 
 内核符号级 Mixin 与 ELM 间的声明式补缀点是两条不同链路。前者直接附着到
@@ -1347,6 +1382,11 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 ### Rust ELM 独立仓库开发框架
 
 外部 ELM 不维护函数表式第二套内核 API，也不从原内核仓库建立 path dependency。`cargo elm sync` 同步小型 `elm`/`kernel-symbols` 开发框架和声明式生成的内核子系统 metadata façade；目标专属的真实 metadata、Rust 支持归档、审核导入库与 LSP 源码投影来自共享接口仓库。工程内 `.elm/kernel-interface/<target>` 是接口缓存链接，`.elm/kernel-source` 指向当前活动 Profile 的只读源码投影；它们不复制完整内核 checkout。普通开发代码通过 `elm::runtime::*` 使用 ELM 自身运行时能力，并按 `vfs::*`、`socket::*`、`net::*`、`sched::*`、`general::mm::*`、`hal::*` 等原路径调用真实内核能力；Manager 工程额外启用 `management` feature。AF_UNIX 所属的 `socket` crate、INET 数据路径所属的 `vfs` 接口，以及网络驱动接入所需的 `net` 类型与方法都是正式 Kernel API。网络协议执行实现位于 `net.stack` ELM；`libs/net` 保留共享契约、队列、flow 状态及 host/ELM 共用数据类型，不额外生成 smoltcp façade。正式构建严格使用目标接口包中的二进制 metadata，源码投影只参与补全、诊断、悬停、跳转和宿主 `cargo check`。
+
+> **备注（外语工程工作流）：** 本节的 `cargo elm new`、Cargo 双目标和
+> `src/main.rs` 约定是默认 Rust 工作流。外语仓库可以使用自己的 SDK、编译
+> 插件和目录结构，但 carrier 与打包工具最终必须产出相同语义的 EKI/EBI，
+> 绑定同一个 Kernel API Profile，并继续遵守本文的 `m/y/n` 和生命周期规则。
 
 #### Kernel API Profile（内核 API 配置）与条件编译
 
@@ -1392,6 +1432,13 @@ fn configure_device() {
 - `mode = "m"`：生成受管 EKI。代码拥有 ELM 生命周期、依赖、事件、provider、mixin、热替换、故障隔离和审计上下文；内核 API 调用仍是直接符号调用。
 - `mode = "y"`：生成普通静态归档，通过 `ELM_INTEGRATED_ARCHIVES` 链入内核。组件按链接顺序初始化、按逆序终结，不具有 cell、来源、generation、EBI 或 elm-mgr 身份，快照中不会出现它。
 - `mode = "n"`：不编译、不打包，并删除所选架构下属于该组件的旧 EKI、临时变体和集成归档，防止构建系统误用陈旧产物。
+
+> **备注（外语部署模式）：** 外语 ELM 沿用这里的 `m/y/n`，不会因为语言
+> runtime 而改变其含义。`m` 仍是具有独立 cell/generation 的动态 EKI；`y`
+> 仍是没有独立 ELM 身份的静态集成代码。常驻 `language-runtime` 可作为外语
+> 支持层的框架 ABI 与依赖锚点，但不能把 `y` 伪装成动态父 cell，也不能要求
+> `m` 模块的每次调用经由它转发；依赖绑定的实现状态与限制以
+> [LANGUAGE_RUNTIME.md](LANGUAGE_RUNTIME.md) 为准。
 
 `y` 和 `m` 编译同一个 `src/main.rs`。Cargo 的 bin 与 lib 目标共同指向该文件：`m` 选择 bin，
 `y` 选择 lib 并启用 `elm-integrated`。该 feature 只改变生命周期落点、panic 边界和 ELM 元数据
@@ -1508,6 +1555,11 @@ let policy = manager
 - `#[elm::payload("contract@version")]` 为具名字段结构体生成固定小端线编码，只接受定宽整数、`bool` 和 `[u8; N]`，v1 总尺寸不得超过 256 字节。
 - `#[elm::mixin_point(..., stages(...))]` 把普通安全 Rust 函数包装为 ingress、substitute、egress、observe 声明式补缀点；`#[elm::mixin(...)]` 标记独立函数时生成对应 provider 和拓展声明，标记固有 `impl` 时则声明内核符号级 Mixin。固有 `impl` 当前稳定支持 `inject`、`modify_arg`、`modify_return` 和 `overwrite`；`modify_local`、`redirect`、`wrap_operation` 明确等待 `TODO(ELM-MIR)`，不会生成不完整运行时代码。
 - 宏在编译期拒绝手写 `extern`、`unsafe fn`、泛型 ABI 函数、非法契约、无效版本范围、重复 stage、超长补缀点和越界优先级；打包器再次执行独立的元数据与 EBI 校验。
+
+> **备注（外语生成边界）：** 上述属性限制针对手写 Rust ELM 的导出面。
+> 语言支持仓库中的生成器和受审核 carrier 可以在内部使用显式 native ABI 与
+> 必要的 `unsafe`，但必须把这些细节封闭在生成边界内，并通过 package、schema、
+> EKI Profile 与 ABI 校验；普通外语模块不直接手写 loader 入口或 Rust ABI 声明。
 
 attribute 生成的记录位于非装载段 `.elm.meta`。该段使用 `ELMMETA1` 固定记录、字段排序、CRC32 和零填充规则，不能进入任何 `PT_LOAD`；`cargo elm` 只读取该协议，不依赖 Rust 符号修饰规则，也不会从函数名猜测拓扑。`y` 构建会在编译期完全排除 `.elm.meta`、ELM ABI trampoline 和 ELM 描述符，只保留普通内核 initcall 描述符。
 
