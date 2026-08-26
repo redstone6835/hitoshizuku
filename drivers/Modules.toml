@@ -26,12 +26,199 @@ targets = "riscv64gc-unknown-none-elf"
 after = "platform.firmware-bus"
 
 [[modules]]
+name = "platform.riscv-pmu"
+path = "riscv-pmu"
+config = "CONFIG_RISCV_PMU"
+prompt = "RISC-V 固件 PMU 映射驱动"
+default = "m"
+targets = "riscv64gc-unknown-none-elf"
+after = "platform.firmware-bus"
+
+[[modules]]
+name = "platform.riscv-iommu"
+path = "riscv-iommu"
+config = "CONFIG_RISCV_IOMMU"
+prompt = "RISC-V IOMMU 1.0 驱动"
+default = "m"
+targets = "riscv64gc-unknown-none-elf"
+after = "platform.firmware-bus,platform.plic"
+
+[[modules]]
+name = "platform.dt-providers"
+path = "dt-providers"
+config = "CONFIG_DT_PROVIDERS"
+prompt = "标准 Device Tree 固定 provider 驱动"
+default = "m"
+after = "platform.firmware-bus"
+
+[[modules]]
+name = "platform.jh7110-crg"
+path = "jh7110-crg"
+config = "CONFIG_JH7110_CRG"
+prompt = "StarFive JH7110 时钟与复位控制器驱动"
+default = "m"
+targets = "riscv64gc-unknown-none-elf"
+after = "platform.firmware-bus,platform.dt-providers"
+
+[[modules]]
+name = "platform.jh7110-pinctrl"
+path = "jh7110-pinctrl"
+config = "CONFIG_JH7110_PINCTRL"
+prompt = "StarFive JH7110 pinctrl 驱动"
+default = "m"
+targets = "riscv64gc-unknown-none-elf"
+after = "platform.firmware-bus,platform.jh7110-crg"
+
+[[modules]]
+name = "platform.jh7110-uart"
+path = "jh7110-uart"
+config = "CONFIG_JH7110_UART"
+prompt = "StarFive JH7110 DesignWare APB UART 驱动"
+default = "m"
+targets = "riscv64gc-unknown-none-elf"
+after = "platform.firmware-bus,platform.jh7110-crg,platform.jh7110-pinctrl,platform.plic"
+
+[[modules]]
+name = "platform.jh7110-mmc"
+path = "jh7110-mmc"
+config = "CONFIG_JH7110_MMC"
+prompt = "StarFive JH7110 DesignWare MMC 驱动"
+default = "m"
+targets = "riscv64gc-unknown-none-elf"
+after = "platform.firmware-bus,platform.jh7110-crg,platform.jh7110-pinctrl,platform.plic"
+
+[[modules]]
+name = "platform.jh7110-trng"
+path = "jh7110-trng"
+config = "CONFIG_JH7110_TRNG"
+prompt = "StarFive JH7110 真随机数发生器驱动"
+default = "m"
+targets = "riscv64gc-unknown-none-elf"
+after = "platform.firmware-bus,platform.jh7110-crg"
+
+[[modules]]
+name = "platform.loongson-clk"
+path = "loongson-clk"
+config = "CONFIG_LOONGSON_CLK"
+prompt = "Loongson LS2X 时钟控制器驱动"
+default = "m"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.dt-providers"
+
+[[modules]]
+name = "platform.loongson-pinctrl-gpio"
+path = "loongson-pinctrl-gpio"
+config = "CONFIG_LOONGSON_PINCTRL_GPIO"
+prompt = "Loongson LS2K1000 Pinctrl/GPIO 驱动"
+default = "m"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.loongson-irq"
+
+[[modules]]
+name = "platform.ahci"
+path = "ahci"
+config = "CONFIG_PLATFORM_AHCI"
+prompt = "Platform AHCI/SATA 块设备驱动"
+default = "m"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.loongson-irq,platform.loongson-clk"
+
+[[modules]]
+name = "platform.loongson-apbdma"
+path = "loongson-apbdma"
+config = "CONFIG_LOONGSON_APBDMA"
+prompt = "Loongson LS2X APB-DMA 驱动"
+default = "m"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.dt-providers"
+
+[[modules]]
+name = "platform.loongson-sdio"
+path = "loongson-sdio"
+config = "CONFIG_LOONGSON_SDIO"
+prompt = "Loongson LS2K SDIO/MMC 块设备驱动"
+default = "m"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.loongson-clk,platform.loongson-apbdma"
+
+[[modules]]
+name = "platform.pci-host-ecam"
+path = "pci-host-ecam"
+config = "CONFIG_PCI_HOST_ECAM"
+prompt = "Generic PCI CAM/ECAM host bridge 驱动"
+default = "m"
+after = "platform.firmware-bus,platform.loongson-irq,platform.plic,platform.riscv-iommu"
+
+[[modules]]
 name = "platform.syscon"
 path = "syscon"
 config = "CONFIG_SYSCON"
 prompt = "Syscon 与固件电源驱动"
 default = "m"
 after = "platform.firmware-bus"
+
+[[modules]]
+name = "platform.ls2k-gmac"
+path = "ls2k-gmac"
+config = "CONFIG_LS2K_GMAC"
+prompt = "Loongson LS2K1000 GMAC 以太网驱动"
+default = "m"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.loongson-irq,platform.loongson-clk"
+
+[[modules]]
+name = "platform.ls2k-tsensor"
+path = "ls2k-tsensor"
+config = "CONFIG_LS2K_TSENSOR"
+prompt = "Loongson LS2K 温度传感器驱动"
+default = "m"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.loongson-irq"
+
+[[modules]]
+name = "platform.ls2k-usb"
+path = "ls2k-usb"
+config = "CONFIG_LS2K_USB"
+prompt = "Loongson LS2K1000 USB 主机控制器驱动（dwc2/ehci/ohci）"
+default = "m"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.loongson-irq"
+
+[[modules]]
+name = "platform.ls2k-i2c"
+path = "ls2k-i2c"
+config = "CONFIG_LS2K_I2C"
+prompt = "Loongson LS2K I2C 控制器驱动"
+default = "m"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.loongson-clk"
+
+[[modules]]
+name = "platform.ls2k-spi"
+path = "ls2k-spi"
+config = "CONFIG_LS2K_SPI"
+prompt = "Loongson LS2K SPI 控制器与 SPI-NOR 驱动"
+default = "m"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.loongson-clk"
+
+[[modules]]
+name = "platform.ls2x-wdt"
+path = "ls2x-wdt"
+config = "CONFIG_LS2X_WDT"
+prompt = "Loongson LS2X 看门狗驱动"
+default = "m"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.loongson-clk"
+
+[[modules]]
+name = "platform.ls2k-rtc"
+path = "ls2k-rtc"
+config = "CONFIG_LS2K_RTC"
+prompt = "Loongson LS2K RTC 驱动"
+default = "m"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.loongson-irq"
 
 [[modules]]
 name = "platform.ls7a-rtc"
@@ -73,7 +260,7 @@ path = "uart16550"
 config = "CONFIG_UART16550"
 prompt = "NS16550A UART 驱动"
 default = "y"
-after = "platform.firmware-bus,platform.loongson-irq,platform.plic"
+after = "platform.firmware-bus,platform.loongson-irq,platform.loongson-clk,platform.plic"
 
 [[modules]]
 name = "kernel.random"

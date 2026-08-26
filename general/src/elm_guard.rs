@@ -227,6 +227,19 @@ impl ElmTaskExecutionState {
         }
     }
 
+    fn suspend_context(&self) -> Option<u64> {
+        let mut stack = self.contexts.lock();
+        if stack.depth >= ELM_CONTEXT_MAX_DEPTH {
+            return None;
+        }
+        let depth = stack.depth;
+        stack.entries[depth] = None;
+        stack.depth = depth + 1;
+        self.context_cell.store(0, Ordering::Relaxed);
+        self.context_present.store(false, Ordering::Release);
+        Some((depth + 1) as u64)
+    }
+
     fn current_context(&self) -> Option<ElmCurrentContext> {
         let stack = self.contexts.lock();
         stack
@@ -965,9 +978,21 @@ fn task_current_context() -> Option<ElmCurrentContext> {
     current_state_ref()?.current_context()
 }
 
+fn task_context_suspend() -> Option<u64> {
+    ensure_current_state()?.suspend_context()
+}
+
+fn task_context_resume(token: u64) {
+    if let Some(state) = current_state_ref() {
+        state.pop_context(token);
+    }
+}
+
 static TASK_CONTEXT_OPS: ElmCurrentContextOps = ElmCurrentContextOps {
     enter: task_context_enter,
     leave: task_context_leave,
+    suspend: task_context_suspend,
+    resume: task_context_resume,
     current: task_current_context,
 };
 
@@ -1017,6 +1042,12 @@ mod tests {
         let outer = state.push_context(context(11)).expect("外层上下文应可入栈");
         assert_eq!(state.current_context_cell(), Some(11));
         let inner = state.push_context(context(22)).expect("内层上下文应可入栈");
+        assert_eq!(state.current_context_cell(), Some(22));
+
+        let suspended = state.suspend_context().expect("上下文应可暂停");
+        assert_eq!(state.current_context(), None);
+        assert_eq!(state.current_context_cell(), None);
+        state.pop_context(suspended);
         assert_eq!(state.current_context_cell(), Some(22));
 
         state.pop_context(inner);

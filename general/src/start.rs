@@ -20,8 +20,8 @@ use allocator::{
     VirtToPhysFn,
 };
 
-use crate::dtb::Dtb;
 use crate::firmware::{FirmwareTableMapping, normalize_segments};
+use fdt::Fdt;
 
 /// 将设备 MMIO 物理地址转换为内核虚拟地址，该虚拟地址用于
 /// 易失性寄存器访问。
@@ -29,6 +29,52 @@ use crate::firmware::{FirmwareTableMapping, normalize_segments};
 /// 有意不采用任何具体架构早期映射或 ioremap 等机制来命名。
 /// 各架构自行选择实现方式。
 pub type DeviceMmioToVirtFn = fn(phys_addr: usize) -> usize;
+
+/// 架构在线性内存映射中准备 `no-map` 洞的回调。
+pub type PrepareNoMapFn = fn(&[StartPhysRange]) -> Result<(), StartNoMapError>;
+
+/// 线性映射实现准备 `no-map` 范围时可能返回的错误。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartNoMapError {
+    /// 范围不满足架构页表的地址/对齐不变量。
+    InvalidRange,
+    /// 范围覆盖了内核仍需访问的启动映射。
+    OverlapsKernelImage,
+    /// 启动堆无法保存范围快照或为正式线性映射分配页表页。
+    OutOfMemory,
+}
+
+/// 架构对标准 RAM 线性映射的能力声明。
+#[derive(Clone, Copy)]
+pub enum StartNoMapSupport {
+    /// 当前启动协议没有需要处理的标准线性映射约束。
+    None,
+    /// 架构可以按至少 `granule` 粒度落实范围；回调必须在物理 allocator
+    /// 初始化前完成约束登记，正式页表建立时消费同一份登记。
+    Enforced {
+        granule: usize,
+        prepare: PrepareNoMapFn,
+    },
+    /// 架构会按 `granule` 从物理 allocator 排除范围，但固定直映窗口无法移除
+    /// 对应虚拟别名。这与 Linux LoongArch 的 DMW 内存保留模型一致；调用方必须
+    /// 明确记录该限制，且普通 RAM API 不得主动访问这些范围。
+    ReservedOnly {
+        granule: usize,
+        mechanism: &'static str,
+    },
+    /// 架构的固定窗口无法挖洞。遇到有效 `no-map` 时启动层必须 fail-closed。
+    Unsupported { mechanism: &'static str },
+}
+
+impl StartNoMapSupport {
+    /// 返回落实物理页保留所需的粒度。
+    pub const fn granule(self) -> Option<usize> {
+        match self {
+            Self::Enforced { granule, .. } | Self::ReservedOnly { granule, .. } => Some(granule),
+            Self::None | Self::Unsupported { .. } => None,
+        }
+    }
+}
 
 /// 安装内核堆所需的架构页表状态。
 ///
@@ -158,7 +204,7 @@ pub struct StartAcpiTables {
 #[derive(Clone, Copy)]
 pub enum StartFirmware {
     /// 稳定的 DTB 视图。
-    Dtb(Dtb<'static>),
+    Dtb(Fdt<'static>),
     /// 稳定的 ACPI 视图。
     Acpi(StartAcpiTables),
 }
@@ -208,6 +254,14 @@ pub enum StartMemoryMap {
 }
 
 impl StartMemoryMap {
+    /// 返回启动协议规范化后的原始区域切片。
+    pub const fn regions(self) -> Option<&'static [StartMemoryRegion]> {
+        match self {
+            Self::None => None,
+            Self::Regions(regions) => Some(regions),
+        }
+    }
+
     /// 返回启动内存映射中是否至少存在一段在交接后仍可用的 RAM。
     pub fn has_usable_region(self) -> bool {
         match self {
@@ -281,6 +335,9 @@ pub struct StartMemoryRegion {
     /// 对于 EFI，对应描述符属性；对于 E820/Multiboot，
     /// 可能为零或协议特定的位集合。
     pub attributes: u64,
+    /// 协议原始区域类型。EFI 路径保存 descriptor `Type`，没有对应概念的
+    /// 启动协议保持 `None`。
+    pub source_type: Option<u32>,
 }
 
 impl StartMemoryRegion {
@@ -290,7 +347,14 @@ impl StartMemoryRegion {
             range,
             kind,
             attributes,
+            source_type: None,
         }
+    }
+
+    /// 附加协议原始区域类型。
+    pub const fn with_source_type(mut self, source_type: u32) -> Self {
+        self.source_type = Some(source_type);
+        self
     }
 }
 
@@ -319,6 +383,35 @@ fn memory_segments_from_regions(
 
 fn normalize_memory_segments(segments: Vec<MemorySegment>) -> Option<Vec<MemorySegment>> {
     normalize_segments(segments)
+}
+
+/// 校验架构加载器发布的显式启动内存图。
+///
+/// `Regions` 表示加载器已经给出了 RAM 权威边界，因此即使条目本身格式完整，
+/// 完全没有可交接 RAM 也必须失败；调用方不得把这种情况降级成 `None` 后改信 DT。
+fn validate_start_memory_map(
+    protocol: StartBootProtocol,
+    boot_map: StartMemoryMap,
+) -> Result<(), &'static str> {
+    let StartMemoryMap::Regions(regions) = boot_map else {
+        if matches!(protocol, StartBootProtocol::Efi) {
+            return Err("[start-context] EFI boot requires a usable boot memory map");
+        }
+        return Ok(());
+    };
+    if regions.is_empty() {
+        return Err("[start-context] boot memory map is empty");
+    }
+    if regions
+        .iter()
+        .any(|region| region.range.end <= region.range.start)
+    {
+        return Err("[start-context] boot memory map contains empty or inverted ranges");
+    }
+    if !boot_map.has_usable_region() {
+        return Err("[start-context] boot memory map contains no usable RAM");
+    }
+    Ok(())
 }
 
 /// 由架构提供的地址转换能力。
@@ -352,6 +445,8 @@ pub struct StartAllocatorOps {
     pub sync_icache: SyncIcacheFn,
     /// 安装映射的堆页所需的架构页表状态。
     pub init_kernel_page_table: InitKernelPageTableFn,
+    /// 标准 RAM 线性映射的 `no-map` 能力。
+    pub no_map: StartNoMapSupport,
 }
 
 /// 从架构初始化代码到内核启动代码的平台无关交接对象。
@@ -397,16 +492,13 @@ impl StartContext {
             return Err("[start-context] kernel image range is empty or inverted");
         }
 
-        if let StartMemoryMap::Regions(regions) = self.memory.boot_map {
-            if regions.is_empty() {
-                return Err("[start-context] boot memory map is empty");
-            }
-            if regions
-                .iter()
-                .any(|region| region.range.end <= region.range.start)
-            {
-                return Err("[start-context] boot memory map contains empty or inverted ranges");
-            }
+        validate_start_memory_map(self.boot.protocol, self.memory.boot_map)?;
+
+        if let Some(allocator) = self.allocator
+            && let Some(granule) = allocator.no_map.granule()
+            && (granule == 0 || !granule.is_power_of_two())
+        {
+            return Err("[start-context] no-map granule must be a non-zero power of two");
         }
 
         if let StartFirmware::Acpi(acpi) = self.firmware {
@@ -435,4 +527,43 @@ pub fn set_start_cmdline(cmdline: Option<&'static [u8]>) {
 /// 读取运行期启动命令行快照。
 pub fn start_cmdline() -> Option<&'static [u8]> {
     unsafe { START_CMDLINE }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        StartBootProtocol, StartMemoryMap, StartMemoryRegion, StartMemoryRegionKind,
+        StartPhysRange, validate_start_memory_map,
+    };
+
+    static RESERVED_ONLY: [StartMemoryRegion; 1] = [StartMemoryRegion::new(
+        StartPhysRange::new(0x1000, 0x2000),
+        StartMemoryRegionKind::Reserved,
+        0,
+    )];
+    static USABLE: [StartMemoryRegion; 1] = [StartMemoryRegion::new(
+        StartPhysRange::new(0x2000, 0x4000),
+        StartMemoryRegionKind::UsableRam,
+        0,
+    )];
+
+    #[test]
+    fn explicit_boot_memory_map_requires_usable_ram() {
+        assert!(validate_start_memory_map(StartBootProtocol::Direct, StartMemoryMap::None).is_ok());
+        assert_eq!(
+            validate_start_memory_map(StartBootProtocol::Efi, StartMemoryMap::None),
+            Err("[start-context] EFI boot requires a usable boot memory map")
+        );
+        assert_eq!(
+            validate_start_memory_map(
+                StartBootProtocol::Direct,
+                StartMemoryMap::Regions(&RESERVED_ONLY),
+            ),
+            Err("[start-context] boot memory map contains no usable RAM")
+        );
+        assert!(
+            validate_start_memory_map(StartBootProtocol::Efi, StartMemoryMap::Regions(&USABLE),)
+                .is_ok()
+        );
+    }
 }

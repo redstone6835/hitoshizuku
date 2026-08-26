@@ -4,6 +4,7 @@
 //! data. Architecture-specific discovery, copying, storage, and ACPI-vs-DTB
 //! policy stay in the architecture init code.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use allocator::MemorySegment;
 
@@ -11,9 +12,9 @@ pub mod acpi;
 pub mod dtb;
 pub mod power;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SerialPortInfo {
-    pub name: &'static str,
+    pub name: Box<str>,
     pub phys_addr: usize,
     /// 固件声明的寄存器窗口大小。没有该信息时保持 `None`，由最终 platform
     /// 资源保留未知大小，而不是在固件摘要层替调用方猜一个固定窗口。

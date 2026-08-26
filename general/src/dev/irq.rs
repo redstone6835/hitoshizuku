@@ -127,6 +127,105 @@ pub trait IrqBottomHalf: Send + Sync {
     fn run_bottom_half(&self, line: IrqLine);
 }
 
+struct ElmIrqHandlerProxy {
+    context: elm_model::ElmCurrentContext,
+    owner: &'static str,
+    handler: Option<Arc<dyn IrqHandler>>,
+}
+
+impl IrqHandler for ElmIrqHandlerProxy {
+    fn handle_irq(&self, line: IrqLine) -> IrqStatus {
+        let Some(_guard) = super::pnp::enter_elm_snapshot(self.context) else {
+            log::error!(
+                "[irq] cannot enter ELM handler context: owner={} cell={} generation={}",
+                self.owner,
+                self.context.cell_id.0,
+                self.context.generation.0,
+            );
+            super::elm_lifecycle::mark_context_failed(self.context);
+            return IrqStatus::Handled;
+        };
+        self.handler
+            .as_ref()
+            .expect("ELM IRQ handler proxy used after drop")
+            .handle_irq(line)
+    }
+}
+
+impl Drop for ElmIrqHandlerProxy {
+    fn drop(&mut self) {
+        let Some(handler) = self.handler.take() else {
+            return;
+        };
+        let Some(_guard) = super::pnp::enter_elm_snapshot(self.context) else {
+            super::elm_lifecycle::mark_context_failed(self.context);
+            core::mem::forget(handler);
+            return;
+        };
+        drop(handler);
+    }
+}
+
+struct ElmIrqBottomHalfProxy {
+    context: elm_model::ElmCurrentContext,
+    owner: &'static str,
+    bottom_half: Option<Arc<dyn IrqBottomHalf>>,
+}
+
+impl IrqBottomHalf for ElmIrqBottomHalfProxy {
+    fn run_bottom_half(&self, line: IrqLine) {
+        let Some(_guard) = super::pnp::enter_elm_snapshot(self.context) else {
+            log::error!(
+                "[irq] cannot enter ELM bottom-half context: owner={} cell={} generation={}",
+                self.owner,
+                self.context.cell_id.0,
+                self.context.generation.0,
+            );
+            super::elm_lifecycle::mark_context_failed(self.context);
+            return;
+        };
+        self.bottom_half
+            .as_ref()
+            .expect("ELM IRQ bottom-half proxy used after drop")
+            .run_bottom_half(line);
+    }
+}
+
+impl Drop for ElmIrqBottomHalfProxy {
+    fn drop(&mut self) {
+        let Some(bottom_half) = self.bottom_half.take() else {
+            return;
+        };
+        let Some(_guard) = super::pnp::enter_elm_snapshot(self.context) else {
+            super::elm_lifecycle::mark_context_failed(self.context);
+            core::mem::forget(bottom_half);
+            return;
+        };
+        drop(bottom_half);
+    }
+}
+
+fn wrap_elm_irq_callbacks(request: &mut IrqRequest) -> Result<(), IrqError> {
+    let Some(context) = elm_model::current_context() else {
+        return Ok(());
+    };
+    let _accounting =
+        allocator::suspend_implicit_allocation_accounting().ok_or(IrqError::OutOfMemory)?;
+    request.handler = Arc::new(ElmIrqHandlerProxy {
+        context,
+        owner: request.owner,
+        handler: Some(Arc::clone(&request.handler)),
+    });
+    if let Some(bottom_half) = request.bottom_half.take() {
+        request.bottom_half = Some(Arc::new(ElmIrqBottomHalfProxy {
+            context,
+            owner: request.owner,
+            bottom_half: Some(bottom_half),
+        }));
+    }
+    Ok(())
+}
+
 /// IRQ 注册请求。
 ///
 /// 这是设备驱动面向 IRQ core 的完整声明：要消费哪条 line、是否允许共享、
@@ -208,6 +307,8 @@ struct IrqRegistration {
     handler: Arc<dyn IrqHandler>,
     bottom_half: Option<Arc<dyn IrqBottomHalf>>,
     counts: [u64; sched::NR_CPUS],
+    calls_in_flight: usize,
+    retiring: bool,
 }
 
 pub struct IrqRegistry {
@@ -266,6 +367,8 @@ impl IrqRegistry {
             handler: request.handler,
             bottom_half: request.bottom_half,
             counts: [0; sched::NR_CPUS],
+            calls_in_flight: 0,
+            retiring: false,
         });
         drop(handlers);
         enable_irq_line(line);
@@ -280,7 +383,7 @@ impl IrqRegistry {
         self.register_request(IrqRequest::shared(line, "legacy-irq-handler", handler))
     }
 
-    pub fn unregister(&self, handle: IrqHandle) -> Result<(), IrqError> {
+    fn unregister_inner(&self, handle: IrqHandle, allow_prepared: bool) -> Result<bool, IrqError> {
         let mut handlers = self.handlers.lock();
         let Some(index) = handlers
             .iter()
@@ -288,6 +391,9 @@ impl IrqRegistry {
         else {
             return Err(IrqError::NotFound);
         };
+        if handlers[index].calls_in_flight != 0 || (handlers[index].retiring && !allow_prepared) {
+            return Err(IrqError::AlreadyRegistered);
+        }
         let removed = handlers.remove(index);
         let still_used = if let Some(remaining) =
             handlers.iter_mut().find(|entry| entry.line == handle.line)
@@ -303,7 +409,43 @@ impl IrqRegistry {
         if !still_used {
             disable_irq_line(handle.line);
         }
-        Ok(())
+        Ok(removed.retiring)
+    }
+
+    pub fn unregister(&self, handle: IrqHandle) -> Result<(), IrqError> {
+        self.unregister_inner(handle, false).map(|_| ())
+    }
+
+    fn prepare_unregister(&self, handle: IrqHandle) -> Option<IrqLine> {
+        let mut handlers = self.handlers.lock();
+        let entry = handlers
+            .iter_mut()
+            .find(|entry| entry.id == handle.id && entry.line == handle.line)?;
+        if entry.retiring || entry.calls_in_flight != 0 {
+            return None;
+        }
+        entry.retiring = true;
+        Some(entry.line)
+    }
+
+    fn cancel_unregister(&self, handle: IrqHandle) {
+        let mut handlers = self.handlers.lock();
+        if let Some(entry) = handlers
+            .iter_mut()
+            .find(|entry| entry.id == handle.id && entry.line == handle.line)
+        {
+            entry.retiring = false;
+        }
+    }
+
+    fn finish_call(&self, id: u64, line: IrqLine) {
+        let mut handlers = self.handlers.lock();
+        if let Some(entry) = handlers
+            .iter_mut()
+            .find(|entry| entry.id == id && entry.line == line)
+        {
+            entry.calls_in_flight = entry.calls_in_flight.saturating_sub(1);
+        }
     }
 
     pub fn dispatch_line(&self, line: IrqLine) -> bool {
@@ -312,17 +454,18 @@ impl IrqRegistry {
 
         loop {
             let next = {
-                let handlers = self.handlers.lock();
+                let mut handlers = self.handlers.lock();
                 handlers
-                    .iter()
-                    .filter(|entry| entry.line == line && entry.id > last_id)
+                    .iter_mut()
+                    .filter(|entry| entry.line == line && entry.id > last_id && !entry.retiring)
                     .min_by_key(|entry| entry.id)
-                    .map(|entry| {
-                        (
+                    .and_then(|entry| {
+                        entry.calls_in_flight = entry.calls_in_flight.checked_add(1)?;
+                        Some((
                             entry.id,
                             Arc::clone(&entry.handler),
                             entry.bottom_half.as_ref().map(Arc::clone),
-                        )
+                        ))
                     })
             };
             let Some((id, handler, bottom_half)) = next else {
@@ -340,6 +483,7 @@ impl IrqRegistry {
                     bottom_half.run_bottom_half(line);
                 }
             }
+            self.finish_call(id, line);
         }
 
         if handled {
@@ -462,6 +606,91 @@ pub trait IrqDomain: Send + Sync {
     }
 }
 
+struct ElmIrqDomainProxy {
+    context: elm_model::ElmCurrentContext,
+    controller: u32,
+    domain: Option<Arc<dyn IrqDomain>>,
+}
+
+impl ElmIrqDomainProxy {
+    fn domain(&self) -> &dyn IrqDomain {
+        self.domain
+            .as_deref()
+            .expect("ELM IRQ domain proxy used after drop")
+    }
+
+    fn enter(&self, operation: &'static str) -> Option<elm_model::ElmCurrentContextGuard> {
+        let guard = super::pnp::enter_elm_snapshot(self.context);
+        if guard.is_none() {
+            log::error!(
+                "[irq] cannot enter ELM domain context: controller={} operation={} cell={} generation={}",
+                self.controller,
+                operation,
+                self.context.cell_id.0,
+                self.context.generation.0,
+            );
+            super::elm_lifecycle::mark_context_failed(self.context);
+        }
+        guard
+    }
+}
+
+impl IrqDomain for ElmIrqDomainProxy {
+    fn translate(&self, cells: &[u32]) -> Option<IrqLine> {
+        let _guard = self.enter("translate")?;
+        self.domain().translate(cells)
+    }
+
+    fn set_line_enabled(&self, hwirq: u32, enabled: bool) -> bool {
+        let Some(_guard) = self.enter("set_line_enabled") else {
+            return false;
+        };
+        self.domain().set_line_enabled(hwirq, enabled)
+    }
+
+    fn configure_line(
+        &self,
+        hwirq: u32,
+        trigger: Option<IrqTrigger>,
+        polarity: Option<IrqPolarity>,
+    ) -> bool {
+        let Some(_guard) = self.enter("configure_line") else {
+            return false;
+        };
+        self.domain().configure_line(hwirq, trigger, polarity)
+    }
+}
+
+impl Drop for ElmIrqDomainProxy {
+    fn drop(&mut self) {
+        let Some(domain) = self.domain.take() else {
+            return;
+        };
+        let Some(_guard) = super::pnp::enter_elm_snapshot(self.context) else {
+            super::elm_lifecycle::mark_context_failed(self.context);
+            core::mem::forget(domain);
+            return;
+        };
+        drop(domain);
+    }
+}
+
+fn wrap_elm_irq_domain(
+    controller: u32,
+    domain: Arc<dyn IrqDomain>,
+) -> Result<Arc<dyn IrqDomain>, IrqError> {
+    let Some(context) = elm_model::current_context() else {
+        return Ok(domain);
+    };
+    let _accounting =
+        allocator::suspend_implicit_allocation_accounting().ok_or(IrqError::OutOfMemory)?;
+    Ok(Arc::new(ElmIrqDomainProxy {
+        context,
+        controller,
+        domain: Some(domain),
+    }))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IrqDomainHandle {
     controller: u32,
@@ -484,6 +713,10 @@ struct IrqDomainRegistration {
     // 不能注销后来安装的新 domain。
     id: u64,
     domain: Arc<dyn IrqDomain>,
+    active_handlers: usize,
+    prepared_handlers: usize,
+    calls_in_flight: usize,
+    retiring: bool,
 }
 
 pub struct IrqDomainRegistry {
@@ -514,6 +747,10 @@ impl IrqDomainRegistry {
             controller,
             id,
             domain,
+            active_handlers: 0,
+            prepared_handlers: 0,
+            calls_in_flight: 0,
+            retiring: false,
         });
         let handle = IrqDomainHandle { controller, id };
         drop(domains);
@@ -529,25 +766,129 @@ impl IrqDomainRegistry {
         else {
             return Err(IrqError::NotFound);
         };
+        if domains[index].active_handlers != 0
+            || domains[index].prepared_handlers != 0
+            || domains[index].calls_in_flight != 0
+        {
+            return Err(IrqError::AlreadyRegistered);
+        }
         domains.remove(index);
         Ok(())
     }
 
-    fn domain(&self, controller: u32) -> Option<Arc<dyn IrqDomain>> {
-        let domains = self.domains.lock();
-        domains
-            .iter()
+    fn begin_call(&self, controller: u32) -> Option<(u64, Arc<dyn IrqDomain>)> {
+        let mut domains = self.domains.lock();
+        let entry = domains
+            .iter_mut()
+            .find(|entry| entry.controller == controller && !entry.retiring)?;
+        entry.calls_in_flight = entry.calls_in_flight.checked_add(1)?;
+        Some((entry.id, Arc::clone(&entry.domain)))
+    }
+
+    fn finish_call(&self, controller: u32, id: u64) {
+        let mut domains = self.domains.lock();
+        if let Some(entry) = domains
+            .iter_mut()
+            .find(|entry| entry.controller == controller && entry.id == id)
+        {
+            entry.calls_in_flight = entry.calls_in_flight.saturating_sub(1);
+        }
+    }
+
+    fn acquire_handler(&self, controller: u32) -> bool {
+        let mut domains = self.domains.lock();
+        let Some(entry) = domains
+            .iter_mut()
+            .find(|entry| entry.controller == controller && !entry.retiring)
+        else {
+            return false;
+        };
+        let Some(next) = entry.active_handlers.checked_add(1) else {
+            return false;
+        };
+        entry.active_handlers = next;
+        true
+    }
+
+    fn prepare_handler(&self, controller: u32) -> bool {
+        let mut domains = self.domains.lock();
+        let Some(entry) = domains
+            .iter_mut()
+            .find(|entry| entry.controller == controller && !entry.retiring)
+        else {
+            return false;
+        };
+        if entry.prepared_handlers >= entry.active_handlers {
+            return false;
+        }
+        entry.prepared_handlers += 1;
+        true
+    }
+
+    fn cancel_handler(&self, controller: u32) {
+        let mut domains = self.domains.lock();
+        if let Some(entry) = domains
+            .iter_mut()
             .find(|entry| entry.controller == controller)
-            .map(|entry| Arc::clone(&entry.domain))
+        {
+            entry.prepared_handlers = entry.prepared_handlers.saturating_sub(1);
+        }
+    }
+
+    fn release_handler(&self, controller: u32, prepared: bool) {
+        let mut domains = self.domains.lock();
+        if let Some(entry) = domains
+            .iter_mut()
+            .find(|entry| entry.controller == controller)
+        {
+            entry.active_handlers = entry.active_handlers.saturating_sub(1);
+            if prepared {
+                entry.prepared_handlers = entry.prepared_handlers.saturating_sub(1);
+            }
+        }
+    }
+
+    fn prepare_unregister(&self, handle: IrqDomainHandle) -> bool {
+        let mut domains = self.domains.lock();
+        let Some(entry) = domains
+            .iter_mut()
+            .find(|entry| entry.controller == handle.controller && entry.id == handle.id)
+        else {
+            return false;
+        };
+        entry.retiring = true;
+        if entry.active_handlers == entry.prepared_handlers && entry.calls_in_flight == 0 {
+            true
+        } else {
+            entry.retiring = false;
+            false
+        }
+    }
+
+    fn cancel_unregister(&self, handle: IrqDomainHandle) {
+        let mut domains = self.domains.lock();
+        if let Some(entry) = domains
+            .iter_mut()
+            .find(|entry| entry.controller == handle.controller && entry.id == handle.id)
+        {
+            entry.retiring = false;
+        }
     }
 
     pub fn translate(&self, controller: u32, cells: &[u32]) -> Option<IrqLine> {
-        self.domain(controller)?.translate(cells)
+        let (id, domain) = self.begin_call(controller)?;
+        let translated = domain.translate(cells);
+        self.finish_call(controller, id);
+        translated
     }
 
     pub fn set_line_enabled(&self, controller: u32, hwirq: u32, enabled: bool) -> bool {
-        self.domain(controller)
-            .is_some_and(|domain| domain.set_line_enabled(hwirq, enabled))
+        let Some((id, domain)) = self.begin_call(controller) else {
+            return false;
+        };
+        let result = domain.set_line_enabled(hwirq, enabled);
+        self.finish_call(controller, id);
+        result
     }
 
     pub fn configure_line(
@@ -557,8 +898,12 @@ impl IrqDomainRegistry {
         trigger: Option<IrqTrigger>,
         polarity: Option<IrqPolarity>,
     ) -> bool {
-        self.domain(controller)
-            .is_some_and(|domain| domain.configure_line(hwirq, trigger, polarity))
+        let Some((id, domain)) = self.begin_call(controller) else {
+            return false;
+        };
+        let result = domain.configure_line(hwirq, trigger, polarity);
+        self.finish_call(controller, id);
+        result
     }
 }
 
@@ -609,10 +954,31 @@ pub fn register_irq_handler(
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
         | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
 )]
-pub fn register_irq_request(request: IrqRequest) -> Result<IrqHandle, IrqError> {
-    let handle = IRQ_REGISTRY.register_request(request)?;
+pub fn register_irq_request(mut request: IrqRequest) -> Result<IrqHandle, IrqError> {
+    wrap_elm_irq_callbacks(&mut request)?;
+    let domain_controller = match request.line {
+        IrqLine::Controller { controller, .. } => {
+            if !IRQ_DOMAINS.acquire_handler(controller) {
+                return Err(IrqError::NotFound);
+            }
+            Some(controller)
+        }
+        _ => None,
+    };
+    let handle = match IRQ_REGISTRY.register_request(request) {
+        Ok(handle) => handle,
+        Err(error) => {
+            if let Some(controller) = domain_controller {
+                IRQ_DOMAINS.release_handler(controller, false);
+            }
+            return Err(error);
+        }
+    };
     if super::elm_lifecycle::track_irq_handler(handle).is_err() {
         let _ = IRQ_REGISTRY.unregister(handle);
+        if let Some(controller) = domain_controller {
+            IRQ_DOMAINS.release_handler(controller, false);
+        }
         return Err(IrqError::OutOfMemory);
     }
     Ok(handle)
@@ -636,13 +1002,40 @@ pub fn register_irq_request_untracked(request: IrqRequest) -> Result<IrqHandle, 
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
 pub fn unregister_irq_handler(handle: IrqHandle) -> Result<(), IrqError> {
-    IRQ_REGISTRY.unregister(handle)?;
+    unregister_irq_handler_inner(handle, false)
+}
+
+fn unregister_irq_handler_inner(handle: IrqHandle, allow_prepared: bool) -> Result<(), IrqError> {
+    let prepared = IRQ_REGISTRY.unregister_inner(handle, allow_prepared)?;
+    if let IrqLine::Controller { controller, .. } = handle.line {
+        IRQ_DOMAINS.release_handler(controller, prepared);
+    }
     super::elm_lifecycle::forget_irq_handler(handle);
     Ok(())
 }
 
 fn release_irq_handler_resource(handle: IrqHandle) -> bool {
-    unregister_irq_handler(handle).is_ok()
+    unregister_irq_handler_inner(handle, true).is_ok()
+}
+
+fn prepare_irq_handler_resource(handle: IrqHandle) -> bool {
+    let Some(line) = IRQ_REGISTRY.prepare_unregister(handle) else {
+        return false;
+    };
+    if let IrqLine::Controller { controller, .. } = line
+        && !IRQ_DOMAINS.prepare_handler(controller)
+    {
+        IRQ_REGISTRY.cancel_unregister(handle);
+        return false;
+    }
+    true
+}
+
+fn cancel_irq_handler_resource(handle: IrqHandle) {
+    if let IrqLine::Controller { controller, .. } = handle.line {
+        IRQ_DOMAINS.cancel_handler(controller);
+    }
+    IRQ_REGISTRY.cancel_unregister(handle);
 }
 
 /// 将 IRQ handler 注册 handle 包装成 PnP-owned resource。
@@ -657,12 +1050,36 @@ pub fn irq_handler_pnp_resource(
     handle: IrqHandle,
     label: &'static str,
 ) -> PnpHandleResource<IrqHandle> {
-    PnpHandleResource::new(
+    let resource = PnpHandleResource::new_checked(
         PnpResourceKind::Irq,
         label,
         handle,
+        prepare_irq_handler_resource,
+        cancel_irq_handler_resource,
+        crate::dev::pnp::PnpResourceReleaseOrder::Consumer,
         release_irq_handler_resource,
-    )
+    );
+    match handle.line {
+        IrqLine::Controller { controller, .. } => {
+            resource.with_consumed_dependency(PnpDependency::IrqController(controller))
+        }
+        _ => resource,
+    }
+}
+
+/// 在常驻 General 侧构造完成类型擦除的 IRQ handler 资源。
+#[kernel_symbols::export(
+    name = "general.dev.irq.irq_handler_pnp_resource_boxed",
+    contract = "kernel.general.device-resource@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn irq_handler_pnp_resource_boxed(
+    handle: IrqHandle,
+    label: &'static str,
+) -> alloc::boxed::Box<dyn crate::dev::pnp::PnpResource> {
+    alloc::boxed::Box::new(irq_handler_pnp_resource(handle, label))
 }
 
 #[kernel_symbols::export(
@@ -857,6 +1274,7 @@ pub fn register_irq_domain(
     controller: u32,
     domain: Arc<dyn IrqDomain>,
 ) -> Result<IrqDomainHandle, IrqError> {
+    let domain = wrap_elm_irq_domain(controller, domain)?;
     let handle = IRQ_DOMAINS.register(controller, domain)?;
     if super::elm_lifecycle::track_irq_domain(handle).is_err() {
         let _ = IRQ_DOMAINS.unregister(handle);
@@ -882,6 +1300,14 @@ fn release_irq_domain_resource(handle: IrqDomainHandle) -> bool {
     unregister_irq_domain(handle).is_ok()
 }
 
+fn prepare_irq_domain_resource(handle: IrqDomainHandle) -> bool {
+    IRQ_DOMAINS.prepare_unregister(handle)
+}
+
+fn cancel_irq_domain_resource(handle: IrqDomainHandle) {
+    IRQ_DOMAINS.cancel_unregister(handle);
+}
+
 /// 将 IRQ domain 注册 handle 包装成 PnP-owned resource。
 #[kernel_symbols::export(
     name = "general.dev.irq.irq_domain_pnp_resource",
@@ -894,12 +1320,16 @@ pub fn irq_domain_pnp_resource(
     handle: IrqDomainHandle,
     label: &'static str,
 ) -> PnpHandleResource<IrqDomainHandle> {
-    PnpHandleResource::new(
+    PnpHandleResource::new_checked(
         PnpResourceKind::IrqDomain,
         label,
         handle,
+        prepare_irq_domain_resource,
+        cancel_irq_domain_resource,
+        crate::dev::pnp::PnpResourceReleaseOrder::Provider,
         release_irq_domain_resource,
     )
+    .with_provided_dependency(PnpDependency::IrqController(handle.controller))
 }
 
 /// 安装当前固件模型的默认 IRQ domain。
@@ -919,6 +1349,7 @@ pub fn irq_domain_pnp_resource(
 pub fn register_default_irq_domain(
     domain: Arc<dyn IrqDomain>,
 ) -> Result<DefaultIrqDomainHandle, IrqError> {
+    let domain = wrap_elm_irq_domain(u32::MAX, domain)?;
     let mut default = DEFAULT_IRQ_DOMAIN.lock();
     if default.is_some() {
         return Err(IrqError::AlreadyRegistered);
@@ -996,5 +1427,72 @@ pub fn translate_firmware_irq(controller: Option<u32>, cells: &[u32]) -> Option<
             .lock()
             .as_ref()
             .and_then(|registration| registration.domain.translate(cells)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingHandler(Arc<AtomicUsize>);
+
+    impl IrqHandler for CountingHandler {
+        fn handle_irq(&self, _line: IrqLine) -> IrqStatus {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            IrqStatus::Handled
+        }
+    }
+
+    struct IdentityDomain;
+
+    impl IrqDomain for IdentityDomain {
+        fn translate(&self, cells: &[u32]) -> Option<IrqLine> {
+            let [hwirq] = cells else {
+                return None;
+            };
+            Some(IrqLine::Controller {
+                controller: 77,
+                hwirq: *hwirq,
+            })
+        }
+    }
+
+    #[test]
+    fn prepared_handler_is_hidden_from_dispatch_until_cancel() {
+        let registry = IrqRegistry::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let line = IrqLine::Hardware(0x7fff);
+        let handle = registry
+            .register(line, Arc::new(CountingHandler(Arc::clone(&count))))
+            .unwrap();
+        assert!(registry.dispatch_line(line));
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+
+        assert_eq!(registry.prepare_unregister(handle), Some(line));
+        assert!(!registry.dispatch_line(line));
+        assert_eq!(
+            registry.unregister(handle),
+            Err(IrqError::AlreadyRegistered)
+        );
+
+        registry.cancel_unregister(handle);
+        assert!(registry.dispatch_line(line));
+        assert_eq!(count.load(Ordering::Relaxed), 2);
+        registry.unregister(handle).unwrap();
+    }
+
+    #[test]
+    fn planned_consumers_allow_domain_provider_prepare() {
+        let registry = IrqDomainRegistry::new();
+        let handle = registry.register(77, Arc::new(IdentityDomain)).unwrap();
+        assert!(registry.acquire_handler(77));
+        assert!(!registry.prepare_unregister(handle));
+
+        assert!(registry.prepare_handler(77));
+        assert!(registry.prepare_unregister(handle));
+        assert!(!registry.acquire_handler(77));
+        registry.release_handler(77, true);
+        registry.unregister(handle).unwrap();
     }
 }

@@ -38,7 +38,7 @@ use general::dtb::Dtb;
 use general::{
     StartAddressOps, StartAllocatorOps, StartArchitecture, StartBootInfo, StartBootProtocol,
     StartContext, StartFirmware, StartMemory, StartMemoryMap, StartMemoryRegion,
-    StartMemoryRegionKind, StartPhysRange,
+    StartMemoryRegionKind, StartNoMapSupport, StartPhysRange,
 };
 
 // ── DTB 访问 ──────────────────────────────────────────────────────────────────
@@ -72,7 +72,26 @@ fn kernel_dtb() -> Option<Dtb<'static>> {
         return None;
     }
     let slice = unsafe { core::slice::from_raw_parts(DTB_BUFFER.0.get().cast::<u8>(), len) };
-    Dtb::from_bytes(slice)
+    Dtb::parse(slice).ok()
+}
+
+/// 从固件虚拟地址取得受快照容量限制的 DTB 字节。
+fn firmware_dtb_bytes(vaddr: usize) -> Result<&'static [u8], &'static str> {
+    // Safety: 启动协议保证 `vaddr` 指向至少包含 magic/totalsize 的 FDT 前缀；
+    // 完整视图只在 totalsize 通过固定容量检查后构造。
+    let prefix = unsafe { core::slice::from_raw_parts(vaddr as *const u8, 8) };
+    let magic = u32::from_be_bytes(prefix[..4].try_into().map_err(|_| "truncated DTB prefix")?);
+    if magic != fdt::DTB_MAGIC {
+        return Err("invalid DTB magic");
+    }
+    let total_size =
+        u32::from_be_bytes(prefix[4..8].try_into().map_err(|_| "truncated DTB size")?) as usize;
+    if total_size < 28 || total_size > DTB_BUF_SIZE {
+        return Err("DTB size is outside the snapshot range");
+    }
+    // Safety: 固件/FDT 交接保证声明的 totalsize 范围可读，且长度已限制在静态
+    // 快照缓冲区容量内。
+    Ok(unsafe { core::slice::from_raw_parts(vaddr as *const u8, total_size) })
 }
 
 /// 将固件提供的 DTB 拷贝到内核静态缓冲区。
@@ -95,7 +114,8 @@ fn store_kernel_dtb(dtb_paddr: usize) -> Result<Dtb<'static>, &'static str> {
         dtb_paddr // MMIO 区域走 identity mapping
     };
 
-    let fw_dtb = unsafe { Dtb::from_ptr(vaddr) }.ok_or("invalid DTB magic")?;
+    let fw_bytes = firmware_dtb_bytes(vaddr)?;
+    let fw_dtb = Dtb::parse(fw_bytes).map_err(|_| "invalid DTB layout")?;
     let bytes = fw_dtb.as_bytes();
     if bytes.len() > DTB_BUF_SIZE {
         return Err("DTB too large for kernel buffer");
@@ -166,20 +186,19 @@ fn format_log_line(record: &log::LogRecord<'_>) -> LineBuf {
 
 /// 从 DTB 的 `/cpus/cpu@*` 节点解析所有启用 hart 共同支持的 ISA 扩展。
 fn detect_isa_extensions(dtb: &Dtb<'_>) {
-    use crate::riscv64::specific::{CBO_BLOCK_SIZE, HAS_ZICBOZ};
+    use crate::riscv64::specific::{CBO_BLOCK_SIZE, CBOM_BLOCK_SIZE, HAS_ZICBOM, HAS_ZICBOZ};
     use core::sync::atomic::Ordering;
 
-    let root = match dtb.root() {
-        Some(r) => r,
-        None => return,
-    };
+    let root = dtb.root();
     let cpus = match root.find_child("cpus") {
         Some(c) => c,
         None => return,
     };
     let mut enabled_harts = 0usize;
     let mut first_isa_processed = false;
+    let mut common_cbom_block_size = None;
     let mut common_cboz_block_size = None;
+    let mut zicbom_common = true;
     let mut zicboz_common = true;
     for cpu_node in cpus.children() {
         if cpu_node.base_name_bytes() != b"cpu" || !cpu_node_enabled(cpu_node) {
@@ -198,29 +217,36 @@ fn detect_isa_extensions(dtb: &Dtb<'_>) {
             }
         }
 
-        if !cpu_has_extension(cpu_node, b"zicboz") {
-            zicboz_common = false;
-            continue;
+        match cache_block_size(cpu_node, b"zicbom", "riscv,cbom-block-size") {
+            Some(block_size) if zicbom_common => match common_cbom_block_size {
+                None => common_cbom_block_size = Some(block_size),
+                Some(expected) if expected == block_size => {}
+                Some(_) => zicbom_common = false,
+            },
+            _ => zicbom_common = false,
         }
-        let Some(block_size) = cpu_node
-            .find_property("riscv,cboz-block-size")
-            .and_then(|property| read_be_u32_prop(property.value()))
-            .map(|value| value as usize)
-        else {
-            zicboz_common = false;
-            continue;
-        };
-        if !block_size.is_power_of_two() || block_size < 16 || block_size > allocator::PAGE_SIZE {
-            zicboz_common = false;
-            continue;
-        }
-        match common_cboz_block_size {
-            None => common_cboz_block_size = Some(block_size),
-            Some(expected) if expected == block_size => {}
-            Some(_) => zicboz_common = false,
+        match cache_block_size(cpu_node, b"zicboz", "riscv,cboz-block-size") {
+            Some(block_size) if zicboz_common => match common_cboz_block_size {
+                None => common_cboz_block_size = Some(block_size),
+                Some(expected) if expected == block_size => {}
+                Some(_) => zicboz_common = false,
+            },
+            _ => zicboz_common = false,
         }
     }
 
+    if enabled_harts != 0 && zicbom_common {
+        if let Some(block_size) = common_cbom_block_size {
+            // 先发布尺寸，HAS_ZICBOM 的 Release store 最后开放 DMA CMO 路径。
+            CBOM_BLOCK_SIZE.store(block_size, Ordering::Relaxed);
+            HAS_ZICBOM.store(true, Ordering::Release);
+            log::info!(
+                "[loader] ISA: Zicbom detected on {} harts, block_size={}",
+                enabled_harts,
+                block_size
+            );
+        }
+    }
     if enabled_harts != 0 && zicboz_common {
         if let Some(block_size) = common_cboz_block_size {
             // 先发布尺寸，HAS_ZICBOZ 的 Release store 最后开放快路径。
@@ -233,6 +259,23 @@ fn detect_isa_extensions(dtb: &Dtb<'_>) {
             );
         }
     }
+}
+
+fn cache_block_size(
+    node: general::dtb::DtbNode<'_>,
+    extension: &[u8],
+    property: &str,
+) -> Option<usize> {
+    if !cpu_has_extension(node, extension) {
+        return None;
+    }
+    let block_size = node
+        .find_property(property)?
+        .value()
+        .get(..4)
+        .and_then(read_be_u32_prop)? as usize;
+    (block_size.is_power_of_two() && block_size >= 16 && block_size <= allocator::PAGE_SIZE)
+        .then_some(block_size)
 }
 
 fn cpu_node_enabled(node: general::dtb::DtbNode<'_>) -> bool {
@@ -304,7 +347,7 @@ fn dtb_cstr(value: &[u8]) -> &[u8] {
 /// 返回 `/chosen/bootargs` 的稳定 DTB 快照，不包含末尾 NUL。
 fn command_line_from_dtb(dtb: &Dtb<'static>) -> Option<&'static [u8]> {
     let value = dtb
-        .root()?
+        .root()
         .find_child("chosen")?
         .find_property("bootargs")?
         .value();
@@ -323,7 +366,7 @@ fn find_dtb_node_by_absolute_path<'a>(
         return None;
     }
 
-    let root = dtb.root()?;
+    let root = dtb.root();
     let mut parent = root;
     let mut current = root;
     let mut depth = 0usize;
@@ -352,9 +395,7 @@ fn dtb_compatible_contains(node: general::dtb::DtbNode<'_>, expected: &[u8]) -> 
 /// 在完整 platform parser 接管前，仅解析 early console 所需的 stdout-path 与首个 reg。
 /// 对带非空 bus `ranges` 的复杂地址转换保持 QEMU fallback，避免在 arch 重复通用解析器。
 fn configure_early_console_from_dtb(dtb: &Dtb<'static>) {
-    let Some(root) = dtb.root() else {
-        return;
-    };
+    let root = dtb.root();
     let Some(chosen) = root.find_child("chosen") else {
         return;
     };
@@ -421,7 +462,7 @@ fn configure_early_console_from_dtb(dtb: &Dtb<'static>) {
 fn configure_timer_from_dtb(dtb: &Dtb<'_>) {
     let hz = dtb
         .root()
-        .and_then(|root| root.find_child("cpus"))
+        .find_child("cpus")
         .and_then(|cpus| {
             cpus.find_property("timebase-frequency")
                 .and_then(|prop| read_be_u32_prop(prop.value()))
@@ -617,6 +658,10 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
                 validate_kernel_heap_range: validate_kernel_heap,
                 sync_icache,
                 init_kernel_page_table: heap_vm::init_kernel_page_table,
+                no_map: StartNoMapSupport::ReservedOnly {
+                    granule: allocator::PAGE_SIZE,
+                    mechanism: "static Sv48 direct-map aliases remain until split mappings are implemented",
+                },
             }),
         };
 

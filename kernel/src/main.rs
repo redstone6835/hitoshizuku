@@ -237,7 +237,6 @@ pub unsafe extern "C" fn __kernel_start_init(context: *const general::StartConte
     context
         .validate()
         .unwrap_or_else(|err| panic!("[main] invalid StartContext: {}", err));
-    #[cfg(target_arch = "riscv64")]
     general::set_start_cmdline(context.boot.command_line);
     match context.firmware_source() {
         general::StartFirmwareSource::Acpi => acpi::kernel_start_init(context),

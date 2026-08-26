@@ -606,6 +606,9 @@ fn pnp_dependency_name(dependency: PnpDependency) -> String {
             format!("pci-host-bridge:{domain}")
         }
         PnpDependency::Dma => "dma".into(),
+        PnpDependency::DtbProvider { kind, phandle } => {
+            format!("dtb-provider:{kind}:{phandle}")
+        }
         PnpDependency::Other(name) => name.into(),
     }
 }

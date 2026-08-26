@@ -2,27 +2,33 @@
 //!
 //! 本模块实现 LoongArch64 平台的内核早期初始化流程，由汇编引导代码在完成
 //! BSS 清零和临时栈建立之后跳转至此。整个初始化过程分为若干阶段，按顺序
-//! 依次执行：安装异常入口、建立早期日志、初始化引导分配器、按启动来源解析
-//! EFI 系统表中的关键信息、快照固件表（ACPI/DTB）并退出 Boot Services，最后构造一次性
+//! 依次执行：安装异常入口、建立早期日志、初始化引导分配器、解析启动来源
+//! （U-Boot / QEMU 直启）并快照 DTB，最后构造一次性
 //! 的 `StartContext` 并跳转到内核主函数 `__kernel_start_init`。
 //!
 //! 所有初始化步骤均为一次性执行，且控制权不会返回到此模块。全局状态通过
 //! `KERNEL_FIRMWARE_STATE` 和 `KERNEL_FIRMWARE_BUFFERS` 保存，供后续
 //! 构建 `StartContext` 时读取。
+//!
+//! 启动协议：只支持 U-Boot / 传统引导器直启（LoongArch Linux 协议：
+//! `$a0=efi_boot`、`$a1=cmdline 或 DTB`、`$a2=system table 或 DTB`）。
+//! QEMU `-kernel` 直启会经伪 EFI 配置表暴露 FDT；板载 fork U-Boot 的
+//! `bootm` 显式传 fdt 时 DTB 经 `$a1`/`$a2` 直传，这里用 FDT magic 探测
+//! 识别。EFI Boot Services / ACPI 路径已随 U-Boot 直启改造删除。
 
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, compiler_fence};
 use core::{fmt, fmt::Write};
 
-use super::efi_stub;
+use super::early_console::configure_early_console;
+use crate::boot_protocol::FirmwareSnapshot;
 use crate::*;
-use efi::*;
-use general::dtb::Dtb;
-use general::firmware::{self, FirmwareTableMapping};
+use efi::{EfiSystemTable, EfiSystemTableView};
+use fdt::Fdt;
 use general::{
-    StartAcpiTables, StartAddressOps, StartAllocatorOps, StartArchitecture, StartBootInfo,
-    StartBootProtocol, StartContext, StartFirmware, StartMemory, StartMemoryMap, StartMemoryRegion,
-    StartMemoryRegionKind, StartPhysRange,
+    StartAddressOps, StartAllocatorOps, StartArchitecture, StartBootInfo, StartContext,
+    StartFirmware, StartFirmwareSource, StartMemory, StartMemoryMap, StartMemoryRegion,
+    StartMemoryRegionKind, StartNoMapSupport, StartPhysRange,
 };
 use log::printk;
 
@@ -34,13 +40,8 @@ const SINK_LINE_BUFFER_SIZE: usize = 1280;
 const CMDLINE_BUF_SIZE: usize = 4096;
 /// DTB 快照缓冲区的最大容量（4 MiB）。
 const DTB_BUF_SIZE: usize = 4096 * 1024;
-/// ACPI 表快照缓冲区的最大容量（4 MiB）。
-const ACPI_BUF_SIZE: usize = 4096 * 1024;
-/// ACPI 表物理到虚拟地址映射表的最大条目数。
-const ACPI_MAPPING_CAPACITY: usize = 128;
-/// 启动期可保留的最大规范化内存区域数。
-const BOOT_MEMORY_REGION_CAPACITY: usize =
-    efi_stub::MEMORY_MAP_BUFFER_SIZE / core::mem::size_of::<EfiMemoryDescriptor>();
+/// 启动期可保留的最大板级内存区域数（2K1000 两段 DDR）。
+const BOARD_MEMORY_REGION_CAPACITY: usize = 4;
 /// 空的启动内存区域，占位用于静态数组初始化。
 const EMPTY_BOOT_MEMORY_REGION: StartMemoryRegion = StartMemoryRegion::new(
     StartPhysRange::new(0, 0),
@@ -48,69 +49,124 @@ const EMPTY_BOOT_MEMORY_REGION: StartMemoryRegion = StartMemoryRegion::new(
     0,
 );
 
+/// 2K1000LA 开发板内存（fork U-Boot bdinfo 实测，工厂 DTB 无 /memory 节点）：
+///
+/// - bank0：物理 0x0000_0000 .. 0x1000_0000（低 256 MiB，内核装载于 0x200000）；
+/// - bank1：物理 0x9000_0000 .. 0x1_0000_0000（高 1.75 GiB）。
+///
+/// DTB 无 /memory 节点时作为直启内存回退；QEMU virt 的 DTB 自带 /memory，
+/// 不受影响。这是板级平台常量，不是 DTB 硬编码。
+const BOARD_MEMORY_RANGES: &[StartPhysRange] = &[
+    StartPhysRange::new(0x0000_0000, 0x1000_0000),
+    StartPhysRange::new(0x9000_0000, 0x1_0000_0000),
+];
+
+/// 由 loader 持有的固件快照引擎。
+///
+/// 实现 [`FirmwareSnapshot`]，把启动协议适配器所需的快照原语桥接到 loader
+/// 私有的静态缓冲区。适配器只定义"该做什么"，本引擎负责"怎么做"。
+struct LoaderFirmwareSnapshot {
+    /// EFI system table 指针（可能为 0；QEMU 伪 EFI 交接会提供，仅用于
+    /// 读取配置表中的 FDT）。
+    system_table: *mut EfiSystemTable,
+    /// 最近一次从配置表读取的 FDT 物理地址。
+    fdt_paddr: Option<usize>,
+    /// 交接寄存器直传的 DTB 物理地址（`$a1`/`$a2` FDT magic 探测结果）。
+    handoff_fdt: Option<usize>,
+}
+
+impl LoaderFirmwareSnapshot {
+    /// 从 EFI 配置表采集 FDT 指针。
+    fn collect_config_tables(&mut self) {
+        if self.system_table.is_null() {
+            return;
+        }
+        // Safety: system table 已在调用点通过 EfiSystemTableView 完整校验。
+        let st = unsafe { &*self.system_table };
+        self.fdt_paddr = unsafe { st.find_fdt() }.map(|p| p as usize);
+    }
+}
+
+impl FirmwareSnapshot for LoaderFirmwareSnapshot {
+    fn snapshot_dtb_from_paddr(&mut self, paddr: usize) -> Result<(), &'static str> {
+        store_kernel_dtb_from_address(paddr).map(|_| ())
+    }
+
+    fn efi_fdt_paddr(&self) -> Option<usize> {
+        // 优先 EFI 配置表暴露的 FDT（QEMU `-kernel` 直启）；否则使用交接
+        // 寄存器直传的 DTB（板载 fork U-Boot bootm 显式传 fdt）。
+        self.fdt_paddr.or(self.handoff_fdt)
+    }
+
+    fn select_firmware_source(&self, source: StartFirmwareSource) {
+        let dtb_enabled = matches!(source, StartFirmwareSource::Dtb);
+        KERNEL_FIRMWARE_STATE
+            .dtb_enabled
+            .store(dtb_enabled, Ordering::Release);
+    }
+}
+
+/// 判断早期可访问地址处是否是一个有效 FDT 前缀（magic + 最小长度）。
+///
+/// 用于从启动交接参数中区分 DTB 与 cmdline / EFI system table：LoongArch 直启
+/// 协议本身没有 DTB 通道，但板载 fork U-Boot 的 `bootm` 显式传入 fdt 参数时
+/// 会把 DTB 放在 `$a1` 或 `$a2`；这里用 magic 做确定性识别，不做任何硬编码。
+///
+/// 早期处于 DMW 直映窗口，任何地址读取都不会触发缺页，地址无效时按读到
+/// 非 magic 字节安全失败。
+fn fdt_prefix_valid(vaddr: usize) -> bool {
+    if vaddr == 0 {
+        return false;
+    }
+    // Safety: DMW 窗口覆盖整个物理地址空间，前 8 字节读取不会 fault；
+    // 只有 magic 完全匹配才继续按 FDT 解释。
+    let prefix = unsafe { core::slice::from_raw_parts(vaddr as *const u8, 8) };
+    let magic = u32::from_be_bytes(prefix[..4].try_into().unwrap_or([0u8; 4]));
+    magic == fdt::DTB_MAGIC
+}
+
 // ─────────────────────── 固件状态与缓冲区 ─────────────────────────────
 
-/// 全局固件状态，使用原子变量存储，可在卸载 Boot Services 前后安全访问。
+/// 全局固件状态，使用原子变量存储，可在启动早期安全访问。
 ///
-/// 包含 ACPI/DTB 是否启用、命令行长度、DTB/ACPI 快照长度、ACPI 映射条目数
-/// 以及 RSDP 物理地址。所有字段的写入均使用 `Release` 排序，读取使用
-/// `Acquire` 排序，以保证在跳转到内核启动代码之前对这些字段的修改可见。
+/// 包含 DTB 是否启用、命令行长度、DTB 快照长度。所有字段的写入均使用
+/// `Release` 排序，读取使用 `Acquire` 排序，以保证在跳转到内核启动代码
+/// 之前对这些字段的修改可见。
 struct KernelFirmwareState {
-    /// ACPI 是否被选为固件解析来源。
-    acpi_enabled: AtomicBool,
     /// DTB 是否被选为固件解析来源。
     dtb_enabled: AtomicBool,
     /// 内核命令行的有效长度（不含终止 NUL）。
     cmdline_valid_len: AtomicUsize,
     /// DTB 快照的有效字节数。
     dtb_valid_len: AtomicUsize,
-    /// ACPI 表快照的总字节数。
-    acpi_valid_len: AtomicUsize,
-    /// ACPI 映射表中已使用的条目数。
-    acpi_mapping_count: AtomicUsize,
-    /// ACPI RSDP 的物理地址，仅在 ACPI 启用时有效。
-    acpi_rsdp_phys: AtomicUsize,
 }
 
 impl KernelFirmwareState {
     /// 使用默认值（全部清零）创建实例。
     const fn new() -> Self {
         Self {
-            acpi_enabled: AtomicBool::new(false),
             dtb_enabled: AtomicBool::new(false),
             cmdline_valid_len: AtomicUsize::new(0),
             dtb_valid_len: AtomicUsize::new(0),
-            acpi_valid_len: AtomicUsize::new(0),
-            acpi_mapping_count: AtomicUsize::new(0),
-            acpi_rsdp_phys: AtomicUsize::new(0),
         }
     }
 
     /// 重置固件选择状态和快照长度，为重新选择做准备。
     fn reset_selection(&self) {
-        self.acpi_enabled.store(false, Ordering::Release);
         self.dtb_enabled.store(false, Ordering::Release);
         self.dtb_valid_len.store(0, Ordering::Release);
-        self.acpi_valid_len.store(0, Ordering::Release);
-        self.acpi_mapping_count.store(0, Ordering::Release);
-        self.acpi_rsdp_phys.store(0, Ordering::Release);
     }
 }
 
-/// 全局固件缓冲区，存储命令行、DTB、ACPI 表和 ACPI 映射表。
+/// 全局固件缓冲区，存储命令行和 DTB 快照。
 ///
-/// 由于这些缓冲区必须在 Boot Services 退出前填充，并在退出后保持有效，
-/// 因此直接定义为静态数组。`unsafe` 访问通过指针进行，但仅在初始化阶段
+/// 直接定义为静态数组；`unsafe` 访问通过指针进行，但仅在初始化阶段
 /// 单线程执行，无竞争。
 struct KernelFirmwareBuffers {
     /// 内核命令行缓冲区，以 NUL 终止。
     command_line: [u8; CMDLINE_BUF_SIZE],
     /// DTB 快照缓冲区。
     dtb: [u8; DTB_BUF_SIZE],
-    /// ACPI 表快照缓冲区，用于存放复制的所有 ACPI 表。
-    acpi: [u8; ACPI_BUF_SIZE],
-    /// ACPI 表物理到虚拟地址映射数组。
-    acpi_mappings: [FirmwareTableMapping; ACPI_MAPPING_CAPACITY],
 }
 
 impl KernelFirmwareBuffers {
@@ -119,8 +175,6 @@ impl KernelFirmwareBuffers {
         Self {
             command_line: [0u8; CMDLINE_BUF_SIZE],
             dtb: [0u8; DTB_BUF_SIZE],
-            acpi: [0u8; ACPI_BUF_SIZE],
-            acpi_mappings: [FirmwareTableMapping::EMPTY; ACPI_MAPPING_CAPACITY],
         }
     }
 }
@@ -129,13 +183,11 @@ impl KernelFirmwareBuffers {
 static KERNEL_FIRMWARE_STATE: KernelFirmwareState = KernelFirmwareState::new();
 /// 内核固件缓冲区的可变全局实例，仅在初始化阶段访问。
 static mut KERNEL_FIRMWARE_BUFFERS: KernelFirmwareBuffers = KernelFirmwareBuffers::new();
-/// 归一化后的启动内存映射，供 `StartContext` 以平台无关形式持有。
-static mut BOOT_MEMORY_REGIONS: [StartMemoryRegion; BOOT_MEMORY_REGION_CAPACITY] =
-    [EMPTY_BOOT_MEMORY_REGION; BOOT_MEMORY_REGION_CAPACITY];
-/// `BOOT_MEMORY_REGIONS` 当前有效的条目数。
-static BOOT_MEMORY_REGION_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// 板级内存回退的归一化启动内存区域。
+static mut BOARD_MEMORY_REGIONS: [StartMemoryRegion; BOARD_MEMORY_REGION_CAPACITY] =
+    [EMPTY_BOOT_MEMORY_REGION; BOARD_MEMORY_REGION_CAPACITY];
 
-// ─────────────────────── 辅助函数 ─────────────────────────────────────
+// ─────────────────────── 辅助函数 ─────────────────────────────────────// ─────────────────────── 辅助函数 ─────────────────────────────────────
 
 /// 返回当前存储的内核命令行切片（不包括终止 NUL）。
 ///
@@ -156,125 +208,129 @@ fn kernel_command_line() -> Option<&'static [u8]> {
 }
 
 /// 返回当前存储的 DTB 视图，如果未存储或长度为零则返回 `None`。
-fn kernel_dtb() -> Option<Dtb<'static>> {
+fn kernel_dtb() -> Option<Fdt<'static>> {
     let len = KERNEL_FIRMWARE_STATE.dtb_valid_len.load(Ordering::Acquire);
     if len == 0 {
         return None;
     }
+    // Safety: dtb_valid_len 只在完整快照复制完成后以 Release 发布；Acquire 读取到
+    // 非零长度后，固定缓冲区在内核生命周期内保持只读，且长度受容量约束。
     let slice = unsafe {
         core::slice::from_raw_parts(addr_of!(KERNEL_FIRMWARE_BUFFERS.dtb).cast::<u8>(), len)
     };
-    Dtb::from_bytes(slice)
+    Fdt::parse(slice).ok()
 }
 
-/// 返回当前有效的 ACPI 映射表切片。
-fn kernel_acpi_mappings() -> &'static [FirmwareTableMapping] {
-    let count = KERNEL_FIRMWARE_STATE
-        .acpi_mapping_count
-        .load(Ordering::Acquire);
-    unsafe {
-        core::slice::from_raw_parts(
-            addr_of!(KERNEL_FIRMWARE_BUFFERS.acpi_mappings).cast::<FirmwareTableMapping>(),
-            count,
-        )
-    }
-}
-
-/// 返回当前有效的归一化启动内存区域切片。
-fn boot_memory_regions() -> &'static [StartMemoryRegion] {
-    let count = BOOT_MEMORY_REGION_COUNT.load(Ordering::Acquire);
-    unsafe {
-        core::slice::from_raw_parts(
-            addr_of!(BOOT_MEMORY_REGIONS).cast::<StartMemoryRegion>(),
-            count,
-        )
-    }
-}
-
-/// 将 EFI 内存类型转换为平台无关的启动内存分类。
-fn classify_efi_memory_type(
-    type_: u32,
-    source: efi_stub::EfiMemoryMapSource,
-) -> StartMemoryRegionKind {
-    match type_ {
-        1 | 2 => StartMemoryRegionKind::BootloaderReclaimable,
-        3 | 4 => {
-            if matches!(source, efi_stub::EfiMemoryMapSource::BootServicesExited) {
-                StartMemoryRegionKind::FirmwareReclaimable
-            } else {
-                StartMemoryRegionKind::Reserved
-            }
-        }
-        5 | 6 => StartMemoryRegionKind::FirmwareRuntime,
-        7 => StartMemoryRegionKind::UsableRam,
-        8 => StartMemoryRegionKind::Unusable,
-        9 => StartMemoryRegionKind::AcpiReclaimable,
-        10 => StartMemoryRegionKind::AcpiNonVolatileStorage,
-        11 | 12 => StartMemoryRegionKind::Mmio,
-        _ => StartMemoryRegionKind::Reserved,
-    }
-}
-
-/// 将 EFI 原始内存描述符转换为平台无关的启动内存区域切片。
-fn snapshot_boot_memory_regions(
-    snapshot: efi_stub::RawEfiMemoryMapSnapshot,
-) -> Result<&'static [StartMemoryRegion], &'static str> {
-    if snapshot.descriptor_size < core::mem::size_of::<EfiMemoryDescriptor>() {
-        printk!(
-            "[loader] EFI memory descriptor size too small: got={} expected_at_least={}",
-            snapshot.descriptor_size,
-            core::mem::size_of::<EfiMemoryDescriptor>(),
-        );
-        return Err("[loader] EFI memory descriptor size is smaller than the UEFI baseline");
-    }
-
-    BOOT_MEMORY_REGION_COUNT.store(0, Ordering::Release);
-    let mut count = 0usize;
-    let mut offset = 0usize;
-    while offset + snapshot.descriptor_size <= snapshot.bytes.len() {
-        let descriptor = unsafe {
-            snapshot.bytes[offset..offset + snapshot.descriptor_size]
-                .as_ptr()
-                .cast::<EfiMemoryDescriptor>()
-                .read_unaligned()
-        };
-        offset += snapshot.descriptor_size;
-
-        if descriptor.number_of_pages == 0 {
+/// 判断 DTB 是否自带可用的 /memory 描述。
+///
+/// 2K1000LA 工厂 DTB 没有 memory 节点（内存信息只存在于 bootloader）；
+/// QEMU virt 的 DTB 自带。与 fdt 解析器 `memory_banks` 的语义一致：遍历根
+/// 节点直接子节点中 `device_type` 精确为 `memory` 的节点（QEMU LA64 有两个
+/// memory 节点，因此不能用 `find_node("/memory")` 的消歧匹配），并要求 `reg`
+/// 长度至少覆盖地址+大小各一个 cell（2×64 位 = 16 字节）。
+fn dtb_describes_memory(dtb: &Fdt<'_>) -> bool {
+    for node in dtb.root().children() {
+        let Some(device_type) = node.property("device_type") else {
             continue;
+        };
+        if device_type.as_str().is_ok_and(|value| value == "memory")
+            && node
+                .property("reg")
+                .is_some_and(|reg| reg.value().len() >= 16)
+        {
+            return true;
         }
+    }
+    false
+}
 
-        let start = descriptor.physical_start as usize;
-        let size = (descriptor.number_of_pages as usize).saturating_mul(4096);
-        let end = start
-            .checked_add(size)
-            .ok_or("[loader] EFI memory descriptor range overflowed")?;
-        if count >= BOOT_MEMORY_REGION_CAPACITY {
-            printk!(
-                "[loader] normalized boot memory region buffer exhausted: descriptors_seen={} capacity={} snapshot_bytes={} descriptor_size={}",
-                count + 1,
-                BOOT_MEMORY_REGION_CAPACITY,
-                snapshot.bytes.len(),
-                snapshot.descriptor_size,
-            );
-            return Err("[loader] normalized boot memory region buffer exhausted");
+/// 构造 LS2K1000 板级内存回退映射。
+///
+/// 该入口只在显式板级构建中存在；其它 LoongArch 平台不得借用固定 DDR 布局。
+#[cfg(mygo_la_board_ls2k1000)]
+fn board_boot_memory_map() -> StartMemoryMap {
+    let regions_ptr = addr_of_mut!(BOARD_MEMORY_REGIONS).cast::<StartMemoryRegion>();
+    let mut count = 0usize;
+    for range in BOARD_MEMORY_RANGES {
+        if count >= BOARD_MEMORY_REGION_CAPACITY {
+            break;
         }
-
+        // Safety: count < BOARD_MEMORY_REGION_CAPACITY 保证写入在数组内；
+        // 单线程启动阶段没有其他访问者，先填满全部元素再发布切片。
         unsafe {
-            addr_of_mut!(BOOT_MEMORY_REGIONS)
-                .cast::<StartMemoryRegion>()
-                .add(count)
-                .write(StartMemoryRegion::new(
-                    StartPhysRange::new(start, end),
-                    classify_efi_memory_type(descriptor.type_, snapshot.source),
-                    descriptor.attribute,
-                ));
+            regions_ptr.add(count).write(StartMemoryRegion::new(
+                *range,
+                StartMemoryRegionKind::UsableRam,
+                0,
+            ));
         }
         count += 1;
     }
+    // Safety: 已填写的 count 个元素都是完整初始化的 StartMemoryRegion，且
+    // 静态数组具有 'static 生命周期。
+    let slice = unsafe {
+        core::slice::from_raw_parts(
+            addr_of!(BOARD_MEMORY_REGIONS).cast::<StartMemoryRegion>(),
+            count,
+        )
+    };
+    let total_mib = BOARD_MEMORY_RANGES
+        .iter()
+        .map(|range| (range.end - range.start) / (1024 * 1024))
+        .sum::<usize>();
+    printk!(
+        "[loader] DTB has no /memory; using 2K1000 board memory: {} regions ({} MiB)",
+        count,
+        total_mib,
+    );
+    StartMemoryMap::Regions(slice)
+}
 
-    BOOT_MEMORY_REGION_COUNT.store(count, Ordering::Release);
-    Ok(boot_memory_regions())
+/// 从固件虚拟地址取得受快照容量限制的 DTB 字节。
+fn firmware_dtb_bytes(vaddr: usize) -> Result<&'static [u8], &'static str> {
+    // Safety: EFI 配置表保证 vaddr 指向至少包含 magic/totalsize 的 FDT 前缀；
+    // 完整视图只在 totalsize 通过固定容量检查后构造。
+    let prefix = unsafe { core::slice::from_raw_parts(vaddr as *const u8, 8) };
+    let magic = u32::from_be_bytes(prefix[..4].try_into().map_err(|_| "truncated DTB prefix")?);
+    if magic != fdt::DTB_MAGIC {
+        return Err("[loader][dtb] invalid DTB magic");
+    }
+    let total_size =
+        u32::from_be_bytes(prefix[4..8].try_into().map_err(|_| "truncated DTB size")?) as usize;
+    if total_size < 32 || total_size > DTB_BUF_SIZE {
+        return Err("[loader][dtb] DTB size is outside the snapshot range");
+    }
+    // Safety: EFI/FDT 交接保证声明的 totalsize 范围可读，且长度已限制在静态
+    // 快照缓冲区容量内。
+    Ok(unsafe { core::slice::from_raw_parts(vaddr as *const u8, total_size) })
+}
+
+/// 在堆初始化之前从 EFI 配置表借用 FDT，仅用于选择最早期控制台。
+///
+/// 该视图不会被保存；正式固件选择仍在退出 Boot Services 前完成私有快照。
+fn early_firmware_dtb() -> Option<Fdt<'static>> {
+    let (fdt, _) = early_firmware_dtb_with_addr()?;
+    Some(fdt)
+}
+
+/// 从 EFI 配置表取 FDT 视图及其物理地址。
+///
+/// 返回 `(解析视图, 物理地址)`。物理地址用于 Linux 直启路径把配置表暴露的 FDT
+/// 快照进内核 DTB 缓冲区（`store_kernel_dtb_from_address` 需要物理地址）。
+fn early_firmware_dtb_with_addr() -> Option<(Fdt<'static>, usize)> {
+    let raw_system_table = EFI_SYSTEM_TABLE_PTR.load(Ordering::Acquire);
+    if raw_system_table == 0 {
+        return None;
+    }
+    let canonical_system_table = reset_to_virt(raw_system_table);
+    // Safety: DMW 已由入口汇编建立；`from_ptr` 会校验 EFI system table 头部、
+    // 对齐和签名，失败时不解引用其配置表。
+    let view = unsafe { EfiSystemTableView::from_ptr(canonical_system_table) }?;
+    // Safety: system table 已通过上面的完整视图校验；EFI 配置表在退出 Boot
+    // Services 前保持可读，这里只提取标准 FDT GUID 对应的指针。
+    let raw_fdt = unsafe { view.table().find_fdt() }? as usize;
+    let bytes = firmware_dtb_bytes(reset_to_virt(raw_fdt)).ok()?;
+    Fdt::parse(bytes).ok().map(|fdt| (fdt, raw_fdt))
 }
 
 /// 将原始命令行地址复制到内核命令行缓冲区，并返回其切片。
@@ -340,13 +396,14 @@ unsafe fn erase_original_cmdline(src: *mut u8, len: usize, saved: *const u8, sav
 /// 从指定的物理地址拷贝 DTB 到内核缓冲区，并返回 DTB 视图。
 ///
 /// 成功时打印拷贝信息，失败时返回错误描述。
-fn store_kernel_dtb_from_address(fdt_addr: usize) -> Result<Dtb<'static>, &'static str> {
+fn store_kernel_dtb_from_address(fdt_addr: usize) -> Result<Fdt<'static>, &'static str> {
     if fdt_addr == 0 {
         return Err("[loader][dtb] missing DTB address");
     }
 
     let fdt_addr = reset_to_virt(fdt_addr);
-    let fw_dtb = unsafe { Dtb::from_ptr(fdt_addr) }.ok_or("[loader][dtb] invalid DTB")?;
+    let fw_bytes = firmware_dtb_bytes(fdt_addr)?;
+    let fw_dtb = Fdt::parse(fw_bytes).map_err(|_| "[loader][dtb] invalid DTB layout")?;
     let dtb_bytes = fw_dtb.as_bytes();
     let dtb_size = dtb_bytes.len();
     if dtb_size > DTB_BUF_SIZE {
@@ -359,6 +416,8 @@ fn store_kernel_dtb_from_address(fdt_addr: usize) -> Result<Dtb<'static>, &'stat
         return Err("[loader][dtb] DTB too large");
     }
 
+    // Safety: 源 DTB 已通过 Fdt::parse 且长度不超过目标静态缓冲区；该复制发生在
+    // 单线程启动阶段，发布有效长度前没有读者，源地址与内核缓冲区不重叠。
     unsafe {
         core::ptr::copy_nonoverlapping(
             dtb_bytes.as_ptr(),
@@ -376,146 +435,6 @@ fn store_kernel_dtb_from_address(fdt_addr: usize) -> Result<Dtb<'static>, &'stat
         dtb_size,
     );
     kernel_dtb().ok_or("[loader][dtb] DTB copy verification failed")
-}
-
-/// 快照所有 ACPI 表（从 RSDP 开始，递归复制根表及其子表）到内核缓冲区。
-///
-/// 成功后返回 RSDP 的物理地址，并填充 ACPI 映射表。
-fn snapshot_acpi_tables(rsdp_addr: usize) -> Result<usize, &'static str> {
-    let rsdp_phys = virt_to_phys(rsdp_addr);
-    let root_info: firmware::acpi::AcpiSnapshotRootInfo =
-        firmware::acpi::snapshot_root_info(rsdp_phys, acpi_phys_bytes)?;
-    copy_acpi_range(rsdp_phys, root_info.rsdp_copy_len)?;
-
-    let root_len = firmware::acpi::table_length(root_info.root_phys, acpi_phys_bytes)?;
-    let root = copy_acpi_range(root_info.root_phys, root_len)?;
-    firmware::acpi::validate_root_table(root, root_info.root_kind)?;
-
-    firmware::acpi::for_each_root_table_entry(root, root_info.root_kind, |table_phys| {
-        let table_len = firmware::acpi::table_length(table_phys, acpi_phys_bytes)?;
-        let table = copy_acpi_range(table_phys, table_len)?;
-        firmware::acpi::validate_sdt(table)?;
-
-        // 如果是 FADT，还需要复制 DSDT 和 FACS（如果存在）
-        if let Some(closure) = firmware::acpi::fadt_closure(table)? {
-            if let Some(dsdt_phys) = closure.dsdt_phys {
-                let dsdt_len = firmware::acpi::table_length(dsdt_phys, acpi_phys_bytes)?;
-                let dsdt = copy_acpi_range(dsdt_phys, dsdt_len)?;
-                firmware::acpi::validate_sdt(dsdt)?;
-            }
-            if let Some(facs_phys) = closure.facs_phys {
-                let facs_len = firmware::acpi::facs_length(facs_phys, acpi_phys_bytes)?;
-                copy_acpi_range(facs_phys, facs_len)?;
-            }
-        }
-        Ok(())
-    })?;
-
-    KERNEL_FIRMWARE_STATE
-        .acpi_rsdp_phys
-        .store(rsdp_phys, Ordering::Release);
-    printk!(
-        "[loader][acpi] ACPI tables copied: RSDP={:#x} tables={} bytes={}",
-        rsdp_phys,
-        KERNEL_FIRMWARE_STATE
-            .acpi_mapping_count
-            .load(Ordering::Acquire),
-        KERNEL_FIRMWARE_STATE.acpi_valid_len.load(Ordering::Acquire),
-    );
-    Ok(rsdp_phys)
-}
-
-/// 将物理地址处长度为 `len` 的 ACPI 数据复制到内核 ACPI 缓冲区，并维护映射。
-///
-/// 如果该物理地址已存在映射且长度足够，直接返回已映射的虚拟切片；
-/// 否则在缓冲区中分配新区域并复制。返回新分配或已存在的虚拟切片。
-fn copy_acpi_range(phys_addr: usize, len: usize) -> Result<&'static [u8], &'static str> {
-    if len == 0 {
-        return Ok(&[]);
-    }
-    // 检查是否已有足够长的映射，避免重复复制
-    if let Some(virt) = kernel_acpi_mappings()
-        .iter()
-        .find_map(|mapping| mapping.resolve(phys_addr, len))
-    {
-        return Ok(unsafe { core::slice::from_raw_parts(virt as *const u8, len) });
-    }
-    // 防止冲突：同一个物理地址已有更短的映射
-    for mapping in kernel_acpi_mappings() {
-        if mapping.physical_start == phys_addr && mapping.length < len {
-            return Err("[loader][acpi] conflicting ACPI table length");
-        }
-    }
-
-    let count = KERNEL_FIRMWARE_STATE
-        .acpi_mapping_count
-        .load(Ordering::Acquire);
-    if count >= ACPI_MAPPING_CAPACITY {
-        printk!(
-            "[loader][acpi] ACPI mapping capacity exhausted: used={} capacity={} next_phys={:#x} next_len={}",
-            count,
-            ACPI_MAPPING_CAPACITY,
-            phys_addr,
-            len,
-        );
-        return Err("[loader][acpi] ACPI mapping table full");
-    }
-
-    // 在 ACPI 缓冲区中分配 8 字节对齐的空间
-    let offset = KERNEL_FIRMWARE_STATE
-        .acpi_valid_len
-        .load(Ordering::Acquire)
-        .checked_add(7)
-        .map(|value| value & !7usize)
-        .ok_or("[loader][acpi] ACPI buffer offset overflow")?;
-    let end = offset
-        .checked_add(len)
-        .ok_or("[loader][acpi] ACPI buffer size overflow")?;
-    if end > ACPI_BUF_SIZE {
-        printk!(
-            "[loader][acpi] ACPI snapshot buffer exhausted: used={} aligned_offset={} request={} capacity={} phys={:#x}",
-            KERNEL_FIRMWARE_STATE.acpi_valid_len.load(Ordering::Acquire),
-            offset,
-            len,
-            ACPI_BUF_SIZE,
-            phys_addr,
-        );
-        return Err("[loader][acpi] ACPI table snapshot too large");
-    }
-
-    unsafe {
-        let src = phys_to_virt(phys_addr) as *const u8;
-        let dst = addr_of_mut!(KERNEL_FIRMWARE_BUFFERS.acpi)
-            .cast::<u8>()
-            .add(offset);
-        core::ptr::copy_nonoverlapping(src, dst, len);
-        addr_of_mut!(KERNEL_FIRMWARE_BUFFERS.acpi_mappings)
-            .cast::<FirmwareTableMapping>()
-            .add(count)
-            .write(FirmwareTableMapping {
-                physical_start: phys_addr,
-                virtual_start: dst as usize,
-                length: len,
-            });
-    }
-    KERNEL_FIRMWARE_STATE
-        .acpi_valid_len
-        .store(end, Ordering::Release);
-    KERNEL_FIRMWARE_STATE
-        .acpi_mapping_count
-        .store(count + 1, Ordering::Release);
-    kernel_acpi_mappings()
-        .iter()
-        .find_map(|mapping| mapping.resolve(phys_addr, len))
-        .map(|virt| unsafe { core::slice::from_raw_parts(virt as *const u8, len) })
-        .ok_or("[loader][acpi] ACPI copy verification failed")
-}
-
-/// 辅助函数：根据物理地址读取指定长度的字节切片。
-///
-/// 在 ACPI 快照过程中用于临时读取固件表内容（尚未复制之前）。
-fn acpi_phys_bytes(phys_addr: usize, len: usize) -> &'static [u8] {
-    unsafe { core::slice::from_raw_parts(phys_to_virt(phys_addr) as *const u8, len) }
 }
 
 /// 简单的行日志缓冲区，实现 `fmt::Write`，用于格式化一条日志消息。
@@ -696,10 +615,55 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
     // 因此必须在 MMU 和 DMW 窗口稳定后安装。
     unsafe { install_exception_entry() };
 
+    // BSS、DMW 和临时栈此时已经可用，但堆尚未建立。先从 `_start` 传入的命令行
+    // 解析显式 `earlycon=`（u-boot 直启路径的唯一可靠定位来源），再从 EFI 配置表
+    // 借用 FDT 作为 DT 候选；两个来源都用零分配解析器配置 chosen 16550，任何异常
+    // 都完整回退到传统 QEMU 参数。
+    //
+    // 注意：QEMU 直启路径下 CMDLINE_PTR 可能是 0，但 0 此时仍是有效地址（映射到
+    // DMW1 基址，即物理地址 0），因此这里不把 0 当作“无命令行”——与
+    // `store_kernel_command_line` 的约定一致。地址无效时读到空字节，find 自然
+    // 返回 None，安全回退。
+    let cmdline_earlycon = {
+        let raw = CMDLINE_PTR.load(Ordering::Acquire);
+        let cmd = unsafe {
+            general::cmdline::Cmdline::from_raw_until_nul(
+                reset_to_virt(raw) as *const u8,
+                CMDLINE_BUF_SIZE,
+            )
+        };
+        cmd.find("earlycon")
+    };
+    let early_console = configure_early_console(early_firmware_dtb(), cmdline_earlycon);
+
     e_print(format_args!(
         "[{:6}.{:06}] [boot] Entering kernel loader...\n",
         0, 0
     ));
+    e_print(format_args!(
+        "[{:6}.{:06}] [boot] early console: source={} phys={:#x} clock={} baud={} reg-offset={:#x} reg-shift={} reg-io-width={} endian={:?}{}\n",
+        0,
+        0,
+        early_console.source.name(),
+        early_console.config.phys_base,
+        early_console.config.clock_hz,
+        early_console.config.baud,
+        early_console.config.reg_offset,
+        early_console.config.reg_shift,
+        early_console.config.io_width.bytes(),
+        early_console.config.endian,
+        if early_console.dt_error.is_some() {
+            " (DT rejected)"
+        } else {
+            ""
+        },
+    ));
+    if let Some(error) = early_console.dt_error {
+        e_print(format_args!(
+            "[{:6}.{:06}] [boot] early console candidate rejected: {:?}\n",
+            0, 0, error
+        ));
+    }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // 步骤 1.1：通过 CPUCFG 读取稳定计时器频率
@@ -757,19 +721,17 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
 
         // 步骤 1.1b：配置定时器中断，使其按配置频率产生中断。
         // 默认 100 Hz；命令行 `timer_hz=N` 可覆盖。
+        //
+        // 与 earlycon 解析相同：CMDLINE_PTR 为 0 时仍是有效地址（QEMU 直启把
+        // cmdline 放在物理地址 0），因此不把 0 当作“无命令行”，一律尝试解析。
         let timer_hz = {
             let mut hz = DEFAULT_TIMER_HZ;
             let raw = CMDLINE_PTR.load(Ordering::Acquire);
-            if raw != 0 {
-                let cmd = unsafe {
-                    general::cmdline::Cmdline::from_raw_until_nul(
-                        reset_to_virt(raw) as *const u8,
-                        4096,
-                    )
-                };
-                if let Some(val) = cmd.find("timer_hz").and_then(|v| v.parse().ok()) {
-                    hz = val;
-                }
+            let cmd = unsafe {
+                general::cmdline::Cmdline::from_raw_until_nul(reset_to_virt(raw) as *const u8, 4096)
+            };
+            if let Some(val) = cmd.find("timer_hz").and_then(|v| v.parse().ok()) {
+                hz = val;
             }
             hz.max(1).min(10000)
         };
@@ -887,15 +849,22 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // 步骤 3：采集启动来源参数并选择固件表
+    // 步骤 3：采集启动来源参数并探测交接 DTB
     // ═══════════════════════════════════════════════════════════════════════════
     //
     // 从 `_start` 传入并由 `pre_boot_init` 保存在全局原子变量中的原始参数：
-    //   - EFI_SYSTEM_TABLE_PTR  (可能为 0)
-    //   - CMDLINE_PTR           (在当前平台上即使为 0 也可能是有效地址)
+    //   - EFI_SYSTEM_TABLE_PTR  (QEMU `-kernel` 伪 EFI 交接的系统表；板子为 0)
+    //   - CMDLINE_PTR           ($a1：命令行，或 fork U-Boot 直传的 DTB 地址)
     // 这些值可能是固件传递的物理地址，也可能是 QEMU 直线路径下的物理地址，
-    // 因此必须通过 `firmware_pointer_to_virt` 转换为当前地址空间可访问的
-    // 虚拟地址（在 DMW 窗口内）。
+    // 因此必须通过 `reset_to_virt` 转换为当前地址空间可访问的虚拟地址
+    // （在 DMW 窗口内）。
+    //
+    // LoongArch Linux 直启协议（booting.rst）定义 $a0=efi_boot、$a1=cmdline、
+    // $a2=system table，没有 DTB 通道；板载 fork U-Boot 的 `bootm` 显式给出
+    // fdt 参数时会把 DTB 放到 $a1 或 $a2。这里对两个交接寄存器做 FDT magic
+    // 探测：命中者即板载 DTB，未命中的 $a1 才按 cmdline 处理。探测在 DMW
+    // 直映窗口内进行，地址无效时按读到非 magic 字节安全失败，不做任何
+    // 板级数据硬编码。
     let raw_st_addr = EFI_SYSTEM_TABLE_PTR.load(Ordering::Acquire);
     let raw_cmdline_ptr = CMDLINE_PTR.load(Ordering::Acquire);
     let canonical_st_addr = if raw_st_addr == 0 {
@@ -904,17 +873,31 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
         reset_to_virt(raw_st_addr)
     };
     let canonical_cmdline_ptr = reset_to_virt(raw_cmdline_ptr);
-
-    // 将命令行复制到内核静态缓冲区（.data 或 .bss 中），避免后续被覆盖
-    let _ = store_kernel_command_line(raw_cmdline_ptr);
-
+    let a1_is_fdt = fdt_prefix_valid(canonical_cmdline_ptr);
+    let a2_is_fdt = fdt_prefix_valid(canonical_st_addr);
     printk!(
-        "[loader] boot args: efi_boot={} cmdline={:#x}->{:#x} efi_system_table={:#x}->{:#x}",
-        EFI_BOOT.load(Ordering::Acquire),
+        "[loader] handoff probe: cmdline={:#x}->{:#x} st={:#x}->{:#x} a1_is_fdt={} a2_is_fdt={}",
         raw_cmdline_ptr,
         canonical_cmdline_ptr,
         raw_st_addr,
         canonical_st_addr,
+        a1_is_fdt,
+        a2_is_fdt,
+    );
+
+    // $a1 命中 FDT 时不存在命令行，直接置空；否则按直启协议把命令行复制到
+    // 内核静态缓冲区（.data 或 .bss 中），避免后续被覆盖。
+    if a1_is_fdt {
+        KERNEL_FIRMWARE_STATE
+            .cmdline_valid_len
+            .store(0, Ordering::Release);
+    } else {
+        let _ = store_kernel_command_line(raw_cmdline_ptr);
+    }
+    printk!(
+        "[loader] boot args: efi_boot={} cmdline={:?}",
+        EFI_BOOT.load(Ordering::Acquire),
+        kernel_command_line().map(|bytes| core::str::from_utf8(bytes).unwrap_or("<invalid UTF-8>")),
     );
 
     // 如果原始系统表地址有效，尝试创建 EfiSystemTableView（非空校验+对齐校验）
@@ -943,93 +926,37 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
     };
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // 步骤 3.1：固件表选择、退出 Boot Services、完成私有快照
+    // 步骤 3.1：固件表选择、完成 DTB 私有快照
     // ═══════════════════════════════════════════════════════════════════════════
     //
-    // 固件选择策略：优先使用 ACPI（若 EFI 配置表中有 RSDP），否则使用 DTB。
-    // 这遵循 Linux/LoongArch 的默认行为。
-    //
-    // 在退出 Boot Services 之前，只从 EFI 系统表中提取后续真正需要的
-    // ACPI/DTB 指针；退出后不再访问 EFI 系统表本体。
-    //
-    // 接着根据选择执行对应的快照操作：
-    //   - ACPI：从 RSDP 出发递归发现并复制所有 ACPI 表到内核缓冲区，
-    //           同时建立物理→虚拟地址映射表。
-    //   - DTB ：直接将设备树数据复制到内核预留的 DTB 缓冲区中。
-    //
-    // 若 EFI 内存映射快照可用，后续 `StartMemoryMap` 将携带归一化后的平台区域；
-    // 若无，则仅允许那些本身不依赖独立启动内存映射的固件路径继续。
+    // 本内核只支持 DTB 固件路径（U-Boot / QEMU 直启；ACPI 与 EFI Boot Services
+    // 已随 U-Boot 直启改造删除）。`BootProtocolDispatcher` 依据 `_start` 原始
+    // 参数做协议分类，快照引擎把固件暴露的 DTB 复制进内核私有缓冲区：
+    //   - QEMU `-kernel` 直启：FDT 经伪 EFI 配置表暴露（fw_table 非空）；
+    //   - 板载 fork U-Boot：DTB 经 $a1/$a2 直传（handoff_fdt 命中）。
+    // 两类来源都只读交接，快照由 dispatcher 驱动，不依赖任何 DTB 硬编码。
     KERNEL_FIRMWARE_STATE.reset_selection();
-    let mut acpi_rsdp_for_state = 0usize;
-    if let Some(fw_table) = fw_table {
-        let acpi_rsdp = unsafe { (*fw_table).find_acpi_rsdp() };
-        let fdt = unsafe { (*fw_table).find_fdt() };
-        match efi_stub::exit_boot_services_with_memory_map_snapshot(fw_table) {
-            Ok(()) => {
-                printk!("[loader] EFI Boot Services exited after extracting system table data")
-            }
-            Err(status) if status == status_unsupported() => {
-                match efi_stub::snapshot_memory_map(fw_table) {
-                    Ok(()) => printk!(
-                        "[loader] EFI ExitBootServices hook unavailable; captured EFI memory map without exiting Boot Services"
-                    ),
-                    Err(map_status) if acpi_rsdp.is_some() => panic!(
-                        "[loader] ACPI tables discovered but EFI memory map snapshot failed without ExitBootServices: {} ({:#x})",
-                        status_name(map_status),
-                        map_status,
-                    ),
-                    Err(map_status) => {
-                        printk!(
-                            "[loader] EFI ExitBootServices hook unavailable and EFI memory map snapshot failed: {} ({:#x}); continuing without EFI memory map",
-                            status_name(map_status),
-                            map_status,
-                        );
-                    }
-                }
-            }
-            Err(status) => panic!(
-                "[loader] failed to exit EFI Boot Services: {} ({:#x})",
-                status_name(status),
-                status
-            ),
-        }
-
-        if let Some(rsdp) = acpi_rsdp {
-            // ACPI 路径需要 EFI 内存映射来获取可用物理内存，否则无法初始化分配器
-            if efi_stub::memory_map_snapshot().is_some() {
-                let rsdp_phys = snapshot_acpi_tables(rsdp as usize).unwrap_or_else(|err| {
-                    panic!("[loader] failed to snapshot ACPI tables: {}", err)
-                });
-                acpi_rsdp_for_state = rsdp_phys;
-                KERNEL_FIRMWARE_STATE
-                    .acpi_enabled
-                    .store(true, Ordering::Release);
-                KERNEL_FIRMWARE_STATE
-                    .dtb_enabled
-                    .store(false, Ordering::Release);
-                printk!(
-                    "[loader] firmware selection: ACPI enabled, RSDP={:#x}; DTB ignored",
-                    rsdp_phys,
-                );
-            } else {
-                panic!("[loader] ACPI tables discovered but EFI memory map is unavailable");
-            }
-        } else if let Some(fdt) = fdt {
-            store_kernel_dtb_from_address(fdt as usize)
-                .unwrap_or_else(|err| panic!("[loader] failed to snapshot EFI DTB: {}", err));
-            KERNEL_FIRMWARE_STATE
-                .dtb_enabled
-                .store(true, Ordering::Release);
-            KERNEL_FIRMWARE_STATE
-                .acpi_enabled
-                .store(false, Ordering::Release);
-            printk!("[loader] firmware selection: DTB enabled from EFI configuration table");
+    let dispatcher =
+        crate::boot_protocol::BootProtocolDispatcher::new(crate::loongarch64::boot_registers());
+    let mut snapshot_engine = LoaderFirmwareSnapshot {
+        system_table: fw_table.unwrap_or(core::ptr::null_mut()),
+        fdt_paddr: None,
+        handoff_fdt: if a1_is_fdt {
+            Some(raw_cmdline_ptr)
+        } else if a2_is_fdt {
+            Some(raw_st_addr)
         } else {
-            panic!("[loader] firmware selection failed: neither ACPI nor DTB found");
-        }
-    } else {
-        panic!("[loader] EFI system table unavailable; cannot discover ACPI or DTB");
-    }
+            None
+        },
+    };
+    snapshot_engine.collect_config_tables();
+    let firmware_handoff = dispatcher
+        .dispatch(&mut snapshot_engine)
+        .unwrap_or_else(|err| panic!("[loader] firmware handoff failed: {}", err));
+    printk!(
+        "[loader] firmware selection: DTB via {} adapter",
+        firmware_handoff.adapter,
+    );
     // ═══════════════════════════════════════════════════════════════════════════
     // 步骤 4：构造启动上下文 (StartContext) 并跳转到内核主函数
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1040,7 +967,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
     //
     // 内容包括：
     //   - boot          : 架构类型、启动协议、boot CPU ID 以及命令行。
-    //   - firmware      : 选定的固件表格（ACPI 或 DTB 及其私有快照）。
+    //   - firmware      : 选定的固件表格（本路径固定为 DTB 及其私有快照）。
     //   - memory        : 内核镜像占用的物理范围，以及启动内存映射（如有）。
     //   - address       : 物理地址到虚拟地址的转换函数（普通 RAM 和 MMIO）。
     //   - allocator     : 可选的分配器回调（内核堆区域、映射/解映射等）。
@@ -1056,58 +983,56 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
         // 内核映像占用的物理地址范围（从虚拟地址反推物理地址）
         let kernel_phys_start = virt_to_phys(skernel as *const () as usize);
         let kernel_phys_end = virt_to_phys(ekernel as *const () as usize);
-        let boot_map = if let Some(snapshot) = efi_stub::memory_map_snapshot() {
-            let regions = snapshot_boot_memory_regions(snapshot).unwrap_or_else(|err| {
-                panic!("[loader] failed to normalize EFI memory map: {}", err)
-            });
-            printk!(
-                "[loader] boot memory map normalized into {} platform regions ({})",
-                regions.len(),
-                match snapshot.source {
-                    efi_stub::EfiMemoryMapSource::BootServicesExited => {
-                        "post-ExitBootServices"
-                    }
-                    efi_stub::EfiMemoryMapSource::BootServicesActive => {
-                        "observed-only; Boot Services still active"
-                    }
-                },
-            );
-            StartMemoryMap::Regions(regions)
-        } else {
-            StartMemoryMap::None
-        };
-        let acpi_enabled = KERNEL_FIRMWARE_STATE.acpi_enabled.load(Ordering::Acquire);
-        let dtb_enabled = KERNEL_FIRMWARE_STATE.dtb_enabled.load(Ordering::Acquire);
-        if acpi_enabled == dtb_enabled {
-            panic!("[loader] expected exactly one firmware source to be selected");
-        }
-
-        let firmware = if acpi_enabled {
-            if acpi_rsdp_for_state == 0 {
-                panic!("[loader] ACPI selected but RSDP snapshot is missing");
-            }
-            StartFirmware::Acpi(StartAcpiTables {
-                rsdp_phys: acpi_rsdp_for_state,
-                mappings: kernel_acpi_mappings(),
-            })
-        } else {
-            StartFirmware::Dtb(
-                kernel_dtb()
-                    .unwrap_or_else(|| panic!("[loader] DTB selected but snapshot missing")),
+        // DTB 私有快照：dispatcher 已把固件暴露的 DTB 复制进内核缓冲区。若
+        // 两个交接通道都未命中（例如板载 U-Boot 的 bootm 未显式传 fdt），
+        // 这里直接失败并给出可操作的修复提示。
+        let dtb = kernel_dtb().unwrap_or_else(|| {
+            panic!(
+                "[loader] no device tree in handoff (a1_is_fdt={} a2_is_fdt={}); \
+                 board U-Boot must pass the DTB explicitly: bootm <kernel> - <fdt_addr>",
+                a1_is_fdt, a2_is_fdt,
             )
+        });
+        // 板级内存回退：2K1000 工厂 DTB 没有 /memory 节点（内存信息只存在于
+        // bootloader），此时以 fork U-Boot bdinfo 实测的板级 DDR 布局
+        // （BOARD_MEMORY_RANGES）作为启动内存映射；DTB 自带 /memory（QEMU
+        // virt）时交给内核按 DTB 描述建立（boot_map=None）。
+        let boot_map = if dtb_describes_memory(&dtb) {
+            printk!("[loader] DTB describes /memory; kernel will use the DT memory map");
+            StartMemoryMap::None
+        } else {
+            #[cfg(mygo_la_board_ls2k1000)]
+            {
+                board_boot_memory_map()
+            }
+            #[cfg(not(mygo_la_board_ls2k1000))]
+            {
+                panic!(
+                    "[loader] DTB has no /memory; fixed DDR fallback is only valid for --board ls2k1000"
+                )
+            }
         };
+        let dtb_command_line = dtb
+            .chosen_bootargs()
+            .unwrap_or_else(|error| panic!("[loader] invalid /chosen/bootargs: {:?}", error))
+            .map(str::as_bytes);
+        let command_line = kernel_command_line().or(dtb_command_line);
+        if kernel_command_line().is_none()
+            && let Some(command_line) = dtb_command_line
+        {
+            printk!(
+                "[loader] command line from DTB: {}",
+                core::str::from_utf8(command_line).unwrap_or("<invalid UTF-8>")
+            );
+        }
         let context = StartContext {
             boot: StartBootInfo {
                 architecture: StartArchitecture::new("loongarch64"),
-                protocol: if EFI_BOOT.load(Ordering::Acquire) == 1 {
-                    StartBootProtocol::Efi
-                } else {
-                    StartBootProtocol::Direct
-                },
+                protocol: firmware_handoff.protocol,
                 boot_cpu_id: LoongArch64MessageInterruptOps::current_cpu_id(),
-                command_line: kernel_command_line(),
+                command_line,
             },
-            firmware,
+            firmware: StartFirmware::Dtb(dtb),
             memory: StartMemory {
                 kernel_image: StartPhysRange::new(kernel_phys_start, kernel_phys_end),
                 boot_map,
@@ -1126,6 +1051,10 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
                 validate_kernel_heap_range,
                 sync_icache,
                 init_kernel_page_table,
+                no_map: StartNoMapSupport::ReservedOnly {
+                    granule: allocator::PAGE_SIZE,
+                    mechanism: "LoongArch DMW0/DMW1 fixed windows cannot remove individual aliases",
+                },
             }),
         };
         context

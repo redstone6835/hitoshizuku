@@ -32,6 +32,7 @@ version = "0.1.0"
 dependencies = [
  "allocator",
  "efi",
+ "fdt",
  "general",
  "log",
  "mm",
@@ -272,6 +273,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fdt"
+version = "0.1.0"
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -295,6 +300,7 @@ dependencies = [
  "errno",
  "extfs",
  "fatfs",
+ "fdt",
  "hashbrown",
  "kernel-symbols",
  "log",
@@ -602,6 +608,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "platform-ahci"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "spin",
+ "vfs",
+]
+
+[[package]]
 name = "platform-cfi-flash"
 version = "0.1.0"
 dependencies = [
@@ -621,6 +650,28 @@ dependencies = [
  "sched",
  "socket",
  "spin",
+ "vfs",
+]
+
+[[package]]
+name = "platform-dt-providers"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
  "vfs",
 ]
 
@@ -694,7 +745,372 @@ dependencies = [
 ]
 
 [[package]]
+name = "platform-jh7110-crg"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "spin",
+ "vfs",
+]
+
+[[package]]
+name = "platform-jh7110-mmc"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "spin",
+ "vfs",
+]
+
+[[package]]
+name = "platform-jh7110-pinctrl"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "spin",
+ "vfs",
+]
+
+[[package]]
+name = "platform-jh7110-trng"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "vfs",
+]
+
+[[package]]
+name = "platform-jh7110-uart"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "spin",
+ "vfs",
+]
+
+[[package]]
+name = "platform-loongson-apbdma"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "spin",
+ "vfs",
+]
+
+[[package]]
+name = "platform-loongson-clk"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "vfs",
+]
+
+[[package]]
 name = "platform-loongson-irq"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "spin",
+ "vfs",
+]
+
+[[package]]
+name = "platform-loongson-pinctrl-gpio"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "vfs",
+]
+
+[[package]]
+name = "platform-loongson-sdio"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "spin",
+ "vfs",
+]
+
+[[package]]
+name = "platform-ls2k-gmac"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "spin",
+ "vfs",
+]
+
+[[package]]
+name = "platform-ls2k-i2c"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "spin",
+ "vfs",
+]
+
+[[package]]
+name = "platform-ls2k-rtc"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "spin",
+ "vfs",
+]
+
+[[package]]
+name = "platform-ls2k-spi"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "spin",
+ "vfs",
+]
+
+[[package]]
+name = "platform-ls2k-tsensor"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "spin",
+ "vfs",
+]
+
+[[package]]
+name = "platform-ls2k-usb"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "spin",
+ "vfs",
+]
+
+[[package]]
+name = "platform-ls2x-wdt"
 version = "0.1.0"
 dependencies = [
  "acpi",
@@ -740,6 +1156,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "platform-pci-host-ecam"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "vfs",
+]
+
+[[package]]
 name = "platform-plic"
 version = "0.1.0"
 dependencies = [
@@ -759,6 +1197,50 @@ dependencies = [
  "sched",
  "socket",
  "spin",
+ "vfs",
+]
+
+[[package]]
+name = "platform-riscv-iommu"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
+ "vfs",
+]
+
+[[package]]
+name = "platform-riscv-pmu"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "allocator",
+ "efi",
+ "elf",
+ "elm",
+ "errno",
+ "extfs",
+ "fatfs",
+ "general",
+ "hal",
+ "log",
+ "mm",
+ "net",
+ "sched",
+ "socket",
  "vfs",
 ]
 

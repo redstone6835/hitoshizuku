@@ -20,11 +20,11 @@ use general::dev::pnp::{
     PnpError, PnpId, PnpResourceKind, register_driver_factory,
 };
 use virtio::{
-    SplitVirtQueue, VIRTIO_F_RING_EVENT_IDX, VIRTIO_F_VERSION_1, VIRTIO_MSI_NO_VECTOR,
-    VIRTIO_PCI_RESET_SPIN_LIMIT, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
-    VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK, VIRTQ_DESC_F_WRITE,
-    VirtioPciCap, VirtioPciFunction, VirtioPciTransport, VirtqDescUpdate, choose_split_queue_size,
-    parse_virtio_pci_caps,
+    SplitVirtQueue, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_RING_EVENT_IDX, VIRTIO_F_VERSION_1,
+    VIRTIO_MSI_NO_VECTOR, VIRTIO_PCI_RESET_SPIN_LIMIT, VIRTIO_STATUS_ACKNOWLEDGE,
+    VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK,
+    VIRTQ_DESC_F_WRITE, VirtioPciCap, VirtioPciFunction, VirtioPciTransport, VirtqDescUpdate,
+    access_platform_compatible, choose_split_queue_size, parse_virtio_pci_caps,
 };
 
 use super::common::{VirtioNetQueue, VirtioNetTransport, install_active, install_active_queues};
@@ -40,8 +40,11 @@ const VIRTIO_NET_F_CTRL_VQ: u64 = 1 << 17;
 const VIRTIO_NET_F_MQ: u64 = 1 << 22;
 const VIRTIO_NET_F_RSS: u64 = 1 << 60;
 const REQUIRED_FEATURES: u64 = VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC | VIRTIO_NET_F_MRG_RXBUF;
-const OPTIONAL_FEATURES: u64 =
-    VIRTIO_NET_F_CSUM | VIRTIO_NET_F_MTU | VIRTIO_NET_F_STATUS | VIRTIO_F_RING_EVENT_IDX;
+const OPTIONAL_FEATURES: u64 = VIRTIO_NET_F_CSUM
+    | VIRTIO_NET_F_MTU
+    | VIRTIO_NET_F_STATUS
+    | VIRTIO_F_RING_EVENT_IDX
+    | VIRTIO_F_ACCESS_PLATFORM;
 
 fn read_u8(capability: VirtioPciCap, offset: usize) -> Option<u8> {
     let address = capability.checked_addr(offset, mem::size_of::<u8>())?;
@@ -71,7 +74,7 @@ fn read_mac(capability: VirtioPciCap) -> Option<[u8; 6]> {
 
 fn setup_queue(
     transport: VirtioPciTransport,
-    context: general::dev::dma::DmaContext,
+    context: &general::dev::dma::DmaContext,
     index: u16,
     msix_vector: Option<u16>,
 ) -> Result<(SplitVirtQueue, usize), &'static str> {
@@ -86,8 +89,8 @@ fn setup_queue(
         return Err("VirtIO-net PCI queue 过小");
     }
     transport.set_selected_queue_size(size);
-    let queue =
-        SplitVirtQueue::new_in(context, size).map_err(|_| "VirtIO-net PCI queue DMA 分配失败")?;
+    let queue = SplitVirtQueue::new_in(context.clone(), size)
+        .map_err(|_| "VirtIO-net PCI queue DMA 分配失败")?;
     transport.set_selected_queue_addresses(
         queue.desc_dma_addr() as u64,
         queue.avail_dma_addr() as u64,
@@ -118,7 +121,7 @@ fn run_control_command(
     notify: usize,
     queue_index: u16,
     queue: &mut SplitVirtQueue,
-    context: general::dev::dma::DmaContext,
+    context: &general::dev::dma::DmaContext,
     class: u8,
     command: u8,
     payload: &[u8],
@@ -127,7 +130,7 @@ fn run_control_command(
         .len()
         .checked_add(3)
         .ok_or("VirtIO-net control command 过大")?;
-    let mut buffer = DmaBuffer::new_in(context, total, 16, DmaDirection::Bidirectional)
+    let mut buffer = DmaBuffer::new_in(context.clone(), total, 16, DmaDirection::Bidirectional)
         .map_err(|_| "VirtIO-net control DMA 分配失败")?;
     let bytes = buffer.as_mut_slice();
     bytes[0] = class;
@@ -217,6 +220,10 @@ fn build_multi_queue_candidate(
     transport.add_status(VIRTIO_STATUS_ACKNOWLEDGE);
     transport.add_status(VIRTIO_STATUS_DRIVER);
     let offered = transport.device_features();
+    let context = pci.dma_context();
+    if !access_platform_compatible(offered, context.requires_access_platform()) {
+        return Err("VirtIO-net PCI device cannot honor platform DMA/IOMMU addresses");
+    }
     let multi_features = VIRTIO_NET_F_CTRL_VQ | VIRTIO_NET_F_MQ | VIRTIO_NET_F_RSS;
     let accepted = REQUIRED_FEATURES | multi_features | (offered & OPTIONAL_FEATURES);
     transport.set_driver_features(accepted);
@@ -236,15 +243,14 @@ fn build_multi_queue_candidate(
     } else {
         1500
     };
-    let context = pci.dma_context();
     let event_idx = accepted & VIRTIO_F_RING_EVENT_IDX != 0;
     let tx_checksum = accepted & VIRTIO_NET_F_CSUM != 0;
     let mut queues = Vec::with_capacity(pair_count as usize);
     for id in 0..pair_count {
         let rx_index = id * 2;
         let tx_index = rx_index + 1;
-        let (rx, rx_notify) = setup_queue(transport, context, rx_index, Some(id))?;
-        let (tx, tx_notify) = setup_queue(transport, context, tx_index, Some(id))?;
+        let (rx, rx_notify) = setup_queue(transport, &context, rx_index, Some(id))?;
+        let (tx, tx_notify) = setup_queue(transport, &context, tx_index, Some(id))?;
         let irq = if event_idx {
             virtio_pci_msix_queue_irq_event_idx(
                 rx.used_event_addr()
@@ -277,14 +283,14 @@ fn build_multi_queue_candidate(
     }
     let control_index = pair_count * 2;
     let (mut control, control_notify) =
-        setup_queue(transport, context, control_index, Some(pair_count))?;
+        setup_queue(transport, &context, control_index, Some(pair_count))?;
     transport.add_status(VIRTIO_STATUS_DRIVER_OK);
     run_control_command(
         transport,
         control_notify,
         control_index,
         &mut control,
-        context,
+        &context,
         VIRTIO_NET_CTRL_MQ,
         VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
         &pair_count.to_le_bytes(),
@@ -296,7 +302,7 @@ fn build_multi_queue_candidate(
         control_notify,
         control_index,
         &mut control,
-        context,
+        &context,
         VIRTIO_NET_CTRL_MQ,
         VIRTIO_NET_CTRL_MQ_RSS_CONFIG,
         &rss,
@@ -340,6 +346,11 @@ fn probe_queue(
         transport.set_status(transport.status() | VIRTIO_STATUS_FAILED);
         return Err("VirtIO-net 缺少 VERSION_1、MAC 或 MRG_RXBUF feature");
     }
+    let context = pci.dma_context();
+    if !access_platform_compatible(offered, context.requires_access_platform()) {
+        transport.set_status(transport.status() | VIRTIO_STATUS_FAILED);
+        return Err("VirtIO-net PCI device cannot honor platform DMA/IOMMU addresses");
+    }
     let accepted = REQUIRED_FEATURES | (offered & OPTIONAL_FEATURES);
     transport.set_driver_features(accepted);
     transport.add_status(VIRTIO_STATUS_FEATURES_OK);
@@ -356,9 +367,8 @@ fn probe_queue(
     } else {
         1500
     };
-    let context = pci.dma_context();
-    let (rx, rx_notify) = setup_queue(transport, context, 0, None)?;
-    let (tx, tx_notify) = setup_queue(transport, context, 1, None)?;
+    let (rx, rx_notify) = setup_queue(transport, &context, 0, None)?;
+    let (tx, tx_notify) = setup_queue(transport, &context, 1, None)?;
     let event_idx = accepted & VIRTIO_F_RING_EVENT_IDX != 0;
     let tx_checksum = accepted & VIRTIO_NET_F_CSUM != 0;
     let irq = if event_idx {
@@ -556,7 +566,11 @@ fn register_irq(
     transport: VirtioPciTransport,
 ) -> Result<(), PnpError> {
     let handler = queue_irq_handler(binding);
-    if let Ok(msix) = pci.try_configure_msix(1) {
+    let msix_result = pci.try_configure_msix(1);
+    if let Err(error) = &msix_result {
+        log::warning!("[virtio-net] PCI MSI-X 配置失败: {:?}", error);
+    }
+    if let Ok(msix) = msix_result {
         let Some(line) = msix.line(0) else {
             pci.release_configured_msix(msix);
             return Err(PnpError::InvalidState);
@@ -601,7 +615,11 @@ fn register_irq(
         clear_queue_msix_vectors(transport);
         pci.release_configured_msix(msix);
     }
-    if let Ok(msi) = pci.try_configure_single_msi() {
+    let msi_result = pci.try_configure_single_msi();
+    if let Err(error) = &msi_result {
+        log::warning!("[virtio-net] PCI MSI 配置失败: {:?}", error);
+    }
+    if let Ok(msi) = msi_result {
         let line = msi.line();
         match irq::register_irq_handler(line, Arc::clone(&handler)) {
             Ok(irq_handle) if pci.try_enable_configured_msi(msi).is_ok() => {
@@ -694,7 +712,7 @@ impl PnpDriver for VirtioPciNetDriver {
                 ));
             }
             if let Err(error) = dev.register_function(net_function("eth0", pci.dma_context())) {
-                super::common::remove_active_from_pnp();
+                let _ = super::common::remove_active_from_pnp();
                 super::common::destroy_active();
                 return Err(error);
             }
@@ -734,7 +752,7 @@ impl PnpDriver for VirtioPciNetDriver {
             ));
         }
         if let Err(error) = dev.register_function(net_function("eth0", pci.dma_context())) {
-            super::common::remove_active_from_pnp();
+            let _ = super::common::remove_active_from_pnp();
             super::common::destroy_active();
             return Err(error);
         }
@@ -752,11 +770,29 @@ impl PnpDriver for VirtioPciNetDriver {
     }
 
     fn remove(&self, dev: &Arc<PnpDevice>) {
-        super::common::remove_active_from_pnp();
+        if let Err(error) = self.try_remove(dev) {
+            log::error!(
+                "[virtio-net] PCI remove failed for {}: {:?}",
+                dev.name,
+                error
+            );
+        }
+    }
+
+    fn try_remove(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
+        super::common::quiesce_active()
+            .map_err(|_| PnpError::hardware_failure("virtio-net PCI quiesce failed"))?;
         if let Some(pci) = PciDevice::from_pnp(dev) {
             pci.disable_interrupts();
+            pci.try_disable_bus_master().map_err(|_| {
+                PnpError::hardware_failure("virtio-net PCI bus master disable failed")
+            })?;
         }
+        super::common::detach_active()
+            .map_err(|_| PnpError::hardware_failure("virtio-net PCI detach failed"))?;
+        super::common::destroy_active();
         log::printk!("[virtio-net] PCI removed {}", dev.name);
+        Ok(())
     }
 }
 

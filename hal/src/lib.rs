@@ -25,13 +25,17 @@ pub mod user_context;
 /// 强制链接器保留稳定 HAL 直接符号所在的代码生成单元。
 #[doc(hidden)]
 pub fn kernel_symbol_catalog_anchor() -> usize {
-    abi::decode_dev_t as usize
+    let anchor = abi::decode_dev_t as usize
         ^ console::early_write_bytes as usize
         ^ interrupt::save_and_disable_local as usize
         ^ interrupt::restore_local as usize
         ^ memory::page_size as usize
+        ^ memory::dma_clean_range as usize
+        ^ memory::dma_invalidate_range as usize
+        ^ memory::device_io_barrier as usize
         ^ platform::arch_name as usize
         ^ time::monotonic_ns as usize
         ^ user::default_stack_top as usize
-        ^ user_context::set_kernel_trap_stack as usize
+        ^ user_context::set_kernel_trap_stack as usize;
+    anchor
 }

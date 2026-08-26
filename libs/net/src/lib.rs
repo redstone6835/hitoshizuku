@@ -43,5 +43,5 @@ pub use socket::{
 /// 保留网络子系统的 ELM provider 规格代码生成单元。
 #[doc(hidden)]
 pub fn kernel_symbol_catalog_anchor() -> usize {
-    elm::providers as usize
+    elm::providers as usize ^ buf::PacketFragment::as_slice as usize
 }

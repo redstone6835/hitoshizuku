@@ -42,8 +42,10 @@ ownership，`net-stack` 处理 flow shard 的协议状态。
 默认策略按职责而不是目录名划分。基础、通用且启动后持续使用的
 `platform.firmware-bus`、`platform.uart16550`、`kernel.random`、`net.stack`、
 `net.loopback`、`language.runtime` 使用 `y`；板级或架构特定的中断控制器、RTC，以及可选的
-syscon、fw_cfg、CFI Flash 和 VirtIO 设备链使用 `m`。`m` 模块仍按 `after` 与 `depends` 顺序
-装载，不代表它们是不受支持的次级实现。
+syscon、fw_cfg、CFI Flash 和 VirtIO 设备链使用 `m`。新增的 Loongson/LS2K、
+RISC-V IOMMU、RISC-V PMU、通用 DT provider、PCI host 和 platform AHCI 驱动也统一默认
+为 `m`；具体板型只有在启动关键路径确实要求内置时才覆盖为 `y`。`m` 模块仍按 `after` 与
+`depends` 顺序装载，不代表它们是不受支持的次级实现。
 
 从仓库根目录生成默认配置、调整选项并构建当前模块集合：
 
@@ -76,7 +78,23 @@ cargo check -p virtio-block --lib --target riscv64gc-unknown-none-elf
 | [`firmware-bus`](firmware-bus/) | `platform.firmware-bus` | 从固件描述建立 platform 设备与资源 |
 | [`loongson-irq`](loongson-irq/) | `platform.loongson-irq` | LoongArch64 Loongson 中断控制器 |
 | [`plic`](plic/) | `platform.plic` | RISC-V PLIC 中断域 |
+| [`riscv-iommu`](riscv-iommu/) | `platform.riscv-iommu` | RISC-V IOMMU 1.0 platform/PCI 控制器 |
+| [`riscv-pmu`](riscv-pmu/) | `platform.riscv-pmu` | RISC-V 固件 PMU event/counter 约束 |
+| [`dt-providers`](dt-providers/) | `platform.dt-providers` | 标准 DT fixed-clock 与 fixed-factor-clock provider |
+| [`loongson-clk`](loongson-clk/) | `platform.loongson-clk` | LS2X 时钟树速率 provider |
+| [`loongson-pinctrl-gpio`](loongson-pinctrl-gpio/) | `platform.loongson-pinctrl-gpio` | LS2K1000 pinctrl 与 Loongson GPIO provider |
+| [`loongson-apbdma`](loongson-apbdma/) | `platform.loongson-apbdma` | LS2X APB-DMA selector 与单通道 provider |
+| [`ahci`](ahci/) | `platform.ahci` | LS2K1000 platform AHCI/SATA 块设备 |
+| [`loongson-sdio`](loongson-sdio/) | `platform.loongson-sdio` | LS2K SD/eMMC 块设备 |
+| [`pci-host-ecam`](pci-host-ecam/) | `platform.pci-host-ecam` | 通用 CAM/ECAM 与 LS2K1000 PCI host |
 | [`syscon`](syscon/) | `platform.syscon` | 固件 syscon、电源和复位操作 |
+| [`ls2k-gmac`](ls2k-gmac/) | `platform.ls2k-gmac` | LS2K1000 DWMAC 以太网设备 |
+| [`ls2k-i2c`](ls2k-i2c/) | `platform.ls2k-i2c` | LS2K I2C 总线 function |
+| [`ls2k-spi`](ls2k-spi/) | `platform.ls2k-spi` | LS2K SPI master 与 SPI-NOR flash |
+| [`ls2k-tsensor`](ls2k-tsensor/) | `platform.ls2k-tsensor` | LS2K 温度读取与阈值 IRQ |
+| [`ls2k-usb`](ls2k-usb/) | `platform.ls2k-usb` | LS2K1000 DWC2/EHCI/OHCI USB host |
+| [`ls2x-wdt`](ls2x-wdt/) | `platform.ls2x-wdt` | LS2X 看门狗 function |
+| [`ls2k-rtc`](ls2k-rtc/) | `platform.ls2k-rtc` | LS2K RTC、alarm 与 realtime source |
 | [`ls7a-rtc`](ls7a-rtc/) | `platform.ls7a-rtc` | LoongArch64 LS7A RTC |
 | [`goldfish-rtc`](goldfish-rtc/) | `platform.goldfish-rtc` | RISC-V/QEMU Goldfish RTC |
 | [`fw-cfg`](fw-cfg/) | `platform.fw-cfg` | QEMU fw_cfg 数据通道 |

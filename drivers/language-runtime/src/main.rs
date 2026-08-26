@@ -8,7 +8,11 @@ use elm::{
     ElmModule, HookError, HookResult, LifecycleContext, ManagedRequest, ManagedResult,
     ProviderReply,
 };
-use elm_language_abi::{
+#[cfg(not(feature = "elm-integrated"))]
+use elm_language_abi as language_abi;
+#[cfg(feature = "elm-integrated")]
+use general::language_abi;
+use language_abi::{
     LanguageBackendCancelAckV1, LanguageBackendCompleteRequestV1, LanguageBackendDescriptorV1,
     LanguageBackendNextRequestV1, LanguageBackendRequestV1, LanguageCancelRequestV1,
     LanguageDelegatedKernelCallRequestV2, LanguageDelegatedResourceRequestV2,
@@ -25,8 +29,8 @@ mod language_runtime;
 
 struct LanguageRuntimeElm;
 
-fn owner(request: &ManagedRequest) -> elm_language_abi::LanguageOwnerV1 {
-    elm_language_abi::LanguageOwnerV1::new(request.caller_cell_id, request.caller_generation)
+fn owner(request: &ManagedRequest) -> language_abi::LanguageOwnerV1 {
+    language_abi::LanguageOwnerV1::new(request.caller_cell_id, request.caller_generation)
 }
 
 fn invalid() -> HookError {
@@ -34,7 +38,7 @@ fn invalid() -> HookError {
 }
 
 fn decode<T: LanguageWire>(payload: &[u8]) -> Result<T, HookError> {
-    elm_language_abi::decode(payload).map_err(|error| HookError::new(error.status().raw()))
+    language_abi::decode(payload).map_err(|error| HookError::new(error.status().raw()))
 }
 
 fn encode<T: LanguageWire>(value: &T) -> Result<ProviderReply, HookError> {
@@ -70,7 +74,7 @@ impl ElmModule for LanguageRuntimeElm {
     }
 
     fn initialize(&mut self, context: &LifecycleContext) -> HookResult {
-        language_runtime::initialize_for_provider(elm_language_abi::LanguageOwnerV1::new(
+        language_runtime::initialize_for_provider(language_abi::LanguageOwnerV1::new(
             context.cell_id(),
             context.generation(),
         ));
@@ -88,7 +92,7 @@ impl ElmModule for LanguageRuntimeElm {
     }
 
     fn resume(&mut self, context: &LifecycleContext) -> HookResult {
-        language_runtime::resume_for_provider(elm_language_abi::LanguageOwnerV1::new(
+        language_runtime::resume_for_provider(language_abi::LanguageOwnerV1::new(
             context.cell_id(),
             context.generation(),
         ));

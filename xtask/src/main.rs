@@ -57,35 +57,49 @@ fn configure(root: &Path, mode: &str) -> Result<(), String> {
 
 fn build_modules(root: &Path, args: &[String]) -> Result<(), String> {
     let options = BuildOptions::parse(args)?;
-    let target = options.target.as_deref().unwrap_or(DEFAULT_TARGET);
-    let arch = target_arch(target)?;
-    let config = options.config.as_deref().unwrap_or(".config");
+    let context = BuildContext::resolve(&options)?;
     let output = options
         .output
         .clone()
-        .unwrap_or_else(|| format!("build/{arch}/modules"));
-    let target_dir = options
-        .target_dir
-        .clone()
-        .unwrap_or_else(|| format!("target/{arch}"));
+        .unwrap_or_else(|| context.default_module_output());
 
-    ensure_config(root, config)?;
-    let cargo_target = root.join(&target_dir);
-    cargo(
+    build_modules_to(root, &options, &context, &output)
+}
+
+fn build_modules_to(
+    root: &Path,
+    options: &BuildOptions,
+    context: &BuildContext,
+    output: &str,
+) -> Result<(), String> {
+    ensure_config(root, &context.config)?;
+    let cargo_target = root.join(&context.target_dir);
+    let mut kernel_environment = vec![("CARGO_TARGET_DIR", cargo_target.as_os_str().to_owned())];
+    context
+        .board
+        .append_kernel_environment(&mut kernel_environment);
+    cargo_with_env(
         root,
-        ["build", "-p", "kernel", "--target", target, "--release"],
-        Some(("CARGO_TARGET_DIR", cargo_target.as_os_str().to_owned())),
+        vec![
+            "build".into(),
+            "-p".into(),
+            "kernel".into(),
+            "--target".into(),
+            context.target.clone().into(),
+            "--release".into(),
+        ],
+        &kernel_environment,
     )?;
 
-    let kernel = cargo_target.join(target).join("release/kernel");
-    let interface = root.join(format!("build/elm-interface/{arch}"));
+    let kernel = cargo_target.join(&context.target).join("release/kernel");
+    let interface = root.join(&context.interface_dir);
     cargo_elm_with_env(
         root,
         vec![
             "profile-export".into(),
             kernel.as_os_str().to_owned(),
             "--target".into(),
-            target.into(),
+            context.target.clone().into(),
             "--profile".into(),
             "hitoshizuku-default".into(),
             "--output".into(),
@@ -98,13 +112,13 @@ fn build_modules(root: &Path, args: &[String]) -> Result<(), String> {
         "build-set".into(),
         "drivers/Modules.toml".into(),
         "--config".into(),
-        config.into(),
+        context.config.clone().into(),
         "--target".into(),
-        target.into(),
+        context.target.clone().into(),
         "--output".into(),
         output.into(),
     ];
-    if let Some(features) = options.features {
+    if let Some(features) = options.features.as_deref() {
         command.push("--features".into());
         command.push(features.into());
     }
@@ -123,21 +137,15 @@ fn build_modules(root: &Path, args: &[String]) -> Result<(), String> {
 
 fn build_kernel(root: &Path, args: &[String]) -> Result<(), String> {
     let options = BuildOptions::parse(args)?;
-    let target = options.target.as_deref().unwrap_or(DEFAULT_TARGET);
-    let arch = target_arch(target)?;
-    let config = options.config.as_deref().unwrap_or(".config");
-    let target_dir = options
-        .target_dir
-        .clone()
-        .unwrap_or_else(|| format!("target/{arch}"));
-    ensure_config(root, config)?;
+    let context = BuildContext::resolve(&options)?;
+    ensure_config(root, &context.config)?;
 
     let module_output = options
         .modules
         .clone()
-        .unwrap_or_else(|| format!("build/{arch}/modules"));
-    if !Path::new(&root.join(&module_output).join("modules.manifest")).exists() {
-        build_modules(root, args)?;
+        .unwrap_or_else(|| context.default_module_output());
+    if !root.join(&module_output).join("modules.manifest").is_file() {
+        build_modules_to(root, &options, &context, &module_output)?;
     }
 
     let manifest = root.join(&module_output).join("modules.manifest");
@@ -167,14 +175,18 @@ fn build_kernel(root: &Path, args: &[String]) -> Result<(), String> {
     if let Some(initramfs) = options.initramfs {
         environment.push(("INITRAMFS", initramfs.into()));
     }
-    environment.push(("CARGO_TARGET_DIR", root.join(target_dir).into_os_string()));
+    environment.push((
+        "CARGO_TARGET_DIR",
+        root.join(&context.target_dir).into_os_string(),
+    ));
+    context.board.append_kernel_environment(&mut environment);
 
     let mut command: Vec<OsString> = vec![
         "build".into(),
         "-p".into(),
         "kernel".into(),
         "--target".into(),
-        target.into(),
+        context.target.into(),
         "--release".into(),
     ];
     if let Some(features) = options.features {
@@ -213,6 +225,7 @@ fn target_arch(target: &str) -> Result<&'static str, String> {
 }
 
 struct BuildOptions {
+    board: Board,
     target: Option<String>,
     config: Option<String>,
     output: Option<String>,
@@ -225,6 +238,7 @@ struct BuildOptions {
 impl BuildOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut options = Self {
+            board: Board::Qemu,
             target: None,
             config: None,
             output: None,
@@ -242,6 +256,7 @@ impl BuildOptions {
                     .ok_or_else(|| format!("{key} requires a value"))
             };
             match key {
+                "--board" => options.board = Board::parse(&value()?)?,
                 "--target" => options.target = Some(value()?),
                 "--config" => options.config = Some(value()?),
                 "--output" => options.output = Some(value()?),
@@ -254,6 +269,124 @@ impl BuildOptions {
             index += 2;
         }
         Ok(options)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Board {
+    Qemu,
+    Ls2k1000,
+    VisionFive2,
+}
+
+impl Board {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "qemu" => Ok(Self::Qemu),
+            "ls2k1000" => Ok(Self::Ls2k1000),
+            "visionfive2" => Ok(Self::VisionFive2),
+            other => Err(format!(
+                "unsupported board {other:?}; expected qemu, ls2k1000, or visionfive2"
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Qemu => "qemu",
+            Self::Ls2k1000 => "ls2k1000",
+            Self::VisionFive2 => "visionfive2",
+        }
+    }
+
+    fn default_target(self) -> &'static str {
+        match self {
+            Self::Qemu | Self::Ls2k1000 => DEFAULT_TARGET,
+            Self::VisionFive2 => RISCV_TARGET,
+        }
+    }
+
+    fn default_config(self) -> &'static str {
+        match self {
+            Self::Qemu => ".config",
+            Self::Ls2k1000 => "configs/ls2k1000.config",
+            Self::VisionFive2 => "configs/visionfive2.config",
+        }
+    }
+
+    fn validate_target(self, target: &str) -> Result<(), String> {
+        let valid = match self {
+            Self::Qemu => matches!(target, DEFAULT_TARGET | RISCV_TARGET),
+            Self::Ls2k1000 => target == DEFAULT_TARGET,
+            Self::VisionFive2 => target == RISCV_TARGET,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(format!(
+                "board {:?} does not support target {target:?}; expected {:?}",
+                self.name(),
+                self.default_target()
+            ))
+        }
+    }
+
+    fn append_kernel_environment(self, environment: &mut Vec<(&'static str, OsString)>) {
+        let value = match self {
+            Self::Ls2k1000 => "ls2k1000",
+            Self::Qemu | Self::VisionFive2 => "",
+        };
+        environment.push(("MYGO_LA_BOARD", value.into()));
+    }
+}
+
+struct BuildContext {
+    board: Board,
+    target: String,
+    arch: &'static str,
+    config: String,
+    target_dir: String,
+    interface_dir: String,
+}
+
+impl BuildContext {
+    fn resolve(options: &BuildOptions) -> Result<Self, String> {
+        let target = options
+            .target
+            .as_deref()
+            .unwrap_or_else(|| options.board.default_target());
+        options.board.validate_target(target)?;
+        let arch = target_arch(target)?;
+        let board_suffix = (options.board != Board::Qemu).then(|| options.board.name());
+        let target_dir = options
+            .target_dir
+            .clone()
+            .unwrap_or_else(|| match board_suffix {
+                Some(board) => format!("target/{arch}/{board}"),
+                None => format!("target/{arch}"),
+            });
+        let interface_dir = match board_suffix {
+            Some(board) => format!("build/elm-interface/{arch}/{board}"),
+            None => format!("build/elm-interface/{arch}"),
+        };
+        Ok(Self {
+            board: options.board,
+            target: target.to_string(),
+            arch,
+            config: options
+                .config
+                .clone()
+                .unwrap_or_else(|| options.board.default_config().to_string()),
+            target_dir,
+            interface_dir,
+        })
+    }
+
+    fn default_module_output(&self) -> String {
+        match self.board {
+            Board::Qemu => format!("build/{}/modules", self.arch),
+            board => format!("build/{}/{}/modules", self.arch, board.name()),
+        }
     }
 }
 
@@ -348,9 +481,111 @@ fn print_help() {
     println!(
         "cargo xtask commands:\n\
   config | oldconfig | defconfig\n\
-  modules [--target <triple>] [--config <path>] [--output <dir>]\n\
-  build [--target <triple>] [--config <path>] [--features <a,b>] [--initramfs <cpio>]\n\
+  modules [--board <qemu|ls2k1000|visionfive2>] [--target <triple>] [--config <path>] [--output <dir>]\n\
+  build [--board <qemu|ls2k1000|visionfive2>] [--target <triple>] [--config <path>] [--features <a,b>] [--initramfs <cpio>]\n\
   clean\n\n\
+Board defaults select the matching target and config. QEMU keeps the existing architecture-level output paths; physical boards use isolated board-level paths.\n\
 The initramfs image is an input to `build`; image generation is intentionally separate."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(args: &[&str]) -> BuildOptions {
+        BuildOptions::parse(
+            &args
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .expect("valid build options")
+    }
+
+    #[test]
+    fn qemu_defaults_remain_architecture_scoped() {
+        let context = BuildContext::resolve(&options(&[])).expect("resolve QEMU defaults");
+        assert_eq!(context.board, Board::Qemu);
+        assert_eq!(context.target, DEFAULT_TARGET);
+        assert_eq!(context.config, ".config");
+        assert_eq!(context.target_dir, "target/loongarch64");
+        assert_eq!(context.interface_dir, "build/elm-interface/loongarch64");
+        assert_eq!(context.default_module_output(), "build/loongarch64/modules");
+    }
+
+    #[test]
+    fn physical_board_defaults_are_isolated() {
+        let context = BuildContext::resolve(&options(&["--board", "visionfive2"]))
+            .expect("resolve VisionFive 2 defaults");
+        assert_eq!(context.target, RISCV_TARGET);
+        assert_eq!(context.config, "configs/visionfive2.config");
+        assert_eq!(context.target_dir, "target/riscv64/visionfive2");
+        assert_eq!(
+            context.interface_dir,
+            "build/elm-interface/riscv64/visionfive2"
+        );
+        assert_eq!(
+            context.default_module_output(),
+            "build/riscv64/visionfive2/modules"
+        );
+    }
+
+    #[test]
+    fn explicit_paths_override_board_defaults() {
+        let context = BuildContext::resolve(&options(&[
+            "--board",
+            "ls2k1000",
+            "--config",
+            "local.config",
+            "--target-dir",
+            "target/custom",
+        ]))
+        .expect("resolve path overrides");
+        assert_eq!(context.config, "local.config");
+        assert_eq!(context.target_dir, "target/custom");
+    }
+
+    #[test]
+    fn ls2k1000_selects_board_linker_for_kernel_builds() {
+        let context = BuildContext::resolve(&options(&["--board", "ls2k1000"]))
+            .expect("resolve LS2K1000 defaults");
+        let mut environment = Vec::new();
+        context.board.append_kernel_environment(&mut environment);
+        assert_eq!(
+            environment,
+            vec![("MYGO_LA_BOARD", OsString::from("ls2k1000"))]
+        );
+    }
+
+    #[test]
+    fn qemu_clears_inherited_physical_board_selection() {
+        let context =
+            BuildContext::resolve(&options(&["--board", "qemu"])).expect("resolve QEMU defaults");
+        let mut environment = Vec::new();
+        context.board.append_kernel_environment(&mut environment);
+        assert_eq!(environment, vec![("MYGO_LA_BOARD", OsString::new())]);
+    }
+
+    #[test]
+    fn board_target_mismatch_is_rejected() {
+        let error = BuildContext::resolve(&options(&[
+            "--board",
+            "visionfive2",
+            "--target",
+            DEFAULT_TARGET,
+        ]))
+        .err()
+        .expect("mismatched target must fail");
+        assert!(error.contains("visionfive2"));
+        assert!(error.contains(DEFAULT_TARGET));
+    }
+
+    #[test]
+    fn unknown_board_is_rejected() {
+        let error = BuildOptions::parse(&["--board".into(), "unknown".into()])
+            .err()
+            .expect("unknown board must fail");
+        assert!(error.contains("unsupported board"));
+    }
 }

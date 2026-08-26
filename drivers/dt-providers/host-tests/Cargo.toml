@@ -1,0 +1,14 @@
+[package]
+name = "dt-providers-host-tests"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+general = { path = "../../../general" }
+log = { path = "../../../libs/log" }

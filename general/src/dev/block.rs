@@ -703,6 +703,13 @@ impl BlockDevice {
         self.state() == DeviceState::Active
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.block.BlockDevice.mark_gone",
+        contract = "kernel.general.block-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn mark_gone(&self) {
         self.state.store(DeviceState::Gone as u8, Ordering::Release);
     }

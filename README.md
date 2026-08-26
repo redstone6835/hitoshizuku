@@ -229,6 +229,8 @@ rootfs 或磁盘镜像；需要嵌入 initramfs 时，把外部工程生成的 C
 
 ```sh
 cargo xtask build --target riscv64gc-unknown-none-elf
+cargo xtask build --board ls2k1000
+cargo xtask build --board visionfive2
 cargo check --workspace --lib --target loongarch64-unknown-none
 cargo check -p platform-uart16550 --lib --target loongarch64-unknown-none
 cargo check -p virtio-block --lib --target riscv64gc-unknown-none-elf
@@ -249,8 +251,9 @@ cargo xtask config
 cargo xtask modules --target loongarch64-unknown-none
 ```
 
-目标、链接脚本、交叉 C 编译器和 Rust 编译参数位于 [`.cargo/config.toml`](.cargo/config.toml)；EFI
-路径所需的少量 C 辅助代码由 [`libs/efi/build.rs`](libs/efi/build.rs) 通过 Cargo 编译。
+目标、交叉 C 编译器和 Rust 编译参数位于 [`.cargo/config.toml`](.cargo/config.toml)，链接脚本
+由 `kernel/build.rs` 按 target 和 board 选择。LS2K1000 只保留 U-Boot/DTB 直接入口，不包含
+EFI stub 或 EFI 入口。
 
 ## Initramfs 边界
 
@@ -260,6 +263,8 @@ cargo xtask modules --target loongarch64-unknown-none
 ## 文档入口
 
 - [架构设计](ARCHITECTURE.md)：crate 依赖、驱动边界和构建产物。
+- [LS2K1000LA 板级指南](BOARD_LS2K1000.md)：U-Boot/DTB 直启、镜像制作和驱动验证。
+- [VisionFive 2 板级指南](BOARD_VISIONFIVE2.md)：OpenSBI/U-Boot 交接、板级 preset 和驱动边界。
 - [设备抽象](DEVICE_ABSTRACTION.md)：PnP、DeviceFunction、资源租约、驱动匹配和热拔契约。
 - [ELM 设计](ELM.md)：单元、端口、租约、DeviceFunction 和 EBI。
 - [Language Runtime](LANGUAGE_RUNTIME.md)：通用外语 ELM 底层 ABI、所有权、安全与仓库边界。

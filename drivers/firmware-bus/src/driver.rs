@@ -66,6 +66,7 @@ impl PnpDriver for FirmwareBusPlatformDriver {
         let info = platform_info(dev)?;
         let descriptor = firmware_bus_descriptor(info)?;
         let bus = Arc::new(DtbFirmwareBus { descriptor });
+        dev.reserve_owned_resources(1)?;
         let handle = firmware_bus::register(bus.clone()).map_err(map_firmware_bus_error)?;
         if let Err(err) =
             dev.own_resource(firmware_bus::pnp_resource(handle, "platform-firmware-bus"))
@@ -115,8 +116,22 @@ fn firmware_bus_descriptor(info: &PlatformDeviceInfo) -> Result<FirmwareBusDescr
             crate::dev::pnp::PnpResourceKind::FirmwareBus,
             "parent #address-cells missing",
         ))?;
+    let raw_ranges = info.bytes_property(PROP_RANGES).ok_or(PnpError::missing(
+        crate::dev::pnp::PnpResourceKind::FirmwareBus,
+        "ranges property missing",
+    ))?;
+    let range_cells: Vec<u32> = if raw_ranges.is_empty() {
+        Vec::new()
+    } else {
+        info.u32_list_property(PROP_RANGES)
+            .ok_or(PnpError::malformed(
+                crate::dev::pnp::PnpResourceKind::FirmwareBus,
+                "ranges is not a cell array",
+            ))?
+            .collect()
+    };
     let ranges = parse_ranges(
-        info.u32_list_property(PROP_RANGES).unwrap_or(&[]),
+        &range_cells,
         child_address_cells as usize,
         parent_address_cells as usize,
         child_size_cells as usize,

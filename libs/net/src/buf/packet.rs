@@ -80,6 +80,12 @@ impl PacketFragment {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "net.buf.PacketFragment.as_slice",
+        contract = "kernel.net.buffer-ownership@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
     pub fn as_slice(&self) -> Result<&[u8], super::NetBufPoolError> {
         match self {
             Self::Exclusive(lease) => lease.as_slice(),

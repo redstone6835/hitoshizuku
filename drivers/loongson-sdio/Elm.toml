@@ -1,0 +1,7 @@
+[elm]
+name = "platform.loongson-sdio"
+version = "0.1.0"
+kind = "driver"
+source = "kernel-tree:drivers.loongson-sdio"
+mode = "m"
+integrated_phase = "device"

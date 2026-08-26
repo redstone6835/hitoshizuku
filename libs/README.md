@@ -12,6 +12,7 @@
 | `vfs`、`fatfs`、`extfs`、`elf` | 文件系统、镜像和可执行文件解析 |
 | `elm`、`elm-loader`、`kernel-symbols` | ELM 运行时、装载和内核符号导出 |
 | `native-abi`、`soyo` | Native ABI 与 SOYO wire 格式 |
+| `fdt` | 无分配 FDT 校验视图，以及可选的索引、地址翻译和 overlay 支持 |
 | `efi`、`acpi` | 固件和启动辅助 |
 | `log`、`errno`、`profiling`、`kcsan`、`ktest` | 基础设施、诊断和测试支持 |
 

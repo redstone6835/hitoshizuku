@@ -2,6 +2,7 @@
 resolver = "2"
 default-members = ["kernel"]
 members = [
+    "libs/fdt",
     "libs/ktest",
     "libs/ktest/ktest-mock",
     "libs/errno",

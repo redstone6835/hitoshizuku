@@ -35,15 +35,65 @@ impl<'a> Cmdline<'a> {
     }
 
     /// 查找指定键对应的值。重复键返回最后一个值。
+    ///
+    /// 空白分隔 token，单/双引号可以包裹含空白的值，独立的 `--` 之后不再
+    /// 把内容视为内核参数。返回值直接借用原始命令行，因此只去掉成对的
+    /// 外层引号，不展开反斜杠转义。
     pub fn find(&self, key: &str) -> Option<&'a str> {
         let mut found = None;
-        for item in self.text.split_ascii_whitespace() {
-            let Some((item_key, value)) = item.split_once('=') else {
+        let bytes = self.text.as_bytes();
+        let key_bytes = key.as_bytes();
+        let mut cursor = 0usize;
+
+        while cursor < bytes.len() {
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor == bytes.len() {
+                break;
+            }
+
+            let token_start = cursor;
+            let mut quote = None;
+            let mut equals = None;
+            while cursor < bytes.len() {
+                let byte = bytes[cursor];
+                if let Some(expected) = quote {
+                    if byte == expected {
+                        quote = None;
+                    }
+                } else if byte == b'\'' || byte == b'"' {
+                    quote = Some(byte);
+                } else if byte == b'=' && equals.is_none() {
+                    equals = Some(cursor);
+                } else if byte.is_ascii_whitespace() {
+                    break;
+                }
+                cursor += 1;
+            }
+
+            let token_end = cursor;
+            if equals.is_none() && &bytes[token_start..token_end] == b"--" {
+                break;
+            }
+            let Some(equals) = equals else {
                 continue;
             };
-            if item_key == key {
-                found = Some(value);
+            if &bytes[token_start..equals] != key_bytes {
+                continue;
             }
+
+            let value_start = equals + 1;
+            let value = if value_start < token_end
+                && (bytes[value_start] == b'\'' || bytes[value_start] == b'"')
+                && token_end > value_start + 1
+                && bytes[token_end - 1] == bytes[value_start]
+            {
+                &self.text[value_start + 1..token_end - 1]
+            } else {
+                &self.text[value_start..token_end]
+            };
+            found = Some(value);
         }
         found
     }

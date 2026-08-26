@@ -189,6 +189,21 @@ pub fn pnp_resource(handle: SysconHandle, label: &'static str) -> PnpHandleResou
     )
 }
 
+/// 在常驻 General 侧构造完成类型擦除的 syscon registration 资源。
+#[kernel_symbols::export(
+    name = "general.dev.syscon.pnp_resource_boxed",
+    contract = "kernel.general.syscon@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn pnp_resource_boxed(
+    handle: SysconHandle,
+    label: &'static str,
+) -> alloc::boxed::Box<dyn crate::dev::pnp::PnpResource> {
+    alloc::boxed::Box::new(pnp_resource(handle, label))
+}
+
 #[kernel_symbols::export(
     name = "general.dev.syscon.get",
     contract = "kernel.general.syscon@1",

@@ -78,6 +78,7 @@ impl DeviceClassId {
     pub const CHAR: Self = Self::new("char");
     pub const BLOCK: Self = Self::new("block");
     pub const RTC: Self = Self::new("rtc");
+    pub const WDT: Self = Self::new("wdt");
 
     pub const fn new(name: &'static str) -> Self {
         Self {

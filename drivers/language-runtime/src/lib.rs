@@ -3,7 +3,11 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use elm_language_abi::{
+#[cfg(not(feature = "elm-integrated"))]
+use elm_language_abi as language_abi;
+#[cfg(feature = "elm-integrated")]
+use general::language_abi;
+use language_abi::{
     LANGUAGE_BACKEND_FLAG_ASYNC, LANGUAGE_BACKEND_FLAG_CANCEL, LANGUAGE_BUFFER_LEASE_READ,
     LANGUAGE_BUFFER_LEASE_WRITE, LANGUAGE_CANCEL_REASON_DRAIN, LANGUAGE_CANCEL_REASON_QUIESCE,
     LANGUAGE_CANCEL_REASON_REQUESTED, LANGUAGE_CAPABILITY_BUFFER_READ,
@@ -219,7 +223,7 @@ struct RequestRecord {
     state: LanguageRequestState,
     status: LanguageRuntimeStatus,
     result_len: u16,
-    result: [u8; elm_language_abi::LANGUAGE_FRAME_PAYLOAD_LEN],
+    result: [u8; language_abi::LANGUAGE_FRAME_PAYLOAD_LEN],
     cancellation: Option<CancellationRecord>,
     delegation: Option<DelegationRecord>,
 }
@@ -668,7 +672,7 @@ impl RuntimeRegistry {
             state: LanguageRequestState::Queued,
             status: LanguageRuntimeStatus::OK,
             result_len: 0,
-            result: [0; elm_language_abi::LANGUAGE_FRAME_PAYLOAD_LEN],
+            result: [0; language_abi::LANGUAGE_FRAME_PAYLOAD_LEN],
             cancellation: None,
             delegation: delegation.map(DelegationRecord::pending),
         });
@@ -1861,7 +1865,7 @@ pub fn delegated_kernel_call(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use elm_language_abi::{LANGUAGE_BACKEND_FLAG_ASYNC, LANGUAGE_BACKEND_FLAG_CANCEL};
+    use language_abi::{LANGUAGE_BACKEND_FLAG_ASYNC, LANGUAGE_BACKEND_FLAG_CANCEL};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     const OWNER: LanguageOwnerV1 = LanguageOwnerV1::new(11, 3);
@@ -1906,10 +1910,10 @@ mod tests {
 
     fn delegation_policy() -> LanguageDelegationPolicyV1 {
         LanguageDelegationPolicyV1::new(
-            elm_language_abi::LANGUAGE_DELEGATION_FLAG_RESOURCE
-                | elm_language_abi::LANGUAGE_DELEGATION_FLAG_KERNEL_CALL,
+            language_abi::LANGUAGE_DELEGATION_FLAG_RESOURCE
+                | language_abi::LANGUAGE_DELEGATION_FLAG_KERNEL_CALL,
             LANGUAGE_CAPABILITY_BUFFER_READ | LANGUAGE_CAPABILITY_BUFFER_WRITE,
-            elm_language_abi::language_delegation_resource_opcode_bit(
+            language_abi::language_delegation_resource_opcode_bit(
                 LANGUAGE_RESOURCE_OPCODE_BUFFER_CREATE,
             )
             .unwrap(),
@@ -1986,7 +1990,7 @@ mod tests {
         let descriptor = LanguageBackendDescriptorV1::new(
             1,
             7,
-            elm_language_abi::LANGUAGE_BACKEND_FLAG_SYNC,
+            language_abi::LANGUAGE_BACKEND_FLAG_SYNC,
             0,
             4,
             8,
@@ -2206,7 +2210,7 @@ mod tests {
             LanguageHandle::INVALID,
             LanguageHandle::INVALID,
             100,
-            elm_language_abi::LANGUAGE_RESOURCE_OPCODE_BUFFER_CREATE,
+            language_abi::LANGUAGE_RESOURCE_OPCODE_BUFFER_CREATE,
         );
         assert_eq!(
             resource_request(OWNER, resource_frame).status,

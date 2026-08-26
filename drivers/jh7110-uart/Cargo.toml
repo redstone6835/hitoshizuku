@@ -1,0 +1,40 @@
+[package]
+name = "platform-jh7110-uart"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "platform-jh7110-uart"
+path = "src/main.rs"
+test = false
+bench = false
+
+[lib]
+name = "platform_jh7110_uart"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false
+
+[features]
+default = []
+elm-integrated = []
+
+[dependencies]
+net = { path = "../../libs/net", default-features = false }
+socket = { path = "../../libs/socket", default-features = false }
+mm = { path = "../../libs/mm", default-features = false }
+hal = { path = "../../hal", default-features = false }
+fatfs = { path = "../../libs/fatfs", default-features = false }
+extfs = { path = "../../libs/extfs", default-features = false }
+errno = { path = "../../libs/errno", default-features = false }
+elf = { path = "../../libs/elf", default-features = false }
+efi = { path = "../../libs/efi", default-features = false }
+acpi = { path = "../../libs/acpi", default-features = false }
+elm = { path = "../../libs/elm", default-features = false, features = ["module", "macros"] }
+allocator = { path = "../../libs/allocator", default-features = false }
+general = { path = "../../general", default-features = false }
+log = { path = "../../libs/log", default-features = false }
+sched = { path = "../../libs/sched", default-features = false }
+vfs = { path = "../../libs/vfs", default-features = false }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }

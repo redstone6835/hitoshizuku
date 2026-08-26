@@ -129,7 +129,7 @@ pub(crate) fn validate_catalog() -> Result<(), KernelSymbolError> {
 
 /// 计算当前链接目录的规范 API Profile 摘要。
 pub(crate) fn catalog_profile_hash() -> Result<[u8; 32], KernelSymbolError> {
-    const DOMAIN: &[u8] = b"ELM-KERNEL-API-PROFILE-V1\0";
+    const DOMAIN: &[u8] = b"ELM-KERNEL-API-PROFILE-V2\0";
     const ABI_MODE: &[u8] = b"exact-rust";
 
     let mut symbols = catalog()?.iter().collect::<Vec<_>>();
@@ -142,6 +142,7 @@ pub(crate) fn catalog_profile_hash() -> Result<[u8; 32], KernelSymbolError> {
     let mut hash = elm_model::Sha256::new();
     hash.update(DOMAIN);
     hash.update(&KERNEL_API_BRIDGE_ABI_VERSION.to_le_bytes());
+    hash.update(&kernel_symbols::KERNEL_INTERFACE_SOURCE_SHA256);
     hash.update(&(symbols.len() as u64).to_le_bytes());
     for symbol in symbols {
         hash.update(&[symbol.kind]);
