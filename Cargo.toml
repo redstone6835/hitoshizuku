@@ -17,7 +17,6 @@ members = [
     "libs/socket",
     "libs/net",
     "libs/vfs",
-    "libs/acpi",
     "libs/fatfs",
     "libs/extfs",
     "libs/elm",
@@ -38,6 +37,10 @@ members = [
     "drivers/virtio/consumer-api"
 ]
 exclude = ["tests/elm/kernel-mixin"]
+
+[workspace.dependencies]
+acpi = { version = "=5.2.0", default-features = false }
+aml = "=0.16.4"
 
 [workspace.package]
 version = "0.1.0"

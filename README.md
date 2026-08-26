@@ -156,6 +156,11 @@ cargo install --locked --git \
 `riscv64-unknown-elf-gcc` 伪装或链接成其它命令。SOYO 的 C header 集成测试位于独立
 链接器仓库，需要时再安装 `clang`。
 
+ACPI 的 AML 解释器使用 crates.io 发布的 `aml 0.16.4`。该版本仍以
+`#![feature(decl_macro)]` 实现解析宏，因此 `.cargo/config.toml` 将
+`RUSTC_BOOTSTRAP` 严格限定为 `aml` 这个依赖；项目自身 crate 仍使用系统默认 stable
+工具链，不获得 unstable feature 权限。
+
 Fedora 可以直接使用发行版签名仓库中的交叉编译器：
 
 ```sh

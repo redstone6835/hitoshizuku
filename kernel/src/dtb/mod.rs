@@ -101,7 +101,11 @@ pub fn kernel_start_init(context: &StartContext) {
     // 正常关机、重启还是错误路径上的兜底退出，都能通过统一接口回到本平台提供的
     // syscon 寄存器写入方案，而不需要再次接触 DTB 原始节点。
 
-    general::firmware::power::install(power_controls, context.address.phys_to_virt);
+    general::firmware::power::install_with_platform_ops(
+        power_controls,
+        context.address.device_mmio_to_virt,
+        None,
+    );
 
     // 步骤 3 初始化分层分配器。这个阶段会消费上面整理好的内存段、内核镜像占用区
     // 以及可选的外部 initramfs 范围。这里先建立物理地址与虚拟地址转换关系，再

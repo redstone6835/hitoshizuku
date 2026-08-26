@@ -2,6 +2,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::StartAcpiIoOps;
 use log::printk;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,13 +85,13 @@ pub enum PowerError {
     InvalidRegister,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Default)]
 struct RuntimePowerControlInfo {
     shutdown: Option<RuntimePowerControlMethod>,
     reboot: Option<RuntimePowerControlMethod>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 enum RuntimePowerControlMethod {
     RegisterWrite {
         register: RuntimePowerRegister,
@@ -108,11 +109,12 @@ enum RuntimePowerControlMethod {
     },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 struct RuntimePowerRegister {
     space: PowerRegisterSpace,
     address: usize,
     access_width: PowerAccessWidth,
+    io_ops: Option<StartAcpiIoOps>,
 }
 
 static POWER_CONTROLS_VALID: AtomicBool = AtomicBool::new(false);
@@ -131,13 +133,25 @@ pub fn clear() {
 
 #[kernel_symbols::export(name = "general.firmware.power.install", contract = "kernel.firmware.power@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE, retained_args = 1 << 1)]
 pub fn install(info: PowerControlInfo, phys_to_virt: fn(usize) -> usize) {
+    install_with_platform_ops(info, phys_to_virt, None);
+}
+
+/// 安装内核启动路径解析出的电源控制信息。
+///
+/// 该入口不是 ELM 导出 ABI。设备 MMIO 必须使用架构提供的设备地址转换，SystemIO
+/// 则只在 ACPI 启动路径提供了真实端口访问回调时可用。
+pub fn install_with_platform_ops(
+    info: PowerControlInfo,
+    device_mmio_to_virt: fn(usize) -> usize,
+    io_ops: Option<StartAcpiIoOps>,
+) {
     let runtime = RuntimePowerControlInfo {
         shutdown: info
             .shutdown
-            .map(|method| runtime_method(method, phys_to_virt)),
+            .map(|method| runtime_method(method, device_mmio_to_virt, io_ops)),
         reboot: info
             .reboot
-            .map(|method| runtime_method(method, phys_to_virt)),
+            .map(|method| runtime_method(method, device_mmio_to_virt, io_ops)),
     };
 
     unsafe {
@@ -154,12 +168,12 @@ pub fn install(info: PowerControlInfo, phys_to_virt: fn(usize) -> usize) {
 
 #[kernel_symbols::export(name = "general.firmware.power.install_shutdown", contract = "kernel.firmware.power@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE, retained_args = 1 << 1)]
 pub fn install_shutdown(method: PowerControlMethod, phys_to_virt: fn(usize) -> usize) {
-    install_one(Some(runtime_method(method, phys_to_virt)), None);
+    install_one(Some(runtime_method(method, phys_to_virt, None)), None);
 }
 
 #[kernel_symbols::export(name = "general.firmware.power.install_reboot", contract = "kernel.firmware.power@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE, retained_args = 1 << 1)]
 pub fn install_reboot(method: PowerControlMethod, phys_to_virt: fn(usize) -> usize) {
-    install_one(None, Some(runtime_method(method, phys_to_virt)));
+    install_one(None, Some(runtime_method(method, phys_to_virt, None)));
 }
 
 fn install_one(
@@ -217,12 +231,13 @@ fn load_controls() -> Result<RuntimePowerControlInfo, PowerError> {
 
 fn runtime_method(
     method: PowerControlMethod,
-    phys_to_virt: fn(usize) -> usize,
+    device_mmio_to_virt: fn(usize) -> usize,
+    io_ops: Option<StartAcpiIoOps>,
 ) -> RuntimePowerControlMethod {
     match method {
         PowerControlMethod::RegisterWrite { register, value } => {
             RuntimePowerControlMethod::RegisterWrite {
-                register: runtime_register(register, phys_to_virt),
+                register: runtime_register(register, device_mmio_to_virt, io_ops),
                 value,
             }
         }
@@ -232,8 +247,9 @@ fn runtime_method(
             sleep_type_a,
             sleep_type_b,
         } => RuntimePowerControlMethod::AcpiPm1Sleep {
-            pm1a_control: runtime_register(pm1a_control, phys_to_virt),
-            pm1b_control: pm1b_control.map(|register| runtime_register(register, phys_to_virt)),
+            pm1a_control: runtime_register(pm1a_control, device_mmio_to_virt, io_ops),
+            pm1b_control: pm1b_control
+                .map(|register| runtime_register(register, device_mmio_to_virt, io_ops)),
             sleep_type_a,
             sleep_type_b,
         },
@@ -241,7 +257,7 @@ fn runtime_method(
             sleep_control,
             sleep_type,
         } => RuntimePowerControlMethod::AcpiSleepControl {
-            sleep_control: runtime_register(sleep_control, phys_to_virt),
+            sleep_control: runtime_register(sleep_control, device_mmio_to_virt, io_ops),
             sleep_type,
         },
     }
@@ -249,16 +265,24 @@ fn runtime_method(
 
 fn runtime_register(
     register: PowerRegister,
-    phys_to_virt: fn(usize) -> usize,
+    device_mmio_to_virt: fn(usize) -> usize,
+    io_ops: Option<StartAcpiIoOps>,
 ) -> RuntimePowerRegister {
     let address = match register.space {
-        PowerRegisterSpace::SystemMemory => phys_to_virt(register.address),
+        PowerRegisterSpace::SystemMemory => {
+            if memory_address_valid(register.address, register.access_width) {
+                device_mmio_to_virt(register.address)
+            } else {
+                0
+            }
+        }
         PowerRegisterSpace::SystemIo => register.address,
     };
     RuntimePowerRegister {
         space: register.space,
         address,
         access_width: register.access_width,
+        io_ops,
     }
 }
 
@@ -296,13 +320,44 @@ fn write_pm1_sleep(register: RuntimePowerRegister, sleep_type: u8) -> Result<(),
 }
 
 fn read_register(register: RuntimePowerRegister) -> Result<u64, PowerError> {
-    if register.space != PowerRegisterSpace::SystemMemory {
-        return Err(PowerError::UnsupportedAddressSpace(register.space));
+    match register.space {
+        PowerRegisterSpace::SystemMemory => read_memory_register(register),
+        PowerRegisterSpace::SystemIo => {
+            let port = system_io_port(register)?;
+            let ops = register.io_ops.ok_or(PowerError::UnsupportedAddressSpace(
+                PowerRegisterSpace::SystemIo,
+            ))?;
+            Ok(match register.access_width {
+                PowerAccessWidth::U8 => (ops.read_u8)(port) as u64,
+                PowerAccessWidth::U16 => (ops.read_u16)(port) as u64,
+                PowerAccessWidth::U32 => (ops.read_u32)(port) as u64,
+                PowerAccessWidth::U64 => return Err(PowerError::InvalidRegister),
+            })
+        }
     }
-    if register.address == 0 {
-        return Err(PowerError::InvalidRegister);
-    }
+}
 
+fn write_register(register: RuntimePowerRegister, value: u64) -> Result<(), PowerError> {
+    match register.space {
+        PowerRegisterSpace::SystemMemory => write_memory_register(register, value),
+        PowerRegisterSpace::SystemIo => {
+            let port = system_io_port(register)?;
+            let ops = register.io_ops.ok_or(PowerError::UnsupportedAddressSpace(
+                PowerRegisterSpace::SystemIo,
+            ))?;
+            match register.access_width {
+                PowerAccessWidth::U8 => (ops.write_u8)(port, value as u8),
+                PowerAccessWidth::U16 => (ops.write_u16)(port, value as u16),
+                PowerAccessWidth::U32 => (ops.write_u32)(port, value as u32),
+                PowerAccessWidth::U64 => return Err(PowerError::InvalidRegister),
+            }
+            Ok(())
+        }
+    }
+}
+
+fn read_memory_register(register: RuntimePowerRegister) -> Result<u64, PowerError> {
+    validate_memory_register(register)?;
     let value = unsafe {
         match register.access_width {
             PowerAccessWidth::U8 => core::ptr::read_volatile(register.address as *const u8) as u64,
@@ -318,14 +373,8 @@ fn read_register(register: RuntimePowerRegister) -> Result<u64, PowerError> {
     Ok(value)
 }
 
-fn write_register(register: RuntimePowerRegister, value: u64) -> Result<(), PowerError> {
-    if register.space != PowerRegisterSpace::SystemMemory {
-        return Err(PowerError::UnsupportedAddressSpace(register.space));
-    }
-    if register.address == 0 {
-        return Err(PowerError::InvalidRegister);
-    }
-
+fn write_memory_register(register: RuntimePowerRegister, value: u64) -> Result<(), PowerError> {
+    validate_memory_register(register)?;
     unsafe {
         match register.access_width {
             PowerAccessWidth::U8 => {
@@ -341,4 +390,195 @@ fn write_register(register: RuntimePowerRegister, value: u64) -> Result<(), Powe
         }
     }
     Ok(())
+}
+
+fn validate_memory_register(register: RuntimePowerRegister) -> Result<(), PowerError> {
+    if !memory_address_valid(register.address, register.access_width) {
+        return Err(PowerError::InvalidRegister);
+    }
+    Ok(())
+}
+
+fn system_io_port(register: RuntimePowerRegister) -> Result<u16, PowerError> {
+    // ACPI defines no 64-bit SystemIO transaction and the architecture backend
+    // intentionally exposes only the three widths implementable by port I/O.
+    if register.access_width == PowerAccessWidth::U64 {
+        return Err(PowerError::InvalidRegister);
+    }
+    u16::try_from(register.address).map_err(|_| PowerError::InvalidRegister)
+}
+
+fn memory_address_valid(address: usize, width: PowerAccessWidth) -> bool {
+    let width = access_width_bytes(width);
+    address != 0 && address.is_multiple_of(width) && address.checked_add(width - 1).is_some()
+}
+
+const fn access_width_bytes(width: PowerAccessWidth) -> usize {
+    match width {
+        PowerAccessWidth::U8 => 1,
+        PowerAccessWidth::U16 => 2,
+        PowerAccessWidth::U32 => 4,
+        PowerAccessWidth::U64 => 8,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_IO_OPS: StartAcpiIoOps = StartAcpiIoOps {
+        read_u8: test_read_u8,
+        read_u16: test_read_u16,
+        read_u32: test_read_u32,
+        write_u8: test_write_u8,
+        write_u16: test_write_u16,
+        write_u32: test_write_u32,
+    };
+
+    fn map_device_mmio(address: usize) -> usize {
+        address + 0x1000
+    }
+
+    fn test_read_u8(port: u16) -> u8 {
+        port as u8
+    }
+
+    fn test_read_u16(port: u16) -> u16 {
+        port ^ 0x55aa
+    }
+
+    fn test_read_u32(port: u16) -> u32 {
+        u32::from(port) | 0xa5a5_0000
+    }
+
+    fn test_write_u8(port: u16, value: u8) {
+        assert_eq!(port, 0x64);
+        assert_eq!(value, 1);
+    }
+
+    fn test_write_u16(port: u16, value: u16) {
+        assert_eq!(port, 0x1234);
+        assert_eq!(value, 2);
+    }
+
+    fn test_write_u32(port: u16, value: u32) {
+        assert_eq!(port, 0xcf8);
+        assert_eq!(value, 3);
+    }
+
+    fn io_register(address: usize, access_width: PowerAccessWidth) -> RuntimePowerRegister {
+        RuntimePowerRegister {
+            space: PowerRegisterSpace::SystemIo,
+            address,
+            access_width,
+            io_ops: Some(TEST_IO_OPS),
+        }
+    }
+
+    #[test]
+    fn runtime_register_uses_device_mapping_only_for_system_memory() {
+        let memory = runtime_register(
+            PowerRegister {
+                space: PowerRegisterSpace::SystemMemory,
+                address: 0x2000,
+                access_width: PowerAccessWidth::U32,
+            },
+            map_device_mmio,
+            Some(TEST_IO_OPS),
+        );
+        assert_eq!(memory.address, 0x3000);
+
+        let invalid_memory = runtime_register(
+            PowerRegister {
+                space: PowerRegisterSpace::SystemMemory,
+                address: 0x2001,
+                access_width: PowerAccessWidth::U16,
+            },
+            map_device_mmio,
+            None,
+        );
+        assert_eq!(invalid_memory.address, 0);
+
+        let io = runtime_register(
+            PowerRegister {
+                space: PowerRegisterSpace::SystemIo,
+                address: 0x64,
+                access_width: PowerAccessWidth::U8,
+            },
+            map_device_mmio,
+            Some(TEST_IO_OPS),
+        );
+        assert_eq!(io.address, 0x64);
+    }
+
+    #[test]
+    fn system_memory_requires_natural_alignment() {
+        let mut storage = 0u64;
+        let address = core::ptr::addr_of_mut!(storage) as usize;
+        let register = RuntimePowerRegister {
+            space: PowerRegisterSpace::SystemMemory,
+            address,
+            access_width: PowerAccessWidth::U64,
+            io_ops: None,
+        };
+        write_register(register, 0x1122_3344_5566_7788).unwrap();
+        assert_eq!(read_register(register), Ok(0x1122_3344_5566_7788));
+
+        let unaligned = RuntimePowerRegister {
+            address: address + 1,
+            access_width: PowerAccessWidth::U16,
+            ..register
+        };
+        assert_eq!(read_register(unaligned), Err(PowerError::InvalidRegister));
+        assert_eq!(
+            write_register(unaligned, 0),
+            Err(PowerError::InvalidRegister)
+        );
+    }
+
+    #[test]
+    fn system_io_supports_u8_u16_and_u32() {
+        let u8_register = io_register(0x64, PowerAccessWidth::U8);
+        let u16_register = io_register(0x1234, PowerAccessWidth::U16);
+        let u32_register = io_register(0xcf8, PowerAccessWidth::U32);
+
+        assert_eq!(read_register(u8_register), Ok(0x64));
+        assert_eq!(read_register(u16_register), Ok(0x1234 ^ 0x55aa));
+        assert_eq!(read_register(u32_register), Ok(0xa5a5_0cf8));
+        assert_eq!(write_register(u8_register, 1), Ok(()));
+        assert_eq!(write_register(u16_register, 2), Ok(()));
+        assert_eq!(write_register(u32_register, 3), Ok(()));
+    }
+
+    #[test]
+    fn system_io_validates_range_backend_and_width() {
+        let maximum_port = io_register(usize::from(u16::MAX), PowerAccessWidth::U16);
+        assert_eq!(
+            read_register(maximum_port),
+            Ok(u64::from(u16::MAX ^ 0x55aa))
+        );
+
+        let out_of_range = io_register(usize::from(u16::MAX) + 1, PowerAccessWidth::U8);
+        assert_eq!(
+            read_register(out_of_range),
+            Err(PowerError::InvalidRegister)
+        );
+
+        let unsupported_width = io_register(0x64, PowerAccessWidth::U64);
+        assert_eq!(
+            write_register(unsupported_width, 0),
+            Err(PowerError::InvalidRegister)
+        );
+
+        let no_backend = RuntimePowerRegister {
+            io_ops: None,
+            ..io_register(0x64, PowerAccessWidth::U8)
+        };
+        assert_eq!(
+            read_register(no_backend),
+            Err(PowerError::UnsupportedAddressSpace(
+                PowerRegisterSpace::SystemIo
+            ))
+        );
+    }
 }

@@ -141,6 +141,50 @@ impl StartFirmwareSource {
     }
 }
 
+/// 架构向 AML 解释器提供的 SystemIO 端口访问入口。
+#[derive(Clone, Copy)]
+pub struct StartAcpiIoOps {
+    pub read_u8: fn(u16) -> u8,
+    pub read_u16: fn(u16) -> u16,
+    pub read_u32: fn(u16) -> u32,
+    pub write_u8: fn(u16, u8),
+    pub write_u16: fn(u16, u16),
+    pub write_u32: fn(u16, u32),
+}
+
+/// 架构向 AML 解释器提供的 PCI 配置空间访问入口。
+///
+/// 参数依次为 segment、bus、device、function、register offset。支持 ECAM 的平台可以
+/// 不提供本组回调，内核会优先从 MCFG 建立配置空间映射；没有 MCFG 的平台则必须提供
+/// 回调后才能执行访问 PCI OperationRegion 的 AML 方法。
+#[derive(Clone, Copy)]
+pub struct StartAcpiPciOps {
+    pub read_u8: fn(u16, u8, u8, u8, u16) -> u8,
+    pub read_u16: fn(u16, u8, u8, u8, u16) -> u16,
+    pub read_u32: fn(u16, u8, u8, u8, u16) -> u32,
+    pub write_u8: fn(u16, u8, u8, u8, u16, u8),
+    pub write_u16: fn(u16, u8, u8, u8, u16, u16),
+    pub write_u32: fn(u16, u8, u8, u8, u16, u32),
+}
+
+/// AML Host I/O 能力。
+///
+/// ACPI 静态表和 AML 字节码的解析不依赖这些回调。只有执行访问 SystemIO 或传统 PCI
+/// 配置空间的 AML 方法时才需要它们。架构层必须提供真实硬件访问，不能用固定返回值
+/// 模拟成功；缺失能力时，内核会保留已解析的 AML namespace，并跳过方法执行。
+#[derive(Clone, Copy)]
+pub struct StartAcpiHostOps {
+    pub io: Option<StartAcpiIoOps>,
+    pub pci: Option<StartAcpiPciOps>,
+}
+
+impl StartAcpiHostOps {
+    pub const NONE: Self = Self {
+        io: None,
+        pci: None,
+    };
+}
+
 /// 从架构初始化传递给内核启动代码的稳定 ACPI 快照。
 #[derive(Clone, Copy)]
 pub struct StartAcpiTables {
@@ -149,6 +193,8 @@ pub struct StartAcpiTables {
     pub rsdp_phys: usize,
     /// 已复制的 ACPI 表的物理到虚拟地址映射。
     pub mappings: &'static [FirmwareTableMapping],
+    /// AML 执行期可使用的架构 Host I/O 能力。
+    pub host_ops: StartAcpiHostOps,
 }
 
 /// 由架构初始化选定并交给内核的固件表视图。

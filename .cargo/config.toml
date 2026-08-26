@@ -17,6 +17,10 @@ rustflags = [
 # libs/efi contains the small freestanding C shim required by the firmware path.
 # These are compiler names, not Rust toolchain overrides.
 [env]
+# `aml` 0.16.4 still uses the unstable `decl_macro` feature. Limit the
+# bootstrap exception to that crates.io dependency; workspace crates remain
+# on the developer's stable toolchain.
+RUSTC_BOOTSTRAP = { value = "aml", force = false }
 CC_loongarch64_unknown_none = "loongarch64-linux-gnu-gcc"
 CC_riscv64gc_unknown_none_elf = "riscv64-linux-gnu-gcc"
 

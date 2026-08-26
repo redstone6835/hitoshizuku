@@ -153,7 +153,6 @@ pub(crate) fn kernel_interface_profile_hash() -> Result<[u8; 32], &'static str> 
 }
 
 pub(crate) fn init_builtin_mgr() {
-    let _ = acpi::kernel_symbol_catalog_anchor();
     let _ = allocator::kernel_symbol_catalog_anchor();
     let _ = efi::kernel_symbol_catalog_anchor();
     let _ = elf::kernel_symbol_catalog_anchor();

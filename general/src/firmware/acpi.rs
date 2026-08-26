@@ -1,7 +1,5 @@
 //! ACPI table snapshot helpers used by the loader path.
 
-use acpi::sdt::fadt::Fadt;
-
 use super::{checksum_valid, read_u32_le, read_u64_le};
 
 const ACPI_TABLE_HEADER_SIZE: usize = 36;
@@ -133,6 +131,16 @@ pub fn validate_root_table(root: &[u8], root_kind: AcpiRootTableKind) -> Result<
     if root.get(..4) != Some(expected) {
         return Err("[loader][acpi] ACPI root table signature mismatch");
     }
+    let declared_length =
+        read_u32_le(root, 4).ok_or("[loader][acpi] truncated ACPI root table")? as usize;
+    if declared_length != root.len()
+        || root
+            .len()
+            .checked_sub(ACPI_TABLE_HEADER_SIZE)
+            .is_none_or(|payload| !payload.is_multiple_of(root_kind.entry_size()))
+    {
+        return Err("[loader][acpi] malformed ACPI root table entries");
+    }
     if !checksum_valid(root) {
         return Err("[loader][acpi] ACPI root table checksum mismatch");
     }
@@ -166,12 +174,109 @@ pub fn fadt_closure(table: &[u8]) -> Result<Option<AcpiFadtClosure>, &'static st
         return Ok(None);
     }
 
-    let fadt = unsafe { &*table.as_ptr().cast::<Fadt>() };
-    fadt.validate()
-        .map_err(|_| "[loader][acpi] invalid FADT checksum or signature")?;
+    const FADT_LEGACY_POINTERS_END: usize = 44;
+    if table.len() < FADT_LEGACY_POINTERS_END || !checksum_valid(table) {
+        return Err("[loader][acpi] invalid FADT checksum or length");
+    }
+
+    // ACPI 1.0 addresses are always present at offsets 36 and 40. ACPI 2.0 added the
+    // preferred 64-bit X_FIRMWARE_CTRL and X_DSDT fields at offsets 132 and 140. Parse the
+    // byte representation explicitly: old FADT revisions are shorter than the latest Rust
+    // `Fadt` structure, so constructing `&Fadt` over their storage would already violate
+    // Rust's reference validity rules before the crate could inspect the revision.
+    let firmware_ctrl = read_u32_le(table, 36).unwrap_or(0) as usize;
+    let dsdt = read_u32_le(table, 40).unwrap_or(0) as usize;
+    let x_firmware_ctrl = read_u64_le(table, 132)
+        .and_then(|address| usize::try_from(address).ok())
+        .unwrap_or(0);
+    let x_dsdt = read_u64_le(table, 140)
+        .and_then(|address| usize::try_from(address).ok())
+        .unwrap_or(0);
 
     Ok(Some(AcpiFadtClosure {
-        dsdt_phys: fadt.dsdt_address().ok().filter(|phys| *phys != 0),
-        facs_phys: fadt.facs_address().ok().filter(|phys| *phys != 0),
+        dsdt_phys: (x_dsdt != 0)
+            .then_some(x_dsdt)
+            .or((dsdt != 0).then_some(dsdt)),
+        facs_phys: (x_firmware_ctrl != 0)
+            .then_some(x_firmware_ctrl)
+            .or((firmware_ctrl != 0).then_some(firmware_ctrl)),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finish_sdt(table: &mut [u8], revision: u8) {
+        let length = table.len() as u32;
+        table[..4].copy_from_slice(b"FACP");
+        table[4..8].copy_from_slice(&length.to_le_bytes());
+        table[8] = revision;
+        table[9] = 0;
+        let checksum = table.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        table[9] = 0u8.wrapping_sub(checksum);
+    }
+
+    #[test]
+    fn parses_short_acpi_v1_fadt_without_constructing_latest_layout() {
+        let mut table = [0u8; 44];
+        table[36..40].copy_from_slice(&0x1234u32.to_le_bytes());
+        table[40..44].copy_from_slice(&0x5678u32.to_le_bytes());
+        finish_sdt(&mut table, 1);
+
+        assert_eq!(
+            fadt_closure(&table),
+            Ok(Some(AcpiFadtClosure {
+                dsdt_phys: Some(0x5678),
+                facs_phys: Some(0x1234),
+            }))
+        );
+    }
+
+    #[test]
+    fn rejects_fadt_without_legacy_closure_pointers() {
+        let mut table = [0u8; ACPI_TABLE_HEADER_SIZE];
+        finish_sdt(&mut table, 1);
+
+        assert_eq!(
+            fadt_closure(&table),
+            Err("[loader][acpi] invalid FADT checksum or length")
+        );
+    }
+
+    #[test]
+    fn extended_fadt_addresses_take_precedence() {
+        let mut table = [0u8; 148];
+        table[36..40].copy_from_slice(&0x1234u32.to_le_bytes());
+        table[40..44].copy_from_slice(&0x5678u32.to_le_bytes());
+        table[132..140].copy_from_slice(&0x1_0000_1234u64.to_le_bytes());
+        table[140..148].copy_from_slice(&0x1_0000_5678u64.to_le_bytes());
+        finish_sdt(&mut table, 2);
+
+        let closure = fadt_closure(&table).unwrap().unwrap();
+        if let (Ok(facs), Ok(dsdt)) = (
+            usize::try_from(0x1_0000_1234u64),
+            usize::try_from(0x1_0000_5678u64),
+        ) {
+            assert_eq!(closure.facs_phys, Some(facs));
+            assert_eq!(closure.dsdt_phys, Some(dsdt));
+        } else {
+            assert_eq!(closure.facs_phys, Some(0x1234));
+            assert_eq!(closure.dsdt_phys, Some(0x5678));
+        }
+    }
+
+    #[test]
+    fn rejects_root_table_with_partial_trailing_entry() {
+        let mut root = [0u8; ACPI_TABLE_HEADER_SIZE + 5];
+        let root_len = root.len() as u32;
+        root[..4].copy_from_slice(b"RSDT");
+        root[4..8].copy_from_slice(&root_len.to_le_bytes());
+        root[9] = 0u8.wrapping_sub(root.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)));
+
+        assert_eq!(
+            validate_root_table(&root, AcpiRootTableKind::Rsdt),
+            Err("[loader][acpi] malformed ACPI root table entries")
+        );
+    }
 }

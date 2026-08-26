@@ -20,9 +20,9 @@ use efi::*;
 use general::dtb::Dtb;
 use general::firmware::{self, FirmwareTableMapping};
 use general::{
-    StartAcpiTables, StartAddressOps, StartAllocatorOps, StartArchitecture, StartBootInfo,
-    StartBootProtocol, StartContext, StartFirmware, StartMemory, StartMemoryMap, StartMemoryRegion,
-    StartMemoryRegionKind, StartPhysRange,
+    StartAcpiHostOps, StartAcpiTables, StartAddressOps, StartAllocatorOps, StartArchitecture,
+    StartBootInfo, StartBootProtocol, StartContext, StartFirmware, StartMemory, StartMemoryMap,
+    StartMemoryRegion, StartMemoryRegionKind, StartPhysRange,
 };
 use log::printk;
 
@@ -1089,6 +1089,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
             StartFirmware::Acpi(StartAcpiTables {
                 rsdp_phys: acpi_rsdp_for_state,
                 mappings: kernel_acpi_mappings(),
+                host_ops: StartAcpiHostOps::NONE,
             })
         } else {
             StartFirmware::Dtb(

@@ -31,7 +31,6 @@ extfs = { path = "../../libs/extfs", default-features = false }
 errno = { path = "../../libs/errno", default-features = false }
 elf = { path = "../../libs/elf", default-features = false }
 efi = { path = "../../libs/efi", default-features = false }
-acpi = { path = "../../libs/acpi", default-features = false }
 elm = { path = "../../libs/elm", default-features = false, features = ["module", "macros"] }
 allocator = { path = "../../libs/allocator", default-features = false }
 general = { path = "../../general", default-features = false }

@@ -56,7 +56,8 @@ doctest = false
 bench = false
 
 [dependencies]
-acpi = { path = "../libs/acpi", default-features = false, features = ["aml", "alloc"] }
+acpi = { workspace = true }
+aml = { workspace = true }
 arch = { path = "../arch" }
 elf = { path = "../libs/elf" }
 elm_model = { package = "elm", path = "../libs/elm", default-features = false, features = ["runtime-model"] }
