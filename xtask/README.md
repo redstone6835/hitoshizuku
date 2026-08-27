@@ -42,13 +42,14 @@ cargo xtask clean
 
 | board | 默认 target | 未指定 `--config` | 默认产物前缀 |
 | --- | --- | --- | --- |
-| `qemu` | `loongarch64-unknown-none` | `.config` | `target/<arch>`、`build/<arch>` |
+| `qemu` | `loongarch64-unknown-none` | `configs/qemu.config` | `target/<arch>`、`build/<arch>` |
 | `ls2k1000` | `loongarch64-unknown-none` | `configs/ls2k1000.config` | `target/loongarch64/ls2k1000`、`build/loongarch64/ls2k1000` |
 | `visionfive2` | `riscv64gc-unknown-none-elf` | `configs/visionfive2.config` | `target/riscv64/visionfive2`、`build/riscv64/visionfive2` |
 
 物理板的 Kernel API Profile 也按板卡放在 `build/elm-interface/<arch>/<board>`。
-`qemu` 保持原有架构级路径兼容，并可显式选择两个受支持 target。物理板与错误架构组合会
-在启动 Cargo 前失败。xtask 从 `configs/platforms.toml` 解析平台，向 Cargo 传递唯一的
+`qemu` 保持原有架构级产物路径兼容，并可显式选择两个受支持 target；其默认 preset 将
+QEMU virt 的固件、IRQ、RTC、PCI、控制台和 VirtIO 块/网驱动全部内建。物理板与错误架构
+组合会在启动 Cargo 前失败。xtask 从 `configs/platforms.toml` 解析平台，向 Cargo 传递唯一的
 `HITOSHIZUKU_PLATFORM=<id>`；链接脚本不再读取板卡专用环境变量。
 
 ```sh

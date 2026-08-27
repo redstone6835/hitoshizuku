@@ -1069,7 +1069,7 @@ mod tests {
             .expect("resolve QEMU defaults");
         assert_eq!(context.platform.id, "qemu-loongarch64");
         assert_eq!(context.target, "loongarch64-unknown-none");
-        assert_eq!(context.config, ".config");
+        assert_eq!(context.config, "configs/qemu.config");
         assert_eq!(context.target_dir, "target/loongarch64");
         assert_eq!(context.interface_dir, "build/elm-interface/loongarch64");
         assert_eq!(context.default_module_output(), "build/loongarch64/modules");
