@@ -414,7 +414,6 @@ dependencies = [
 name = "kernel-random"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -549,7 +548,6 @@ dependencies = [
 name = "net-loopback"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -572,7 +570,6 @@ dependencies = [
 name = "net-stack"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -594,7 +591,6 @@ dependencies = [
 name = "net-virtio"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -656,7 +652,6 @@ dependencies = [
 name = "platform-ahci"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -679,7 +674,6 @@ dependencies = [
 name = "platform-cfi-flash"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -702,7 +696,6 @@ dependencies = [
 name = "platform-dt-providers"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -724,7 +717,6 @@ dependencies = [
 name = "platform-firmware-bus"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -747,7 +739,6 @@ dependencies = [
 name = "platform-fw-cfg"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -770,7 +761,6 @@ dependencies = [
 name = "platform-goldfish-rtc"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -793,7 +783,6 @@ dependencies = [
 name = "platform-jh7110-crg"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -816,7 +805,6 @@ dependencies = [
 name = "platform-jh7110-mmc"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -839,7 +827,6 @@ dependencies = [
 name = "platform-jh7110-pinctrl"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -862,7 +849,6 @@ dependencies = [
 name = "platform-jh7110-trng"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -884,7 +870,6 @@ dependencies = [
 name = "platform-jh7110-uart"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -907,7 +892,6 @@ dependencies = [
 name = "platform-loongson-apbdma"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -930,7 +914,6 @@ dependencies = [
 name = "platform-loongson-clk"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -952,7 +935,6 @@ dependencies = [
 name = "platform-loongson-irq"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -975,7 +957,6 @@ dependencies = [
 name = "platform-loongson-pinctrl-gpio"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -997,7 +978,6 @@ dependencies = [
 name = "platform-loongson-sdio"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -1020,7 +1000,6 @@ dependencies = [
 name = "platform-ls2k-gmac"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -1043,7 +1022,6 @@ dependencies = [
 name = "platform-ls2k-i2c"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -1066,7 +1044,6 @@ dependencies = [
 name = "platform-ls2k-rtc"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -1089,7 +1066,6 @@ dependencies = [
 name = "platform-ls2k-spi"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -1112,7 +1088,6 @@ dependencies = [
 name = "platform-ls2k-tsensor"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -1135,7 +1110,6 @@ dependencies = [
 name = "platform-ls2k-usb"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -1158,7 +1132,6 @@ dependencies = [
 name = "platform-ls2x-wdt"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -1181,7 +1154,6 @@ dependencies = [
 name = "platform-ls7a-rtc"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -1204,7 +1176,6 @@ dependencies = [
 name = "platform-pci-host-ecam"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -1226,7 +1197,6 @@ dependencies = [
 name = "platform-plic"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -1249,7 +1219,6 @@ dependencies = [
 name = "platform-riscv-iommu"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -1271,7 +1240,6 @@ dependencies = [
 name = "platform-riscv-pmu"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -1293,7 +1261,6 @@ dependencies = [
 name = "platform-syscon"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -1316,7 +1283,6 @@ dependencies = [
 name = "platform-uart16550"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -1649,7 +1615,6 @@ dependencies = [
 name = "virtio-block"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",
@@ -1681,7 +1646,6 @@ dependencies = [
 name = "virtio-framework"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "allocator",
  "efi",
  "elf",

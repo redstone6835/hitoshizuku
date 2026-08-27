@@ -940,6 +940,7 @@ fn map_uart_char_error(err: CharIoError) -> ControlError {
         CharIoError::Unavailable => ControlError::NoDevice,
         CharIoError::Interrupted => ControlError::Busy,
         CharIoError::Timeout => ControlError::Busy,
+        CharIoError::NoSpace => ControlError::Invalid,
     }
 }
 
