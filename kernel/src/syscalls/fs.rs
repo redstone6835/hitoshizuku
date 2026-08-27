@@ -241,9 +241,8 @@ const STATX__RESERVED: u32 = 0xffff_0000;
 
 const MSGHDR_SIZE_64: usize = 56;
 const MMSGHDR_SIZE_64: usize = 64;
-// Linux 只在 x86_64 上把 epoll_event 压缩为 12 字节；LoongArch64、
-// RISC-V64 等 64 位架构按 8 字节对齐 data，结构体大小为 16 字节。
-const EPOLL_EVENT_DATA_OFFSET_64: usize = if cfg!(target_arch = "x86_64") { 4 } else { 8 };
+// Linux 的 `epoll_event` 对齐属于架构用户 ABI，由 arch 经 HAL 提供。
+const EPOLL_EVENT_DATA_OFFSET_64: usize = hal::user::linux_epoll_event_data_offset();
 const EPOLL_EVENT_SIZE_64: usize = EPOLL_EVENT_DATA_OFFSET_64 + 8;
 const PSELECT6_SIGSET_ARG_SIZE_64: usize = 16;
 
@@ -3766,17 +3765,21 @@ pub(super) fn sys_tee(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Ok(total)
 }
 
-pub(super) fn sys_sync_file_range2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+fn sync_file_range(
+    fd_raw: usize,
+    offset_raw: usize,
+    nbytes_raw: usize,
+    flags: usize,
+) -> Result<usize, Errno> {
     const SYNC_FILE_RANGE_WAIT_BEFORE: usize = 1;
     const SYNC_FILE_RANGE_WRITE: usize = 2;
     const SYNC_FILE_RANGE_WAIT_AFTER: usize = 4;
     const SYNC_FILE_RANGE_SUPPORTED: usize =
         SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER;
 
-    let fd = fd_arg(ctx.args[0])?;
-    let flags = ctx.args[1];
-    let _offset = nonnegative_i64_arg(ctx.args[2])?;
-    let _nbytes = nonnegative_i64_arg(ctx.args[3])?;
+    let fd = fd_arg(fd_raw)?;
+    let _offset = nonnegative_i64_arg(offset_raw)?;
+    let _nbytes = nonnegative_i64_arg(nbytes_raw)?;
     if (flags & !SYNC_FILE_RANGE_SUPPORTED) != 0 {
         return Err(Errno::EINVAL);
     }
@@ -3785,6 +3788,14 @@ pub(super) fn sys_sync_file_range2(ctx: &mut SyscallContext<'_>) -> Result<usize
         file.sync().map_err(|e| e.to_errno())?;
     }
     Ok(0)
+}
+
+pub(super) fn sys_sync_file_range(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    sync_file_range(ctx.args[0], ctx.args[1], ctx.args[2], ctx.args[3])
+}
+
+pub(super) fn sys_sync_file_range2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    sync_file_range(ctx.args[0], ctx.args[2], ctx.args[3], ctx.args[1])
 }
 
 pub(super) fn sys_acct(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

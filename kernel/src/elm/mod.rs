@@ -479,14 +479,7 @@ pub(crate) fn reload_build_bound_module_for_test(
 }
 
 fn current_ebi_arch() -> elm_model::ElmEbiArch {
-    #[cfg(target_arch = "riscv64")]
-    {
-        elm_model::ElmEbiArch::Riscv64
-    }
-    #[cfg(target_arch = "loongarch64")]
-    {
-        elm_model::ElmEbiArch::LoongArch64
-    }
+    hal::platform::elm_ebi_arch()
 }
 
 #[allow(dead_code)]

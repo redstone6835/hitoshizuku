@@ -234,7 +234,7 @@ unsafe fn invoke_on_native_stack<T>(
     #[cfg(feature = "performance-profile")]
     let body_start = observe_pinned_call.then(profiling::read_counter);
     // 安全性：调用方保证入口地址与上下文 ABI；架构调用门只使用本对象持有的隔离栈。
-    let status = unsafe { arch::call_elm_native(address, context.cast::<u8>(), stack.top()) };
+    let status = unsafe { hal::elm::call_native(address, context.cast::<u8>(), stack.top()) };
     #[cfg(feature = "performance-profile")]
     if let Some(body_start) = body_start {
         profiling::observe(
@@ -1456,7 +1456,7 @@ pub(crate) fn invoke_kernel_mixin_handler(
     };
     // Safety: 地址和边界来自已验证、仍由路由快照固定的 RX 镜像；处理器 ABI 只接收该帧。
     let status = unsafe {
-        arch::call_elm_native_current_stack(address, core::ptr::from_mut(frame).cast::<u8>())
+        hal::elm::call_native_current_stack(address, core::ptr::from_mut(frame).cast::<u8>())
     };
     let aborted = guard.aborted();
     let accounting = accounting.finish(sched::now_ns_direct());

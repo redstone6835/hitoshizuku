@@ -14,6 +14,10 @@ pub(crate) mod early_console_config;
 #[cfg(any(test, target_arch = "loongarch64"))]
 pub(crate) mod boot_protocol;
 
+// x86_64 的 syscall 编号表是纯常量模块，可在 host 测试和 x86_64 架构
+// 后端尚未接入时独立编译。
+pub mod x86_64;
+
 #[cfg(target_arch = "riscv64")]
 pub mod riscv64;
 #[cfg(target_arch = "riscv64")]

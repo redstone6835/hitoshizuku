@@ -6,7 +6,6 @@ use core::mem::size_of;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use general::TaskOps;
 use general::mm::{VmSpace, copy_from_user, copy_to_user};
 use general::syscall::NativeCallOutcome;
 use mm::VmFlags;
@@ -1060,7 +1059,7 @@ fn prepare_load(
         .try_reserve_exact(resources.nodes.len())
         .map_err(|_| status::CORE_RESOURCE_EXHAUSTED)?;
     let (new_nodes, owned_slots) = resources.disarm();
-    arch::CurrentTaskOps::sync_icache();
+    hal::memory::sync_icache();
     let mut load = LoadTransaction {
         nodes: new_nodes,
         root,

@@ -34,6 +34,9 @@ pub(super) fn process_exit_payload(target: TargetArch) -> &'static [u8] {
     match target {
         TargetArch::Riscv64 => RISCV64_EXIT_CODE,
         TargetArch::LoongArch64 => LOONGARCH64_EXIT_CODE,
+        TargetArch::X86_64 => {
+            panic!("x86_64 Native ABI process-exit test payload is not implemented")
+        }
     }
 }
 

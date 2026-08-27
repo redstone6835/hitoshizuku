@@ -1048,7 +1048,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
         }
         let context = StartContext {
             boot: StartBootInfo {
-                architecture: StartArchitecture::new("loongarch64"),
+                architecture: StartArchitecture::LoongArch64,
                 protocol: firmware_handoff.protocol,
                 boot_cpu_id: LoongArch64MessageInterruptOps::current_cpu_id(),
                 command_line,

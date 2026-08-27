@@ -1,8 +1,7 @@
-//! Linux asm-generic syscall 号。
-//!
-//! 这里的常量和元数据表由当前 host Linux 源码
-//! `/usr/src/linux-6.18.33-p1-gentoo-dist/include/uapi/asm-generic/unistd.h`
-//! 统计得到，只描述 Linux 用户 ABI 编号，不代表本内核已经实现对应语义。
+// Linux 64 位 asm-generic syscall 号，供使用该 ABI 的架构编号表复用。
+//
+// 这里的常量和元数据表由 Linux UAPI `include/uapi/asm-generic/unistd.h`
+// 统计得到，只描述 Linux 用户 ABI 编号，不代表本内核已经实现对应语义。
 
 pub const SYS_IO_SETUP: usize = 0;
 pub const SYS_IO_DESTROY: usize = 1;
@@ -88,7 +87,10 @@ pub const SYS_FSTAT: usize = 80;
 pub const SYS_SYNC: usize = 81;
 pub const SYS_FSYNC: usize = 82;
 pub const SYS_FDATASYNC: usize = 83;
-pub const SYS_SYNC_FILE_RANGE2: usize = 84;
+// RISC-V64 与 LoongArch64 未定义 `__ARCH_WANT_SYNC_FILE_RANGE2`，因此 84
+// 使用参数顺序为 fd, offset, nbytes, flags 的 sync_file_range。
+pub const SYS_SYNC_FILE_RANGE: Option<usize> = Some(84);
+pub const SYS_SYNC_FILE_RANGE2: Option<usize> = None;
 pub const SYS_TIMERFD_CREATE: usize = 85;
 pub const SYS_TIMERFD_SETTIME: usize = 86;
 pub const SYS_TIMERFD_GETTIME: usize = 87;
@@ -248,8 +250,6 @@ pub const SYS_RT_TGSIGQUEUEINFO: usize = 240;
 pub const SYS_PERF_EVENT_OPEN: usize = 241;
 pub const SYS_ACCEPT4: usize = 242;
 pub const SYS_RECVMMSG: usize = 243;
-#[cfg(target_arch = "riscv64")]
-pub const SYS_RISCV_FLUSH_ICACHE: usize = 259;
 pub const SYS_WAIT4: usize = 260;
 pub const SYS_PRLIMIT64: usize = 261;
 pub const SYS_FANOTIFY_INIT: usize = 262;
@@ -285,26 +285,28 @@ pub const SYS_STATX: usize = 291;
 pub const SYS_IO_PGETEVENTS: usize = 292;
 pub const SYS_RSEQ: usize = 293;
 pub const SYS_KEXEC_FILE_LOAD: usize = 294;
-pub const SYS_CLOCK_GETTIME64: usize = 403;
-pub const SYS_CLOCK_SETTIME64: usize = 404;
-pub const SYS_CLOCK_ADJTIME64: usize = 405;
-pub const SYS_CLOCK_GETRES_TIME64: usize = 406;
-pub const SYS_CLOCK_NANOSLEEP_TIME64: usize = 407;
-pub const SYS_TIMER_GETTIME64: usize = 408;
-pub const SYS_TIMER_SETTIME64: usize = 409;
-pub const SYS_TIMERFD_GETTIME64: usize = 410;
-pub const SYS_TIMERFD_SETTIME64: usize = 411;
-pub const SYS_UTIMENSAT_TIME64: usize = 412;
-pub const SYS_PSELECT6_TIME64: usize = 413;
-pub const SYS_PPOLL_TIME64: usize = 414;
-pub const SYS_IO_PGETEVENTS_TIME64: usize = 416;
-pub const SYS_RECVMMSG_TIME64: usize = 417;
-pub const SYS_MQ_TIMEDSEND_TIME64: usize = 418;
-pub const SYS_MQ_TIMEDRECEIVE_TIME64: usize = 419;
-pub const SYS_SEMTIMEDOP_TIME64: usize = 420;
-pub const SYS_RT_SIGTIMEDWAIT_TIME64: usize = 421;
-pub const SYS_FUTEX_TIME64: usize = 422;
-pub const SYS_SCHED_RR_GET_INTERVAL_TIME64: usize = 423;
+// 403..423 仅在 32 位或 compat asm-generic ABI 中定义；原生 64 位 ABI
+// 直接使用较早的时间系统调用编号。
+pub const SYS_CLOCK_GETTIME64: Option<usize> = None;
+pub const SYS_CLOCK_SETTIME64: Option<usize> = None;
+pub const SYS_CLOCK_ADJTIME64: Option<usize> = None;
+pub const SYS_CLOCK_GETRES_TIME64: Option<usize> = None;
+pub const SYS_CLOCK_NANOSLEEP_TIME64: Option<usize> = None;
+pub const SYS_TIMER_GETTIME64: Option<usize> = None;
+pub const SYS_TIMER_SETTIME64: Option<usize> = None;
+pub const SYS_TIMERFD_GETTIME64: Option<usize> = None;
+pub const SYS_TIMERFD_SETTIME64: Option<usize> = None;
+pub const SYS_UTIMENSAT_TIME64: Option<usize> = None;
+pub const SYS_PSELECT6_TIME64: Option<usize> = None;
+pub const SYS_PPOLL_TIME64: Option<usize> = None;
+pub const SYS_IO_PGETEVENTS_TIME64: Option<usize> = None;
+pub const SYS_RECVMMSG_TIME64: Option<usize> = None;
+pub const SYS_MQ_TIMEDSEND_TIME64: Option<usize> = None;
+pub const SYS_MQ_TIMEDRECEIVE_TIME64: Option<usize> = None;
+pub const SYS_SEMTIMEDOP_TIME64: Option<usize> = None;
+pub const SYS_RT_SIGTIMEDWAIT_TIME64: Option<usize> = None;
+pub const SYS_FUTEX_TIME64: Option<usize> = None;
+pub const SYS_SCHED_RR_GET_INTERVAL_TIME64: Option<usize> = None;
 pub const SYS_PIDFD_SEND_SIGNAL: usize = 424;
 pub const SYS_IO_URING_SETUP: usize = 425;
 pub const SYS_IO_URING_ENTER: usize = 426;
@@ -351,6 +353,8 @@ pub const SYS_REMOVEXATTRAT: usize = 466;
 pub const SYS_OPEN_TREE_ATTR: usize = 467;
 pub const SYS_FILE_GETATTR: usize = 468;
 pub const SYS_FILE_SETATTR: usize = 469;
+pub const SYS_LISTNS: usize = 470;
+pub const SYS_RSEQ_SLICE_YIELD: usize = 471;
 
 // ELM 私有控制入口。该号位于当前分发表容量内，且避开已接入的
 // 通用 Linux ABI；语义由 kernel/src/elm/syscall.rs 定义。
@@ -359,3 +363,9 @@ pub const SYS_ELM_CTL: usize = 509;
 // Hitoshizuku 内核私有调度查询入口。该号位于当前分发表容量内，且避开已接入的
 // 通用 Linux ABI；返回格式由 kernel/syscalls/process.rs 的兼容层定义。
 pub const SYS_MYGO_SCHED_INFO: usize = 510;
+
+const _: () = {
+    assert!(SYS_ELM_CTL > SYS_RSEQ_SLICE_YIELD);
+    assert!(SYS_MYGO_SCHED_INFO > SYS_RSEQ_SLICE_YIELD);
+    assert!(SYS_MYGO_SCHED_INFO < 512);
+};

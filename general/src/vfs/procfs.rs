@@ -4087,14 +4087,7 @@ fn render_mountinfo_root() -> String {
 }
 
 fn render_version() -> String {
-    // 按目标架构报告，避免 RISC-V 构建也输出 loongarch64。
-    let arch = if cfg!(target_arch = "loongarch64") {
-        "loongarch64"
-    } else if cfg!(target_arch = "riscv64") {
-        "riscv64"
-    } else {
-        "unknown"
-    };
+    let arch = crate::start_architecture().name();
     format!("Hitoshizuku kernel version 0.1.0 ({arch})\n")
 }
 
@@ -4823,6 +4816,7 @@ fn proc_pnp_state_name(state: PnpState) -> &'static str {
 fn proc_pnp_resource_kind_name(kind: PnpResourceKind) -> &'static str {
     match kind {
         PnpResourceKind::Mmio => "mmio",
+        PnpResourceKind::IoPort => "io-port",
         PnpResourceKind::Irq => "irq",
         PnpResourceKind::IrqDomain => "irq-domain",
         PnpResourceKind::Msi => "msi",

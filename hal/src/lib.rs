@@ -13,11 +13,14 @@ extern crate arch;
 
 pub mod abi;
 pub mod console;
+pub mod elm;
 pub mod interrupt;
 pub mod memory;
 pub mod platform;
 pub mod random;
 pub mod sched;
+pub mod syscall;
+pub mod task_state;
 pub mod time;
 pub mod user;
 pub mod user_context;

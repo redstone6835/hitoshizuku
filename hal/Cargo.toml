@@ -10,6 +10,9 @@ bench = false
 
 [dependencies]
 arch = { path = "../arch" }
+elm_model = { package = "elm", path = "../libs/elm", default-features = false, features = ["runtime-model"] }
 elf = { path = "../libs/elf" }
 general = { path = "../general" }
 kernel-symbols = { path = "../libs/kernel-symbols" }
+native-abi = { path = "../libs/native-abi" }
+sched = { path = "../libs/sched" }

@@ -2,20 +2,21 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use general::dev::dma::DmaWindow;
-use general::dev::irq::{self, IrqLine};
+use general::dev::irq;
 use general::dev::msi;
 use general::dev::pci::{
     PCI_DEVICES_PER_BUS, PCI_EXTENDED_CONFIG_SPACE_SIZE, PCI_FUNCTIONS_PER_DEVICE, PciBarMapping,
     PciBarType, PciConfigAccess, PciConfigError, PciConfigSpaceKind, PciDevice, PciFunctionDmaInfo,
     PciFunctionFirmwareInfo, PciHostAddressSpace, PciHostBridgeError, PciHostBridgeHandle,
-    PciHostBridgeInfo, PciHostBridgeWindow, PciHostBusRange, PciHostDmaInfo, PciHostTable,
-    PciIommuReference, PciProbeStatus, PciRegisterError, PciRequesterIdMap, PciRequesterIdMapEntry,
-    PciScanRegisterSummary, host_bridge_pnp_resource, register_host_bridge,
-    try_install_pci_access_pair, unregister_host_bridge,
+    PciHostBridgeInfo, PciHostBridgeWindow, PciHostBusRange, PciHostConfigRegion, PciHostDmaInfo,
+    PciHostTable, PciIommuReference, PciProbeStatus, PciRegisterError, PciRequesterIdMap,
+    PciRequesterIdMapEntry, PciResolvedIrq, PciScanRegisterSummary, host_bridge_pnp_resource,
+    register_host_bridge, try_install_pci_access_pair, unregister_host_bridge,
 };
 use general::dev::platform::FirmwareProperty;
 use general::dev::pnp::{PnpDevice, PnpError, PnpResourceKind};
@@ -101,8 +102,12 @@ fn register_pci_host_bridge(
         domain: host.domain,
         bus_start: host.bus_start,
         bus_end: host.bus_end,
-        ecam_phys: host.ecam_phys,
-        ecam_size: host.ecam_size,
+        config_regions: vec![PciHostConfigRegion {
+            bus_start: host.bus_start,
+            bus_end: host.bus_end,
+            physical_start: host.ecam_phys,
+            size: host.ecam_size,
+        }],
         config_space: pci_config_space_kind(host.config_space),
         dma_coherent: host.effective_dma.coherent,
         dma: pci_host_dma_info(host),
@@ -795,7 +800,7 @@ fn resolve_pci_irq(
     function: u8,
     interrupt_pin: Option<u8>,
     _interrupt_line: Option<u8>,
-) -> Option<IrqLine> {
+) -> Option<PciResolvedIrq> {
     let interrupt_pin = interrupt_pin?;
     let routing = {
         let routings = PCI_IRQ_ROUTING.lock();
@@ -805,7 +810,7 @@ fn resolve_pci_irq(
         let intx = routing.intx.lock();
         intx.resolve(bus, device, function, interrupt_pin)?
     };
-    match &routing.backend {
+    let line = match &routing.backend {
         PciIrqRoutingBackend::Dtb {
             address_cells,
             interrupt_cells,
@@ -823,14 +828,15 @@ fn resolve_pci_irq(
             let route = resolve_dtb_pci_interrupt(resolver, child_address, child_interrupt)
                 .ok()
                 .flatten()?;
-            irq::translate_firmware_irq(Some(route.parent), &route.parent_specifier)
+            irq::translate_firmware_irq(Some(route.parent), &route.parent_specifier)?
         }
         PciIrqRoutingBackend::Ls2k1000(table) => {
             let (parent, specifier) =
                 table.resolve(route_key.bus, route_key.device, route_key.function)?;
-            irq::translate_firmware_irq(Some(parent), &[specifier])
+            irq::translate_firmware_irq(Some(parent), &[specifier])?
         }
-    }
+    };
+    Some(PciResolvedIrq::shared(line))
 }
 
 fn pci_requester_id(bus: u8, device: u8, function: u8) -> u32 {

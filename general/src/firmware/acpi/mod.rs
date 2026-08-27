@@ -1,4 +1,14 @@
-//! ACPI table snapshot helpers used by the loader path.
+//! Architecture-neutral ACPI table validation, snapshots, and platform data.
+
+mod madt;
+mod numa;
+mod platform;
+mod types;
+
+pub use madt::parse_madt;
+pub use numa::{parse_slit, parse_srat};
+pub use platform::{parse_fadt, parse_hpet, parse_mcfg, parse_pptt, parse_spcr};
+pub use types::*;
 
 use super::{checksum_valid, read_u32_le, read_u64_le};
 
@@ -28,6 +38,10 @@ impl AcpiRootTableKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AcpiSnapshotRootInfo {
+    /// 固件中经过校验、允许读取的 RSDP 字节数。
+    pub rsdp_source_len: usize,
+    /// 交给 `acpi` crate 的映射长度。v1 RSDP 必须把 source 后的字节清零，
+    /// 不能从固件地址继续读取并复制。
     pub rsdp_copy_len: usize,
     pub root_phys: usize,
     pub root_kind: AcpiRootTableKind,
@@ -43,24 +57,29 @@ pub fn snapshot_root_info(
     rsdp_phys: usize,
     read_physical: AcpiReadPhysicalBytesFn,
 ) -> Result<AcpiSnapshotRootInfo, &'static str> {
-    let rsdp_probe = read_physical(rsdp_phys, ACPI_RSDP_V2_SIZE);
-    if rsdp_probe.get(..8) != Some(ACPI_SIG_RSDP) {
+    let rsdp_v1 = read_physical(rsdp_phys, ACPI_RSDP_V1_SIZE);
+    if rsdp_v1.get(..8) != Some(ACPI_SIG_RSDP) {
         return Err("[loader][acpi] invalid RSDP signature");
     }
     if !checksum_valid(
-        rsdp_probe
+        rsdp_v1
             .get(..ACPI_RSDP_V1_SIZE)
             .ok_or("[loader][acpi] truncated RSDP")?,
     ) {
         return Err("[loader][acpi] RSDP v1 checksum mismatch");
     }
 
-    let revision = *rsdp_probe.get(15).ok_or("[loader][acpi] truncated RSDP")?;
+    let revision = *rsdp_v1.get(15).ok_or("[loader][acpi] truncated RSDP")?;
+    if revision == 1 {
+        return Err("[loader][acpi] reserved RSDP revision");
+    }
+    let mut rsdp_source_len = ACPI_RSDP_V1_SIZE;
     let mut rsdp_copy_len = ACPI_RSDP_V2_SIZE;
-    let mut root_phys = read_u32_le(rsdp_probe, 16).ok_or("[loader][acpi] missing RSDT")? as usize;
+    let mut root_phys = read_u32_le(rsdp_v1, 16).ok_or("[loader][acpi] missing RSDT")? as usize;
     let mut root_kind = AcpiRootTableKind::Rsdt;
 
     if revision >= 2 {
+        let rsdp_probe = read_physical(rsdp_phys, ACPI_RSDP_V2_SIZE);
         let length =
             read_u32_le(rsdp_probe, 20).ok_or("[loader][acpi] missing RSDP length")? as usize;
         if !(ACPI_RSDP_V2_SIZE..=ACPI_MAX_RSDP_SIZE).contains(&length) {
@@ -71,10 +90,12 @@ pub fn snapshot_root_info(
             return Err("[loader][acpi] RSDP extended checksum mismatch");
         }
         let xsdt_phys = read_u64_le(rsdp, 24).ok_or("[loader][acpi] missing XSDT")? as usize;
-        if xsdt_phys != 0 {
-            root_phys = xsdt_phys;
-            root_kind = AcpiRootTableKind::Xsdt;
+        if xsdt_phys == 0 {
+            return Err("[loader][acpi] extended RSDP is missing XSDT");
         }
+        root_phys = xsdt_phys;
+        root_kind = AcpiRootTableKind::Xsdt;
+        rsdp_source_len = length;
         rsdp_copy_len = length.max(ACPI_RSDP_V2_SIZE);
     }
 
@@ -83,6 +104,7 @@ pub fn snapshot_root_info(
     }
 
     Ok(AcpiSnapshotRootInfo {
+        rsdp_source_len,
         rsdp_copy_len,
         root_phys,
         root_kind,
@@ -110,7 +132,7 @@ pub fn facs_length(
         return Err("[loader][acpi] invalid FACS signature");
     }
     let len = read_u32_le(header, 4).ok_or("[loader][acpi] malformed FACS header")? as usize;
-    if !(8..=ACPI_MAX_TABLE_SIZE).contains(&len) {
+    if !(64..=ACPI_MAX_TABLE_SIZE).contains(&len) {
         return Err("[loader][acpi] invalid FACS length");
     }
     Ok(len)

@@ -241,6 +241,12 @@ pub unsafe extern "C" fn __kernel_start_init(context: *const general::StartConte
     context
         .validate()
         .unwrap_or_else(|err| panic!("[main] invalid StartContext: {}", err));
+    let target_architecture = hal::platform::architecture_id();
+    assert_eq!(
+        context.boot.architecture, target_architecture,
+        "[main] StartContext architecture does not match the compiled kernel"
+    );
+    general::set_start_architecture(context.boot.architecture);
     general::set_start_cmdline(context.boot.command_line);
     match context.firmware_source() {
         general::StartFirmwareSource::Acpi => acpi::kernel_start_init(context),

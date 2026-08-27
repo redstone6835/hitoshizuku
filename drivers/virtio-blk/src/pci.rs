@@ -819,11 +819,12 @@ fn register_virtio_pci_irq(
         }
     }
 
-    let Some(line) = pci.routed_irq_line() else {
+    let Some(route) = pci.routed_irq() else {
         pci.disable_interrupts();
         return Ok(None);
     };
-    match irq::register_irq_handler(line, handler) {
+    let line = route.line;
+    match irq::register_irq_request(route.request("virtio-pci-blk-intx", handler)) {
         Ok(handle) => {
             pci.enable_interrupts();
             if let Err(err) =

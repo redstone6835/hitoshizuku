@@ -6,7 +6,6 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 
 use errno::Errno;
-use general::TaskOps;
 use general::mm::{VmSpace, copy_cstr_bytes_from_user, copy_cstr_from_user, copy_from_user};
 use general::vfs::{FdTable, VfsContext, VfsExecLease};
 use hal::user_context::UserTrapFrame;
@@ -997,7 +996,7 @@ pub(crate) fn commit_exec(
                 // 令牌，避免返回路径重新装回旧页表。
                 prepared.initial_thread.frame.set_current_address_space();
                 if prepared.image.sync_icache {
-                    arch::CurrentTaskOps::sync_icache();
+                    hal::memory::sync_icache();
                 }
                 // 新 VM 激活后即可读回 exec 布好的 auxv，供 PR_GET_AUXV 使用。
                 capture_exec_auxv(task, &prepared.initial_thread.frame, &prepared.image.vm);
@@ -1029,8 +1028,7 @@ pub(crate) fn commit_exec(
                 guard.install_personality(prepared.personality.state.clone());
             }
             InstallStep::InitialThread => {
-                #[cfg(target_arch = "riscv64")]
-                arch::riscv64::vector::clear_for_task(task);
+                hal::task_state::reset(task);
                 task.clear_rseq_registration();
                 task.clear_sigaltstack();
                 reset_signal_state_for_exec(task, target_abi);

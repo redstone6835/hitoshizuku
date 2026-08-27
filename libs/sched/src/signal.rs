@@ -329,7 +329,6 @@ impl SignalState {
     /// 发布本任务存在返回用户态前必须处理的工作。
     #[inline]
     pub(crate) fn mark_user_return_work(&self) {
-        #[cfg(any(target_arch = "riscv64", test))]
         self.user_return_work.fetch_or(1, Ordering::Release);
     }
 

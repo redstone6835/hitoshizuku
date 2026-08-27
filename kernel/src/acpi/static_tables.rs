@@ -7,11 +7,9 @@
 use core::{mem, slice, str};
 
 use acpi::bgrt::Bgrt;
-use acpi::fadt::Fadt;
 use acpi::madt::Madt;
 use acpi::mcfg::Mcfg;
 use acpi::sdt::{SdtHeader, Signature};
-use acpi::spcr::Spcr;
 use acpi::{AcpiTable, AcpiTables, PhysicalMapping};
 use general::firmware::FirmwareTableMapping;
 use log::printk;
@@ -304,34 +302,7 @@ fn inspect_fadt(tables: &AcpiTables<AcpiMapper>) -> bool {
         }
     }
 
-    if let Some(fadt_mapping) = find_supported_fadt(tables) {
-        let fadt = &*fadt_mapping;
-        printk!(
-            "[kernel-start][acpi] FADT typed profile={:?} FACS={:?} DSDT={:?} PM-timer={:?} reset={:?}",
-            fadt.power_profile(),
-            fadt.facs_address(),
-            fadt.dsdt_address(),
-            fadt.pm_timer_block(),
-            fadt.reset_register(),
-        );
-    }
     true
-}
-
-pub(super) fn find_supported_fadt(
-    tables: &AcpiTables<AcpiMapper>,
-) -> Option<PhysicalMapping<AcpiMapper, Fadt>> {
-    let raw_mapping = tables.find_table::<RawFadtTable>().ok()?;
-    if raw_mapping.region_length() < mem::size_of::<Fadt>() {
-        printk!(
-            "[kernel-start][acpi] FADT cannot provide a typed view: len={} minimum={}",
-            raw_mapping.region_length(),
-            mem::size_of::<Fadt>(),
-        );
-        return None;
-    }
-    drop(raw_mapping);
-    tables.find_table::<Fadt>().ok()
 }
 
 fn inspect_madt(tables: &AcpiTables<AcpiMapper>) -> MadtSummary {
@@ -646,7 +617,14 @@ fn inspect_madt_entry(entry_type: u8, entry: &[u8], summary: &mut MadtSummary) {
         17 => {
             need!(15);
             let flags = read_u32(entry, 11).unwrap_or(0);
-            summary.usable_processors += usize::from(madt_processor_usable(flags));
+            let physical_id = read_u32(entry, 7).unwrap_or(u32::MAX);
+            if entry.len() != 15 || entry[2] != 1 || flags & !1 != 0 {
+                summary.malformed_entries += 1;
+                return;
+            }
+            if physical_id != u32::MAX && flags & MADT_PROCESSOR_ENABLED != 0 {
+                summary.usable_processors += 1;
+            }
             summary.loongarch_components += 1;
             printk!(
                 "[kernel-start][acpi] MADT Core-PIC version={} processor={} core={} flags={:#x}",
@@ -1022,27 +1000,6 @@ fn inspect_spcr(tables: &AcpiTables<AcpiMapper>) -> bool {
         bytes[63],
     );
 
-    if bytes.len() >= mem::size_of::<Spcr>() {
-        match tables.find_table::<Spcr>() {
-            Ok(mapping) => {
-                let spcr = &*mapping;
-                printk!(
-                    "[kernel-start][acpi] SPCR typed interface={:?} base={:?} interrupt={:?} baud={:?} clock={:?}",
-                    spcr.interface_type(),
-                    spcr.base_address(),
-                    spcr.interrupt_type(),
-                    spcr.baud_rate(),
-                    spcr.uart_clock_frequency(),
-                );
-            }
-            Err(err) => {
-                printk!(
-                    "[kernel-start][acpi] SPCR typed view unavailable: {:?}",
-                    err
-                );
-            }
-        }
-    }
     if let Some(namespace) = bounded_spcr_namespace(bytes) {
         printk!("[kernel-start][acpi] SPCR namespace={}", namespace);
     } else if bytes.len() >= 88 {
@@ -1051,26 +1008,10 @@ fn inspect_spcr(tables: &AcpiTables<AcpiMapper>) -> bool {
     true
 }
 
-pub(super) fn find_supported_spcr(
-    tables: &AcpiTables<AcpiMapper>,
-) -> Option<PhysicalMapping<AcpiMapper, Spcr>> {
-    let raw_mapping = tables.find_table::<RawSpcrTable>().ok()?;
-    if raw_mapping.region_length() < mem::size_of::<Spcr>() {
-        printk!(
-            "[kernel-start][acpi] SPCR cannot provide a typed view: len={} minimum={}",
-            raw_mapping.region_length(),
-            mem::size_of::<Spcr>(),
-        );
-        return None;
-    }
-    drop(raw_mapping);
-    tables.find_table::<Spcr>().ok()
-}
-
 fn bounded_spcr_namespace(bytes: &[u8]) -> Option<&str> {
     let length = usize::from(read_u16(bytes, 84)?);
     let offset = usize::from(read_u16(bytes, 86)?);
-    if length == 0 || offset < mem::size_of::<Spcr>() {
+    if length == 0 || offset < 88 {
         return None;
     }
     let value = bytes.get(offset..offset.checked_add(length)?)?;
@@ -1331,7 +1272,7 @@ fn parse_slit(bytes: &[u8]) -> SlitSummary {
             let distance = distances[index];
             summary.minimum_distance = summary.minimum_distance.min(distance);
             summary.maximum_distance = summary.maximum_distance.max(distance);
-            if (from == to && distance != 10) || (from != to && distance <= 10) {
+            if (from == to && distance != 10) || (from != to && distance < 10) {
                 summary.invalid_distances += 1;
             }
             if to > from && distance != distances[to * locality_count + from] {

@@ -48,11 +48,9 @@ pub(crate) fn decode_header(
         other => return Err(SoyoError::Unsupported(UnsupportedKind::ArtifactKind(other))),
     };
     let target_arch_raw = u16_at(bytes, wire::header::TARGET_ARCH);
-    let target_arch = match target_arch_raw {
-        value if value == TargetArch::Riscv64 as u16 => TargetArch::Riscv64,
-        value if value == TargetArch::LoongArch64 as u16 => TargetArch::LoongArch64,
-        other => return Err(SoyoError::Unsupported(UnsupportedKind::TargetArch(other))),
-    };
+    let target_arch = TargetArch::from_raw(target_arch_raw).ok_or(SoyoError::Unsupported(
+        UnsupportedKind::TargetArch(target_arch_raw),
+    ))?;
     let endian = bytes[wire::header::ENDIAN];
     if endian != 1 {
         return Err(SoyoError::Unsupported(UnsupportedKind::Endian(endian)));

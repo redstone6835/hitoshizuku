@@ -1908,17 +1908,6 @@ fn plain_bytes<T>(value: &T) -> &[u8] {
     }
 }
 
-#[cfg(target_arch = "riscv64")]
 fn current_ebi_arch() -> ElmEbiArch {
-    ElmEbiArch::Riscv64
-}
-
-#[cfg(target_arch = "loongarch64")]
-fn current_ebi_arch() -> ElmEbiArch {
-    ElmEbiArch::LoongArch64
-}
-
-#[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
-fn current_ebi_arch() -> ElmEbiArch {
-    ElmEbiArch::Any
+    hal::platform::elm_ebi_arch()
 }

@@ -644,7 +644,7 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
 
         let context = StartContext {
             boot: StartBootInfo {
-                architecture: StartArchitecture::new("riscv64"),
+                architecture: StartArchitecture::Riscv64,
                 protocol: StartBootProtocol::Direct,
                 boot_cpu_id: hart_id,
                 command_line: command_line_from_dtb(&dtb),

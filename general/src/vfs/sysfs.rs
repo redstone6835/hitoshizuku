@@ -1165,6 +1165,7 @@ fn pnp_state_name(state: PnpState) -> &'static str {
 fn pnp_resource_kind_name(kind: PnpResourceKind) -> &'static str {
     match kind {
         PnpResourceKind::Mmio => "mmio",
+        PnpResourceKind::IoPort => "io-port",
         PnpResourceKind::Irq => "irq",
         PnpResourceKind::IrqDomain => "irq-domain",
         PnpResourceKind::Msi => "msi",

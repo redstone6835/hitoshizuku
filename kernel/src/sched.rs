@@ -55,9 +55,6 @@ pub(crate) const TASKEXT_EXEC_ARGS: TaskExtKey = sched::TASKEXT_EXEC_ARGS;
 pub(crate) const TASKEXT_EXEC_ENVP: TaskExtKey = sched::TASKEXT_EXEC_ENVP;
 pub(crate) const TASKEXT_EXEC_ACCESS: TaskExtKey = sched::TASKEXT_EXEC_ACCESS;
 
-#[cfg(target_arch = "riscv64")]
-type RiscvVectorSignalStack = Spinlock<Vec<Option<arch::riscv64::vector::UserVectorState>>>;
-
 pub fn stash_boot_console_name(name: alloc::string::String) {
     *BOOT_CONSOLE_NAME.lock() = Some(name);
 }
@@ -113,6 +110,9 @@ impl TaskExtCloneHook for KernelExtCloneHook {
         src: &Arc<dyn Any + Send + Sync>,
         flags: CloneFlags,
     ) -> Arc<dyn Any + Send + Sync> {
+        if let Some(cloned) = hal::task_state::clone_extension(key, src) {
+            return cloned;
+        }
         match key {
             TASKEXT_VFS_CONTEXT => {
                 let s = Arc::clone(src)
@@ -144,12 +144,6 @@ impl TaskExtCloneHook for KernelExtCloneHook {
                 } else {
                     Arc::new(s.fork())
                 }
-            }
-            #[cfg(target_arch = "riscv64")]
-            sched::TASKEXT_RISCV_VECTOR_STATE => arch::riscv64::vector::clone_ext_payload(src),
-            #[cfg(target_arch = "riscv64")]
-            sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK => {
-                Arc::new(RiscvVectorSignalStack::new(Vec::new()))
             }
             sched::TASKEXT_ELM_EXECUTION => {
                 Arc::new(general::elm_guard::ElmTaskExecutionState::new())
@@ -213,12 +207,7 @@ struct KernelExtExitHook;
 impl TaskExtExitHook for KernelExtExitHook {
     fn cleanup_on_exit(&self, task: &Arc<Task>) {
         crate::native_runtime::record_task_exit(task);
-        #[cfg(target_arch = "riscv64")]
-        arch::riscv64::vector::clear_for_task(task);
-        #[cfg(target_arch = "riscv64")]
-        {
-            let _ = task.ext_remove(sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK);
-        }
+        hal::task_state::reset(task);
         let _ = task.ext_remove(TASKEXT_USER_TRAP_FRAME);
         let _ = task.ext_remove(crate::native_runtime::TASKEXT_NATIVE_THREAD);
         let _ = task.ext_remove(sched::TASKEXT_ELM_EXECUTION);
@@ -429,44 +418,6 @@ fn activate_task_vm(task: &Arc<Task>) {
     if let Some(vm) = task_vm_space(task) {
         vm.activate();
     }
-}
-
-#[cfg(target_arch = "riscv64")]
-fn push_riscv_vector_signal_snapshot(
-    task: &Arc<Task>,
-    user_ctx: UserContextRef,
-) -> Result<(), Errno> {
-    let tf = unsafe { &mut *(user_ctx.as_usize() as *mut arch::riscv64::TrapFrame) };
-    let snapshot = arch::riscv64::vector::snapshot_current_for_signal(tf);
-    let stack = if let Some(stack) = task
-        .ext_lookup(sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK)
-        .and_then(|payload| payload.downcast::<RiscvVectorSignalStack>().ok())
-    {
-        stack
-    } else {
-        let stack = Arc::new(RiscvVectorSignalStack::new(Vec::new()));
-        task.ext_install(sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK, stack.clone());
-        stack
-    };
-    let mut guard = stack.lock();
-    guard.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
-    guard.push(snapshot);
-    Ok(())
-}
-
-#[cfg(target_arch = "riscv64")]
-fn pop_riscv_vector_signal_snapshot(task: &Arc<Task>, user_ctx: UserContextRef) {
-    let Some(stack) = task
-        .ext_lookup(sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK)
-        .and_then(|payload| payload.downcast::<RiscvVectorSignalStack>().ok())
-    else {
-        return;
-    };
-    let Some(snapshot) = stack.lock().pop() else {
-        return;
-    };
-    let tf = unsafe { &mut *(user_ctx.as_usize() as *mut arch::riscv64::TrapFrame) };
-    arch::riscv64::vector::restore_signal_snapshot(tf, snapshot);
 }
 
 unsafe extern "C" fn user_clone_entry(_arg: usize) -> ! {
@@ -711,14 +662,7 @@ pub(crate) fn spawn_mq_notify_thread(registrant: &Arc<Task>, function: usize, va
 /// loongarch64：`ori $a7, $zero, 93` + `syscall 0`（SYS_exit）。
 /// riscv64：`addi a7, zero, 93` + `ecall`（SYS_exit）。
 fn exit_stub_code() -> &'static [u8] {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        &[0x0b, 0x74, 0x81, 0x03, 0x00, 0x00, 0x2b, 0x00]
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        &[0x93, 0x08, 0xd0, 0x05, 0x73, 0x00, 0x00, 0x00]
-    }
+    hal::user::exit_stub_code()
 }
 
 fn process_clone_user_context(
@@ -860,8 +804,7 @@ fn process_sigreturn(task: &Arc<Task>, user_ctx: UserContextRef) -> Result<(), E
     task.signal
         .block(SigSet::from_raw(restore_mask), SigProcMaskHow::SetMask);
     restored.apply_to_context(user_ctx.as_usize());
-    #[cfg(target_arch = "riscv64")]
-    pop_riscv_vector_signal_snapshot(task, user_ctx);
+    hal::task_state::pop_signal_state(task, user_ctx.as_usize());
     Ok(())
 }
 
@@ -958,8 +901,7 @@ fn process_setup_signal_frame(
         return Err(Errno::EINVAL);
     }
     copy_to_user(new_sp, &frame_bytes).map_err(|e| e.as_errno())?;
-    #[cfg(target_arch = "riscv64")]
-    push_riscv_vector_signal_snapshot(task, user_ctx)?;
+    hal::task_state::push_signal_state(task, user_ctx.as_usize()).map_err(|()| Errno::ENOMEM)?;
 
     let mut handler_mask = old_mask.union(action.mask);
     if !action.flags.has(SigActionFlags::SA_NODEFER) {

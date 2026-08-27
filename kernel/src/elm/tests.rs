@@ -1379,14 +1379,9 @@ fn eki_provider_port_block(
 }
 
 fn kernel_abi_fingerprint(arch: ElmEbiArch) -> ElmRustAbiFingerprintV1 {
-    let target = match arch {
-        ElmEbiArch::Any => b"any".as_slice(),
-        ElmEbiArch::Riscv64 => b"riscv64gc-unknown-none-elf".as_slice(),
-        ElmEbiArch::LoongArch64 => b"loongarch64-unknown-none".as_slice(),
-    };
     ElmRustAbiFingerprintV1::new(
         sha256(env!("ELM_RUSTC_VERSION").as_bytes()),
-        sha256(target),
+        sha256(arch.target_spec_identifier().as_bytes()),
         sha256(elm_model::kernel_interface_manifest_v1(arch as u32).as_bytes()),
         ELM_API_CURRENT_VERSION,
         ElmPanicStrategy::AbortThroughRuntime,

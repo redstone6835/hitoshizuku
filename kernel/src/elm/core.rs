@@ -19274,12 +19274,7 @@ fn runtime_log_level(level: u32) -> Option<log::LogLevel> {
 }
 
 fn expected_target_spec_hash(arch: ElmEbiArch) -> [u8; 32] {
-    let identifier: &[u8] = match arch {
-        ElmEbiArch::Any => b"any",
-        ElmEbiArch::Riscv64 => b"riscv64gc-unknown-none-elf",
-        ElmEbiArch::LoongArch64 => b"loongarch64-unknown-none",
-    };
-    sha256(identifier)
+    sha256(arch.target_spec_identifier().as_bytes())
 }
 
 const fn trust_blocker(status: ElmEbiLoadStatus) -> u64 {
@@ -19608,7 +19603,7 @@ pub(crate) extern "C" fn elm_api_abort_current_v1(reason: u32) -> ! {
     if let Some(recovery) = general::elm_guard::try_recover_explicit_abort(reason) {
         // 安全性：恢复地址和栈只可能来自当前任务调用门发布的边界帧。
         unsafe {
-            arch::resume_elm_panic(
+            hal::elm::resume_panic(
                 recovery.return_pc,
                 recovery.return_sp,
                 recovery.return_value,

@@ -1181,6 +1181,16 @@ fn start_info_builder_rejects_oversize_or_noncanonical_input() {
 }
 
 #[test]
+fn target_arch_registry_preserves_append_only_wire_values() {
+    assert_eq!(TargetArch::from_raw(1), Some(TargetArch::Riscv64));
+    assert_eq!(TargetArch::from_raw(2), Some(TargetArch::LoongArch64));
+    assert_eq!(TargetArch::from_raw(3), Some(TargetArch::X86_64));
+    assert_eq!(TargetArch::from_raw(0), None);
+    assert_eq!(TargetArch::from_raw(4), None);
+    assert_eq!(TargetArch::X86_64.instruction_alignment(), 1);
+}
+
+#[test]
 fn required_operation_binds_without_soyo_types() {
     let imports = [TestImport::known(0, OperationId::ProcessExit, true)];
     let plan = bind_native_abi(

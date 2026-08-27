@@ -88,10 +88,7 @@ pub(crate) fn validate_segments(
             {
                 continue;
             }
-            let alignment = match header.target_arch {
-                TargetArch::Riscv64 => 2,
-                TargetArch::LoongArch64 => 4,
-            };
+            let alignment = header.target_arch.instruction_alignment();
             if header.entry_offset % alignment != 0 {
                 return Err(SoyoError::Malformed(MalformedKind::Alignment));
             }
@@ -311,10 +308,7 @@ fn validate_one_array_entries<R: SoyoReadAt>(
         .file_offset
         .checked_add(offset - array_segment.virtual_offset)
         .ok_or(SoyoError::Malformed(MalformedKind::Range))?;
-    let instruction_alignment = match target_arch {
-        TargetArch::Riscv64 => 2,
-        TargetArch::LoongArch64 => 4,
-    };
+    let instruction_alignment = target_arch.instruction_alignment();
 
     for index in 0..count {
         let entry_file_offset = array_file_offset

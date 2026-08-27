@@ -1671,6 +1671,7 @@ fn image_session_abi_is_fixed_layout() {
 fn kernel_interface_manifest_tracks_layout_and_target() {
     let riscv = crate::kernel_interface_manifest_v1(crate::ElmEbiArch::Riscv64 as u32);
     let loongarch = crate::kernel_interface_manifest_v1(crate::ElmEbiArch::LoongArch64 as u32);
+    let x86_64 = crate::kernel_interface_manifest_v1(crate::ElmEbiArch::X86_64 as u32);
     assert_ne!(
         crate::sha256(riscv.as_bytes()),
         crate::sha256(loongarch.as_bytes())
@@ -1679,6 +1680,14 @@ fn kernel_interface_manifest_tracks_layout_and_target() {
     assert!(riscv.contains("field=ElmRuntimeApiV1.invoke_managed offset="));
     assert!(riscv.contains("fn.abort-current=extern-C(u32)->never"));
     assert!(riscv.ends_with('\n'));
+    assert_ne!(
+        crate::sha256(riscv.as_bytes()),
+        crate::sha256(x86_64.as_bytes())
+    );
+    assert_eq!(
+        crate::ElmEbiArch::X86_64.target_spec_identifier(),
+        "x86_64-unknown-none"
+    );
 }
 
 #[test]

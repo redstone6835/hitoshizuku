@@ -12,6 +12,7 @@ use general::syscall::SyscallContext;
 use general::vfs::nsfs::ProcNsKind;
 use general::vfs::pidfd;
 use general::vfs::{self, fdtable::Fd};
+use hal::syscall::nr;
 use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::ids::{CapSet, Capability, Credentials, Gid, Uid};
 use sched::pid::PidT;
@@ -47,9 +48,6 @@ const LINUX_REBOOT_CMD_KEXEC: u32 = 0x4558_4543;
 const UTS_FIELD_LEN: usize = 65;
 const UTS_NAME_MAX: usize = UTS_FIELD_LEN - 1;
 const EXEC_PATH_MAX: usize = 4096;
-
-#[cfg(target_arch = "riscv64")]
-const SYS_RISCV_FLUSH_ICACHE_LOCAL: usize = 1;
 
 const PTRACE_TRACEME: usize = 0;
 const PTRACE_PEEKTEXT: usize = 1;
@@ -89,29 +87,6 @@ const PTRACE_GET_RSEQ_CONFIGURATION: usize = 0x420f;
 const PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG: usize = 0x4210;
 const PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG: usize = 0x4211;
 const PTRACE_SET_SYSCALL_INFO: usize = 0x4212;
-
-#[cfg(target_arch = "riscv64")]
-fn validate_riscv_flush_icache_flags(flags: usize) -> Result<(), Errno> {
-    if flags & !SYS_RISCV_FLUSH_ICACHE_LOCAL != 0 {
-        Err(Errno::EINVAL)
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(target_arch = "riscv64")]
-pub(super) fn sys_riscv_flush_icache(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    validate_riscv_flush_icache_flags(ctx.args[2])?;
-
-    // Linux 当前保留并忽略 start/end，因为 RISC-V 不支持按范围失效 I-cache。
-    let _start = ctx.args[0];
-    let _end = ctx.args[1];
-
-    // TODO(riscv64): 为 LOCAL=1 增加仅本地执行 fence.i 的路径。当前全局同步
-    // 在语义上正确，但会产生不必要的远端 hart RFENCE 开销。
-    <arch::CurrentTaskOps as general::TaskOps>::sync_icache();
-    Ok(0)
-}
 
 pub(super) fn sys_getpid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let task = ctx.task();
@@ -5715,7 +5690,7 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             let raw = (data as u64).to_ne_bytes();
             vm.copy_user_bytes_out(addr, &raw)?;
             if request == PTRACE_POKETEXT {
-                <arch::CurrentTaskOps as general::TaskOps>::sync_icache();
+                hal::memory::sync_icache();
             }
             Ok(0)
         }
@@ -5910,17 +5885,8 @@ fn ptrace_target_frame(target: &Arc<Task>) -> Result<hal::user_context::UserTrap
     // 优先取 syscall 入口的 arch 快照（arch 在 syscall 分发前保存）；
     // 回退到恢复/写回路径保存的 UserTrapFrame（POKEUSR 写回后、以及
     // 信号/单步场景）。
-    #[cfg(target_arch = "loongarch64")]
-    let arch_frame = target
-        .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
-        .and_then(|payload| payload.downcast::<arch::loongarch64::TrapFrame>().ok());
-    #[cfg(target_arch = "riscv64")]
-    let arch_frame = target
-        .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
-        .and_then(|payload| payload.downcast::<arch::riscv64::TrapFrame>().ok());
-    if let Some(frame) = arch_frame {
-        let raw = Arc::as_ptr(&frame) as usize;
-        return Ok(hal::user_context::UserTrapFrame::from_context(raw));
+    if let Some(frame) = hal::user_context::UserTrapFrame::from_ptrace_task(target) {
+        return Ok(frame);
     }
     let frame = target
         .ext_lookup(sched::TASKEXT_USER_TRAP_FRAME)
@@ -6081,45 +6047,12 @@ fn linux_user_regs_size() -> usize {
 /// - loongarch64：`{ u64 fpr[32]; u64 fcc; u32 fcsr; }`，8 字节对齐后 272；
 /// - riscv64：`{ u64 f[32]; u64 fcsr; }`，264。
 fn linux_fpregset_size() -> usize {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        32 * 8 + 8 + 4 + 4
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        32 * 8 + 8
-    }
+    hal::user_context::UserTrapFrame::linux_fpregset_size()
 }
 
 /// 从架构 trap frame 读出浮点寄存器，按 `struct user_fpregs_struct` 布局编码。
 fn ptrace_read_arch_fpregs(target: &Arc<Task>) -> Result<Vec<u8>, Errno> {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        let frame = target
-            .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
-            .and_then(|payload| payload.downcast::<arch::loongarch64::TrapFrame>().ok())
-            .ok_or(Errno::EIO)?;
-        let mut out = vec![0u8; linux_fpregset_size()];
-        for (index, reg) in frame.f.iter().enumerate() {
-            out[index * 8..index * 8 + 8].copy_from_slice(&reg.to_le_bytes());
-        }
-        out[256..264].copy_from_slice(&frame.fcc.to_le_bytes());
-        out[264..268].copy_from_slice(&(frame.fcsr as u32).to_le_bytes());
-        Ok(out)
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        let frame = target
-            .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
-            .and_then(|payload| payload.downcast::<arch::riscv64::TrapFrame>().ok())
-            .ok_or(Errno::EIO)?;
-        let mut out = vec![0u8; linux_fpregset_size()];
-        for (index, reg) in frame.f.iter().enumerate() {
-            out[index * 8..index * 8 + 8].copy_from_slice(&reg.to_le_bytes());
-        }
-        out[256..264].copy_from_slice(&(frame.fcsr as u64).to_le_bytes());
-        Ok(out)
-    }
+    hal::user_context::UserTrapFrame::read_linux_fpregs(target).ok_or(Errno::EIO)
 }
 
 /// 把 `struct user_fpregs_struct` 布局的字节写回架构 trap frame。
@@ -6128,43 +6061,9 @@ fn ptrace_write_arch_fpregs(target: &Arc<Task>, bytes: &[u8]) -> Result<(), Errn
     if bytes.len() < size {
         return Err(Errno::EIO);
     }
-    #[cfg(target_arch = "loongarch64")]
-    {
-        let frame = target
-            .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
-            .and_then(|payload| payload.downcast::<arch::loongarch64::TrapFrame>().ok())
-            .ok_or(Errno::EIO)?;
-        let mut new = *frame;
-        for (index, reg) in new.f.iter_mut().enumerate() {
-            *reg = u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap());
-        }
-        new.fcc = u64::from_le_bytes(bytes[256..264].try_into().unwrap());
-        new.fcsr = u32::from_le_bytes(bytes[264..268].try_into().unwrap()) as u64;
-        let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(new);
-        target
-            .ext_replace(sched::TASKEXT_PTRACE_FRAME, erased)
-            .map_err(|_| Errno::EIO)?;
-        Ok(())
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        let frame = target
-            .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
-            .and_then(|payload| payload.downcast::<arch::riscv64::TrapFrame>().ok())
-            .ok_or(Errno::EIO)?;
-        let mut new = *frame;
-        for (index, reg) in new.f.iter_mut().enumerate() {
-            *reg = u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap());
-        }
-        // user_fpregs_struct.fcsr 是 u64（8 字节），与读路径对称地从 8 字节
-        // 读回后截断为 TrapFrame.fcsr（u32）。
-        new.fcsr = u64::from_le_bytes(bytes[256..264].try_into().unwrap()) as u32;
-        let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(new);
-        target
-            .ext_replace(sched::TASKEXT_PTRACE_FRAME, erased)
-            .map_err(|_| Errno::EIO)?;
-        Ok(())
-    }
+    hal::user_context::UserTrapFrame::write_linux_fpregs(target, bytes)
+        .then_some(())
+        .ok_or(Errno::EIO)
 }
 
 /// 单步断点：把目标 PC 处的指令替换为断点指令。
@@ -6180,21 +6079,14 @@ fn arm_singlestep(target: &Arc<Task>) -> Result<(), Errno> {
     let original = u32::from_ne_bytes(insn);
     let breakpoint = breakpoint_insn();
     vm.copy_user_bytes_out(pc, &breakpoint.to_ne_bytes())?;
-    <arch::CurrentTaskOps as general::TaskOps>::sync_icache();
+    hal::memory::sync_icache();
     target.arm_singlestep(pc, original);
     Ok(())
 }
 
 /// 架构断点指令（loongarch64 `break 0` / riscv64 `ebreak`）。
 fn breakpoint_insn() -> u32 {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        0x2a000000 // break 0
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        0x00100073 // ebreak
-    }
+    hal::user_context::UserTrapFrame::breakpoint_insn()
 }
 
 /// 单步断点陷阱钩子（arch 的 break trap 在用户态调用）：命中则恢复原指令
@@ -6214,7 +6106,7 @@ pub(crate) fn ptrace_singlestep_trap_hook(pc: usize) -> bool {
         if let Some(vm) = task_vm_space(&me) {
             let _ = vm.copy_user_bytes_out(pc, &insn.to_ne_bytes());
         }
-        <arch::CurrentTaskOps as general::TaskOps>::sync_icache();
+        hal::memory::sync_icache();
     }
     me.set_ptrace_stop_event(0);
     me.clear_ptrace_last_siginfo();
@@ -6345,10 +6237,7 @@ fn write_ptrace_syscall_info(target: &Arc<Task>, user: usize) -> Result<(), Errn
     const PTRACE_SYSCALL_INFO_ENTRY: u8 = 1;
     const PTRACE_SYSCALL_INFO_EXIT: u8 = 2;
     const PTRACE_SYSCALL_INFO_SECCOMP: u8 = 3;
-    #[cfg(target_arch = "loongarch64")]
-    const AUDIT_ARCH: u32 = 0x4000_0102; // AUDIT_ARCH_LOONGARCH64
-    #[cfg(target_arch = "riscv64")]
-    const AUDIT_ARCH: u32 = 0x4000_00f3; // AUDIT_ARCH_RISCV64
+    const AUDIT_ARCH: u32 = nr::AUDIT_ARCH;
 
     let (state, nr, args, ret) = target.ptrace_syscall_info();
     let frame = ptrace_target_frame(target)?;
@@ -7812,36 +7701,6 @@ fn put_u64(out: &mut [u8], off: usize, v: u64) {
 
 fn put_i64(out: &mut [u8], off: usize, v: i64) {
     out[off..off + 8].copy_from_slice(&v.to_le_bytes());
-}
-
-#[cfg(all(feature = "kernel-tests", target_arch = "riscv64"))]
-mod riscv_flush_icache_tests {
-    use errno::Errno;
-    use ktest::ktest;
-
-    use super::validate_riscv_flush_icache_flags;
-
-    #[ktest]
-    fn riscv_flush_icache_accepts_linux_flags() {
-        assert!(validate_riscv_flush_icache_flags(0).is_ok());
-        assert!(validate_riscv_flush_icache_flags(1).is_ok());
-    }
-
-    #[ktest]
-    fn riscv_flush_icache_rejects_unknown_flag_bits() {
-        assert!(matches!(
-            validate_riscv_flush_icache_flags(2),
-            Err(Errno::EINVAL)
-        ));
-        assert!(matches!(
-            validate_riscv_flush_icache_flags(3),
-            Err(Errno::EINVAL)
-        ));
-        assert!(matches!(
-            validate_riscv_flush_icache_flags(usize::MAX),
-            Err(Errno::EINVAL)
-        ));
-    }
 }
 
 #[cfg(feature = "kernel-tests")]

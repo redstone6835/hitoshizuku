@@ -12,11 +12,11 @@
 .option norvc
 .option arch, +m
 
-.equ SYS_CLOCK_GETTIME, 113
-.equ SYS_CLOCK_GETRES, 114
-.equ SYS_RT_SIGRETURN, 139
-.equ SYS_GETCPU, 168
-.equ SYS_GETTIMEOFDAY, 169
+.equ SYS_CLOCK_GETTIME, {sys_clock_gettime}
+.equ SYS_CLOCK_GETRES, {sys_clock_getres}
+.equ SYS_RT_SIGRETURN, {sys_rt_sigreturn}
+.equ SYS_GETCPU, {sys_getcpu}
+.equ SYS_GETTIMEOFDAY, {sys_gettimeofday}
 
 .equ CLOCK_REALTIME, 0
 .equ CLOCK_MONOTONIC, 1

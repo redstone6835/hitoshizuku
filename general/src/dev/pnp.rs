@@ -58,6 +58,7 @@ use crate::dev::registry_id;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PnpResourceKind {
     Mmio,
+    IoPort,
     Irq,
     IrqDomain,
     Msi,
@@ -330,6 +331,10 @@ pub enum PlatformIdentityResource {
     Mmio {
         phys: usize,
         size: usize,
+    },
+    IoPort {
+        base: u16,
+        size: u16,
     },
     Irq {
         controller: Option<u32>,
@@ -775,6 +780,8 @@ pub struct RealtimeClockSource {
 pub struct DevInitContext {
     /// 将设备 MMIO 物理地址转换为可访问的内核虚拟地址。
     pub device_mmio_to_virt: fn(usize) -> usize,
+    /// 可选的 SystemIO 端口访问。具体 `in`/`out` 实现只由架构启动代码提供。
+    pub system_io: Option<crate::StartAcpiIoOps>,
     /// 固件选择的启动 CPU/hart ID，供中断控制器选择对应的本地上下文。
     pub boot_cpu_id: usize,
     /// 用硬件 RTC 读出的 Unix 纳秒时间更新内核 realtime 时钟。
@@ -789,11 +796,17 @@ impl DevInitContext {
     pub const fn new(device_mmio_to_virt: fn(usize) -> usize) -> Self {
         Self {
             device_mmio_to_virt,
+            system_io: None,
             boot_cpu_id: 0,
             set_realtime_ns: None,
             install_realtime_source: None,
             unregister_realtime_source: None,
         }
+    }
+
+    pub const fn with_system_io(mut self, system_io: Option<crate::StartAcpiIoOps>) -> Self {
+        self.system_io = system_io;
+        self
     }
 
     pub const fn with_boot_cpu_id(mut self, boot_cpu_id: usize) -> Self {

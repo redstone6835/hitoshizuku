@@ -101,6 +101,7 @@ fn loader_rejects_the_other_architecture() {
     let other = match current_target_arch() {
         TargetArch::Riscv64 => TargetArch::LoongArch64,
         TargetArch::LoongArch64 => TargetArch::Riscv64,
+        TargetArch::X86_64 => TargetArch::Riscv64,
     };
     let bytes = process_exit_image(other);
     let reader = MemoryReader { bytes: &bytes };

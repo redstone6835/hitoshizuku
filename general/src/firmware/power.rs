@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use crate::StartAcpiIoOps;
+use crate::{StartAcpiIoOps, StartAcpiPciOps};
 use log::printk;
 use vfs::sync::Spinlock;
 
@@ -12,6 +12,12 @@ use crate::dev::pnp::{PnpHandleResource, PnpResourceKind, PnpResourceReleaseOrde
 pub enum PowerRegisterSpace {
     SystemMemory,
     SystemIo,
+    PciConfig {
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +135,7 @@ struct RuntimePowerRegister {
     address: usize,
     access_width: PowerAccessWidth,
     io_ops: Option<StartAcpiIoOps>,
+    pci_ops: Option<StartAcpiPciOps>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,13 +258,23 @@ pub fn install_with_platform_ops(
     device_mmio_to_virt: fn(usize) -> usize,
     io_ops: Option<StartAcpiIoOps>,
 ) {
+    install_with_acpi_ops(info, device_mmio_to_virt, io_ops, None);
+}
+
+/// 安装同时支持 SystemIO 与 PCIConfig GAS 的 ACPI 电源控制。
+pub fn install_with_acpi_ops(
+    info: PowerControlInfo,
+    device_mmio_to_virt: fn(usize) -> usize,
+    io_ops: Option<StartAcpiIoOps>,
+    pci_ops: Option<StartAcpiPciOps>,
+) {
     let runtime = RuntimePowerControlInfo {
         shutdown: info
             .shutdown
-            .map(|method| runtime_method(method, device_mmio_to_virt, io_ops)),
+            .map(|method| runtime_method(method, device_mmio_to_virt, io_ops, pci_ops)),
         reboot: info
             .reboot
-            .map(|method| runtime_method(method, device_mmio_to_virt, io_ops)),
+            .map(|method| runtime_method(method, device_mmio_to_virt, io_ops, pci_ops)),
     };
 
     POWER_CONTROLS.lock().fallback = runtime;
@@ -271,12 +288,12 @@ pub fn install_with_platform_ops(
 
 #[kernel_symbols::export(name = "general.firmware.power.install_shutdown", contract = "kernel.firmware.power@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE, retained_args = 1 << 1)]
 pub fn install_shutdown(method: PowerControlMethod, phys_to_virt: fn(usize) -> usize) {
-    install_one(Some(runtime_method(method, phys_to_virt, None)), None);
+    install_one(Some(runtime_method(method, phys_to_virt, None, None)), None);
 }
 
 #[kernel_symbols::export(name = "general.firmware.power.install_reboot", contract = "kernel.firmware.power@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE, retained_args = 1 << 1)]
 pub fn install_reboot(method: PowerControlMethod, phys_to_virt: fn(usize) -> usize) {
-    install_one(None, Some(runtime_method(method, phys_to_virt, None)));
+    install_one(None, Some(runtime_method(method, phys_to_virt, None, None)));
 }
 
 fn install_one(
@@ -315,7 +332,7 @@ pub fn register_shutdown(
 ) -> Result<PowerControlHandle, PowerError> {
     register_dynamic(
         PowerControlAction::Shutdown,
-        runtime_method(method, phys_to_virt, None),
+        runtime_method(method, phys_to_virt, None, None),
     )
 }
 
@@ -335,7 +352,7 @@ pub fn register_reboot(
 ) -> Result<PowerControlHandle, PowerError> {
     register_dynamic(
         PowerControlAction::Reboot,
-        runtime_method(method, phys_to_virt, None),
+        runtime_method(method, phys_to_virt, None, None),
     )
 }
 
@@ -456,11 +473,12 @@ fn runtime_method(
     method: PowerControlMethod,
     device_mmio_to_virt: fn(usize) -> usize,
     io_ops: Option<StartAcpiIoOps>,
+    pci_ops: Option<StartAcpiPciOps>,
 ) -> RuntimePowerControlMethod {
     match method {
         PowerControlMethod::RegisterWrite { register, value } => {
             RuntimePowerControlMethod::RegisterWrite {
-                register: runtime_register(register, device_mmio_to_virt, io_ops),
+                register: runtime_register(register, device_mmio_to_virt, io_ops, pci_ops),
                 value,
             }
         }
@@ -470,9 +488,9 @@ fn runtime_method(
             sleep_type_a,
             sleep_type_b,
         } => RuntimePowerControlMethod::AcpiPm1Sleep {
-            pm1a_control: runtime_register(pm1a_control, device_mmio_to_virt, io_ops),
+            pm1a_control: runtime_register(pm1a_control, device_mmio_to_virt, io_ops, pci_ops),
             pm1b_control: pm1b_control
-                .map(|register| runtime_register(register, device_mmio_to_virt, io_ops)),
+                .map(|register| runtime_register(register, device_mmio_to_virt, io_ops, pci_ops)),
             sleep_type_a,
             sleep_type_b,
         },
@@ -480,7 +498,7 @@ fn runtime_method(
             sleep_control,
             sleep_type,
         } => RuntimePowerControlMethod::AcpiSleepControl {
-            sleep_control: runtime_register(sleep_control, device_mmio_to_virt, io_ops),
+            sleep_control: runtime_register(sleep_control, device_mmio_to_virt, io_ops, pci_ops),
             sleep_type,
         },
     }
@@ -490,6 +508,7 @@ fn runtime_register(
     register: PowerRegister,
     device_mmio_to_virt: fn(usize) -> usize,
     io_ops: Option<StartAcpiIoOps>,
+    pci_ops: Option<StartAcpiPciOps>,
 ) -> RuntimePowerRegister {
     let address = match register.space {
         PowerRegisterSpace::SystemMemory => {
@@ -500,12 +519,14 @@ fn runtime_register(
             }
         }
         PowerRegisterSpace::SystemIo => register.address,
+        PowerRegisterSpace::PciConfig { .. } => register.address,
     };
     RuntimePowerRegister {
         space: register.space,
         address,
         access_width: register.access_width,
         io_ops,
+        pci_ops,
     }
 }
 
@@ -557,6 +578,29 @@ fn read_register(register: RuntimePowerRegister) -> Result<u64, PowerError> {
                 PowerAccessWidth::U64 => return Err(PowerError::InvalidRegister),
             })
         }
+        PowerRegisterSpace::PciConfig {
+            segment,
+            bus,
+            device,
+            function,
+        } => {
+            let offset = pci_config_offset(register)?;
+            let ops = register
+                .pci_ops
+                .ok_or(PowerError::UnsupportedAddressSpace(register.space))?;
+            Ok(match register.access_width {
+                PowerAccessWidth::U8 => {
+                    (ops.read_u8)(segment, bus, device, function, offset) as u64
+                }
+                PowerAccessWidth::U16 => {
+                    (ops.read_u16)(segment, bus, device, function, offset) as u64
+                }
+                PowerAccessWidth::U32 => {
+                    (ops.read_u32)(segment, bus, device, function, offset) as u64
+                }
+                PowerAccessWidth::U64 => return Err(PowerError::InvalidRegister),
+            })
+        }
     }
 }
 
@@ -576,7 +620,44 @@ fn write_register(register: RuntimePowerRegister, value: u64) -> Result<(), Powe
             }
             Ok(())
         }
+        PowerRegisterSpace::PciConfig {
+            segment,
+            bus,
+            device,
+            function,
+        } => {
+            let offset = pci_config_offset(register)?;
+            let ops = register
+                .pci_ops
+                .ok_or(PowerError::UnsupportedAddressSpace(register.space))?;
+            match register.access_width {
+                PowerAccessWidth::U8 => {
+                    (ops.write_u8)(segment, bus, device, function, offset, value as u8)
+                }
+                PowerAccessWidth::U16 => {
+                    (ops.write_u16)(segment, bus, device, function, offset, value as u16)
+                }
+                PowerAccessWidth::U32 => {
+                    (ops.write_u32)(segment, bus, device, function, offset, value as u32)
+                }
+                PowerAccessWidth::U64 => return Err(PowerError::InvalidRegister),
+            }
+            Ok(())
+        }
     }
+}
+
+fn pci_config_offset(register: RuntimePowerRegister) -> Result<u16, PowerError> {
+    let offset = u16::try_from(register.address).map_err(|_| PowerError::InvalidRegister)?;
+    let width = register.access_width.bytes();
+    if usize::from(offset) % width != 0
+        || usize::from(offset)
+            .checked_add(width)
+            .is_none_or(|end| end > 4096)
+    {
+        return Err(PowerError::InvalidRegister);
+    }
+    Ok(offset)
 }
 
 fn read_memory_register(register: RuntimePowerRegister) -> Result<u64, PowerError> {
@@ -666,6 +747,15 @@ mod tests {
         write_u32: test_write_u32,
     };
 
+    const TEST_PCI_OPS: StartAcpiPciOps = StartAcpiPciOps {
+        read_u8: test_pci_read_u8,
+        read_u16: test_pci_read_u16,
+        read_u32: test_pci_read_u32,
+        write_u8: test_pci_write_u8,
+        write_u16: test_pci_write_u16,
+        write_u32: test_pci_write_u32,
+    };
+
     fn map_device_mmio(address: usize) -> usize {
         address + 0x1000
     }
@@ -697,12 +787,59 @@ mod tests {
         assert_eq!(value, 3);
     }
 
+    fn assert_test_bdf(segment: u16, bus: u8, device: u8, function: u8, offset: u16) {
+        assert_eq!((segment, bus, device, function, offset), (0, 0, 7, 2, 0x44));
+    }
+
+    fn test_pci_read_u8(segment: u16, bus: u8, device: u8, function: u8, offset: u16) -> u8 {
+        assert_test_bdf(segment, bus, device, function, offset);
+        0x5a
+    }
+
+    fn test_pci_read_u16(segment: u16, bus: u8, device: u8, function: u8, offset: u16) -> u16 {
+        assert_test_bdf(segment, bus, device, function, offset);
+        0x5a5a
+    }
+
+    fn test_pci_read_u32(segment: u16, bus: u8, device: u8, function: u8, offset: u16) -> u32 {
+        assert_test_bdf(segment, bus, device, function, offset);
+        0x5a5a_5a5a
+    }
+
+    fn test_pci_write_u8(segment: u16, bus: u8, device: u8, function: u8, offset: u16, value: u8) {
+        assert_test_bdf(segment, bus, device, function, offset);
+        assert_eq!(value, 0xcf);
+    }
+
+    fn test_pci_write_u16(
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u16,
+        _value: u16,
+    ) {
+        assert_test_bdf(segment, bus, device, function, offset);
+    }
+
+    fn test_pci_write_u32(
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u16,
+        _value: u32,
+    ) {
+        assert_test_bdf(segment, bus, device, function, offset);
+    }
+
     fn io_register(address: usize, access_width: PowerAccessWidth) -> RuntimePowerRegister {
         RuntimePowerRegister {
             space: PowerRegisterSpace::SystemIo,
             address,
             access_width,
             io_ops: Some(TEST_IO_OPS),
+            pci_ops: None,
         }
     }
 
@@ -806,6 +943,7 @@ mod tests {
             },
             map_device_mmio,
             Some(TEST_IO_OPS),
+            None,
         );
         assert_eq!(memory.address, 0x3000);
         assert_eq!(memory.io_ops.map(|_| ()), Some(()));
@@ -818,6 +956,7 @@ mod tests {
             },
             map_device_mmio,
             None,
+            None,
         );
         assert_eq!(invalid_memory.address, 0);
 
@@ -829,6 +968,7 @@ mod tests {
             },
             map_device_mmio,
             Some(TEST_IO_OPS),
+            None,
         );
         assert_eq!(io.address, 0x64);
     }
@@ -842,6 +982,7 @@ mod tests {
             address,
             access_width: PowerAccessWidth::U64,
             io_ops: None,
+            pci_ops: None,
         };
         write_register(register, 0x1122_3344_5566_7788).unwrap();
         assert_eq!(read_register(register), Ok(0x1122_3344_5566_7788));
@@ -902,5 +1043,29 @@ mod tests {
                 PowerRegisterSpace::SystemIo
             ))
         );
+    }
+
+    #[test]
+    fn pci_config_register_uses_full_bdf_and_validates_offset() {
+        let register = RuntimePowerRegister {
+            space: PowerRegisterSpace::PciConfig {
+                segment: 0,
+                bus: 0,
+                device: 7,
+                function: 2,
+            },
+            address: 0x44,
+            access_width: PowerAccessWidth::U8,
+            io_ops: None,
+            pci_ops: Some(TEST_PCI_OPS),
+        };
+        assert_eq!(read_register(register), Ok(0x5a));
+        assert_eq!(write_register(register, 0xcf), Ok(()));
+
+        let invalid = RuntimePowerRegister {
+            address: 4096,
+            ..register
+        };
+        assert_eq!(read_register(invalid), Err(PowerError::InvalidRegister));
     }
 }

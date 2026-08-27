@@ -327,10 +327,7 @@ fn validate_signature(component: &ComponentMetadata) -> Result<(), SoyoError> {
 }
 
 fn is_raw_code(entry: u64, target_arch: TargetArch, segments: &[ImageSegment]) -> bool {
-    let alignment = match target_arch {
-        TargetArch::Riscv64 => 2,
-        TargetArch::LoongArch64 => 4,
-    };
+    let alignment = target_arch.instruction_alignment();
     entry % alignment == 0
         && segments.iter().any(|segment| {
             segment.kind == SegmentKind::Code

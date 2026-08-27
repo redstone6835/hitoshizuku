@@ -611,7 +611,7 @@ Wire Header 同样为 192 字节，但字段完全不同：
 | `0x04` | `format_version:u16` | v1 为 `1`。 |
 | `0x06` | `header_size:u16` | `192`。 |
 | `0x08` | `artifact_kind:u16` | `1=Executable`，`2=SharedComponent`。 |
-| `0x0a` | `target_arch:u16` | `riscv64` 或 `loongarch64`。 |
+| `0x0a` | `target_arch:u16` | `1=riscv64`，`2=loongarch64`，`3=x86_64`。 |
 | `0x0c` | `endian:u8` | `1=little-endian`。 |
 | `0x0d` | `pointer_width:u8` | 当前必须为 `64`。 |
 | `0x0e` | `abi_family:u16` | 非零 ABI 家族。 |

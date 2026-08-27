@@ -64,6 +64,11 @@ pub const VDSO_DATA_CLOCK_REALTIME_RES_OFFSET: usize = 0x44;
 
 global_asm!(
     include_str!("vdso_text.S"),
+    sys_clock_gettime = const crate::riscv64::syscall::nr::SYS_CLOCK_GETTIME,
+    sys_clock_getres = const crate::riscv64::syscall::nr::SYS_CLOCK_GETRES,
+    sys_rt_sigreturn = const crate::riscv64::syscall::nr::SYS_RT_SIGRETURN,
+    sys_getcpu = const crate::riscv64::syscall::nr::SYS_GETCPU,
+    sys_gettimeofday = const crate::riscv64::syscall::nr::SYS_GETTIMEOFDAY,
     vdso_data_seq_offset = const VDSO_DATA_SEQ_OFFSET,
     vdso_data_clock_mode_offset = const VDSO_DATA_CLOCK_MODE_OFFSET,
     vdso_data_hz_offset = const VDSO_DATA_HZ_OFFSET,

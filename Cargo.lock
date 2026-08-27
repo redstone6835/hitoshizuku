@@ -43,6 +43,7 @@ version = "0.1.0"
 dependencies = [
  "allocator",
  "efi",
+ "errno",
  "fdt",
  "general",
  "log 0.1.0",
@@ -379,8 +380,11 @@ version = "0.1.0"
 dependencies = [
  "arch",
  "elf",
+ "elm",
  "general",
  "kernel-symbols",
+ "native-abi",
+ "sched",
 ]
 
 [[package]]

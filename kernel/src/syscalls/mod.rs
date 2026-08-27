@@ -2,14 +2,13 @@
 //!
 //! 分文件按 syscall 类别组织：process / fs / mm / signal。每个 fn 签名统一
 //! 为 `fn(&mut SyscallContext) -> Result<usize, Errno>`，由 general 层的
-//! 分发主循环调用。号码常量集中在 `nr.rs`。
+//! 分发主循环调用。号码由 `hal::syscall` 选择当前架构的 Linux ABI 表。
 //!
 //! `register_all()` 在 `kernel::sched::boot_init` 的末尾调用一次。
 
 mod fs;
 pub(crate) mod ipc;
 mod mm;
-mod nr;
 pub(crate) mod process;
 mod signal;
 mod syslog;
@@ -21,7 +20,8 @@ pub(crate) use process::{
 };
 
 use alloc::sync::Arc;
-use general::syscall::register_syscall;
+use general::syscall::{SyscallFn, register_linux_syscall_abi, register_syscall};
+use hal::syscall::{USER_BREAK_HOOK_REGISTRAR, nr, register_linux_extensions};
 use sched::Task;
 use sched::ids::{Capability as SchedCapability, Credentials as SchedCredentials};
 use vfs::cred::{
@@ -31,6 +31,12 @@ use vfs::cred::{
 
 pub(crate) fn cleanup_task_before_exit(task: &Arc<Task>) {
     process::cleanup_task_before_exit(task);
+}
+
+fn register_optional_syscall(nr: Option<usize>, syscall: SyscallFn) {
+    if let Some(nr) = nr {
+        register_syscall(nr, syscall);
+    }
 }
 
 pub(super) fn vfs_cred_from_sched(src: &SchedCredentials) -> VfsCredentials {
@@ -77,6 +83,8 @@ pub(super) fn vfs_cred_from_sched(src: &SchedCredentials) -> VfsCredentials {
 }
 
 pub fn register_all() {
+    register_linux_syscall_abi(&nr::LINUX_SYSCALL_ABI);
+
     // 文件 I/O
     register_syscall(nr::SYS_GETCWD, fs::sys_getcwd);
     register_syscall(nr::SYS_DUP, fs::sys_dup);
@@ -187,7 +195,8 @@ pub fn register_all() {
     register_syscall(nr::SYS_VMSPLICE, fs::sys_vmsplice);
     register_syscall(nr::SYS_SPLICE, fs::sys_splice);
     register_syscall(nr::SYS_TEE, fs::sys_tee);
-    register_syscall(nr::SYS_SYNC_FILE_RANGE2, fs::sys_sync_file_range2);
+    register_optional_syscall(nr::SYS_SYNC_FILE_RANGE, fs::sys_sync_file_range);
+    register_optional_syscall(nr::SYS_SYNC_FILE_RANGE2, fs::sys_sync_file_range2);
     register_syscall(nr::SYS_ACCT, fs::sys_acct);
     register_syscall(nr::SYS_FANOTIFY_INIT, fs::sys_fanotify_init);
     register_syscall(nr::SYS_FANOTIFY_MARK, fs::sys_fanotify_mark);
@@ -196,12 +205,12 @@ pub fn register_all() {
     register_syscall(nr::SYS_MEMFD_CREATE, fs::sys_memfd_create);
     register_syscall(nr::SYS_PREADV2, fs::sys_preadv2);
     register_syscall(nr::SYS_PWRITEV2, fs::sys_pwritev2);
-    register_syscall(nr::SYS_TIMERFD_GETTIME64, fs::sys_timerfd_gettime64);
-    register_syscall(nr::SYS_TIMERFD_SETTIME64, fs::sys_timerfd_settime64);
-    register_syscall(nr::SYS_UTIMENSAT_TIME64, fs::sys_utimensat_time64);
-    register_syscall(nr::SYS_PSELECT6_TIME64, fs::sys_pselect6_time64);
-    register_syscall(nr::SYS_PPOLL_TIME64, fs::sys_ppoll_time64);
-    register_syscall(nr::SYS_RECVMMSG_TIME64, fs::sys_recvmmsg_time64);
+    register_optional_syscall(nr::SYS_TIMERFD_GETTIME64, fs::sys_timerfd_gettime64);
+    register_optional_syscall(nr::SYS_TIMERFD_SETTIME64, fs::sys_timerfd_settime64);
+    register_optional_syscall(nr::SYS_UTIMENSAT_TIME64, fs::sys_utimensat_time64);
+    register_optional_syscall(nr::SYS_PSELECT6_TIME64, fs::sys_pselect6_time64);
+    register_optional_syscall(nr::SYS_PPOLL_TIME64, fs::sys_ppoll_time64);
+    register_optional_syscall(nr::SYS_RECVMMSG_TIME64, fs::sys_recvmmsg_time64);
     register_syscall(nr::SYS_IO_URING_SETUP, fs::sys_io_uring_setup);
     register_syscall(nr::SYS_IO_URING_ENTER, fs::sys_io_uring_enter);
     register_syscall(nr::SYS_IO_URING_REGISTER, fs::sys_io_uring_register);
@@ -233,8 +242,7 @@ pub fn register_all() {
     register_syscall(nr::SYS_CLONE, process::sys_clone);
     register_syscall(nr::SYS_CLONE3, process::sys_clone3);
     register_syscall(nr::SYS_EXECVE, process::sys_execve);
-    #[cfg(target_arch = "riscv64")]
-    register_syscall(nr::SYS_RISCV_FLUSH_ICACHE, process::sys_riscv_flush_icache);
+    register_linux_extensions(register_syscall);
     register_syscall(nr::SYS_WAIT4, process::sys_wait4);
     register_syscall(nr::SYS_WAITID, process::sys_waitid);
     register_syscall(nr::SYS_SET_TID_ADDRESS, process::sys_set_tid_address);
@@ -315,8 +323,8 @@ pub fn register_all() {
     register_syscall(nr::SYS_MEMBARRIER, process::sys_membarrier);
     register_syscall(nr::SYS_FUTEX, process::sys_futex);
     register_syscall(nr::SYS_RSEQ, process::sys_rseq);
-    register_syscall(nr::SYS_FUTEX_TIME64, process::sys_futex);
-    register_syscall(
+    register_optional_syscall(nr::SYS_FUTEX_TIME64, process::sys_futex);
+    register_optional_syscall(
         nr::SYS_SCHED_RR_GET_INTERVAL_TIME64,
         process::sys_sched_rr_get_interval,
     );
@@ -351,19 +359,19 @@ pub fn register_all() {
     register_syscall(nr::SYS_BPF, process::sys_bpf);
     register_syscall(nr::SYS_EXECVEAT, process::sys_execveat);
     register_syscall(nr::SYS_KEXEC_FILE_LOAD, process::sys_kexec_file_load);
-    register_syscall(nr::SYS_CLOCK_GETTIME64, process::sys_clock_gettime64);
-    register_syscall(nr::SYS_CLOCK_SETTIME64, process::sys_clock_settime64);
-    register_syscall(nr::SYS_CLOCK_ADJTIME64, process::sys_clock_adjtime64);
-    register_syscall(
+    register_optional_syscall(nr::SYS_CLOCK_GETTIME64, process::sys_clock_gettime64);
+    register_optional_syscall(nr::SYS_CLOCK_SETTIME64, process::sys_clock_settime64);
+    register_optional_syscall(nr::SYS_CLOCK_ADJTIME64, process::sys_clock_adjtime64);
+    register_optional_syscall(
         nr::SYS_CLOCK_GETRES_TIME64,
         process::sys_clock_getres_time64,
     );
-    register_syscall(
+    register_optional_syscall(
         nr::SYS_CLOCK_NANOSLEEP_TIME64,
         process::sys_clock_nanosleep_time64,
     );
-    register_syscall(nr::SYS_TIMER_GETTIME64, process::sys_timer_gettime64);
-    register_syscall(nr::SYS_TIMER_SETTIME64, process::sys_timer_settime64);
+    register_optional_syscall(nr::SYS_TIMER_GETTIME64, process::sys_timer_gettime64);
+    register_optional_syscall(nr::SYS_TIMER_SETTIME64, process::sys_timer_settime64);
     register_syscall(nr::SYS_PIDFD_OPEN, process::sys_pidfd_open);
     register_syscall(
         nr::SYS_LANDLOCK_CREATE_RULESET,
@@ -445,13 +453,13 @@ pub fn register_all() {
     register_syscall(nr::SYS_REQUEST_KEY, ipc::sys_request_key);
     register_syscall(nr::SYS_KEYCTL, ipc::sys_keyctl);
     register_syscall(nr::SYS_IO_PGETEVENTS, ipc::sys_io_pgetevents);
-    register_syscall(nr::SYS_IO_PGETEVENTS_TIME64, ipc::sys_io_pgetevents_time64);
-    register_syscall(nr::SYS_MQ_TIMEDSEND_TIME64, ipc::sys_mq_timedsend_time64);
-    register_syscall(
+    register_optional_syscall(nr::SYS_IO_PGETEVENTS_TIME64, ipc::sys_io_pgetevents_time64);
+    register_optional_syscall(nr::SYS_MQ_TIMEDSEND_TIME64, ipc::sys_mq_timedsend_time64);
+    register_optional_syscall(
         nr::SYS_MQ_TIMEDRECEIVE_TIME64,
         ipc::sys_mq_timedreceive_time64,
     );
-    register_syscall(nr::SYS_SEMTIMEDOP_TIME64, ipc::sys_semtimedop_time64);
+    register_optional_syscall(nr::SYS_SEMTIMEDOP_TIME64, ipc::sys_semtimedop_time64);
 
     // 信号
     register_syscall(nr::SYS_RT_SIGACTION, signal::sys_rt_sigaction);
@@ -463,7 +471,7 @@ pub fn register_all() {
     register_syscall(nr::SYS_SIGALTSTACK, signal::sys_sigaltstack);
     register_syscall(nr::SYS_RESTART_SYSCALL, signal::sys_restart_syscall);
     register_syscall(nr::SYS_RT_SIGQUEUEINFO, signal::sys_rt_sigqueueinfo);
-    register_syscall(
+    register_optional_syscall(
         nr::SYS_RT_SIGTIMEDWAIT_TIME64,
         signal::sys_rt_sigtimedwait_time64,
     );
@@ -472,12 +480,9 @@ pub fn register_all() {
     ipc::register_mq_notify_dispatcher_once();
     ipc::register_proc_ipc_providers_once();
     general::vfs::nsfs::register_ns_provider(process::ns_provider);
-    #[cfg(target_arch = "riscv64")]
-    arch::riscv64::trap::exception::register_user_break_hook(process::ptrace_singlestep_trap_hook);
-    #[cfg(target_arch = "loongarch64")]
-    arch::loongarch64::trap::exception::register_user_break_hook(
-        process::ptrace_singlestep_trap_hook,
-    );
+    if let Some(register_user_break_hook) = USER_BREAK_HOOK_REGISTRAR {
+        register_user_break_hook(process::ptrace_singlestep_trap_hook);
+    }
 
     let registered = general::syscall::registered_count();
     log::info!("[syscalls] registered {} entries", registered);

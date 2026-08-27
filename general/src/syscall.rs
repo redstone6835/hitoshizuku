@@ -98,7 +98,27 @@ pub struct SyscallFrameOps {
 unsafe impl Sync for SyscallFrameOps {}
 unsafe impl Send for SyscallFrameOps {}
 
+/// 当前 Linux 用户 ABI 的 syscall 编号元数据。
+///
+/// 编号表由 arch 实现，kernel 经 HAL 选择后在启动期注入。general 只消费
+/// 已选 ABI，不包含任何目标架构判断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinuxSyscallAbi {
+    pub audit_arch: u32,
+    pub strict_allow: [usize; 4],
+    pub trace_signal_boundary: usize,
+}
+
+impl LinuxSyscallAbi {
+    #[inline]
+    pub const fn strict_allows(&self, nr: usize) -> bool {
+        let [read, write, exit, rt_sigreturn] = self.strict_allow;
+        nr == read || nr == write || nr == exit || nr == rt_sigreturn
+    }
+}
+
 static FRAME_OPS: AtomicPtr<SyscallFrameOps> = AtomicPtr::new(core::ptr::null_mut());
+static LINUX_SYSCALL_ABI: AtomicPtr<LinuxSyscallAbi> = AtomicPtr::new(core::ptr::null_mut());
 static NATIVE_DISPATCHER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn register_frame_ops(ops: &'static SyscallFrameOps) {
@@ -117,6 +137,21 @@ pub fn frame_ops() -> Option<&'static SyscallFrameOps> {
 
 pub fn frame_ops_registered() -> bool {
     frame_ops().is_some()
+}
+
+/// 注册当前架构的 Linux syscall ABI。调用方必须提供进程生命周期内有效的静态表。
+pub fn register_linux_syscall_abi(abi: &'static LinuxSyscallAbi) {
+    LINUX_SYSCALL_ABI.store(abi as *const _ as *mut _, Ordering::Release);
+}
+
+pub fn linux_syscall_abi() -> Option<&'static LinuxSyscallAbi> {
+    let ptr = LINUX_SYSCALL_ABI.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        // Safety: 仅注册静态 ABI 表，发布后只读。
+        Some(unsafe { &*(ptr as *const LinuxSyscallAbi) })
+    }
 }
 
 pub fn register_native_dispatcher(dispatch: NativeDispatchFn) {
@@ -300,7 +335,7 @@ impl Drop for SyscallContext<'_> {
 /// 标准 syscall 函数签名。
 pub type SyscallFn = fn(&mut SyscallContext<'_>) -> Result<usize, Errno>;
 
-/// 表大小：覆盖 Linux asm-generic 全部 syscall 号（最大约 450）。
+/// 表大小：覆盖当前各架构的 Linux 原生号段及 509/510 私有入口。
 pub const SYSCALL_TABLE_LEN: usize = 512;
 
 static SYSCALL_TABLE: [AtomicUsize; SYSCALL_TABLE_LEN] =
@@ -308,8 +343,7 @@ static SYSCALL_TABLE: [AtomicUsize; SYSCALL_TABLE_LEN] =
 
 #[cfg(feature = "trace-task-lifecycle")]
 fn trace_signal_boundary(nr: usize) -> bool {
-    // LoongArch 与 RISC-V 均采用 asm-generic 的 kill 系统调用号。
-    nr == 129
+    linux_syscall_abi().is_some_and(|abi| nr == abi.trace_signal_boundary)
 }
 
 /// 在启动期注册一个 syscall 号 → fn 的映射。重复注册会 panic（防止表条目被
@@ -559,10 +593,11 @@ fn seccomp_filter_syscall(ctx: &mut SyscallContext<'_>) -> bool {
     else {
         return false;
     };
+    let abi = linux_syscall_abi().expect("Linux syscall ABI 尚未注册");
 
     let mode = state.mode();
     if mode == SECCOMP_MODE_STRICT {
-        if crate::seccomp::SeccompState::strict_allows(ctx.nr) {
+        if abi.strict_allows(ctx.nr) {
             return false;
         }
         // strict 模式违规：发不可捕获的 SIGKILL（Linux 语义），而非可捕获的 SIGSYS。
@@ -579,14 +614,12 @@ fn seccomp_filter_syscall(ctx: &mut SyscallContext<'_>) -> bool {
         return false;
     }
 
-    #[cfg(target_arch = "loongarch64")]
-    const AUDIT_ARCH: u32 = 0x4000_0102;
-    #[cfg(target_arch = "riscv64")]
-    const AUDIT_ARCH: u32 = 0x4000_00f3;
-    #[cfg(target_arch = "x86_64")]
-    const AUDIT_ARCH: u32 = 0xc000_003e;
-
-    let data = encode_data(ctx.nr as i32, AUDIT_ARCH, 0, ctx.args.map(|arg| arg as u64));
+    let data = encode_data(
+        ctx.nr as i32,
+        abi.audit_arch,
+        0,
+        ctx.args.map(|arg| arg as u64),
+    );
 
     let result = state.run(&data);
     let action = result & SECCOMP_RET_ACTION_FULL;
@@ -619,7 +652,7 @@ fn seccomp_filter_syscall(ctx: &mut SyscallContext<'_>) -> bool {
             raw[8..12].copy_from_slice(&1i32.to_le_bytes()); // si_code = SYS_SECCOMP
             // raw[12..16] 为对齐填充；raw[16..24] 为 si_call_addr（填 0）。
             raw[24..28].copy_from_slice(&(ctx.nr as i32).to_le_bytes()); // si_syscall
-            raw[28..32].copy_from_slice(&AUDIT_ARCH.to_le_bytes()); // si_arch
+            raw[28..32].copy_from_slice(&abi.audit_arch.to_le_bytes()); // si_arch
             let info = sched::SigInfo {
                 sig: sched::SignalNumber::SIGSYS,
                 code: 1, // SYS_SECCOMP
@@ -955,5 +988,29 @@ where
         FastDispatchOutcome::FrameRewritten
     } else {
         FastDispatchOutcome::FrameAdvanced
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LinuxSyscallAbi;
+
+    #[test]
+    fn strict_allowlist_is_supplied_by_the_selected_abi() {
+        let asm_generic = LinuxSyscallAbi {
+            audit_arch: 0xc000_00f3,
+            strict_allow: [63, 64, 93, 139],
+            trace_signal_boundary: 129,
+        };
+        let x86_64 = LinuxSyscallAbi {
+            audit_arch: 0xc000_003e,
+            strict_allow: [0, 1, 60, 15],
+            trace_signal_boundary: 62,
+        };
+
+        assert!(asm_generic.strict_allows(139));
+        assert!(!asm_generic.strict_allows(15));
+        assert!(x86_64.strict_allows(15));
+        assert!(!x86_64.strict_allows(139));
     }
 }

@@ -47,6 +47,10 @@ pub enum DeviceResource {
         phys: usize,
         size: usize,
     },
+    IoPort {
+        base: u16,
+        size: u16,
+    },
     /// 固件描述的中断 specifier。
     ///
     /// DTB `interrupts` cells 的长度和含义由对应 interrupt controller 的
@@ -100,18 +104,29 @@ impl DeviceResource {
         Self::Mmio { phys, size }
     }
 
+    pub const fn io_port(base: u16, size: u16) -> Self {
+        Self::IoPort { base, size }
+    }
+
     /// 如果该资源是 MMIO，返回 `(phys, size)`；其它资源返回 `None`。
     pub const fn as_mmio(&self) -> Option<(usize, usize)> {
         match self {
             Self::Mmio { phys, size } => Some((*phys, *size)),
-            Self::Irq { .. } => None,
+            Self::IoPort { .. } | Self::Irq { .. } => None,
+        }
+    }
+
+    pub const fn as_io_port(&self) -> Option<(u16, u16)> {
+        match self {
+            Self::IoPort { base, size } => Some((*base, *size)),
+            Self::Mmio { .. } | Self::Irq { .. } => None,
         }
     }
 
     /// 如果该资源是 IRQ，返回只读视图；其它资源返回 `None`。
     pub fn as_irq(&self) -> Option<FirmwareIrqResource<'_>> {
         match self {
-            Self::Mmio { .. } => None,
+            Self::Mmio { .. } | Self::IoPort { .. } => None,
             Self::Irq {
                 controller,
                 cells,
@@ -452,6 +467,14 @@ impl PlatformDeviceInfo {
     )]
     pub fn mmio_at(&self, index: usize) -> Option<(usize, usize)> {
         self.mmio_resources().nth(index)
+    }
+
+    pub fn io_port_resources(&self) -> impl Iterator<Item = (u16, u16)> + '_ {
+        self.resources.iter().filter_map(DeviceResource::as_io_port)
+    }
+
+    pub fn first_io_port(&self) -> Option<(u16, u16)> {
+        self.io_port_resources().next()
     }
 
     /// 按声明顺序遍历 IRQ 资源。
@@ -1116,6 +1139,10 @@ fn platform_identity(info: &PlatformDeviceInfo) -> PlatformIdentity {
         .map(|resource| match resource {
             DeviceResource::Mmio { phys, size } => PlatformIdentityResource::Mmio {
                 phys: *phys,
+                size: *size,
+            },
+            DeviceResource::IoPort { base, size } => PlatformIdentityResource::IoPort {
+                base: *base,
                 size: *size,
             },
             DeviceResource::Irq {

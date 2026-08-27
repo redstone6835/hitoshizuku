@@ -18,6 +18,31 @@ pub struct UserTrapFrame {
 
 #[kernel_symbols::export]
 impl UserTrapFrame {
+    /// 复制 ptrace 停止点保存的原始架构 trap frame。
+    pub fn from_ptrace_task(task: &sched::Task) -> Option<Self> {
+        arch::ptrace_task_frame(task).map(|inner| Self { inner })
+    }
+
+    /// Linux `NT_FPREGSET` 在当前架构上的固定长度。
+    pub const fn linux_fpregset_size() -> usize {
+        arch::LINUX_FPREGSET_SIZE
+    }
+
+    /// 从 ptrace 停止点按 Linux `NT_FPREGSET` 布局编码浮点寄存器。
+    pub fn read_linux_fpregs(task: &sched::Task) -> Option<alloc::vec::Vec<u8>> {
+        arch::read_user_linux_fpregs(task)
+    }
+
+    /// 把 Linux `NT_FPREGSET` 字节写回 ptrace 停止点。
+    pub fn write_linux_fpregs(task: &sched::Task, bytes: &[u8]) -> bool {
+        arch::write_user_linux_fpregs(task, bytes)
+    }
+
+    /// 当前架构用于软件单步的用户断点指令。
+    pub const fn breakpoint_insn() -> u32 {
+        arch::USER_BREAKPOINT_INSN
+    }
+
     #[kernel_symbols::export(name = "hal.user_context.UserTrapFrame.from_context", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_CONTROL)]
     pub fn from_context(raw: usize) -> Self {
         #[cfg(target_arch = "loongarch64")]

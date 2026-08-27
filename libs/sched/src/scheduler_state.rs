@@ -184,7 +184,6 @@ impl CpuSchedState {
 
     #[inline]
     pub(crate) fn mark_user_return_work(&self) {
-        #[cfg(any(target_arch = "riscv64", test))]
         self.user_return_work.fetch_or(1, Ordering::Release);
     }
 

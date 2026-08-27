@@ -14,12 +14,14 @@
 //!   内核静态内存来满足这一要求。
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use allocator::{
     KernelHeapRegionFn, MapKernelHeapRangeFn, MemorySegment, PhysToVirtFn, UnmapKernelHeapRangeFn,
     VirtToPhysFn,
 };
 
+use crate::ArchitectureId;
 use crate::firmware::{FirmwareTableMapping, normalize_segments};
 use fdt::Fdt;
 
@@ -110,27 +112,8 @@ impl StartPhysRange {
     }
 }
 
-/// 当前正在运行的内核镜像所属的指令集架构与 ABI 家族。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StartArchitecture {
-    name: &'static str,
-}
-
-impl StartArchitecture {
-    pub const UNKNOWN: Self = Self { name: "" };
-
-    pub const fn new(name: &'static str) -> Self {
-        Self { name }
-    }
-
-    pub const fn name(self) -> &'static str {
-        self.name
-    }
-
-    pub const fn is_unknown(self) -> bool {
-        self.name.is_empty()
-    }
-}
+/// 启动交接中的架构身份。保留旧名称以避免启动协议调用方重复定义一套类型。
+pub type StartArchitecture = ArchitectureId;
 
 /// 进入内核所使用的外部启动协议或加载器路径。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -517,6 +500,8 @@ pub struct StartContext {
 
 /// 运行期保存的启动命令行快照。
 static mut START_CMDLINE: Option<&'static [u8]> = None;
+/// 运行期保存的已校验架构身份。
+static START_ARCHITECTURE: AtomicU8 = AtomicU8::new(ArchitectureId::Unknown as u8);
 
 impl StartContext {
     /// 返回当前启动上下文所选定的固件来源。
@@ -551,9 +536,7 @@ impl StartContext {
             if acpi.rsdp_phys == 0 {
                 return Err("[start-context] ACPI firmware is missing the copied RSDP");
             }
-            if acpi.mappings.is_empty() {
-                return Err("[start-context] ACPI firmware is missing copied table mappings");
-            }
+            validate_acpi_table_mappings(acpi.rsdp_phys, acpi.mappings)?;
             if !self.memory.boot_map.has_usable_region() {
                 return Err("[start-context] ACPI firmware requires usable boot memory segments");
             }
@@ -563,11 +546,72 @@ impl StartContext {
     }
 }
 
+fn validate_acpi_table_mappings(
+    rsdp_phys: usize,
+    mappings: &[FirmwareTableMapping],
+) -> Result<(), &'static str> {
+    if mappings.is_empty() {
+        return Err("[start-context] ACPI firmware is missing copied table mappings");
+    }
+
+    for (index, mapping) in mappings.iter().enumerate() {
+        if mapping.length == 0 || mapping.virtual_start == 0 {
+            return Err("[start-context] ACPI table mapping is empty or null");
+        }
+        if mapping.physical_start.checked_add(mapping.length).is_none()
+            || mapping.virtual_start.checked_add(mapping.length).is_none()
+        {
+            return Err("[start-context] ACPI table mapping address overflows");
+        }
+
+        let physical_end = mapping.physical_start + mapping.length;
+        if mappings[..index].iter().any(|previous| {
+            let previous_end = previous.physical_start + previous.length;
+            mapping.physical_start < previous_end && previous.physical_start < physical_end
+        }) {
+            return Err("[start-context] ACPI table mappings overlap");
+        }
+    }
+
+    if !mappings
+        .iter()
+        .any(|mapping| mapping.resolve(rsdp_phys, 36).is_some())
+    {
+        return Err("[start-context] copied RSDP is outside ACPI table mappings");
+    }
+
+    Ok(())
+}
+
 /// 安装运行期启动命令行快照。
 pub fn set_start_cmdline(cmdline: Option<&'static [u8]>) {
     unsafe {
         START_CMDLINE = cmdline;
     }
+}
+
+/// 安装运行期架构身份。重复安装同一身份是幂等的，冲突身份会立即失败。
+pub fn set_start_architecture(architecture: ArchitectureId) {
+    assert!(
+        !architecture.is_unknown(),
+        "[start-context] cannot install an unknown runtime architecture"
+    );
+    match START_ARCHITECTURE.compare_exchange(
+        ArchitectureId::Unknown as u8,
+        architecture as u8,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {}
+        Err(previous) if previous == architecture as u8 => {}
+        Err(_) => panic!("[start-context] runtime architecture already installed"),
+    }
+}
+
+/// 读取运行期架构身份；启动上下文尚未安装时返回 [`ArchitectureId::Unknown`]。
+pub fn start_architecture() -> ArchitectureId {
+    ArchitectureId::from_raw(START_ARCHITECTURE.load(Ordering::Acquire))
+        .unwrap_or(ArchitectureId::Unknown)
 }
 
 /// 读取运行期启动命令行快照。
@@ -578,8 +622,9 @@ pub fn start_cmdline() -> Option<&'static [u8]> {
 #[cfg(test)]
 mod tests {
     use super::{
-        StartBootProtocol, StartMemoryMap, StartMemoryRegion, StartMemoryRegionKind,
-        StartPhysRange, validate_start_memory_map,
+        ArchitectureId, FirmwareTableMapping, StartBootProtocol, StartMemoryMap, StartMemoryRegion,
+        StartMemoryRegionKind, StartPhysRange, validate_acpi_table_mappings,
+        validate_start_memory_map,
     };
 
     static RESERVED_ONLY: [StartMemoryRegion; 1] = [StartMemoryRegion::new(
@@ -610,6 +655,61 @@ mod tests {
         assert!(
             validate_start_memory_map(StartBootProtocol::Efi, StartMemoryMap::Regions(&USABLE),)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn architecture_identity_has_canonical_names_and_values() {
+        assert_eq!(ArchitectureId::Riscv64.name(), "riscv64");
+        assert_eq!(ArchitectureId::LoongArch64.name(), "loongarch64");
+        assert_eq!(ArchitectureId::X86_64.name(), "x86_64");
+        assert_eq!(ArchitectureId::from_raw(3), Some(ArchitectureId::X86_64));
+        assert!(ArchitectureId::Unknown.is_unknown());
+    }
+
+    #[test]
+    fn acpi_snapshot_mappings_cover_rsdp_without_overlap_or_overflow() {
+        let valid = [FirmwareTableMapping {
+            physical_start: 0x1000,
+            virtual_start: 0x8000,
+            length: 0x100,
+        }];
+        assert!(validate_acpi_table_mappings(0x1020, &valid).is_ok());
+
+        let null = [FirmwareTableMapping {
+            virtual_start: 0,
+            ..valid[0]
+        }];
+        assert_eq!(
+            validate_acpi_table_mappings(0x1020, &null),
+            Err("[start-context] ACPI table mapping is empty or null")
+        );
+
+        let overflow = [FirmwareTableMapping {
+            virtual_start: usize::MAX - 8,
+            length: 0x100,
+            ..valid[0]
+        }];
+        assert_eq!(
+            validate_acpi_table_mappings(0x1020, &overflow),
+            Err("[start-context] ACPI table mapping address overflows")
+        );
+
+        let overlap = [
+            valid[0],
+            FirmwareTableMapping {
+                physical_start: 0x1080,
+                virtual_start: 0x9000,
+                length: 0x100,
+            },
+        ];
+        assert_eq!(
+            validate_acpi_table_mappings(0x1020, &overlap),
+            Err("[start-context] ACPI table mappings overlap")
+        );
+        assert_eq!(
+            validate_acpi_table_mappings(0x2000, &valid),
+            Err("[start-context] copied RSDP is outside ACPI table mappings")
         );
     }
 }

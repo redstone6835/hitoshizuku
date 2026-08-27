@@ -2,19 +2,24 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use general::dev::irq::{self, IrqLine};
+use general::dev::dma::DmaWindow;
+use general::dev::irq;
 use general::dev::msi;
 use general::dev::pci::{
     PCI_DEVICES_PER_BUS, PCI_EXTENDED_CONFIG_SPACE_SIZE, PCI_FUNCTIONS_PER_DEVICE, PciConfigAccess,
-    PciConfigError, PciDevice, PciHostAddressSpace, PciHostBridgeError, PciHostBridgeInfo,
-    PciHostBridgeWindow, pci_scan_raw, register_host_bridge, set_pci_config_access,
+    PciConfigError, PciConfigSpaceKind, PciDevice, PciHostAddressSpace, PciHostBridgeError,
+    PciHostBridgeInfo, PciHostBridgeWindow, PciHostConfigRegion, PciHostDmaInfo, PciResolvedIrq,
+    pci_scan_raw, register_host_bridge, set_pci_config_access,
 };
 use general::dev::pnp::PnpDevice;
-use general::firmware::dtb::{DtbPciAddressSpace, DtbPciRangeInfo, DtbPcieHostInfo};
+use general::firmware::dtb::{
+    DtbPciAddressSpace, DtbPciConfigSpace, DtbPciRangeInfo, DtbPcieHostInfo,
+};
 use vfs::sync::Spinlock;
 
 /// ECAM 全局状态:base(虚拟地址)+ 总线范围。
@@ -64,12 +69,37 @@ pub(crate) fn register_pci_host_bridge(host: &DtbPcieHostInfo, pnp: Option<Arc<P
     let info = PciHostBridgeInfo {
         name: host.name.into(),
         firmware_path: Some(host.path.into()),
+        numa_node_id: host.numa_node_id,
         domain: host.domain,
         bus_start: host.bus_start,
         bus_end: host.bus_end,
-        ecam_phys: host.ecam_phys,
-        ecam_size: host.ecam_size,
-        dma_coherent: host.dma_coherent,
+        config_regions: vec![PciHostConfigRegion {
+            bus_start: host.bus_start,
+            bus_end: host.bus_end,
+            physical_start: host.ecam_phys,
+            size: host.ecam_size,
+        }],
+        config_space: match host.config_space {
+            DtbPciConfigSpace::Cam => PciConfigSpaceKind::Cam,
+            DtbPciConfigSpace::Ecam => PciConfigSpaceKind::Ecam,
+            DtbPciConfigSpace::Ls2k1000 => PciConfigSpaceKind::Ls2k1000,
+        },
+        dma_coherent: host.effective_dma.coherent,
+        dma: PciHostDmaInfo {
+            windows: host.effective_dma.windows.as_ref().map(|windows| {
+                windows
+                    .iter()
+                    .map(|window| DmaWindow {
+                        cpu_start: window.cpu_start,
+                        dma_start: window.dma_start,
+                        size: window.size,
+                    })
+                    .collect()
+            }),
+            unsupported: host.effective_dma.unsupported,
+            ..PciHostDmaInfo::default()
+        },
+        firmware_functions: Vec::new(),
         windows: host.ranges.iter().map(pci_host_window).collect(),
         irq_route_count: host.interrupt_map.len(),
         msi_route_count: host.msi_map.len(),
@@ -263,7 +293,7 @@ fn resolve_pci_irq(
     function: u8,
     interrupt_pin: Option<u8>,
     _interrupt_line: Option<u8>,
-) -> Option<IrqLine> {
+) -> Option<PciResolvedIrq> {
     let interrupt_pin = interrupt_pin?;
     let routing = PCI_IRQ_ROUTING.lock();
     let routing = routing.as_ref()?;
@@ -283,6 +313,7 @@ fn resolve_pci_irq(
         .iter()
         .find(|route| masked_cells_match(&key, &route.child_key, &routing.mask))
         .and_then(|route| irq::translate_firmware_irq(Some(route.parent), &route.parent_specifier))
+        .map(PciResolvedIrq::shared)
 }
 
 fn pci_requester_id(bus: u8, device: u8, function: u8) -> u32 {

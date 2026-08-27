@@ -7,13 +7,5 @@
 
 /// 把本架构的 `EntropySource` 装到 `general` 随机子系统里。
 pub fn register_arch_hooks() {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        arch::register_entropy_source();
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    {
-        arch::register_entropy_source();
-    }
+    arch::register_entropy_source();
 }

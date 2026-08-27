@@ -93,14 +93,7 @@ impl SoyoReadAt for ExecutableImageReader<'_> {
 }
 
 fn current_target_arch() -> TargetArch {
-    #[cfg(target_arch = "riscv64")]
-    {
-        TargetArch::Riscv64
-    }
-    #[cfg(target_arch = "loongarch64")]
-    {
-        TargetArch::LoongArch64
-    }
+    hal::platform::native_abi_arch()
 }
 
 const fn map_soyo_error(error: SoyoError) -> Errno {

@@ -42,11 +42,11 @@ pub const VDSO_DATA_CPU_ID_OFFSET: usize = 0x3C;
 pub const VDSO_DATA_NODE_ID_OFFSET: usize = 0x40;
 pub const VDSO_DATA_CLOCK_REALTIME_RES_OFFSET: usize = 0x44;
 
-const SYS_CLOCK_GETTIME: usize = 113;
-const SYS_CLOCK_GETRES: usize = 114;
-const SYS_GETTIMEOFDAY: usize = 169;
-const SYS_GETCPU: usize = 168;
-const SYS_RT_SIGRETURN: usize = 139;
+const SYS_CLOCK_GETTIME: usize = crate::loongarch64::syscall::nr::SYS_CLOCK_GETTIME;
+const SYS_CLOCK_GETRES: usize = crate::loongarch64::syscall::nr::SYS_CLOCK_GETRES;
+const SYS_GETTIMEOFDAY: usize = crate::loongarch64::syscall::nr::SYS_GETTIMEOFDAY;
+const SYS_GETCPU: usize = crate::loongarch64::syscall::nr::SYS_GETCPU;
+const SYS_RT_SIGRETURN: usize = crate::loongarch64::syscall::nr::SYS_RT_SIGRETURN;
 
 const CLOCK_REALTIME: usize = 0;
 const CLOCK_MONOTONIC: usize = 1;

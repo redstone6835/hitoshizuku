@@ -11,6 +11,28 @@ pub const PAGE_SIZE: u64 = 4096;
 pub enum TargetArch {
     Riscv64 = 1,
     LoongArch64 = 2,
+    X86_64 = 3,
+}
+
+impl TargetArch {
+    /// 校验 Native ABI wire 值，未知值不得构造成枚举。
+    pub const fn from_raw(raw: u16) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Riscv64),
+            2 => Some(Self::LoongArch64),
+            3 => Some(Self::X86_64),
+            _ => None,
+        }
+    }
+
+    /// SOYO 原生代码入口必须满足的最小指令对齐。
+    pub const fn instruction_alignment(self) -> u64 {
+        match self {
+            Self::Riscv64 => 2,
+            Self::LoongArch64 => 4,
+            Self::X86_64 => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

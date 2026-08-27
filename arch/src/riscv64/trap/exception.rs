@@ -200,7 +200,7 @@ fn native_fault_kind(code: usize) -> u32 {
 }
 
 // Linux RISC-V64 syscall ABI 中会整体替换当前用户上下文的调用。
-const SYS_RT_SIGRETURN: usize = 139;
+const SYS_RT_SIGRETURN: usize = crate::riscv64::syscall::nr::SYS_RT_SIGRETURN;
 
 /// 对即将返回 U-mode 的架构上下文做最后一道防御性净化。
 ///

@@ -169,11 +169,6 @@ impl SeccompState {
         action
     }
 
-    /// strict 模式：仅允许 read/write/_exit/rt_sigreturn。
-    pub fn strict_allows(nr: usize) -> bool {
-        matches!(nr, 63 | 64 | 93 | 139) // read/write/_exit/rt_sigreturn
-    }
-
     /// fork/clone 时的深拷贝：mode/log/listener_factory 拷贝，过滤器逐项
     /// `Arc::clone`（`SeccompFilter` 不可变，共享即可）。防止子进程安装过滤器
     /// 污染父进程的 `SeccompState`。

@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use sched::{TASKEXT_RISCV_VECTOR_STATE, Task};
+use sched::{TASKEXT_RISCV_VECTOR_SIGNAL_STACK, TASKEXT_RISCV_VECTOR_STATE, Task, TaskExtKey};
 use spin::Mutex;
 
 use crate::riscv64::specific::{
@@ -52,6 +52,7 @@ impl UserVectorState {
 }
 
 pub type SharedUserVectorState = Arc<Mutex<UserVectorState>>;
+type UserVectorSignalStack = Mutex<Vec<Option<UserVectorState>>>;
 
 pub fn has_user_vector() -> bool {
     HAS_VECTOR.load(Ordering::Acquire)
@@ -165,8 +166,55 @@ pub fn clone_ext_payload(src: &Arc<dyn Any + Send + Sync>) -> Arc<dyn Any + Send
     Arc::new(Mutex::new(state.lock().clone()))
 }
 
+pub fn clone_task_extension(
+    key: TaskExtKey,
+    src: &Arc<dyn Any + Send + Sync>,
+) -> Option<Arc<dyn Any + Send + Sync>> {
+    match key {
+        TASKEXT_RISCV_VECTOR_STATE => Some(clone_ext_payload(src)),
+        TASKEXT_RISCV_VECTOR_SIGNAL_STACK => Some(Arc::new(UserVectorSignalStack::new(Vec::new()))),
+        _ => None,
+    }
+}
+
 pub fn clear_for_task(task: &Task) {
     let _ = task.ext_remove(TASKEXT_RISCV_VECTOR_STATE);
+    let _ = task.ext_remove(TASKEXT_RISCV_VECTOR_SIGNAL_STACK);
+}
+
+pub fn push_signal_snapshot(task: &Arc<Task>, tf_ptr: usize) -> Result<(), ()> {
+    // Safety: trap-frame 指针来自当前任务的已保存用户上下文，在信号帧构造期间有效。
+    let tf = unsafe { &mut *(tf_ptr as *mut TrapFrame) };
+    let snapshot = snapshot_current_for_signal(tf);
+    let stack = if let Some(stack) = task
+        .ext_lookup(TASKEXT_RISCV_VECTOR_SIGNAL_STACK)
+        .and_then(|payload| payload.downcast::<UserVectorSignalStack>().ok())
+    {
+        stack
+    } else {
+        let stack = Arc::new(UserVectorSignalStack::new(Vec::new()));
+        task.ext_install(TASKEXT_RISCV_VECTOR_SIGNAL_STACK, stack.clone());
+        stack
+    };
+    let mut guard = stack.lock();
+    guard.try_reserve(1).map_err(|_| ())?;
+    guard.push(snapshot);
+    Ok(())
+}
+
+pub fn pop_signal_snapshot(task: &Arc<Task>, tf_ptr: usize) {
+    let Some(stack) = task
+        .ext_lookup(TASKEXT_RISCV_VECTOR_SIGNAL_STACK)
+        .and_then(|payload| payload.downcast::<UserVectorSignalStack>().ok())
+    else {
+        return;
+    };
+    let Some(snapshot) = stack.lock().pop() else {
+        return;
+    };
+    // Safety: trap-frame 指针来自当前任务的已保存用户上下文，在信号恢复期间有效。
+    let tf = unsafe { &mut *(tf_ptr as *mut TrapFrame) };
+    restore_signal_snapshot(tf, snapshot);
 }
 
 pub fn snapshot_current_for_signal(tf: &mut TrapFrame) -> Option<UserVectorState> {

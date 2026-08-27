@@ -672,18 +672,7 @@ fn push_user_string(mode: StackLayoutMode, sp: &mut usize, bytes: &[u8]) -> usiz
 }
 
 fn arch_hwcap() -> usize {
-    #[cfg(target_arch = "riscv64")]
-    {
-        arch::riscv64::vector::user_hwcap()
-    }
-    #[cfg(target_arch = "loongarch64")]
-    {
-        arch::loongarch64::user_hwcap()
-    }
-    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
-    {
-        0
-    }
+    hal::platform::user_hwcap()
 }
 
 struct ShebangExec {

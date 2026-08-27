@@ -15,17 +15,7 @@
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
 pub fn save_and_disable_local() -> usize {
-    #[cfg(target_arch = "loongarch64")]
-    unsafe {
-        let state = arch::LoongArch64InterruptOps::save_interrupt_state();
-        arch::LoongArch64InterruptOps::disable_interrupts();
-        state
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    unsafe {
-        arch::riscv64::trap::Riscv64InterruptOps::save_and_disable()
-    }
+    arch::save_and_disable_local_interrupts()
 }
 
 /// 恢复当前 CPU 此前保存的本地中断状态。
@@ -39,13 +29,5 @@ pub fn save_and_disable_local() -> usize {
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
 pub fn restore_local(state: usize) {
-    #[cfg(target_arch = "loongarch64")]
-    unsafe {
-        arch::LoongArch64InterruptOps::restore_interrupt_state(state);
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    unsafe {
-        arch::riscv64::trap::Riscv64InterruptOps::restore_interrupt_state(state);
-    }
+    arch::restore_local_interrupts(state);
 }

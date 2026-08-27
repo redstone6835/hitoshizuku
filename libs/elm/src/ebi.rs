@@ -317,6 +317,8 @@ pub enum ElmEbiArch {
     Riscv64 = 1,
     /// `LoongArch64` 是 `ElmEbiArch` 中的稳定判别值，表示 `loong arch64`。
     LoongArch64 = 2,
+    /// `X86_64` 是 `ElmEbiArch` 中的稳定判别值，表示 64 位 x86。
+    X86_64 = 3,
 }
 
 impl ElmEbiArch {
@@ -326,7 +328,18 @@ impl ElmEbiArch {
             0 => Some(Self::Any),
             1 => Some(Self::Riscv64),
             2 => Some(Self::LoongArch64),
+            3 => Some(Self::X86_64),
             _ => None,
+        }
+    }
+
+    /// Rust ABI 指纹使用的规范目标标识。
+    pub const fn target_spec_identifier(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Riscv64 => "riscv64gc-unknown-none-elf",
+            Self::LoongArch64 => "loongarch64-unknown-none",
+            Self::X86_64 => "x86_64-unknown-none",
         }
     }
 

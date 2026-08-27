@@ -1529,8 +1529,11 @@ impl<'a> DtbTree<'a> {
         let range = self.first_reg_range(node_id)?;
         Some(SerialPortInfo {
             name: self.node_name_or_path(node_id),
+            register_space: super::FirmwareRegisterSpace::SystemMemory,
             phys_addr: range.start,
             reg_size: Some(range.size),
+            reg_shift: None,
+            reg_io_width: None,
             clock_hz: read_clock_hz(node),
             baud: read_current_speed(node),
         })
@@ -1611,8 +1614,11 @@ impl<'a> DtbTree<'a> {
             }
             ports.push(SerialPortInfo {
                 name: self.node_name_or_path(node_id),
+                register_space: super::FirmwareRegisterSpace::SystemMemory,
                 phys_addr: range.start,
                 reg_size: Some(range.size),
+                reg_shift: None,
+                reg_io_width: None,
                 clock_hz: read_clock_hz(self.node(node_id)),
                 baud: read_current_speed(self.node(node_id)),
             });

@@ -610,7 +610,7 @@ demo    source=eki
 - `ElmEbiSourceRequest`：管理装载信封，显式携带 EBI Source kind、父单元 ID、初始资源预算、Source payload 长度和受控授权 flags；固定线格式为 96 字节，全部对齐字节都由显式保留字段覆盖。
 - `ElmProjectionSourceRequest`：Projection Source 分发头，携带 provider ID 和实际格式 payload 长度；固定线格式为 24 字节。
 - `ElmEbiTarget`：目标架构、EBI ABI 版本和最低 Core 版本。
-- `ElmEbiArch`：`Any`、`Riscv64`、`LoongArch64`。
+- `ElmEbiArch`：`Any=0`、`Riscv64=1`、`LoongArch64=2`、`X86_64=3`。
 - `ElmEbiUnit`：清单、目标、菜单声明、段声明、入口声明、依赖声明、拓展点声明、拓展声明、provider port 声明、imports 和 exports 元数据。
 - `ElmEbiSegment`：段类型、大小、权限 flags、file size、mem size、对齐、EBI Source block 索引、Source 偏移和内容 hash。
 - `ElmEbiEntry`：旧式独立原生入口描述；新 Rust ELM 不再单独生成该记录。

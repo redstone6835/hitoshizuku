@@ -158,14 +158,7 @@ impl FileLike for ImageFileBacking {
 }
 
 fn current_target_arch() -> TargetArch {
-    #[cfg(target_arch = "riscv64")]
-    {
-        TargetArch::Riscv64
-    }
-    #[cfg(target_arch = "loongarch64")]
-    {
-        TargetArch::LoongArch64
-    }
+    hal::platform::native_abi_arch()
 }
 
 fn map_read_error(error: SoyoReadError<core::convert::Infallible>) -> u32 {

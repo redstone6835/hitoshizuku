@@ -16,6 +16,7 @@ syscall-model-markers = ["performance-profile", "profiling/syscall-model-markers
 general = { path = "../general" }
 allocator = { path = "../libs/allocator" }
 efi = { path = "../libs/efi" }
+errno = { path = "../libs/errno" }
 fdt = { path = "../libs/fdt", features = ["alloc"] }
 log = { path = "../libs/log" }
 mm = { path = "../libs/mm" }

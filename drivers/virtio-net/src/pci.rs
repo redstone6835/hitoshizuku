@@ -656,13 +656,15 @@ fn register_irq(
             }
         }
     }
-    let line = pci.routed_irq_line().ok_or_else(|| {
+    let route = pci.routed_irq().ok_or_else(|| {
         PnpError::missing(PnpResourceKind::Irq, "virtio-net PCI routed irq missing")
     })?;
-    let handle = irq::register_irq_handler(line, handler).map_err(|error| {
-        log::error!("[virtio-net] PCI INTx 注册失败: {}", map_irq_error(error));
-        PnpError::registration_failed(PnpResourceKind::Irq, "virtio-net PCI INTx")
-    })?;
+    let handle = irq::register_irq_request(route.request("virtio-net-pci-intx", handler)).map_err(
+        |error| {
+            log::error!("[virtio-net] PCI INTx 注册失败: {}", map_irq_error(error));
+            PnpError::registration_failed(PnpResourceKind::Irq, "virtio-net PCI INTx")
+        },
+    )?;
     pci.enable_interrupts();
     if let Err(error) =
         dev.own_resource(irq::irq_handler_pnp_resource(handle, "virtio-net-pci-intx"))

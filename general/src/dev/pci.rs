@@ -36,7 +36,7 @@ use vfs::sync::Spinlock;
 
 use super::dma::{DmaAddressMapping, DmaBouncePolicy, DmaConstraints, DmaContext, DmaWindow};
 use super::iommu::{self, IommuAttachment, IommuRequester};
-use super::irq::IrqLine;
+use super::irq::{IrqHandler, IrqLine, IrqPolarity, IrqRequest, IrqSharing, IrqTrigger};
 use super::msi;
 use super::platform::FirmwareProperty;
 use super::pnp::{
@@ -391,11 +391,23 @@ impl PciConfigSpaceKind {
     }
 }
 
+/// PCI host 配置空间的一段物理布局。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PciHostConfigRegion {
+    pub bus_start: u8,
+    pub bus_end: u8,
+    pub physical_start: usize,
+    pub size: usize,
+}
+
 /// PCI host bridge 的标准化描述。
 ///
 /// 该结构是设备层认识 host bridge 的统一入口：配置空间范围、bus-range、地址窗口、
 /// DMA 一致性以及固件路由规模都会被保存下来，供 sysfs/诊断/后续热插拔或 DMA
 /// 策略查询。具体的配置空间读写回调仍由 [`PciConfigAccess`] 单独安装。
+///
+/// `config_regions` 是配置空间物理布局的权威描述。一个 host 可以由多段物理上
+/// 不连续的 MCFG allocation 共同覆盖，但每个 bus 必须恰好落入一段 region。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PciHostBridgeInfo {
     pub name: Box<str>,
@@ -405,8 +417,7 @@ pub struct PciHostBridgeInfo {
     pub domain: u16,
     pub bus_start: u8,
     pub bus_end: u8,
-    pub ecam_phys: usize,
-    pub ecam_size: usize,
+    pub config_regions: Vec<PciHostConfigRegion>,
     pub config_space: PciConfigSpaceKind,
     pub dma_coherent: bool,
     pub dma: PciHostDmaInfo,
@@ -523,6 +534,13 @@ impl<T> PciHostTable<T> {
             .map(|(_, value)| value)
     }
 
+    pub fn get_mut(&mut self, segment: u16, bus: u8) -> Option<&mut T> {
+        self.entries
+            .iter_mut()
+            .find(|(key, _)| key.contains(segment, bus))
+            .map(|(_, value)| value)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -589,14 +607,7 @@ pub fn register_host_bridge(
     info: PciHostBridgeInfo,
     pnp: Option<Arc<PnpDevice>>,
 ) -> Result<PciHostBridgeHandle, PciHostBridgeError> {
-    let bus_count = usize::from(info.bus_end)
-        .checked_sub(usize::from(info.bus_start))
-        .and_then(|count| count.checked_add(1));
-    let required_config_size =
-        bus_count.and_then(|count| count.checked_mul(info.config_space.bytes_per_bus()));
-    if info.bus_start > info.bus_end
-        || required_config_size.is_none_or(|required| info.ecam_size < required)
-    {
+    if !pci_host_config_regions_valid(&info) {
         return Err(PciHostBridgeError::Invalid);
     }
 
@@ -655,6 +666,68 @@ pub fn register_host_bridge(
     }
     pnp_core::notify_dependency_ready(PnpDependency::PciHostBridge(domain));
     Ok(handle)
+}
+
+fn pci_host_config_regions_valid(info: &PciHostBridgeInfo) -> bool {
+    if info.bus_start > info.bus_end || info.config_regions.is_empty() {
+        return false;
+    }
+    let bytes_per_bus = info.config_space.bytes_per_bus();
+    for (index, region) in info.config_regions.iter().enumerate() {
+        let Some(bus_count) = usize::from(region.bus_end)
+            .checked_sub(usize::from(region.bus_start))
+            .and_then(|count| count.checked_add(1))
+        else {
+            return false;
+        };
+        let Some(required_size) = bus_count.checked_mul(bytes_per_bus) else {
+            return false;
+        };
+        if region.bus_start < info.bus_start
+            || region.bus_end > info.bus_end
+            || region.size < required_size
+            || region.physical_start.checked_add(region.size).is_none()
+        {
+            return false;
+        }
+        if info.config_regions[..index].iter().any(|existing| {
+            pci_bus_ranges_overlap(
+                existing.bus_start,
+                existing.bus_end,
+                region.bus_start,
+                region.bus_end,
+            ) || ranges_overlap_usize(
+                existing.physical_start,
+                existing.size,
+                region.physical_start,
+                region.size,
+            )
+        }) {
+            return false;
+        }
+    }
+    (info.bus_start..=info.bus_end).all(|bus| {
+        info.config_regions
+            .iter()
+            .filter(|region| (region.bus_start..=region.bus_end).contains(&bus))
+            .count()
+            == 1
+    })
+}
+
+fn ranges_overlap_usize(
+    left_start: usize,
+    left_size: usize,
+    right_start: usize,
+    right_size: usize,
+) -> bool {
+    let (Some(left_end), Some(right_end)) = (
+        left_start.checked_add(left_size),
+        right_start.checked_add(right_size),
+    ) else {
+        return true;
+    };
+    left_start < right_end && right_start < left_end
 }
 
 #[kernel_symbols::export(
@@ -1094,6 +1167,37 @@ fn pci_bar_size_from_mask(mask: u64, is_64: bool) -> Option<u64> {
 /// PCI 驱动只知道 function 自身的 interrupt pin/line 配置；真正应注册到哪条
 /// 规范化 IRQ line 由 host bridge 或固件路由决定。平台层可在安装 config
 /// access 时提供该回调，设备驱动只消费解析后的 [`IrqLine`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PciResolvedIrq {
+    pub line: IrqLine,
+    pub trigger: Option<IrqTrigger>,
+    pub polarity: Option<IrqPolarity>,
+    pub sharing: IrqSharing,
+}
+
+impl PciResolvedIrq {
+    pub const fn shared(line: IrqLine) -> Self {
+        Self {
+            line,
+            trigger: None,
+            polarity: None,
+            sharing: IrqSharing::Shared,
+        }
+    }
+
+    pub fn request(self, owner: &'static str, handler: Arc<dyn IrqHandler>) -> IrqRequest {
+        IrqRequest {
+            line: self.line,
+            handler,
+            owner,
+            sharing: self.sharing,
+            trigger: self.trigger,
+            polarity: self.polarity,
+            bottom_half: None,
+        }
+    }
+}
+
 pub type PciIrqResolver = fn(
     segment: u16,
     bus: u8,
@@ -1101,7 +1205,7 @@ pub type PciIrqResolver = fn(
     function: u8,
     interrupt_pin: Option<u8>,
     interrupt_line: Option<u8>,
-) -> Option<IrqLine>;
+) -> Option<PciResolvedIrq>;
 
 /// PCI endpoint MSI 分配回调。
 ///
@@ -1411,6 +1515,25 @@ pub fn resolve_irq(
     interrupt_pin: Option<u8>,
     interrupt_line: Option<u8>,
 ) -> Option<IrqLine> {
+    resolve_irq_route(
+        segment,
+        bus,
+        device,
+        function,
+        interrupt_pin,
+        interrupt_line,
+    )
+    .map(|route| route.line)
+}
+
+pub fn resolve_irq_route(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    interrupt_pin: Option<u8>,
+    interrupt_line: Option<u8>,
+) -> Option<PciResolvedIrq> {
     let resolver = {
         let guard = PCI_CONFIG.lock();
         guard.as_ref()?.resolve_irq?
@@ -2219,13 +2342,7 @@ impl PciDevice {
     ///
     /// 这里不把 PCI config space 的 interrupt line 字节直接解释为 CPU 中断号；
     /// 该字节只是一段桥接路由输入，具体含义必须由 host bridge/固件层解析。
-    #[kernel_symbols::export(
-        name = "general.dev.pci.PciDevice.routed_irq_line",
-        contract = "kernel.general.pci-route@1",
-        version = 1,
-        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
-    )]
-    pub fn routed_irq_line(&self) -> Option<IrqLine> {
+    pub fn routed_irq(&self) -> Option<PciResolvedIrq> {
         let (segment, bus, device, function) = self.bdf()?;
         let pin = self.irq_pin();
         let line = self.irq_line();
@@ -2235,6 +2352,16 @@ impl PciDevice {
             guard.as_ref()?.resolve_irq?
         };
         resolver(segment, bus, device, function, pin, line)
+    }
+
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.routed_irq_line",
+        contract = "kernel.general.pci-route@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+    )]
+    pub fn routed_irq_line(&self) -> Option<IrqLine> {
+        self.routed_irq().map(|route| route.line)
     }
 
     #[kernel_symbols::export(
@@ -3027,6 +3154,58 @@ mod tests {
 
     static TEST_PCI_ACCESS_STATE: Spinlock<()> = Spinlock::new(());
 
+    fn test_host_with_config_regions(
+        config_regions: Vec<PciHostConfigRegion>,
+    ) -> PciHostBridgeInfo {
+        PciHostBridgeInfo {
+            name: "test-pci-host".into(),
+            firmware_path: None,
+            numa_node_id: None,
+            domain: 0,
+            bus_start: 0x20,
+            bus_end: 0x2f,
+            config_regions,
+            config_space: PciConfigSpaceKind::Ecam,
+            dma_coherent: false,
+            dma: PciHostDmaInfo::default(),
+            firmware_functions: Vec::new(),
+            windows: Vec::new(),
+            irq_route_count: 0,
+            msi_route_count: 0,
+        }
+    }
+
+    #[test]
+    fn host_config_regions_require_exact_nonaliased_bus_coverage() {
+        let valid = test_host_with_config_regions(vec![
+            PciHostConfigRegion {
+                bus_start: 0x20,
+                bus_end: 0x27,
+                physical_start: 0x8200_0000,
+                size: 8 << 20,
+            },
+            PciHostConfigRegion {
+                bus_start: 0x28,
+                bus_end: 0x2f,
+                physical_start: 0x9280_0000,
+                size: 8 << 20,
+            },
+        ]);
+        assert!(pci_host_config_regions_valid(&valid));
+
+        let mut gap = valid.clone();
+        gap.config_regions[1].bus_start = 0x29;
+        assert!(!pci_host_config_regions_valid(&gap));
+
+        let mut logical_overlap = valid.clone();
+        logical_overlap.config_regions[1].bus_start = 0x27;
+        assert!(!pci_host_config_regions_valid(&logical_overlap));
+
+        let mut physical_alias = valid;
+        physical_alias.config_regions[1].physical_start = 0x8240_0000;
+        assert!(!pci_host_config_regions_valid(&physical_alias));
+    }
+
     fn test_config_read_u8(
         _segment: u16,
         _bus: u8,
@@ -3095,8 +3274,10 @@ mod tests {
         _function: u8,
         _interrupt_pin: Option<u8>,
         _interrupt_line: Option<u8>,
-    ) -> Option<IrqLine> {
-        PCI_CONFIG.try_lock().map(|_guard| IrqLine::Hardware(17))
+    ) -> Option<PciResolvedIrq> {
+        PCI_CONFIG
+            .try_lock()
+            .map(|_guard| PciResolvedIrq::shared(IrqLine::Hardware(17)))
     }
 
     #[test]
@@ -3352,6 +3533,284 @@ mod tests {
 }
 
 // ── PCI Bus 扫描器 ──────────────────────────────────────────────────────
+
+/// 任意 function 的 INTx 已逐级 swizzle 到 root bus 后的路由键。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PciIntxRouteKey {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    /// PCI 配置空间编码的 pin 编号，范围为 `1..=4`。
+    pub pin: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PciIntxBridge {
+    primary_bus: u8,
+    secondary_bus: u8,
+    subordinate_bus: u8,
+    device: u8,
+    function: u8,
+}
+
+/// 从标准 PCI-to-PCI bridge bus-number registers 构造的只读 INTx 拓扑。
+///
+/// 固件路由后端只需保存 root bus 的 `_PRT`/interrupt-map。此结构负责把任意
+/// 下游 function 的 pin 按 PCI swizzle 规则归约到 root bus 的直接 child。
+#[derive(Clone, Debug)]
+pub struct PciIntxTopology {
+    root_bus: u8,
+    bus_end: u8,
+    bridges: Vec<PciIntxBridge>,
+}
+
+impl PciIntxTopology {
+    fn new(root_bus: u8, bus_end: u8, mut bridges: Vec<PciIntxBridge>) -> Option<Self> {
+        if root_bus > bus_end {
+            return None;
+        }
+        bridges.sort_unstable_by_key(|bridge| bridge.secondary_bus);
+        for (index, bridge) in bridges.iter().enumerate() {
+            for other in &bridges[index + 1..] {
+                if bridge.secondary_bus == other.secondary_bus
+                    || bridge.primary_bus == other.primary_bus
+                        && bridge.secondary_bus <= other.subordinate_bus
+                        && other.secondary_bus <= bridge.subordinate_bus
+                {
+                    return None;
+                }
+            }
+        }
+        let topology = Self {
+            root_bus,
+            bus_end,
+            bridges,
+        };
+        for bridge in &topology.bridges {
+            if bridge.primary_bus == root_bus {
+                continue;
+            }
+            let parent = topology.bridge_for_secondary(bridge.primary_bus)?;
+            if bridge.subordinate_bus > parent.subordinate_bus {
+                return None;
+            }
+            topology.root_route(bridge.primary_bus, bridge.device, bridge.function, 1)?;
+        }
+        Some(topology)
+    }
+
+    fn bridge_for_secondary(&self, bus: u8) -> Option<PciIntxBridge> {
+        self.bridges
+            .binary_search_by_key(&bus, |bridge| bridge.secondary_bus)
+            .ok()
+            .map(|index| self.bridges[index])
+    }
+
+    fn root_route(&self, bus: u8, device: u8, function: u8, pin: u8) -> Option<PciIntxRouteKey> {
+        if !(self.root_bus..=self.bus_end).contains(&bus)
+            || device >= PCI_DEVICES_PER_BUS
+            || function >= PCI_FUNCTIONS_PER_DEVICE
+            || !(1..=4).contains(&pin)
+        {
+            return None;
+        }
+        if bus == self.root_bus {
+            return Some(PciIntxRouteKey {
+                bus,
+                device,
+                function,
+                pin,
+            });
+        }
+
+        let endpoint_device = device;
+        let mut current_bus = bus;
+        let mut swizzle_offset = 0u8;
+        for _ in 0..=u8::MAX {
+            let bridge = self.bridge_for_secondary(current_bus)?;
+            if bridge.primary_bus == self.root_bus {
+                let pin = ((pin - 1 + endpoint_device % 4 + swizzle_offset) % 4) + 1;
+                return Some(PciIntxRouteKey {
+                    bus: self.root_bus,
+                    device: bridge.device,
+                    function: bridge.function,
+                    pin,
+                });
+            }
+            swizzle_offset = (swizzle_offset + bridge.device % 4) % 4;
+            current_bus = bridge.primary_bus;
+        }
+        None
+    }
+
+    pub fn resolve(&self, bus: u8, device: u8, function: u8, pin: u8) -> Option<PciIntxRouteKey> {
+        self.root_route(bus, device, function, pin)
+    }
+}
+
+/// 读取已经由固件配置的 PCI bridge bus-number registers，并生成 INTx swizzle 拓扑。
+/// 任一活动 bridge 的范围、父链或唯一性不成立时返回 `None`，路由后端必须 fail-closed。
+pub fn pci_intx_topology_snapshot(
+    segment: u16,
+    root_bus: u8,
+    bus_end: u8,
+) -> Option<PciIntxTopology> {
+    if root_bus > bus_end {
+        return None;
+    }
+    let mut bridges = Vec::new();
+    let mut valid = true;
+    pci_scan_bus_range(
+        segment,
+        root_bus,
+        bus_end,
+        &mut |seg, bus, device, function| {
+            let header_type = match config_read_u8(seg, bus, device, function, 0x0e) {
+                Ok(header_type) => header_type & 0x7f,
+                Err(_) => {
+                    valid = false;
+                    return false;
+                }
+            };
+            if header_type != PCI_HEADER_TYPE_BRIDGE {
+                return true;
+            }
+            let buses = match config_read_u32(seg, bus, device, function, 0x18) {
+                Ok(buses) => buses,
+                Err(_) => {
+                    valid = false;
+                    return false;
+                }
+            };
+            let primary_bus = buses as u8;
+            let secondary_bus = (buses >> 8) as u8;
+            let subordinate_bus = (buses >> 16) as u8;
+            if secondary_bus == 0 && subordinate_bus == 0 {
+                return true;
+            }
+            if primary_bus != bus
+                || secondary_bus <= root_bus
+                || secondary_bus > subordinate_bus
+                || subordinate_bus > bus_end
+                || bridges.try_reserve(1).is_err()
+            {
+                valid = false;
+                return false;
+            }
+            bridges.push(PciIntxBridge {
+                primary_bus,
+                secondary_bus,
+                subordinate_bus,
+                device,
+                function,
+            });
+            true
+        },
+    );
+    valid.then(|| PciIntxTopology::new(root_bus, bus_end, bridges))?
+}
+
+#[cfg(test)]
+mod intx_topology_tests {
+    use alloc::vec;
+
+    use super::*;
+
+    #[test]
+    fn resolves_root_and_multilevel_bridge_swizzles() {
+        let topology = PciIntxTopology::new(
+            0,
+            3,
+            vec![
+                PciIntxBridge {
+                    primary_bus: 0,
+                    secondary_bus: 1,
+                    subordinate_bus: 3,
+                    device: 2,
+                    function: 0,
+                },
+                PciIntxBridge {
+                    primary_bus: 1,
+                    secondary_bus: 2,
+                    subordinate_bus: 3,
+                    device: 5,
+                    function: 0,
+                },
+                PciIntxBridge {
+                    primary_bus: 2,
+                    secondary_bus: 3,
+                    subordinate_bus: 3,
+                    device: 7,
+                    function: 0,
+                },
+            ],
+        )
+        .expect("valid bridge tree");
+
+        assert_eq!(
+            topology.resolve(0, 4, 1, 1),
+            Some(PciIntxRouteKey {
+                bus: 0,
+                device: 4,
+                function: 1,
+                pin: 1,
+            })
+        );
+        assert_eq!(
+            topology.resolve(1, 3, 0, 1),
+            Some(PciIntxRouteKey {
+                bus: 0,
+                device: 2,
+                function: 0,
+                pin: 4,
+            })
+        );
+        assert_eq!(
+            topology.resolve(2, 4, 0, 2),
+            Some(PciIntxRouteKey {
+                bus: 0,
+                device: 2,
+                function: 0,
+                pin: 3,
+            })
+        );
+        assert_eq!(
+            topology.resolve(3, 1, 0, 4),
+            Some(PciIntxRouteKey {
+                bus: 0,
+                device: 2,
+                function: 0,
+                pin: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_unparented_bridge_trees() {
+        let bridge = PciIntxBridge {
+            primary_bus: 0,
+            secondary_bus: 1,
+            subordinate_bus: 1,
+            device: 2,
+            function: 0,
+        };
+        assert!(PciIntxTopology::new(0, 2, vec![bridge, bridge]).is_none());
+        assert!(
+            PciIntxTopology::new(
+                0,
+                3,
+                vec![PciIntxBridge {
+                    primary_bus: 2,
+                    secondary_bus: 3,
+                    subordinate_bus: 3,
+                    device: 4,
+                    function: 0,
+                }],
+            )
+            .is_none()
+        );
+    }
+}
 
 /// 对指定 segment 内的 bus 范围进行 PCI 设备扫描。
 ///

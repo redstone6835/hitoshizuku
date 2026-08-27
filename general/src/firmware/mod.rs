@@ -12,13 +12,24 @@ pub mod acpi;
 pub mod dtb;
 pub mod power;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirmwareRegisterSpace {
+    SystemMemory,
+    SystemIo,
+}
+
 #[derive(Clone, Debug)]
 pub struct SerialPortInfo {
     pub name: Box<str>,
+    pub register_space: FirmwareRegisterSpace,
     pub phys_addr: usize,
     /// 固件声明的寄存器窗口大小。没有该信息时保持 `None`，由最终 platform
     /// 资源保留未知大小，而不是在固件摘要层替调用方猜一个固定窗口。
     pub reg_size: Option<usize>,
+    /// 相邻 UART 寄存器之间的字节步长，以 `log2(stride)` 表示。
+    pub reg_shift: Option<u32>,
+    /// 单次寄存器访问宽度（字节）。
+    pub reg_io_width: Option<u32>,
     pub clock_hz: Option<u32>,
     /// 固件当前配置的串口波特率。驱动仍可在未声明时使用自身默认策略。
     pub baud: Option<u32>,

@@ -262,6 +262,15 @@ fn la64_init_array_entry_must_be_four_byte_aligned() {
     );
 }
 
+#[test]
+fn x86_64_init_array_entry_accepts_byte_alignment() {
+    let bytes = soyo_with_init_array(TargetArch::X86_64, 1);
+
+    let metadata = read_soyo(&SliceSoyoReader::new(&bytes), SoyoReadLimits::portable())
+        .expect("x86_64 原生入口允许字节对齐");
+    assert_eq!(metadata.header.target_arch, TargetArch::X86_64);
+}
+
 fn soyo_with_init_array(target_arch: TargetArch, entry: u64) -> alloc::vec::Vec<u8> {
     let mut bytes = extended_soyo();
     put_u16(

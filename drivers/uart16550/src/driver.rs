@@ -9,6 +9,7 @@ use core::any::Any;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use general::StartAcpiIoOps;
 use sched::{Task, WaitQueue};
 
 use crate::dev::char::*;
@@ -222,8 +223,15 @@ enum UartRegisterConfigError {
 
 /// 已按 8250 DT binding 校验的寄存器访问布局。
 #[derive(Clone, Copy)]
+enum UartRegisterBackend {
+    Mmio,
+    SystemIo(StartAcpiIoOps),
+}
+
+#[derive(Clone, Copy)]
 struct UartRegisterAccess {
     base: usize,
+    backend: UartRegisterBackend,
     reg_offset: usize,
     reg_shift: u32,
     width: UartRegisterWidth,
@@ -231,10 +239,33 @@ struct UartRegisterAccess {
 }
 
 impl UartRegisterAccess {
+    fn from_mmio(
+        info: &PlatformDeviceInfo,
+        base: usize,
+        window_size: usize,
+    ) -> Result<Self, UartRegisterConfigError> {
+        Self::from_platform(info, base, window_size, UartRegisterBackend::Mmio)
+    }
+
+    fn from_system_io(
+        info: &PlatformDeviceInfo,
+        base: u16,
+        window_size: u16,
+        ops: StartAcpiIoOps,
+    ) -> Result<Self, UartRegisterConfigError> {
+        Self::from_platform(
+            info,
+            usize::from(base),
+            usize::from(window_size),
+            UartRegisterBackend::SystemIo(ops),
+        )
+    }
+
     fn from_platform(
         info: &PlatformDeviceInfo,
         base: usize,
         window_size: usize,
+        backend: UartRegisterBackend,
     ) -> Result<Self, UartRegisterConfigError> {
         let reg_offset = optional_u32_property(info, "reg-offset")?.unwrap_or(0) as usize;
         let reg_shift = optional_u32_property(info, "reg-shift")?.unwrap_or(0);
@@ -246,6 +277,11 @@ impl UartRegisterAccess {
         )
         .ok_or(UartRegisterConfigError::InvalidWidth)?;
         let endian = uart_register_endian(info)?;
+        if matches!(backend, UartRegisterBackend::SystemIo(_))
+            && endian != UartRegisterEndian::Little
+        {
+            return Err(UartRegisterConfigError::InvalidWidth);
+        }
         let stride = 1usize
             .checked_shl(reg_shift)
             .ok_or(UartRegisterConfigError::AddressOverflow)?;
@@ -267,11 +303,17 @@ impl UartRegisterAccess {
             .ok_or(UartRegisterConfigError::AddressOverflow)?;
         base.checked_add(span)
             .ok_or(UartRegisterConfigError::AddressOverflow)?;
+        if matches!(backend, UartRegisterBackend::SystemIo(_))
+            && base.saturating_add(span).saturating_sub(1) > usize::from(u16::MAX)
+        {
+            return Err(UartRegisterConfigError::AddressOverflow);
+        }
         if window_size != 0 && span > window_size {
             return Err(UartRegisterConfigError::WindowTooSmall);
         }
         Ok(Self {
             base,
+            backend,
             reg_offset,
             reg_shift,
             width,
@@ -291,6 +333,13 @@ impl UartRegisterAccess {
 
     fn read(self, register: usize) -> u8 {
         let address = self.address(register);
+        if let UartRegisterBackend::SystemIo(ops) = self.backend {
+            return match self.width {
+                UartRegisterWidth::U8 => (ops.read_u8)(address as u16),
+                UartRegisterWidth::U16 => (ops.read_u16)(address as u16) as u8,
+                UartRegisterWidth::U32 => (ops.read_u32)(address as u16) as u8,
+            };
+        }
         // Safety: probe 已按 DT reg 窗口、reg-offset、reg-shift、访问宽度和对齐完整
         // 校验该地址；这里只执行对应宽度的易失 MMIO 读取并取 16550 低 8 位。
         unsafe {
@@ -316,6 +365,14 @@ impl UartRegisterAccess {
 
     fn write(self, register: usize, value: u8) {
         let address = self.address(register);
+        if let UartRegisterBackend::SystemIo(ops) = self.backend {
+            match self.width {
+                UartRegisterWidth::U8 => (ops.write_u8)(address as u16, value),
+                UartRegisterWidth::U16 => (ops.write_u16)(address as u16, u16::from(value)),
+                UartRegisterWidth::U32 => (ops.write_u32)(address as u16, u32::from(value)),
+            }
+            return;
+        }
         // Safety: 安全条件与 `read` 相同；目标是 16550 寄存器，写值按 binding
         // 声明的 MMIO 宽度与端序扩展。
         unsafe {
@@ -961,14 +1018,19 @@ impl DriverControl for Uart16550 {
 /// 实例，并注册字符设备 function。
 pub struct Uart16550PlatformDriver {
     device_mmio_to_virt: fn(usize) -> usize,
+    system_io: Option<StartAcpiIoOps>,
     projection_names: FunctionProjectionNameAllocator,
 }
 
 impl Uart16550PlatformDriver {
     /// 创建 platform 串口驱动。
-    pub const fn new(device_mmio_to_virt: fn(usize) -> usize) -> Self {
+    pub const fn new(
+        device_mmio_to_virt: fn(usize) -> usize,
+        system_io: Option<StartAcpiIoOps>,
+    ) -> Self {
         Self {
             device_mmio_to_virt,
+            system_io,
             // 串口的用户可见节点名由兼容层分配器生成，驱动只声明“这是一个
             // 串口 function”，不把该名字作为硬件身份参与 PnP 匹配。
             projection_names: FunctionProjectionNameAllocator::new("uart"),
@@ -1009,12 +1071,30 @@ impl PnpDriver for Uart16550PlatformDriver {
             .as_any()
             .downcast_ref::<PlatformDeviceInfo>()
             .ok_or(PnpError::InvalidState)?;
-        let Some((phys, size)) = info.first_mmio() else {
-            return Err(PnpError::missing(PnpResourceKind::Mmio, "uart reg missing"));
+        let (registers, address_space, address) = if let Some((phys, size)) = info.first_mmio() {
+            let virt_base = (self.device_mmio_to_virt)(phys);
+            (
+                UartRegisterAccess::from_mmio(info, virt_base, size)
+                    .map_err(map_uart_register_config_error)?,
+                "mmio",
+                phys,
+            )
+        } else if let Some((base, size)) = info.first_io_port() {
+            let ops = self.system_io.ok_or(PnpError::Unsupported {
+                feature: "system I/O port access",
+            })?;
+            (
+                UartRegisterAccess::from_system_io(info, base, size, ops)
+                    .map_err(map_uart_register_config_error)?,
+                "io-port",
+                usize::from(base),
+            )
+        } else {
+            return Err(PnpError::missing(
+                PnpResourceKind::Other("registers"),
+                "uart register resource missing",
+            ));
         };
-        let virt_base = (self.device_mmio_to_virt)(phys);
-        let registers = UartRegisterAccess::from_platform(info, virt_base, size)
-            .map_err(map_uart_register_config_error)?;
         let provider_clock = uart_provider_clock(dev, info)?;
         let clock_hz = provider_clock.or(info.properties.clock_hz);
         let uart = if let Some(clock_hz) = clock_hz {
@@ -1065,9 +1145,10 @@ impl PnpDriver for Uart16550PlatformDriver {
             uart: Arc::clone(&uart),
         }));
         log::printk!(
-            "[platform-uart16550] bound {} phys={:#x} reg-offset={:#x} reg-shift={} reg-io-width={} endian={:?} -> /dev/{}",
+            "[platform-uart16550] bound {} {}={:#x} reg-offset={:#x} reg-shift={} reg-io-width={} endian={:?} -> /dev/{}",
             dev.id,
-            phys,
+            address_space,
+            address,
             registers.reg_offset,
             registers.reg_shift,
             registers.width.bytes(),
@@ -1097,6 +1178,7 @@ impl DriverFactory for Uart16550Factory {
     fn create(&self, ctx: &DevInitContext) -> Result<Arc<dyn PnpDriver>, PnpError> {
         Ok(Arc::new(Uart16550PlatformDriver::new(
             ctx.device_mmio_to_virt,
+            ctx.system_io,
         )))
     }
 }
