@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use vfs::sync::Spinlock;
 
 use crate::dev::pnp::{
-    self, PnpDependency, PnpError, PnpHandleResource, PnpResource, PnpResourceKind,
+    self, PnpDependency, PnpDevice, PnpError, PnpHandleResource, PnpResource, PnpResourceKind,
     PnpResourceReleaseError, PnpResourceReleaseOrder,
 };
 use crate::firmware::dtb::DtbProviderReference;
@@ -811,6 +811,75 @@ pub fn acquire_reference(
         DtbProviderKey::new(kind, reference.phandle),
         &reference.args,
     )
+}
+
+/// 获取 provider clock rate，并立即把 lease 交给 consumer PnP 设备管理。
+///
+/// 该入口把 [`DtbResourceLease`] 及其内部资源 trait object 完全留在常驻 General
+/// 一侧，避免动态 ELM 的失败路径生成针对私有资源表示的析构链接依赖。
+#[kernel_symbols::export(
+    name = "general.dev.dt_provider.acquire_reference_rate_for_device",
+    contract = "kernel.general.dt-provider@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE,
+    retained_args = 1u64 << 2
+)]
+pub fn acquire_reference_rate_for_device(
+    device: &Arc<PnpDevice>,
+    reference: &DtbProviderReference,
+    label: &'static str,
+) -> Result<u64, PnpError> {
+    let lease = acquire_reference(reference).map_err(DtbProviderError::into_pnp_error)?;
+    let rate = match lease
+        .control(DtbResourceRequest::GetRate)
+        .map_err(DtbProviderError::into_pnp_error)?
+    {
+        DtbResourceReply::Value(rate) => rate,
+        _ => {
+            return Err(PnpError::malformed(
+                PnpResourceKind::Other("clock"),
+                "clock provider returned a non-rate reply",
+            ));
+        }
+    };
+    device.own_boxed_resource_or_release(lease_pnp_resource_boxed(lease, label))?;
+    Ok(rate)
+}
+
+/// 配置一个 provider 资源，并立即把 lease 交给 consumer PnP 设备管理。
+///
+/// `arguments` 只在同步 `Configure` 调用期间借用；交给设备长期持有的只有 lease
+/// 和静态 `label`。这样动态 ELM 的成功与失败路径都不需要生成
+/// [`DtbResourceLease`] 的析构或资源 trait object 链接依赖。
+#[kernel_symbols::export(
+    name = "general.dev.dt_provider.acquire_reference_configure_for_device",
+    contract = "kernel.general.dt-provider@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE,
+    retained_args = 1u64 << 3
+)]
+pub fn acquire_reference_configure_for_device(
+    device: &Arc<PnpDevice>,
+    reference: &DtbProviderReference,
+    arguments: &[u32],
+    label: &'static str,
+) -> Result<(), PnpError> {
+    let lease = acquire_reference(reference).map_err(DtbProviderError::into_pnp_error)?;
+    match lease
+        .control(DtbResourceRequest::Configure(arguments))
+        .map_err(DtbProviderError::into_pnp_error)?
+    {
+        DtbResourceReply::Done => {}
+        _ => {
+            return Err(PnpError::malformed(
+                PnpResourceKind::Other("dt-provider"),
+                "provider returned a non-completion reply for configure",
+            ));
+        }
+    }
+    device.own_boxed_resource_or_release(lease_pnp_resource_boxed(lease, label))
 }
 
 #[cfg(test)]

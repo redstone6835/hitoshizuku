@@ -1,4 +1,3 @@
-acpi libs/acpi
 allocator libs/allocator
 efi libs/efi
 elf libs/elf

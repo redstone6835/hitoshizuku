@@ -45,12 +45,6 @@ pub mod sdt;
 pub use pci_types::PciAddress;
 pub use sdt::{fadt::PowerProfile, hpet::HpetInfo, madt::MadtError};
 
-/// 强制链接器保留 ACPI 查询直接符号目录。
-#[doc(hidden)]
-pub fn kernel_symbol_catalog_anchor() -> usize {
-    sdt::SdtHeader::length as usize ^ sdt::SdtHeader::revision as usize
-}
-
 use crate::sdt::{SdtHeader, Signature};
 use core::{
     fmt, mem,

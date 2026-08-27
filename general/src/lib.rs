@@ -45,23 +45,30 @@ pub mod seccomp;
 pub mod syscall;
 pub mod vfs;
 
-/// 强制链接器抽取设备抽象直接符号目录所在的代码生成单元。
+/// 强制链接器抽取设备抽象直接符号和集成组件内部桥所在的代码生成单元。
 #[doc(hidden)]
 pub fn kernel_symbol_catalog_anchor() -> usize {
     dev::block::BlockDevice::mark_gone as usize
         ^ dev::cpu::cpu_reg_for_interrupt_controller as usize
         ^ dev::pnp::register_driver_factory as usize
+        ^ dev::pnp::register_function as usize
         ^ dev::pnp::device_mmio_to_virt as usize
         ^ dev::pnp::PnpDevice::parent as usize
         ^ dev::function::register_function_class as usize
+        ^ dev::function::CharFunction::from_driver_arc as usize
         ^ dev::firmware_bus::register as usize
         ^ dev::dma::set_dma_ops as usize
         ^ dev::language::dispatch as usize
         ^ dev::language::revoke_owner as usize
         ^ dev::language::call as usize
+        ^ dev::language::dispatch_for_provider as usize
+        ^ dev::language::revoke_owner_for_provider as usize
+        ^ dev::language::call_for_provider as usize
         ^ dev::dt_bus::register_i2c_controller as usize
         ^ dev::dt_provider::register as usize
         ^ dev::dt_provider::acquire_reference as usize
+        ^ dev::dt_provider::acquire_reference_rate_for_device as usize
+        ^ dev::dt_provider::acquire_reference_configure_for_device as usize
         ^ dev::dt_provider::provider_pnp_resource_boxed as usize
         ^ dev::dt_provider::lease_pnp_resource_boxed as usize
         ^ dev::flash::pnp_resource_v2_boxed as usize

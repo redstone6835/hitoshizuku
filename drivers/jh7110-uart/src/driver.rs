@@ -18,15 +18,14 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use sched::{Task, WaitQueue};
 
 use crate::dev::char::*;
-use crate::dev::dt_provider::{
-    self, DtbProviderError, DtbResourceLease, DtbResourceReply, DtbResourceRequest,
-};
+use crate::dev::dt_provider;
 use crate::dev::function::{CharFunction, FunctionProjectionNameAllocator};
 use crate::dev::irq::{self, IrqHandle, IrqHandler, IrqLine, IrqStatus};
 use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqRegistrationError};
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, DriverHandle, PnpDependency, PnpDevice, PnpDriver,
     PnpDriverPriority, PnpError, PnpId, PnpResourceKind, register_driver_factory,
+    register_function as register_pnp_function,
 };
 
 // ── 寄存器布局 ──
@@ -158,27 +157,14 @@ fn optional_u32(info: &PlatformDeviceInfo, name: &str) -> Option<u32> {
     Some(u32::from_be_bytes(bytes))
 }
 
-fn uart_clock(info: &PlatformDeviceInfo) -> Result<Option<(u32, DtbResourceLease)>, PnpError> {
+fn uart_clock(dev: &Arc<PnpDevice>, info: &PlatformDeviceInfo) -> Result<Option<u32>, PnpError> {
     let reference = info
         .dtb_reference_by_name(CLOCK_PROPERTY, CLOCK_BAUD_NAME)
         .or_else(|| info.dtb_references(CLOCK_PROPERTY).next());
     let Some(reference) = reference else {
         return Ok(None);
     };
-    let lease =
-        dt_provider::acquire_reference(reference).map_err(DtbProviderError::into_pnp_error)?;
-    let rate = match lease
-        .control(DtbResourceRequest::GetRate)
-        .map_err(DtbProviderError::into_pnp_error)?
-    {
-        DtbResourceReply::Value(rate) => rate,
-        _ => {
-            return Err(PnpError::malformed(
-                PnpResourceKind::Other("clock"),
-                "clock provider returned non-rate reply",
-            ));
-        }
-    };
+    let rate = dt_provider::acquire_reference_rate_for_device(dev, reference, "jh7110-uart-clock")?;
     let rate = u32::try_from(rate).map_err(|_| {
         PnpError::malformed(PnpResourceKind::Other("clock"), "clock rate too large")
     })?;
@@ -188,7 +174,7 @@ fn uart_clock(info: &PlatformDeviceInfo) -> Result<Option<(u32, DtbResourceLease
             "zero clock rate",
         ));
     }
-    Ok(Some((rate, lease)))
+    Ok(Some(rate))
 }
 
 fn apply_default_pinctrl(dev: &Arc<PnpDevice>, info: &PlatformDeviceInfo) -> Result<(), PnpError> {
@@ -200,30 +186,17 @@ fn apply_default_pinctrl(dev: &Arc<PnpDevice>, info: &PlatformDeviceInfo) -> Res
     else {
         return Ok(());
     };
-    let lease = match dt_provider::acquire_reference(reference) {
-        Ok(lease) => lease,
-        Err(DtbProviderError::NotReady(_)) => {
-            log::warning!(
-                "[jh7110-uart] default pinctrl provider not ready; continuing without pin state"
-            );
-            return Ok(());
-        }
-        Err(error) => {
-            log::warning!("[jh7110-uart] default pinctrl acquire failed: {:?}", error);
-            return Ok(());
-        }
-    };
-    if let Err(error) = lease.control(DtbResourceRequest::Configure(&[])) {
+    if let Err(error) = dt_provider::acquire_reference_configure_for_device(
+        dev,
+        reference,
+        &[],
+        "jh7110-uart-pinctrl",
+    ) {
         log::warning!(
             "[jh7110-uart] default pinctrl configure failed: {:?}",
             error
         );
-        return Ok(());
     }
-    let _ = dev.own_boxed_resource(dt_provider::lease_pnp_resource_boxed(
-        lease,
-        "jh7110-uart-pinctrl",
-    ));
     Ok(())
 }
 
@@ -629,8 +602,7 @@ impl PnpDriver for Jh7110UartPlatformDriver {
             }
         }
 
-        let provider_clock = uart_clock(info)?;
-        let clock_hz = provider_clock.as_ref().map(|(rate, _)| *rate);
+        let clock_hz = uart_clock(dev, info)?;
         let uart = match clock_hz {
             Some(clock_hz) => Arc::new(Jh7110Uart::new(
                 regs,
@@ -639,12 +611,6 @@ impl PnpDriver for Jh7110UartPlatformDriver {
             )?),
             None => Arc::new(Jh7110Uart::preconfigured(regs)),
         };
-        if let Some((_, lease)) = provider_clock {
-            dev.own_boxed_resource(dt_provider::lease_pnp_resource_boxed(
-                lease,
-                "jh7110-uart-clock",
-            ))?;
-        }
 
         // 应用默认 pinctrl 状态（引脚已由固件配置时等价幂等）。
         apply_default_pinctrl(dev, info)?;
@@ -653,10 +619,6 @@ impl PnpDriver for Jh7110UartPlatformDriver {
             .projection_names
             .try_alloc_stable(&dev.name)?
             .into_string();
-        let ch = CharDevice::from_arc(
-            info.fw_name.clone(),
-            Arc::clone(&uart) as Arc<dyn CharDriver>,
-        );
         let irq_handle = register_uart_irq(info, Arc::clone(&uart))?;
         if let Some(handle) = irq_handle
             && let Err(err) =
@@ -666,9 +628,15 @@ impl PnpDriver for Jh7110UartPlatformDriver {
             let _ = irq::unregister_irq_handler(handle);
             return Err(err);
         }
-        if let Err(err) = dev.register_function(CharFunction::with_projection_name_arc(
-            &dev.name, &dev_name, ch,
-        )) {
+        if let Err(err) = register_pnp_function(
+            dev,
+            CharFunction::from_driver_arc(
+                info.fw_name.clone(),
+                Arc::clone(&uart) as Arc<dyn CharDriver>,
+                &dev.name,
+                &dev_name,
+            ),
+        ) {
             uart.set_rx_irq_enabled(false);
             return Err(err);
         }

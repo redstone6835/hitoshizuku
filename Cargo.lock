@@ -9,7 +9,6 @@ dependencies = [
  "bit_field",
  "bitflags",
  "byteorder",
- "kernel-symbols",
  "log",
  "pci_types",
  "spinning_top",

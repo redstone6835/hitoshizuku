@@ -119,7 +119,6 @@ pub struct SdtHeader {
     pub creator_revision: u32,
 }
 
-#[kernel_symbols::export]
 impl SdtHeader {
     /// Checks that:
     /// 1. The signature matches the one given.
@@ -161,27 +160,22 @@ impl SdtHeader {
         Ok(())
     }
 
-    #[kernel_symbols::export(name = "acpi.sdt.SdtHeader.length", contract = "kernel.firmware.acpi-sdt@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
     pub fn length(&self) -> u32 {
         self.length
     }
 
-    #[kernel_symbols::export(name = "acpi.sdt.SdtHeader.revision", contract = "kernel.firmware.acpi-sdt@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
     pub fn revision(&self) -> u8 {
         self.revision
     }
 
-    #[kernel_symbols::export(name = "acpi.sdt.SdtHeader.checksum", contract = "kernel.firmware.acpi-sdt@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
     pub fn checksum(&self) -> u8 {
         self.checksum
     }
 
-    #[kernel_symbols::export(name = "acpi.sdt.SdtHeader.oem_id", contract = "kernel.firmware.acpi-sdt@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
     pub fn oem_id(&self) -> Result<&str, AcpiError> {
         str::from_utf8(&self.oem_id).map_err(|_| AcpiError::SdtInvalidOemId(self.signature))
     }
 
-    #[kernel_symbols::export(name = "acpi.sdt.SdtHeader.oem_table_id", contract = "kernel.firmware.acpi-sdt@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
     pub fn oem_table_id(&self) -> Result<&str, AcpiError> {
         str::from_utf8(&self.oem_table_id).map_err(|_| AcpiError::SdtInvalidTableId(self.signature))
     }

@@ -244,6 +244,156 @@ fn map_char_control_error(err: CharIoError) -> ControlError {
     }
 }
 
+/// 常驻字符设备对象持有的动态 ELM 驱动代理。
+///
+/// `CharDriver` 的 trait vtable 和 drop glue 可能位于可卸载镜像中。代理只缓存
+/// 不会变化的设备类型元数据；所有会进入动态实现的操作都先恢复创建对象时捕获的
+/// 完整 ELM 上下文。无法恢复时不再触碰动态 vtable，并把对应 generation 标记为失败。
+struct ElmCharDriverProxy {
+    context: elm_model::ElmCurrentContext,
+    is_tty: bool,
+    is_console: bool,
+    driver: Option<Arc<dyn CharDriver>>,
+}
+
+impl ElmCharDriverProxy {
+    fn wrap(
+        driver: Arc<dyn CharDriver>,
+        context: elm_model::ElmCurrentContext,
+    ) -> Arc<dyn CharDriver> {
+        // `from_arc` 在动态调用边界内执行，因此这里仍可安全读取一次稳定元数据。
+        // 后续查询只读代理缓存，避免为类型判断进入可卸载代码。
+        let is_tty = driver.is_tty();
+        let is_console = driver.is_console();
+        Arc::new(Self {
+            context,
+            is_tty,
+            is_console,
+            driver: Some(driver),
+        })
+    }
+
+    fn driver(&self) -> &dyn CharDriver {
+        self.driver
+            .as_deref()
+            .expect("ELM char driver proxy used after drop")
+    }
+
+    fn enter(&self, operation: &'static str) -> Option<elm_model::ElmCurrentContextGuard> {
+        let guard = super::pnp::enter_elm_snapshot(self.context);
+        if guard.is_none() {
+            log::error!(
+                "[char] cannot enter ELM context for driver operation {}: cell={} generation={}",
+                operation,
+                self.context.cell_id.0,
+                self.context.generation.0
+            );
+            super::elm_lifecycle::mark_context_failed(self.context);
+        }
+        guard
+    }
+}
+
+impl CharDriver for ElmCharDriverProxy {
+    fn write(&self, buf: &[u8]) -> Result<usize, CharIoError> {
+        let Some(_guard) = self.enter("write") else {
+            return Err(CharIoError::Unavailable);
+        };
+        self.driver().write(buf)
+    }
+
+    fn read(&self, buf: &mut [u8]) -> Result<usize, CharIoError> {
+        let Some(_guard) = self.enter("read") else {
+            return Err(CharIoError::Unavailable);
+        };
+        self.driver().read(buf)
+    }
+
+    fn poll_read(&self) -> bool {
+        let Some(_guard) = self.enter("poll_read") else {
+            return false;
+        };
+        self.driver().poll_read()
+    }
+
+    fn poll_add_waiter(&self, task: &Arc<sched::Task>, want_read: bool, want_write: bool) -> bool {
+        let Some(_guard) = self.enter("poll_add_waiter") else {
+            return false;
+        };
+        self.driver().poll_add_waiter(task, want_read, want_write)
+    }
+
+    fn poll_remove_waiter(&self, task: &Arc<sched::Task>) {
+        let Some(_guard) = self.enter("poll_remove_waiter") else {
+            return;
+        };
+        self.driver().poll_remove_waiter(task);
+    }
+
+    fn flush(&self) -> Result<(), CharIoError> {
+        let Some(_guard) = self.enter("flush") else {
+            return Err(CharIoError::Unavailable);
+        };
+        self.driver().flush()
+    }
+
+    fn poll_write(&self) {
+        let Some(_guard) = self.enter("poll_write") else {
+            return;
+        };
+        self.driver().poll_write();
+    }
+
+    fn winsize_changed(&self, winsize: crate::vfs::user_api::tty::UserWinSize) {
+        let Some(_guard) = self.enter("winsize_changed") else {
+            return;
+        };
+        self.driver().winsize_changed(winsize);
+    }
+
+    fn control(&self, req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
+        let Some(_guard) = self.enter("control") else {
+            return Err(ControlError::NoDevice);
+        };
+        self.driver().control(req)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        // 不允许动态实现的 `Any` vtable 引用逃出上下文 guard。
+        self
+    }
+
+    fn write_all(&self, buf: &[u8]) -> Result<(), CharIoError> {
+        let Some(_guard) = self.enter("write_all") else {
+            return Err(CharIoError::Unavailable);
+        };
+        self.driver().write_all(buf)
+    }
+
+    fn is_tty(&self) -> bool {
+        self.is_tty
+    }
+
+    fn is_console(&self) -> bool {
+        self.is_console
+    }
+}
+
+impl Drop for ElmCharDriverProxy {
+    fn drop(&mut self) {
+        let Some(driver) = self.driver.take() else {
+            return;
+        };
+        let Some(_guard) = self.enter("drop") else {
+            // 不能恢复精确 generation 时不得执行动态 drop glue。泄漏最后一个 Arc
+            // 并让生命周期失败，优先避免跳进已经卸载或正在替换的镜像。
+            core::mem::forget(driver);
+            return;
+        };
+        drop(driver);
+    }
+}
+
 // ─────────────────────────── 字符设备条目 ─────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -332,6 +482,10 @@ impl CharDevice {
         retained_args = 2u64
     )]
     pub fn from_arc(fw_name: Box<str>, driver: Arc<dyn CharDriver>) -> Self {
+        let driver = match elm_model::current_context() {
+            Some(context) => ElmCharDriverProxy::wrap(driver, context),
+            None => driver,
+        };
         Self {
             inner: Arc::new(CharDeviceInner {
                 fw_name,
@@ -498,5 +652,212 @@ impl core::fmt::Debug for CharDevice {
             .field("fw_name", &self.fw_name())
             .field("state", &self.state())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+    use core::any::Any;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::vfs::sync::Spinlock;
+
+    static TEST_ELM_CONTEXT_STATE: Spinlock<()> = Spinlock::new(());
+
+    struct ContextRecordingCharDriver {
+        expected: elm_model::ElmCurrentContext,
+        calls: Arc<AtomicUsize>,
+        metadata_calls: Arc<AtomicUsize>,
+        any_calls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl ContextRecordingCharDriver {
+        fn record(&self, counter: &AtomicUsize) {
+            assert_eq!(elm_model::current_context(), Some(self.expected));
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl CharDriver for ContextRecordingCharDriver {
+        fn write(&self, buf: &[u8]) -> Result<usize, CharIoError> {
+            self.record(&self.calls);
+            Ok(buf.len())
+        }
+
+        fn read(&self, buf: &mut [u8]) -> Result<usize, CharIoError> {
+            self.record(&self.calls);
+            buf.fill(0x5a);
+            Ok(buf.len())
+        }
+
+        fn poll_read(&self) -> bool {
+            self.record(&self.calls);
+            true
+        }
+
+        fn flush(&self) -> Result<(), CharIoError> {
+            self.record(&self.calls);
+            Ok(())
+        }
+
+        fn poll_write(&self) {
+            self.record(&self.calls);
+        }
+
+        fn winsize_changed(&self, _winsize: crate::vfs::user_api::tty::UserWinSize) {
+            self.record(&self.calls);
+        }
+
+        fn control(&self, _req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
+            self.record(&self.calls);
+            Ok(CharControlResponse::Done)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self.record(&self.any_calls);
+            self
+        }
+
+        fn write_all(&self, _buf: &[u8]) -> Result<(), CharIoError> {
+            self.record(&self.calls);
+            Ok(())
+        }
+
+        fn is_tty(&self) -> bool {
+            self.record(&self.metadata_calls);
+            true
+        }
+
+        fn is_console(&self) -> bool {
+            self.record(&self.metadata_calls);
+            true
+        }
+    }
+
+    impl Drop for ContextRecordingCharDriver {
+        fn drop(&mut self) {
+            assert_eq!(elm_model::current_context(), Some(self.expected));
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct ResidentCharDriver;
+
+    impl CharDriver for ResidentCharDriver {
+        fn write(&self, buf: &[u8]) -> Result<usize, CharIoError> {
+            Ok(buf.len())
+        }
+
+        fn read(&self, _buf: &mut [u8]) -> Result<usize, CharIoError> {
+            Ok(0)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn test_elm_context(
+        cell: u64,
+        generation: u64,
+        phase: elm_model::ElmLifecyclePhase,
+        flags: u32,
+        allowed_actions: u32,
+    ) -> elm_model::ElmContext {
+        elm_model::ElmContext::new(
+            elm_model::ElmId(cell),
+            Some(elm_model::ElmId(cell + 1000)),
+            elm_model::Generation(generation),
+            elm_model::ElmState::Active,
+            phase,
+            flags,
+        )
+        .with_kind(elm_model::ElmKind::Driver)
+        .with_allowed_actions(allowed_actions)
+    }
+
+    #[test]
+    fn elm_proxy_restores_owner_context_without_wrapping_resident_driver() {
+        let _context_state = TEST_ELM_CONTEXT_STATE.lock();
+        assert!(elm_model::current_context().is_none());
+
+        let owner = test_elm_context(
+            0xc401,
+            7,
+            elm_model::ElmLifecyclePhase::Initialize,
+            0x55aa,
+            0x12d,
+        );
+        let owner_snapshot = elm_model::ElmCurrentContext::from_context(&owner);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let metadata_calls = Arc::new(AtomicUsize::new(0));
+        let any_calls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let dynamic_device = {
+            let _owner_guard = elm_model::enter_current_context(&owner).unwrap();
+            CharDevice::from_arc(
+                "elm-context-char".into(),
+                Arc::new(ContextRecordingCharDriver {
+                    expected: owner_snapshot,
+                    calls: Arc::clone(&calls),
+                    metadata_calls: Arc::clone(&metadata_calls),
+                    any_calls: Arc::clone(&any_calls),
+                    drops: Arc::clone(&drops),
+                }),
+            )
+        };
+        assert_eq!(metadata_calls.load(Ordering::Relaxed), 2);
+        assert!(elm_model::current_context().is_none());
+
+        let outer = test_elm_context(
+            0xc402,
+            11,
+            elm_model::ElmLifecyclePhase::Resume,
+            0xa55a,
+            0x3,
+        );
+        let outer_snapshot = elm_model::ElmCurrentContext::from_context(&outer);
+        {
+            let _outer_guard = elm_model::enter_current_context(&outer).unwrap();
+            assert_eq!(dynamic_device.write(b"abc"), Ok(3));
+            let mut read = [0_u8; 2];
+            assert_eq!(dynamic_device.read(&mut read), Ok(2));
+            assert_eq!(read, [0x5a; 2]);
+            assert!(dynamic_device.poll_read());
+            assert_eq!(dynamic_device.flush(), Ok(()));
+            assert_eq!(dynamic_device.write_all(b"def"), Ok(()));
+            dynamic_device.poll_write();
+            dynamic_device
+                .winsize_changed(crate::vfs::user_api::tty::UserWinSize::default_console());
+            assert_eq!(
+                dynamic_device.control(CharControlRequest::DrainTx),
+                Ok(CharControlResponse::Done)
+            );
+            assert!(dynamic_device.is_tty());
+            assert!(dynamic_device.is_console());
+            assert!(
+                dynamic_device
+                    .downcast_driver::<ContextRecordingCharDriver>()
+                    .is_none()
+            );
+            assert_eq!(elm_model::current_context(), Some(outer_snapshot));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 8);
+        assert_eq!(metadata_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(any_calls.load(Ordering::Relaxed), 0);
+        drop(dynamic_device);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert!(elm_model::current_context().is_none());
+
+        let resident: Arc<dyn CharDriver> = Arc::new(ResidentCharDriver);
+        let resident_device = CharDevice::from_arc("resident-char".into(), resident);
+        assert!(
+            resident_device
+                .downcast_driver::<ResidentCharDriver>()
+                .is_some()
+        );
     }
 }

@@ -176,15 +176,18 @@ Kernel API Profile（内核 API 配置）同时包含目标专属 Rust metadata�
 - `cargo xtask defconfig`：恢复默认配置；
 - `cargo xtask modules --target <triple>`：构建用于接口导出的 kernel、导出该目标的
   Kernel API Profile，再构建当前配置选择的模块集合；
-- `cargo xtask build --target <triple>`：消费模块清单与集成归档完成最终 kernel 链接；
-  对应清单不存在时先补跑 `modules`；
+- `cargo xtask build --target <triple>`：默认重新导出 Kernel API Profile、构建当前模块集合，
+  再消费本次生成的模块清单与集成归档完成最终 kernel 链接；只有显式传入
+  `--reuse-modules` 时才复用经过完整性校验的已有模块产物；
 - `cargo xtask build --target <triple> --initramfs <cpio>`：在调用方提供镜像时启用
   `embedded-initramfs` 并嵌入该 CPIO；
 - `cargo xtask image --board <board>`：按平台目录校验最终 ELF，并派生板卡需要的 raw
   payload 或 U-Boot legacy image。
 
-`modules` 与 `build` 默认分别复用 `target/<arch>` 和 `build/<arch>/modules`。切换目标、
-配置或接口后应显式重新运行 `modules`，不要依赖旧的 `modules.manifest` 自动失效。
+`modules` 与 `build` 共享 `target/<arch>` 和 `build/<arch>/modules`，由 Cargo 和
+`cargo-elm` 复用未变化的内部构建结果。`build`/`image` 默认刷新模块产物，因此切换目标、
+配置或接口后无需额外手动运行 `modules`；`--reuse-modules` 不推断源码新鲜度，只适用于调用方
+已经确认现有 manifest 与归档匹配当前源码的场景。
 
 内核总是先链接为带符号 ELF；架构链接脚本只描述 section/ABI，板卡装载地址和封装配方
 来自 `configs/platforms.toml`。initramfs 内容生成、用户态 rootfs 和磁盘镜像装配仍属于

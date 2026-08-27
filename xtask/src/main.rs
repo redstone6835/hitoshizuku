@@ -67,6 +67,9 @@ fn configure(root: &Path, mode: &str) -> Result<(), String> {
 
 fn build_modules(root: &Path, catalog: &PlatformCatalog, args: &[String]) -> Result<(), String> {
     let options = BuildOptions::parse(args)?;
+    if options.reuse_modules {
+        return Err("--reuse-modules is only valid for build and image".to_string());
+    }
     let context = BuildContext::resolve(&options, catalog)?;
     let output = options
         .output
@@ -85,17 +88,17 @@ fn build_modules_to(
     ensure_config(root, &context.config)?;
     let cargo_target = root.join(&context.target_dir);
     let mut kernel_environment = vec![("CARGO_TARGET_DIR", cargo_target.as_os_str().to_owned())];
+    if let Some(initramfs) = options.initramfs.as_deref() {
+        kernel_environment.push(("INITRAMFS", initramfs.into()));
+    }
     context.append_platform_environment(&mut kernel_environment);
     cargo_with_env(
         root,
-        vec![
-            "build".into(),
-            "-p".into(),
-            "kernel".into(),
-            "--target".into(),
-            context.target.clone().into(),
-            "--release".into(),
-        ],
+        kernel_cargo_command(
+            &context.target,
+            options.features.as_deref(),
+            options.initramfs.is_some(),
+        ),
         &kernel_environment,
     )?;
 
@@ -152,35 +155,20 @@ fn build_kernel(root: &Path, catalog: &PlatformCatalog, args: &[String]) -> Resu
         .modules
         .clone()
         .unwrap_or_else(|| context.default_module_output());
-    if !root.join(&module_output).join("modules.manifest").is_file() {
+    if options.refresh_modules() {
         build_modules_to(root, &options, &context, &module_output)?;
     }
 
-    let manifest = root.join(&module_output).join("modules.manifest");
-    let archives = root.join(&module_output).join("integrated.archives");
-    let mut environment = Vec::new();
-    if manifest.is_file() {
-        environment.push(("ELM_BUILD_BOUND_MANIFEST", manifest.into_os_string()));
-    }
-    if archives.is_file() {
-        let archive_paths = std::fs::read_to_string(&archives)
-            .map_err(|error| format!("read {}: {error}", archives.display()))?
-            .lines()
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-            .map(OsString::from)
-            .collect::<Vec<_>>();
-        if archive_paths.is_empty() {
-            return Err(format!(
-                "integrated archive list {} is empty",
-                archives.display()
-            ));
-        }
-        let archive_value = env::join_paths(archive_paths)
-            .map_err(|error| format!("encode integrated archive paths: {error}"))?;
-        environment.push(("ELM_INTEGRATED_ARCHIVES", archive_value));
-    }
-    if let Some(initramfs) = options.initramfs {
+    let module_artifacts = ModuleArtifacts::load(root, &module_output)?;
+    let embedded_initramfs = options.initramfs.is_some();
+    let mut environment = vec![
+        (
+            "ELM_BUILD_BOUND_MANIFEST",
+            module_artifacts.manifest.into_os_string(),
+        ),
+        ("ELM_INTEGRATED_ARCHIVES", module_artifacts.archives),
+    ];
+    if let Some(initramfs) = options.initramfs.as_deref() {
         environment.push(("INITRAMFS", initramfs.into()));
     }
     environment.push((
@@ -189,23 +177,36 @@ fn build_kernel(root: &Path, catalog: &PlatformCatalog, args: &[String]) -> Resu
     ));
     context.append_platform_environment(&mut environment);
 
+    let command = kernel_cargo_command(
+        &context.target,
+        options.features.as_deref(),
+        embedded_initramfs,
+    );
+    cargo_with_env(root, command, &environment)
+}
+
+fn kernel_cargo_command(
+    target: &str,
+    features: Option<&str>,
+    embedded_initramfs: bool,
+) -> Vec<OsString> {
     let mut command: Vec<OsString> = vec![
         "build".into(),
         "-p".into(),
         "kernel".into(),
         "--target".into(),
-        context.target.into(),
+        target.into(),
         "--release".into(),
     ];
-    if let Some(features) = options.features {
+    if let Some(features) = features {
         command.push("--features".into());
         command.push(features.into());
     }
-    if environment.iter().any(|(name, _)| *name == "INITRAMFS") {
+    if embedded_initramfs {
         command.push("--features".into());
         command.push("embedded-initramfs".into());
     }
-    cargo_with_env(root, command, &environment)
+    command
 }
 
 fn build_image(root: &Path, catalog: &PlatformCatalog, args: &[String]) -> Result<(), String> {
@@ -349,6 +350,11 @@ impl ImageOptions {
                     return Err("--no-build was specified more than once".to_string());
                 }
                 options.no_build = true;
+                index += 1;
+                continue;
+            }
+            if key == "--reuse-modules" {
+                options.build_args.push(key.to_string());
                 index += 1;
                 continue;
             }
@@ -743,6 +749,7 @@ struct BuildOptions {
     config: Option<String>,
     output: Option<String>,
     modules: Option<String>,
+    reuse_modules: bool,
     target_dir: Option<String>,
     features: Option<String>,
     initramfs: Option<String>,
@@ -757,6 +764,7 @@ impl BuildOptions {
             config: None,
             output: None,
             modules: None,
+            reuse_modules: false,
             target_dir: None,
             features: None,
             initramfs: None,
@@ -764,6 +772,14 @@ impl BuildOptions {
         let mut index = 0;
         while index < args.len() {
             let key = args[index].as_str();
+            if key == "--reuse-modules" {
+                if options.reuse_modules {
+                    return Err("--reuse-modules was specified more than once".to_string());
+                }
+                options.reuse_modules = true;
+                index += 1;
+                continue;
+            }
             let value = || {
                 args.get(index + 1)
                     .cloned()
@@ -787,6 +803,69 @@ impl BuildOptions {
             return Err("--platform cannot be combined with --board or --target".to_string());
         }
         Ok(options)
+    }
+
+    fn refresh_modules(&self) -> bool {
+        !self.reuse_modules
+    }
+}
+
+struct ModuleArtifacts {
+    manifest: PathBuf,
+    archives: OsString,
+}
+
+impl ModuleArtifacts {
+    fn load(root: &Path, output: &str) -> Result<Self, String> {
+        let output = root.join(output);
+        let manifest = output.join("modules.manifest");
+        if !manifest.is_file() {
+            return Err(format!(
+                "module manifest {} does not exist; rebuild without --reuse-modules",
+                manifest.display()
+            ));
+        }
+        if manifest
+            .metadata()
+            .map_err(|error| format!("inspect {}: {error}", manifest.display()))?
+            .len()
+            == 0
+        {
+            return Err(format!("module manifest {} is empty", manifest.display()));
+        }
+
+        let archive_list = output.join("integrated.archives");
+        let archive_paths = std::fs::read_to_string(&archive_list)
+            .map_err(|error| format!("read {}: {error}", archive_list.display()))?
+            .lines()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    root.join(path)
+                }
+            })
+            .collect::<Vec<_>>();
+        if archive_paths.is_empty() {
+            return Err(format!(
+                "integrated archive list {} is empty",
+                archive_list.display()
+            ));
+        }
+        for archive in &archive_paths {
+            if !archive.is_file() {
+                return Err(format!(
+                    "integrated archive {} does not exist; rebuild without --reuse-modules",
+                    archive.display()
+                ));
+            }
+        }
+        let archives = env::join_paths(archive_paths)
+            .map_err(|error| format!("encode integrated archive paths: {error}"))?;
+        Ok(Self { manifest, archives })
     }
 }
 
@@ -850,11 +929,13 @@ impl BuildContext {
     }
 }
 
-fn clear_inherited_platform_environment(command: &mut Command) {
+fn clear_inherited_build_environment(command: &mut Command) {
     command.env_remove("HITOSHIZUKU_PLATFORM");
     command.env_remove("MYGO_LA_BOARD");
     command.env_remove("MYGO_LA_DEBUG_LINKER");
     command.env_remove("MYGO_RV_DEBUG_LINKER");
+    command.env_remove("ELM_BUILD_BOUND_MANIFEST");
+    command.env_remove("ELM_INTEGRATED_ARCHIVES");
 }
 
 fn cargo<I, S>(root: &Path, args: I, env_var: Option<(&str, OsString)>) -> Result<(), String>
@@ -864,7 +945,7 @@ where
 {
     let mut command = Command::new("cargo");
     command.current_dir(root).args(args);
-    clear_inherited_platform_environment(&mut command);
+    clear_inherited_build_environment(&mut command);
     if let Some((name, value)) = env_var {
         command.env(name, value);
     }
@@ -882,7 +963,7 @@ where
         .env("HITOSHIZUKU_KERNEL_ROOT", root)
         .arg("elm")
         .args(args);
-    clear_inherited_platform_environment(&mut command);
+    clear_inherited_build_environment(&mut command);
     if let Some((name, value)) = env_var {
         command.env(name, value);
     }
@@ -908,7 +989,7 @@ where
         .env("HITOSHIZUKU_KERNEL_ROOT", root)
         .arg("elm")
         .args(args);
-    clear_inherited_platform_environment(&mut command);
+    clear_inherited_build_environment(&mut command);
     for (name, value) in env_vars {
         command.env(name, value);
     }
@@ -926,7 +1007,7 @@ fn cargo_with_env<S: AsRef<std::ffi::OsStr>>(
 ) -> Result<(), String> {
     let mut command = Command::new("cargo");
     command.current_dir(root).args(args);
-    clear_inherited_platform_environment(&mut command);
+    clear_inherited_build_environment(&mut command);
     for (name, value) in env_vars {
         command.env(name, value);
     }
@@ -953,10 +1034,11 @@ fn print_help() {
         "cargo xtask commands:\n\
   config | oldconfig | defconfig\n\
   modules [--platform <id> | --board <qemu|ls2k1000|visionfive2> [--target <triple>]] [--config <path>] [--output <dir>]\n\
-  build [--platform <id> | --board <qemu|ls2k1000|visionfive2> [--target <triple>]] [--config <path>] [--features <a,b>] [--initramfs <cpio>]\n\
-  image [build options] [--no-build] [--format <elf|raw|uimage|all>] [--objcopy <path>] [--mkimage <path>]\n\
+  build [--platform <id> | --board <qemu|ls2k1000|visionfive2> [--target <triple>]] [--config <path>] [--modules <dir>] [--reuse-modules] [--features <a,b>] [--initramfs <cpio>]\n\
+  image [build options] [--reuse-modules] [--no-build] [--format <elf|raw|uimage|all>] [--objcopy <path>] [--mkimage <path>]\n\
   clean\n\n\
 Platform definitions select the target, link layout, config, and output paths. QEMU defaults to qemu-loongarch64; use --target or --platform qemu-riscv64 for RISC-V.\n\
+Build and image refresh the ELM profile and modules by default; --reuse-modules opts into validated existing module artifacts.\n\
 The image command publishes a canonical ELF for QEMU and ELF/raw/uImage outputs for physical boards."
     );
 }
@@ -1102,6 +1184,87 @@ mod tests {
         .err()
         .expect("mixed selectors must fail");
         assert!(error.contains("cannot be combined"));
+    }
+
+    #[test]
+    fn build_refreshes_modules_unless_reuse_is_explicit() {
+        let default = options(&[]);
+        assert!(default.refresh_modules());
+
+        let reuse = options(&["--reuse-modules"]);
+        assert!(reuse.reuse_modules);
+        assert!(!reuse.refresh_modules());
+
+        let error = BuildOptions::parse(&["--reuse-modules".into(), "--reuse-modules".into()])
+            .err()
+            .expect("duplicate reuse flag must fail");
+        assert!(error.contains("more than once"));
+    }
+
+    #[test]
+    fn image_forwards_reuse_modules_as_a_flag() {
+        let options = ImageOptions::parse(&[
+            "--platform".into(),
+            "qemu-loongarch64".into(),
+            "--reuse-modules".into(),
+            "--format".into(),
+            "elf".into(),
+        ])
+        .expect("valid image options");
+        assert_eq!(
+            options.build_args,
+            vec![
+                "--platform".to_string(),
+                "qemu-loongarch64".to_string(),
+                "--reuse-modules".to_string(),
+            ]
+        );
+        assert!(
+            !BuildOptions::parse(&options.build_args)
+                .expect("forwarded build options")
+                .refresh_modules()
+        );
+    }
+
+    #[test]
+    fn reused_module_artifacts_must_be_complete() {
+        let directory = std::env::temp_dir().join(format!(
+            "hitoshizuku-xtask-modules-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let output = directory.join("modules");
+        std::fs::create_dir_all(&output).expect("create module output");
+
+        let missing_manifest = ModuleArtifacts::load(&directory, "modules")
+            .err()
+            .expect("missing manifest must fail");
+        assert!(missing_manifest.contains("rebuild without --reuse-modules"));
+
+        std::fs::write(output.join("modules.manifest"), "ELM-BUILD-MODULES-V1\n")
+            .expect("write manifest");
+        std::fs::write(output.join("integrated.archives"), "\n").expect("write empty archive list");
+        let empty_archives = ModuleArtifacts::load(&directory, "modules")
+            .err()
+            .expect("empty archive list must fail");
+        assert!(empty_archives.contains("is empty"));
+
+        let archive = output.join("libintegrated.a");
+        std::fs::write(&archive, b"archive").expect("write archive");
+        std::fs::write(
+            output.join("integrated.archives"),
+            format!("{}\n", archive.display()),
+        )
+        .expect("write archive list");
+        let artifacts =
+            ModuleArtifacts::load(&directory, "modules").expect("complete artifacts load");
+        assert_eq!(artifacts.manifest, output.join("modules.manifest"));
+        assert_eq!(
+            env::split_paths(&artifacts.archives).collect::<Vec<_>>(),
+            vec![archive]
+        );
+
+        std::fs::remove_dir_all(directory).expect("remove test directory");
     }
 
     #[test]

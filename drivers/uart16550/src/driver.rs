@@ -12,15 +12,14 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use sched::{Task, WaitQueue};
 
 use crate::dev::char::*;
-use crate::dev::dt_provider::{
-    self, DtbProviderError, DtbResourceLease, DtbResourceReply, DtbResourceRequest,
-};
+use crate::dev::dt_provider;
 use crate::dev::function::{CharFunction, FunctionProjectionNameAllocator};
 use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
 use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqRegistrationError};
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, DriverHandle, PnpDependency, PnpDevice, PnpDriver,
     PnpError, PnpId, PnpResourceKind, register_driver_factory,
+    register_function as register_pnp_function,
 };
 
 // ─────────────────────── UART 寄存器偏移与标志 ───────────────────────────
@@ -72,28 +71,17 @@ fn uart_divisor(clock_hz: u32, baud: u32) -> Option<u16> {
 }
 
 fn uart_provider_clock(
+    dev: &Arc<PnpDevice>,
     info: &PlatformDeviceInfo,
-) -> Result<Option<(u32, DtbResourceLease)>, PnpError> {
+) -> Result<Option<u32>, PnpError> {
     let reference = info
         .dtb_reference_by_name(UART_CLOCK_PROPERTY, UART_BAUD_CLOCK_NAME)
         .or_else(|| info.dtb_references(UART_CLOCK_PROPERTY).next());
     let Some(reference) = reference else {
         return Ok(None);
     };
-    let lease =
-        dt_provider::acquire_reference(reference).map_err(DtbProviderError::into_pnp_error)?;
-    let rate = match lease
-        .control(DtbResourceRequest::GetRate)
-        .map_err(DtbProviderError::into_pnp_error)?
-    {
-        DtbResourceReply::Value(rate) => rate,
-        _ => {
-            return Err(PnpError::malformed(
-                PnpResourceKind::Other("clock"),
-                "uart clock provider returned a non-rate reply",
-            ));
-        }
-    };
+    let rate =
+        dt_provider::acquire_reference_rate_for_device(dev, reference, "platform-uart16550-clock")?;
     let rate = u32::try_from(rate).map_err(|_| {
         PnpError::malformed(
             PnpResourceKind::Other("clock"),
@@ -106,7 +94,7 @@ fn uart_provider_clock(
             "uart clock provider returned zero Hz",
         ));
     }
-    Ok(Some((rate, lease)))
+    Ok(Some(rate))
 }
 
 struct UartTxState {
@@ -1041,11 +1029,8 @@ impl PnpDriver for Uart16550PlatformDriver {
         let virt_base = (self.device_mmio_to_virt)(phys);
         let registers = UartRegisterAccess::from_platform(info, virt_base, size)
             .map_err(map_uart_register_config_error)?;
-        let provider_clock = uart_provider_clock(info)?;
-        let clock_hz = provider_clock
-            .as_ref()
-            .map(|(rate, _)| *rate)
-            .or(info.properties.clock_hz);
+        let provider_clock = uart_provider_clock(dev, info)?;
+        let clock_hz = provider_clock.or(info.properties.clock_hz);
         let uart = if let Some(clock_hz) = clock_hz {
             Arc::new(
                 Uart16550::new(
@@ -1063,21 +1048,10 @@ impl PnpDriver for Uart16550PlatformDriver {
         } else {
             Arc::new(Uart16550::new_preconfigured(registers))
         };
-        if let Some((_, lease)) = provider_clock {
-            dev.own_boxed_resource(dt_provider::lease_pnp_resource_boxed(
-                lease,
-                "platform-uart16550-clock",
-            ))?;
-        }
-
         let dev_name = self
             .projection_names
             .try_alloc_stable(&dev.name)?
             .into_string();
-        let ch = CharDevice::from_arc(
-            info.fw_name.clone(),
-            Arc::clone(&uart) as Arc<dyn CharDriver>,
-        );
         let irq_handle = register_uart_irq(info, Arc::clone(&uart))?;
         if let Some(handle) = irq_handle
             && let Err(err) = dev.own_resource(irq::irq_handler_pnp_resource(
@@ -1089,9 +1063,15 @@ impl PnpDriver for Uart16550PlatformDriver {
             let _ = irq::unregister_irq_handler(handle);
             return Err(err);
         }
-        if let Err(err) = dev.register_function(CharFunction::with_projection_name_arc(
-            &dev.name, &dev_name, ch,
-        )) {
+        if let Err(err) = register_pnp_function(
+            dev,
+            CharFunction::from_driver_arc(
+                info.fw_name.clone(),
+                Arc::clone(&uart) as Arc<dyn CharDriver>,
+                &dev.name,
+                &dev_name,
+            ),
+        ) {
             uart.set_rx_irq_enabled(false);
             return Err(err);
         }
