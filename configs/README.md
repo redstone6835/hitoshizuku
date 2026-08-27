@@ -23,5 +23,11 @@ cargo xtask modules --board ls2k1000
 cargo xtask build --board visionfive2
 ```
 
+`platforms.toml` 是独立的构建平台目录：它把 board/target、链接布局、物理/虚拟基址、
+默认 preset、Cargo 输出隔离路径和内核镜像封装配方绑定在一起。高半区地址使用固定的
+`0x0000_0000_0000_0000` 字符串格式，加载时会校验 DMW1/Sv48 映射关系。新增同架构
+板卡只增加平台项，不复制链接脚本；平台 ID 还会生成唯一的 ELF provenance tag，防止
+同 target、同地址的板卡产物互相封装。新增链接布局才需要同时扩展架构链接脚本和校验器。
+
 板级 preset 是可审查基线，不是交互配置输出。需要实验性取值时另建本地配置，并通过
 `--config <path>` 传入。

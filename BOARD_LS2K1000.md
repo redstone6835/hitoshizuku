@@ -11,12 +11,14 @@ EFI stub、PE/COFF 头或 EFI 入口，不应使用 `bootefi`；EFI 数据结构
 ## 1. 构建
 
 ```sh
-# --board 自动选择 loongarch64 target、板级配置与 0x200000 链接布局
-cargo xtask modules --board ls2k1000
-cargo xtask build --board ls2k1000
+# --board 自动选择 loongarch64 target、板级配置与 0x200000 链接布局。
+# image 默认完成模块、内核构建以及 ELF/raw/uImage 发布。
+cargo xtask image --board ls2k1000
 
-# 最终板级二进制
-# target/loongarch64/ls2k1000/loongarch64-unknown-none/release/kernel
+# 可部署产物
+# build/loongarch64/ls2k1000/kernel.elf
+# build/loongarch64/ls2k1000/kernel.bin
+# build/loongarch64/ls2k1000/uImage
 ```
 
 板级默认配置是 `configs/ls2k1000.config`；模块、Kernel API Profile 和 Cargo 缓存
@@ -24,13 +26,15 @@ cargo xtask build --board ls2k1000
 `build/elm-interface/loongarch64/ls2k1000` 和 `target/loongarch64/ls2k1000`。
 需要临时调整配置时显式传 `--config <path>`，不要改写板级 preset。
 
-QEMU 验证必须另建 QEMU ELF，不能复用物理板的 0x200000 二进制：
+Cargo 内部产物始终是未剥离 ELF；板级 raw 和 uImage 只能由 `xtask image` 从同一次
+构建的 ELF 派生。QEMU 验证必须另建 QEMU 平台 ELF，不能复用物理板的
+`0x200000` 布局：
 
 ```sh
-MYGO_LA_DEBUG_LINKER=1 cargo xtask build --board qemu \
+cargo xtask image --board qemu \
   --target loongarch64-unknown-none
 qemu-system-loongarch64 -machine virt -cpu la464 -m 1G -nographic \
-  -kernel target/loongarch64/loongarch64-unknown-none/release/kernel -no-reboot
+  -kernel build/loongarch64/kernel.elf -no-reboot
 ```
 
 预期：`handoff probe` 两条探测日志 → `DTB describes /memory` →
@@ -39,14 +43,14 @@ initramfs 是部署输入不完整，不再把固定的 `boot_root` panic 视为
 
 ## 2. 制作 legacy uImage 并烧录/加载
 
-使用标准 U-Boot `mkimage`；legacy image 格式与板载 fork U-Boot 兼容：
+`xtask image` 使用 `llvm-objcopy` 导出 loadable segments，再调用与板载 fork 匹配的
+`mkimage` 生成 legacy image。LoongArch U-Boot fork 使用 `loongarch` 架构 token；若
+系统 PATH 中的工具不支持该 token，必须显式提供板载 fork 对应的工具：
 
 ```sh
-# 板级内核已按 0x200000 链接；传统镜像入口就是内核 _start
-mkimage -A loongarch64 -O linux -T kernel \
-  -C none -a 0x200000 -e 0x200000 -n "hitoshizuku-ls2k1000" \
-  -d target/loongarch64/ls2k1000/loongarch64-unknown-none/release/kernel \
-  build/loongarch64/ls2k1000/uImage
+cargo xtask image --board ls2k1000 \
+  --objcopy /usr/bin/llvm-objcopy \
+  --mkimage /path/to/loongarch-mkimage
 
 # TFTP 服务器把 uImage 与工厂 DTB（/tmp/board-fdt.dtb）放到同一目录
 # （例如 /srv/tftp/）

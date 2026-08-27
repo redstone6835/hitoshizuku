@@ -88,3 +88,4 @@ vfs = { path = "../libs/vfs" }
 [build-dependencies]
 ed25519-dalek = { version = "2.2.0", default-features = false }
 sha2 = { version = "0.10.9", default-features = false }
+xtask = { path = "../xtask", default-features = false }

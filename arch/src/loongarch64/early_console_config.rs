@@ -27,8 +27,8 @@ pub(crate) const FALLBACK_EARLY_UART_CONFIG: EarlyUartConfig = EarlyUartConfig {
 
 /// LS2K1000LA 板载 UART0 回退配置。
 ///
-/// 该值只随显式 `MYGO_LA_BOARD=ls2k1000` 构建启用，防止任意 LoongArch
-/// 固件解析失败时误写板级 MMIO 地址。
+/// 该值只随平台目录中的 `ls2k1000` 构建配置启用，防止任意 LoongArch 固件解析
+/// 失败时误写板级 MMIO 地址。
 #[cfg(mygo_la_board_ls2k1000)]
 pub(crate) const FALLBACK_EARLY_UART_CONFIG: EarlyUartConfig = EarlyUartConfig {
     phys_base: 0x1fe2_0000,

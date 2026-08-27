@@ -2,13 +2,20 @@ OUTPUT_FORMAT("elf64-littleriscv")
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
-BASE_ADDRESS = 0x80200000;
-VIRTUAL_BASE_ADDRESS = 0xFFFFFFC080200000;
-LOAD_OFFSET = VIRTUAL_BASE_ADDRESS - BASE_ADDRESS;
+/* KERNEL_PHYS_BASE 与 KERNEL_VIRT_BASE 由 kernel/build.rs 按平台注入。 */
+LOAD_OFFSET = KERNEL_VIRT_BASE - KERNEL_PHYS_BASE;
+KERNEL_DIRECT_MAP_OFFSET = 0xFFFFFF8000000000;
+
+PHDRS
+{
+    text   PT_LOAD FLAGS(5); /* R E */
+    rodata PT_LOAD FLAGS(4); /* R   */
+    data   PT_LOAD FLAGS(6); /* RW  */
+}
 
 SECTIONS
 {
-    . = VIRTUAL_BASE_ADDRESS;
+    . = KERNEL_VIRT_BASE;
     skernel = .;
 
     stext = .;
@@ -26,44 +33,16 @@ SECTIONS
         *(.text .text.*)
         . = ALIGN(4K);
         strampoline = .;
-        *(.text.trampoline_user);
-        *(.text.trampoline_kernel);
-    }
+        *(.text.trampoline_user)
+        *(.text.trampoline_kernel)
+    } :text
 
     . = ALIGN(0x200000);
     etext = .;
     srodata = .;
     .rodata ALIGN(4K) : AT(ADDR(.rodata) - LOAD_OFFSET) {
-        *(.rodata .rodata.*)
-        *(.srodata .srodata.*)
-        . = ALIGN(8);
-        PROVIDE(__ex_table_start = .);
-        KEEP(*(__ex_table))
-        PROVIDE(__ex_table_end = .);
-        . = ALIGN(8);
-        PROVIDE(__start_ktest = .);
-        KEEP(*(.ktest .ktest.*))
-        PROVIDE(__stop_ktest = .);
-        . = ALIGN(8);
-        PROVIDE(__elm_kernel_symbols_start = .);
-        KEEP(*(.elm.kernel_symbols .elm.kernel_symbols.*))
-        PROVIDE(__elm_kernel_symbols_end = .);
-        . = ALIGN(8);
-        PROVIDE(__elm_kernel_mixin_sites_start = .);
-        KEEP(*(.elm.kernel_mixin_sites .elm.kernel_mixin_sites.*))
-        PROVIDE(__elm_kernel_mixin_sites_end = .);
-        . = ALIGN(8);
-        PROVIDE(__kernel_integrated_components_start = .);
-        KEEP(*(.kernel.integrated_components .kernel.integrated_components.*))
-        PROVIDE(__kernel_integrated_components_end = .);
-        . = ALIGN(8);
-        PROVIDE(__kernel_integrated_managed_exports_start = .);
-        KEEP(*(.kernel.integrated_managed_exports .kernel.integrated_managed_exports.*))
-        PROVIDE(__kernel_integrated_managed_exports_end = .);
-        . = ALIGN(8);
-        *(.eh_frame_hdr)
-        *(.eh_frame)
-    }
+        INCLUDE common-rodata.ld
+    } :rodata
 
     . = ALIGN(0x200000);
     erodata = .;
@@ -76,7 +55,8 @@ SECTIONS
         . = ALIGN(4K);
         *(.data .data.*)
         *(.sdata .sdata.*)
-    }
+        *(.got .got.*)
+    } :data
 
     edata = .;
     .bss (NOLOAD) : AT(ADDR(.bss) - LOAD_OFFSET) {
@@ -96,21 +76,28 @@ SECTIONS
         sbss = .;
         *(.bss .bss.*)
         *(.sbss .sbss.*)
-    }
+    } :data
 
     . = ALIGN(4K);
     ebss = .;
     . = ALIGN(4K);
     ekernel = .;
 
-    . = ALIGN(8);
-
-    .debug_line : {
-        KEEP(*(.debug_line))
-    }
-
-    . = ALIGN(8);
+    INCLUDE common-debug.ld
 }
 
-ASSERT(_start == VIRTUAL_BASE_ADDRESS,
+ASSERT((KERNEL_PHYS_BASE & 0xfff) == 0,
+       "RISC-V kernel physical base must be 4 KiB aligned")
+ASSERT((KERNEL_VIRT_BASE & 0xfff) == 0,
+       "RISC-V kernel virtual base must be 4 KiB aligned")
+ASSERT(KERNEL_VIRT_BASE - KERNEL_PHYS_BASE == KERNEL_DIRECT_MAP_OFFSET,
+       "RISC-V kernel VMA/LMA offset does not match the direct map")
+ASSERT(_start == KERNEL_VIRT_BASE,
        "RISC-V boot entry must be the first byte of the load image")
+ASSERT(LOADADDR(.text) == KERNEL_PHYS_BASE,
+       "RISC-V first load segment must start at the platform physical base")
+ASSERT(stext <= etext && etext == srodata && srodata <= erodata &&
+       erodata == sdata && sdata <= edata && edata <= ebss && ebss <= ekernel,
+       "RISC-V kernel sections are out of order")
+ASSERT(DEFINED(HITOSHIZUKU_PLATFORM_TAG),
+       "RISC-V kernel is missing its platform provenance tag")

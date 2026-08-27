@@ -18,6 +18,9 @@ cargo xtask build [--board <qemu|ls2k1000|visionfive2>] \
   [--config .config] [--modules build/loongarch64/modules] \
   [--target-dir target/loongarch64] [--features <列表>] \
   [--initramfs <cpio>]
+cargo xtask image [--platform <id> | --board <board> [--target <triple>]] \
+  [--format <elf|raw|uimage|all>] [--no-build] \
+  [--objcopy <path>] [--mkimage <path>]
 cargo xtask clean
 ```
 
@@ -41,15 +44,22 @@ cargo xtask clean
 
 物理板的 Kernel API Profile 也按板卡放在 `build/elm-interface/<arch>/<board>`。
 `qemu` 保持原有架构级路径兼容，并可显式选择两个受支持 target。物理板与错误架构组合会
-在启动 Cargo 前失败。LS2K1000 构建自动向接口导出用 kernel 和最终 kernel 传入
-`MYGO_LA_BOARD=ls2k1000`，选择 U-Boot 的 `0x200000` 直接入口布局。
+在启动 Cargo 前失败。xtask 从 `configs/platforms.toml` 解析平台，向 Cargo 传递唯一的
+`HITOSHIZUKU_PLATFORM=<id>`；链接脚本不再读取板卡专用环境变量。
 
 ```sh
 cargo xtask modules --board ls2k1000
 cargo xtask build --board ls2k1000
+cargo xtask image --board ls2k1000
 cargo xtask modules --board visionfive2
 cargo xtask build --board visionfive2
+cargo xtask image --board visionfive2
 ```
+
+`image` 默认先完成内核构建；`--no-build` 只校验和封装已有 Cargo ELF。QEMU 平台默认
+发布 `kernel.elf`，物理板默认发布 `kernel.elf`、`kernel.bin` 和 `uImage`。内核载荷
+封装属于本仓库构建流程；ELF 中的平台 provenance tag 必须与请求平台一致，不能通过
+`--target-dir` 混用另一块板的内核。rootfs、磁盘镜像和 initramfs 内容仍由外部工程提供。
 
 默认目标是 `loongarch64-unknown-none`，另一个受支持目标是
 `riscv64gc-unknown-none-elf`。`--initramfs` 只接收已经生成的 CPIO 镜像；本仓库不负责

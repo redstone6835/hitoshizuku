@@ -26,3 +26,6 @@ spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 sbi-rt = { version = "0.0.4", features = ["legacy"] }
+
+[build-dependencies]
+xtask = { path = "../xtask", default-features = false }

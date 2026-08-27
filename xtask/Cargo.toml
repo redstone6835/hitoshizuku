@@ -4,4 +4,16 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+default = ["image"]
+image = ["dep:object"]
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+required-features = ["image"]
+
 [dependencies]
+object = { version = "0.36.7", default-features = false, features = ["read", "elf", "std"], optional = true }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"

@@ -10,12 +10,13 @@ virt DTB 用于实机。
 ## 1. 构建
 
 ```sh
-# --board 自动选择 riscv64 target 与 VisionFive 2 preset
-cargo xtask modules --board visionfive2
-cargo xtask build --board visionfive2
+# --board 自动选择 riscv64 target、VisionFive 2 preset 和镜像配方
+cargo xtask image --board visionfive2
 
-# 最终 ELF
-# target/riscv64/visionfive2/riscv64gc-unknown-none-elf/release/kernel
+# 发布产物
+# build/riscv64/visionfive2/kernel.elf
+# build/riscv64/visionfive2/kernel.bin
+# build/riscv64/visionfive2/uImage
 ```
 
 板级默认配置是 `configs/visionfive2.config`。PLIC、DT provider、JH7110 CRG、
@@ -33,23 +34,16 @@ target/riscv64/visionfive2
 
 ## 2. 制作 U-Boot 镜像
 
-规范 RISC-V 链接布局的物理装载地址和入口均为 `0x80200000`。最终 Cargo 产物是 ELF；
-先导出 loadable segments，再封装成 U-Boot legacy image：
+规范 RISC-V 链接布局的物理装载地址和入口均为 `0x80200000`。Cargo 内部产物始终是
+ELF；`xtask image` 校验其 machine、entry 和 PT_LOAD 后，统一导出 raw 并封装 U-Boot
+legacy image：
 
 ```sh
-mkdir -p build/riscv64/visionfive2
-llvm-objcopy -O binary \
-  target/riscv64/visionfive2/riscv64gc-unknown-none-elf/release/kernel \
-  build/riscv64/visionfive2/kernel.bin
-mkimage -A riscv -O linux -T kernel -C none \
-  -a 0x80200000 -e 0x80200000 -n "hitoshizuku-visionfive2" \
-  -d build/riscv64/visionfive2/kernel.bin \
-  build/riscv64/visionfive2/uImage
+cargo xtask image --board visionfive2
 ```
 
-不要对 ELF 直接运行 `bootm`，也不要使用 `bootefi`。若本机 LLVM 工具带版本后缀，使用
-对应的 `llvm-objcopy-<版本>`；转换后可用 `file` 和 `mkimage -l` 核对格式、装载地址和
-入口地址。
+不要对 ELF 直接运行 `bootm`，也不要使用 `bootefi`。若工具不在 PATH，使用
+`--objcopy <path>` 和 `--mkimage <path>`；xtask 会在发布前核对格式、装载地址和入口。
 
 ## 3. 从 OpenSBI/U-Boot 启动
 
