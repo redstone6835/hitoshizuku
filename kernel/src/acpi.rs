@@ -137,6 +137,11 @@ impl AcpiMapper {
         true
     }
 
+    #[cfg(feature = "kernel-tests")]
+    fn pci_backend_available(self) -> bool {
+        self.host_ops.pci.is_some() || self.mcfg_entries().next().is_some()
+    }
+
     fn mcfg_entries(self) -> impl Iterator<Item = &'static [u8]> {
         self.copied_tables.iter().flat_map(|mapping| {
             let bytes: &'static [u8] = if mapping.length >= 44 {
@@ -1985,7 +1990,7 @@ mod tests {
             StartAcpiHostOps::NONE,
         );
 
-        assert!(mapper.host_ops.pci.is_some() || mapper.mcfg_entries().next().is_some());
+        assert!(mapper.pci_backend_available());
         assert_eq!(
             mapper.pci_ecam_address(2, 0x21, 3, 2, 0x120),
             Some(0x8011_a120)
@@ -2023,7 +2028,7 @@ mod tests {
             StartAcpiHostOps::NONE,
         );
 
-        assert!(!(mapper.host_ops.pci.is_some() || mapper.mcfg_entries().next().is_some()));
+        assert!(!mapper.pci_backend_available());
         assert_eq!(mapper.pci_ecam_address(0, 0x20, 0, 0, 0), None);
     }
 
