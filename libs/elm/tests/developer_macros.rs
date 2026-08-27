@@ -1,11 +1,13 @@
-#![feature(linkage)]
-
 use elm::{
-    DirectImport, ElmCallFrame, ElmContext, ElmId, ElmLifecyclePhase, ElmModule,
-    ElmNativeHookContextV1, ElmPayload, ElmState, Generation, HookError, HookResult,
-    KernelMixinContext, LifecycleContext, ManagedImport, ManagedRequest, ManagedResult,
-    MigrationContext, MigrationExportResult, MixinControl, PointResult, ProviderReply,
-    ProviderRequest, ProviderResult, SnapshotReply, SnapshotRequest, SnapshotResult,
+    DirectImport, ElmModule, ElmPayload, HookError, HookResult, KernelMixinContext,
+    LifecycleContext, ManagedImport, ManagedRequest, ManagedResult, MigrationContext,
+    MigrationExportResult, MixinControl, PointResult, ProviderReply, ProviderRequest,
+    ProviderResult, SnapshotReply, SnapshotRequest, SnapshotResult,
+};
+#[cfg(not(feature = "elm-integrated"))]
+use elm::{
+    ElmCallFrame, ElmContext, ElmId, ElmLifecyclePhase, ElmNativeHookContextV1, ElmState,
+    Generation,
 };
 
 #[elm::payload("test.frame@1")]
@@ -111,6 +113,7 @@ impl ElmModule for TestModule {
 #[elm::mixin(target = "allocator")]
 impl TestModule {
     #[elm::inject(method = "GlobalAlloc.alloc", at = "head", priority = 10)]
+    #[cfg_attr(feature = "elm-integrated", allow(dead_code))]
     fn trace_global_alloc(&self, _context: &mut KernelMixinContext<'_>) -> HookResult {
         Ok(())
     }
@@ -173,6 +176,7 @@ fn payload_uses_canonical_little_endian_encoding() {
 }
 
 #[test]
+#[cfg(not(feature = "elm-integrated"))]
 fn module_descriptor_binds_registered_methods_to_the_active_instance() {
     assert!(__ELM_MODULE_DESCRIPTOR_V1.valid_for::<TestModule>());
     let initialize = ElmContext::new(

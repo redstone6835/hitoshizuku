@@ -204,7 +204,7 @@ pub fn is_enabled() -> bool {
 }
 
 /// 注册监视（按作用域键）。
-pub fn register_key(key: WatchKey, watch: Weak<Watch>, perm: bool) {
+pub(crate) fn register_key(key: WatchKey, watch: Weak<Watch>, perm: bool) {
     let mut map = WATCHES.lock();
     map.entry(key).or_default().push(watch);
     NOTIFY_ENABLED.store(true, Ordering::Release);
@@ -219,7 +219,7 @@ pub fn register(inode: &Inode, watch: Weak<Watch>) {
 }
 
 /// 注销监视（按作用域键）。
-pub fn unregister_key(key: WatchKey, watch: &Arc<Watch>) {
+pub(crate) fn unregister_key(key: WatchKey, watch: &Arc<Watch>) {
     let mut map = WATCHES.lock();
     if let Some(list) = map.get_mut(&key) {
         list.retain(|w| {

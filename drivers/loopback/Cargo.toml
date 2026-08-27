@@ -1,3 +1,6 @@
+[lints]
+workspace = true
+
 [package]
 name = "net-loopback"
 version = "0.1.0"
@@ -11,7 +14,7 @@ bench = false
 
 [lib]
 name = "net_loopback"
-path = "src/main.rs"
+path = "src/lib_entry.rs"
 test = false
 doctest = false
 bench = false

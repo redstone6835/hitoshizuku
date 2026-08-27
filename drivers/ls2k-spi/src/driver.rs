@@ -13,7 +13,6 @@
 //! [`general::dev::flash`] 的读写擦接口（JEDEC 0x03/0x02/0x20/0x06/0x05）。
 
 use alloc::borrow::ToOwned;
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -40,11 +39,8 @@ const SPCR_REG: usize = 0x00;
 const SPSR_REG: usize = 0x01;
 const FIFO_REG: usize = 0x02;
 const SPER_REG: usize = 0x03;
-const PARA_REG: usize = 0x04;
 const SFCS_REG: usize = 0x05;
 
-const SPCR_CPHA: u8 = 1 << 2;
-const SPCR_CPOL: u8 = 1 << 3;
 const SPCR_SPE: u8 = 1 << 6;
 const SPSR_RFEMPTY: u8 = 1 << 0;
 const SPSR_WCOL: u8 = 1 << 6;
@@ -391,7 +387,8 @@ impl FlashDeviceV2 for SpiNorFlash {
 // ─────────────────────────── PnP 驱动 ───────────────────────────
 
 struct SpiNorBinding {
-    master: Arc<SpiMaster>,
+    // The registry stores a weak reference; the binding owns the controller.
+    _master: Arc<SpiMaster>,
     handle: Option<FlashHandle>,
 }
 
@@ -457,18 +454,13 @@ impl Ls2kSpiDriver {
             clk_hz
         );
         dev.set_driver_data(Arc::new(SpiNorBinding {
-            master,
+            _master: master,
             handle: None,
         }));
         Ok(())
     }
 
     fn probe_flash(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
-        let info = dev
-            .info
-            .as_any()
-            .downcast_ref::<PlatformDeviceInfo>()
-            .ok_or(PnpError::InvalidState)?;
         let parent_path = dev.parent().and_then(|parent| {
             parent
                 .info
@@ -514,7 +506,7 @@ impl Ls2kSpiDriver {
             parent_path,
         );
         dev.set_driver_data(Arc::new(SpiNorBinding {
-            master,
+            _master: master,
             handle: Some(handle),
         }));
         Ok(())

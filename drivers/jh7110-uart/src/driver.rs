@@ -49,7 +49,6 @@ const FCR_CLEAR_RXTX: u8 = 0x06;
 const MCR_DTR_RTS: u8 = 0x03;
 
 const DEFAULT_BAUD: u32 = 115_200;
-const FIFO_DEPTH: usize = 32; // JH7110 DW_APB FIFO 深度
 const TX_BUF_SIZE: usize = 32 * 1024;
 const TX_SPIN_RETRY: usize = 10_000_000;
 
@@ -264,7 +263,6 @@ impl Drop for TxGuard<'_> {
 
 pub struct Jh7110Uart {
     regs: RegAccess,
-    clock_hz: Option<u32>,
     tx: TxBuffer,
     rx_wait: WaitQueue,
     rx_lock: AtomicUsize,
@@ -281,7 +279,6 @@ impl Jh7110Uart {
         ))?;
         let uart = Self {
             regs,
-            clock_hz: Some(clock_hz),
             tx: TxBuffer::new(),
             rx_wait: WaitQueue::new(),
             rx_lock: AtomicUsize::new(0),
@@ -294,7 +291,6 @@ impl Jh7110Uart {
     fn preconfigured(regs: RegAccess) -> Self {
         let uart = Self {
             regs,
-            clock_hz: None,
             tx: TxBuffer::new(),
             rx_wait: WaitQueue::new(),
             rx_lock: AtomicUsize::new(0),

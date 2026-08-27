@@ -6,8 +6,6 @@
 //! HCCHAR/HCTSIZ/HCDMA/HCINT 编程，轮询 XFERCOMP/CHHLTD 完成。
 //! 不启用任何全局中断（GINTMSK=0），全部传输为同步轮询。
 
-use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::compiler_fence;
 
 use general::dev::dma::DmaContext;

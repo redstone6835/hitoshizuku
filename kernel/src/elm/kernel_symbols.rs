@@ -240,8 +240,3 @@ pub(crate) fn matches_resolved(
 fn symbol_abi_hash(symbol: &KernelSymbolDescriptorV1, _exact: bool) -> [u8; 32] {
     sha256(symbol.rust_abi.as_bytes())
 }
-
-#[cfg(feature = "kernel-tests")]
-pub(crate) fn test_catalog_len() -> usize {
-    catalog().map_or(0, <[_]>::len)
-}

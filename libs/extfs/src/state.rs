@@ -246,15 +246,6 @@ impl BlockCache {
         self.index.contains_key(&block) || self.pending_writebacks.contains_key(&block)
     }
 
-    fn invalidate(&mut self, block: u64) {
-        self.mark_coherence_change(block);
-        if let Some(&idx) = self.index.get(&block) {
-            self.slots[idx].occupied = false;
-            self.slots[idx].dirty = false;
-            self.index.remove(&block);
-        }
-    }
-
     fn read_range(&mut self, start: u64, count: u32, out: &mut [u8]) -> bool {
         if out.len() != self.block_size * count as usize {
             return false;
@@ -673,119 +664,8 @@ impl BlockCache {
         }
     }
 
-    fn insert_clean<F>(
-        &mut self,
-        block: u64,
-        data: &[u8],
-        flush: F,
-    ) -> Result<(), BlockBackendError>
-    where
-        F: FnMut(u64, &[u8]) -> Result<(), BlockBackendError>,
-    {
-        if self.index.contains_key(&block) {
-            return Ok(());
-        }
-        self.insert(block, data, false, flush)
-    }
-
-    fn insert<F>(
-        &mut self,
-        block: u64,
-        data: &[u8],
-        dirty: bool,
-        mut flush: F,
-    ) -> Result<(), BlockBackendError>
-    where
-        F: FnMut(u64, &[u8]) -> Result<(), BlockBackendError>,
-    {
-        if data.len() != self.block_size {
-            return Err(BlockBackendError::OutOfRange);
-        }
-        let version = if dirty { self.next_version() } else { 0 };
-        // 命中：原地更新
-        if let Some(&idx) = self.index.get(&block) {
-            let slot = &mut self.slots[idx];
-            Arc::make_mut(&mut slot.data).copy_from_slice(data);
-            slot.referenced = true;
-            if dirty {
-                slot.dirty = true;
-                slot.version = version;
-            }
-            return Ok(());
-        }
-        // 未满：直接 push
-        if self.slots.len() < self.capacity {
-            let idx = self.slots.len();
-            self.slots.push(BlockCacheSlot {
-                block,
-                data: Arc::new(Vec::from(data)),
-                referenced: true,
-                occupied: true,
-                dirty,
-                version,
-            });
-            self.index.insert(block, idx);
-            return Ok(());
-        }
-        // 已满：Clock eviction
-        let cap = self.slots.len();
-        let mut steps = 0usize;
-        loop {
-            let i = self.hand;
-            self.hand = (self.hand + 1) % cap;
-            let slot = &mut self.slots[i];
-            if !slot.occupied {
-                slot.block = block;
-                Arc::make_mut(&mut slot.data).copy_from_slice(data);
-                slot.referenced = true;
-                slot.occupied = true;
-                slot.dirty = dirty;
-                slot.version = version;
-                self.index.insert(block, i);
-                return Ok(());
-            }
-            if slot.referenced {
-                slot.referenced = false;
-                steps += 1;
-                if steps > cap * 2 {
-                    // 保险：兜底 LRU 化淘汰
-                    let old_block = slot.block;
-                    if slot.dirty {
-                        flush(old_block, slot.data.as_slice())?;
-                    }
-                    self.index.remove(&old_block);
-                    slot.block = block;
-                    Arc::make_mut(&mut slot.data).copy_from_slice(data);
-                    slot.referenced = true;
-                    slot.dirty = dirty;
-                    slot.version = version;
-                    self.index.insert(block, i);
-                    return Ok(());
-                }
-                continue;
-            }
-            // 命中淘汰
-            let old_block = slot.block;
-            if slot.dirty {
-                flush(old_block, slot.data.as_slice())?;
-            }
-            self.index.remove(&old_block);
-            slot.block = block;
-            Arc::make_mut(&mut slot.data).copy_from_slice(data);
-            slot.referenced = true;
-            slot.dirty = dirty;
-            slot.version = version;
-            self.index.insert(block, i);
-            return Ok(());
-        }
-    }
-
     fn try_insert_clean(&mut self, block: u64, data: &[u8]) -> bool {
         self.try_insert(block, data, false)
-    }
-
-    fn try_insert_dirty(&mut self, block: u64, data: &[u8]) -> bool {
-        self.try_insert(block, data, true)
     }
 
     fn try_insert(&mut self, block: u64, data: &[u8], dirty: bool) -> bool {
@@ -1602,35 +1482,6 @@ impl FsState {
         out: &mut [&mut [u8]],
     ) -> Result<(), BlockBackendError> {
         self.read_blocks_coherent_vectored(start_block, count, out)
-    }
-
-    pub(crate) fn write_blocks(
-        &self,
-        start_block: u64,
-        count: u32,
-        data: &[u8],
-    ) -> Result<(), BlockBackendError> {
-        let expected = self.ext_sb.block_size as usize * count as usize;
-        if data.len() != expected {
-            return Err(BlockBackendError::OutOfRange);
-        }
-        if count == 0 {
-            return Ok(());
-        }
-        let bs = self.ext_sb.block_size as usize;
-        let mut evicted_list: Vec<DirtyBlockSnapshot> = Vec::new();
-        {
-            let mut cache = self.block_cache.lock();
-            for i in 0..count {
-                let off = bs * i as usize;
-                let block = start_block + i as u64;
-                if let Some(ev) = cache.insert_wb(block, &data[off..off + bs]) {
-                    evicted_list.push(ev);
-                }
-            }
-        }
-        self.flush_evicted(&mut evicted_list)?;
-        Ok(())
     }
 
     /// 数据块专用批量写入：不递增 epoch（数据覆盖不改变块映射）。

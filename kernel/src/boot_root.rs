@@ -49,6 +49,7 @@ pub(crate) fn prepare(
             .flatten()
         {
             let archive_source = match image.source {
+                #[cfg(feature = "embedded-initramfs")]
                 InitramfsSource::Embedded => "embedded",
                 InitramfsSource::External => "external",
             };

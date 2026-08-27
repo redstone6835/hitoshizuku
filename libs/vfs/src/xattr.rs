@@ -12,7 +12,6 @@
 //! 存储后端由 `InodeOps` 的 xattr 方法提供（extfs 用 ext4 兼容 xattr 块、
 //! tmpfs 用内存表）；本模块负责语义层，避免各文件系统重复实现。
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::vfs::cred::{Capability, Credentials};
@@ -235,9 +234,4 @@ pub fn encode_list(names: &[Vec<u8>]) -> Vec<u8> {
         out.push(0);
     }
     out
-}
-
-/// 空属性名列表（供后端默认实现返回）。
-pub(crate) fn empty_list() -> Vec<Vec<u8>> {
-    vec![]
 }

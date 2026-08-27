@@ -5,7 +5,6 @@
 //! 转发给父设备底层驱动，并在全局设备表中注册独立 function（`/dev` 节点）。
 
 use alloc::boxed::Box;
-use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -15,8 +14,8 @@ use core::num::NonZeroU64;
 
 use crate::dev::bio::{Bio, BioError, BioIoError, BioReqError};
 use crate::dev::block::{
-    BlockAttributes, BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockGeometry,
-    BlockLimits, BlockRange, BlockSubmitError,
+    BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockGeometry, BlockRange,
+    BlockSubmitError,
 };
 use crate::dev::enumerate::DEVICES;
 use crate::dev::function::BlockFunction;

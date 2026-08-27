@@ -1,7 +1,12 @@
 //! LS2X APB-DMA 描述符和寄存器编码的宿主侧测试。
 
+// The harness imports complete production modules but exercises only their pure contracts.
+#[cfg(test)]
+#[allow(dead_code)]
 #[path = "../../src/layout.rs"]
 mod layout;
+#[cfg(test)]
+#[allow(dead_code)]
 #[path = "../../src/protocol.rs"]
 mod protocol;
 

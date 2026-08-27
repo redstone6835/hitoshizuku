@@ -1,5 +1,8 @@
 //! LS2X 时钟驱动的宿主侧频率计算测试。
 
+// The harness imports the complete production module but exercises only its pure contracts.
+#[cfg(test)]
+#[allow(dead_code)]
 #[path = "../../src/layout.rs"]
 mod layout;
 

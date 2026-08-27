@@ -48,68 +48,68 @@ pub mod vfs;
 /// 强制链接器抽取设备抽象直接符号和集成组件内部桥所在的代码生成单元。
 #[doc(hidden)]
 pub fn kernel_symbol_catalog_anchor() -> usize {
-    dev::block::BlockDevice::mark_gone as usize
-        ^ dev::cpu::cpu_reg_for_interrupt_controller as usize
-        ^ dev::pnp::register_driver_factory as usize
-        ^ dev::pnp::register_function as usize
-        ^ dev::pnp::device_mmio_to_virt as usize
-        ^ dev::pnp::PnpDevice::parent as usize
-        ^ dev::function::register_function_class as usize
-        ^ dev::function::CharFunction::from_driver_arc as usize
-        ^ dev::firmware_bus::register as usize
-        ^ dev::dma::set_dma_ops as usize
-        ^ dev::language::dispatch as usize
-        ^ dev::language::revoke_owner as usize
-        ^ dev::language::call as usize
-        ^ dev::language::dispatch_for_provider as usize
-        ^ dev::language::revoke_owner_for_provider as usize
-        ^ dev::language::call_for_provider as usize
-        ^ dev::dt_bus::register_i2c_controller as usize
-        ^ dev::dt_provider::register as usize
-        ^ dev::dt_provider::acquire_reference as usize
-        ^ dev::dt_provider::acquire_reference_rate_for_device as usize
-        ^ dev::dt_provider::acquire_reference_configure_for_device as usize
-        ^ dev::dt_provider::provider_pnp_resource_boxed as usize
-        ^ dev::dt_provider::lease_pnp_resource_boxed as usize
-        ^ dev::flash::pnp_resource_v2_boxed as usize
-        ^ dev::irq::register_irq_request as usize
-        ^ dev::irq::register_irq_domain as usize
-        ^ dev::irq::irq_handler_pnp_resource_boxed as usize
-        ^ dev::iommu::register_iommu_controller as usize
-        ^ dev::iommu::controller_pnp_resource_boxed as usize
-        ^ dev::msi::register_msi_controller as usize
-        ^ dev::numa::memory_node as usize
-        ^ dev::pci::register_host_bridge as usize
-        ^ dev::pci::pci_scan_and_register as usize
-        ^ dev::pci::PciDevice::pnp_id as usize
-        ^ dev::pci::PciDevice::info as usize
-        ^ dev::pci::PciDevice::try_read_config_u16 as usize
-        ^ dev::pci::PciDevice::try_read_config_u32 as usize
-        ^ dev::pci::PciDevice::try_write_config_u16 as usize
-        ^ dev::pci::PciDevice::try_write_config_u32 as usize
-        ^ dev::pci::PciDevice::try_command as usize
-        ^ dev::pci::PciDevice::try_set_command as usize
-        ^ dev::pci::PciDevice::bar_count as usize
-        ^ dev::pci::PciDevice::new_unregistered as usize
-        ^ dev::pci::PciDevice::register_and_probe as usize
-        ^ dev::platform::firmware_u32_list_get as usize
-        ^ dev::platform::PlatformDeviceInfo::dtb_reference_by_name as usize
-        ^ dev::platform::register_and_probe_platform_device as usize
-        ^ dev::pmu::register as usize
-        ^ dev::pmu::open_session as usize
-        ^ dev::random::add_bootloader_randomness as usize
-        ^ dev::syscon::pnp_resource_boxed as usize
-        ^ dev::usb::usb_device_pnp_info_boxed as usize
-        ^ dev::usb::UsbDevice::from_pnp as usize
-        ^ dev::usb::UsbDevice::interfaces as usize
-        ^ dev::usb::UsbDevice::create_interface as usize
-        ^ dev::wdt::WdtDevice::set_timeout as usize
-        ^ dev::wdt::WdtDevice::max_timeout_secs as usize
-        ^ console::console_write as usize
-        ^ firmware::power::pnp_resource_boxed as usize
-        ^ firmware::power::shutdown as usize
-        ^ ipc::ShmManager::info as usize
-        ^ mm::page_size as usize
-        ^ mm::VmSpace::mapped_pages as usize
-        ^ vfs::namespace_path as usize
+    dev::block::BlockDevice::mark_gone as *const () as usize
+        ^ dev::cpu::cpu_reg_for_interrupt_controller as *const () as usize
+        ^ dev::pnp::register_driver_factory as *const () as usize
+        ^ dev::pnp::register_function as *const () as usize
+        ^ dev::pnp::device_mmio_to_virt as *const () as usize
+        ^ dev::pnp::PnpDevice::parent as *const () as usize
+        ^ dev::function::register_function_class as *const () as usize
+        ^ dev::function::CharFunction::from_driver_arc as *const () as usize
+        ^ dev::firmware_bus::register as *const () as usize
+        ^ dev::dma::set_dma_ops as *const () as usize
+        ^ dev::language::dispatch as *const () as usize
+        ^ dev::language::revoke_owner as *const () as usize
+        ^ dev::language::call as *const () as usize
+        ^ dev::language::dispatch_for_provider as *const () as usize
+        ^ dev::language::revoke_owner_for_provider as *const () as usize
+        ^ dev::language::call_for_provider as *const () as usize
+        ^ dev::dt_bus::register_i2c_controller as *const () as usize
+        ^ dev::dt_provider::register as *const () as usize
+        ^ dev::dt_provider::acquire_reference as *const () as usize
+        ^ dev::dt_provider::acquire_reference_rate_for_device as *const () as usize
+        ^ dev::dt_provider::acquire_reference_configure_for_device as *const () as usize
+        ^ dev::dt_provider::provider_pnp_resource_boxed as *const () as usize
+        ^ dev::dt_provider::lease_pnp_resource_boxed as *const () as usize
+        ^ dev::flash::pnp_resource_v2_boxed as *const () as usize
+        ^ dev::irq::register_irq_request as *const () as usize
+        ^ dev::irq::register_irq_domain as *const () as usize
+        ^ dev::irq::irq_handler_pnp_resource_boxed as *const () as usize
+        ^ dev::iommu::register_iommu_controller as *const () as usize
+        ^ dev::iommu::controller_pnp_resource_boxed as *const () as usize
+        ^ dev::msi::register_msi_controller as *const () as usize
+        ^ dev::numa::memory_node as *const () as usize
+        ^ dev::pci::register_host_bridge as *const () as usize
+        ^ dev::pci::pci_scan_and_register as *const () as usize
+        ^ dev::pci::PciDevice::pnp_id as *const () as usize
+        ^ dev::pci::PciDevice::info as *const () as usize
+        ^ dev::pci::PciDevice::try_read_config_u16 as *const () as usize
+        ^ dev::pci::PciDevice::try_read_config_u32 as *const () as usize
+        ^ dev::pci::PciDevice::try_write_config_u16 as *const () as usize
+        ^ dev::pci::PciDevice::try_write_config_u32 as *const () as usize
+        ^ dev::pci::PciDevice::try_command as *const () as usize
+        ^ dev::pci::PciDevice::try_set_command as *const () as usize
+        ^ dev::pci::PciDevice::bar_count as *const () as usize
+        ^ dev::pci::PciDevice::new_unregistered as *const () as usize
+        ^ dev::pci::PciDevice::register_and_probe as *const () as usize
+        ^ dev::platform::firmware_u32_list_get as *const () as usize
+        ^ dev::platform::PlatformDeviceInfo::dtb_reference_by_name as *const () as usize
+        ^ dev::platform::register_and_probe_platform_device as *const () as usize
+        ^ dev::pmu::register as *const () as usize
+        ^ dev::pmu::open_session as *const () as usize
+        ^ dev::random::add_bootloader_randomness as *const () as usize
+        ^ dev::syscon::pnp_resource_boxed as *const () as usize
+        ^ dev::usb::usb_device_pnp_info_boxed as *const () as usize
+        ^ dev::usb::UsbDevice::from_pnp as *const () as usize
+        ^ dev::usb::UsbDevice::interfaces as *const () as usize
+        ^ dev::usb::UsbDevice::create_interface as *const () as usize
+        ^ dev::wdt::WdtDevice::set_timeout as *const () as usize
+        ^ dev::wdt::WdtDevice::max_timeout_secs as *const () as usize
+        ^ console::console_write as *const () as usize
+        ^ firmware::power::pnp_resource_boxed as *const () as usize
+        ^ firmware::power::shutdown as *const () as usize
+        ^ ipc::ShmManager::info as *const () as usize
+        ^ mm::page_size as *const () as usize
+        ^ mm::VmSpace::mapped_pages as *const () as usize
+        ^ vfs::namespace_path as *const () as usize
 }

@@ -61,7 +61,8 @@ pub(crate) enum KernelNativeObject {
     EventPort(Arc<EventPort>),
     Component(Arc<ComponentObject>),
     ComponentTransaction(Arc<ComponentTransaction>),
-    Interface(Arc<InterfaceObject>),
+    /// 持有接口对象以维持组件和接口表的生命周期；分发不直接解包该句柄。
+    Interface(#[allow(dead_code)] Arc<InterfaceObject>),
     MemoryObject(Arc<MemoryObject>),
     Directory(Arc<DirectoryObject>),
     File(Arc<FileObject>),
@@ -85,10 +86,14 @@ pub(crate) struct PreparedNativeCapability {
 pub(crate) struct NativeProcessState {
     pub(crate) binding: NativeBindingPlan,
     pub(crate) handles: Arc<Spinlock<NativeHandleTable<KernelNativeObject>>>,
+    #[allow(dead_code)] // Retained for process identity and future diagnostics.
     pub(crate) build_id: [u8; 32],
+    #[allow(dead_code)] // Retained for process identity and future diagnostics.
     pub(crate) content_hash: [u8; 32],
+    #[allow(dead_code)] // Retained for image-relative Native diagnostics.
     pub(crate) image_base: usize,
     pub(crate) components: Arc<ComponentManager>,
+    #[allow(dead_code)] // Keeps the launch namespace alive for component operations.
     pub(crate) vfs_context: Option<Arc<VfsContext>>,
     runtime_ranges: Spinlock<Option<NativeRuntimeRanges>>,
     allocations: Spinlock<Vec<Range<usize>>>,

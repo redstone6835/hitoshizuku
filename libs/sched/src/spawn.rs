@@ -106,8 +106,6 @@ pub(crate) fn register_pid_chain(task: &Arc<Task>) -> Result<PidT, ()> {
 pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> Arc<Task> {
     #[cfg(feature = "performance-profile")]
     let _profile = profiling::scope(profiling::Event::ProcessClone);
-    let root_ns = root_pid_ns();
-
     let (tgroup, pgroup) = match kind {
         SpawnKind::Thread => (parent.thread_group(), parent.process_group()),
         SpawnKind::Process => {
@@ -186,7 +184,6 @@ pub fn spawn_native_child(
     parent: &Arc<Task>,
     params: SchedParams,
 ) -> Result<Arc<Task>, errno::Errno> {
-    let root_ns = root_pid_ns();
     let owner = parent.thread_group();
     let child_group = ThreadGroup::new();
     {
@@ -250,7 +247,6 @@ pub fn spawn_native_thread(
     parent: &Arc<Task>,
     params: SchedParams,
 ) -> Result<Arc<Task>, errno::Errno> {
-    let root_ns = root_pid_ns();
     let group = parent.thread_group();
     let Some(exec) = group.lock_for_clone() else {
         return Err(errno::Errno::EBUSY);
@@ -281,14 +277,19 @@ pub fn spawn_native_thread(
     }
     process_group.add_member(&child);
 
-    if register_pid_chain(&child).is_err() {
-        abort_new_task(&child);
-        return Err(errno::Errno::ENOMEM);
-    }
+    let pid = match register_pid_chain(&child) {
+        Ok(pid) => pid,
+        Err(()) => {
+            abort_new_task(&child);
+            return Err(errno::Errno::ENOMEM);
+        }
+    };
     child.set_tgid_cache(group.tgid());
 
     #[cfg(feature = "performance-profile")]
     register_profile_child(parent, &child, pid);
+    #[cfg(not(feature = "performance-profile"))]
+    let _ = pid;
     Ok(child)
 }
 

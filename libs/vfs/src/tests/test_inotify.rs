@@ -62,10 +62,15 @@ fn read_all(inst: &InotifyInstance) -> Vec<(i32, u32, u32, Vec<u8>)> {
         let mut buf = [0u8; 256];
         match inst.read_events_for_test(&mut buf) {
             Ok(n) => {
+                assert!(n >= 16, "inotify event must include its fixed header");
                 let wd = i32::from_le_bytes(buf[0..4].try_into().unwrap());
                 let mask = u32::from_le_bytes(buf[4..8].try_into().unwrap());
                 let cookie = u32::from_le_bytes(buf[8..12].try_into().unwrap());
                 let len = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+                assert!(
+                    16 + len <= n,
+                    "inotify event name must fit the returned size"
+                );
                 out.push((wd, mask, cookie, buf[16..16 + len].to_vec()));
             }
             Err(VfsError::WouldBlock) => break,

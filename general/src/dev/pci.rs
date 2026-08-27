@@ -2492,14 +2492,6 @@ impl PciDevice {
         self.find_capability(PCI_MSIX_CAPABILITY_ID)
     }
 
-    pub(crate) fn msix_table_size(&self) -> Option<u16> {
-        let capability = self.msix_capability()?;
-        let control = self
-            .try_read_config_u16(capability + PCI_MSIX_CONTROL_OFFSET)
-            .ok()?;
-        Some((control & PCI_MSIX_CONTROL_TABLE_SIZE_MASK) + 1)
-    }
-
     #[kernel_symbols::export(
         name = "general.dev.pci.PciDevice.try_configure_msix",
         contract = "kernel.general.pci-route@1",

@@ -16,7 +16,6 @@
 //! mode 检查；有 ACL 时按 Linux `posix_acl_permission` 语义（owner → 命名
 //! user → 组（mask 掩蔽）→ other）。
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::vfs::cred::{Capability, Credentials};
@@ -68,14 +67,6 @@ pub enum AclCheckKind {
 }
 
 impl AclCheckKind {
-    fn mode_bit(self, mode: FileMode) -> bool {
-        match self {
-            AclCheckKind::Read => mode.has(FileMode::IRUSR),
-            AclCheckKind::Write => mode.has(FileMode::IWUSR),
-            AclCheckKind::Exec { .. } => mode.has(FileMode::IXUSR),
-        }
-    }
-
     fn perm_bit(self) -> u16 {
         match self {
             AclCheckKind::Read => 4,

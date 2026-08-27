@@ -1,7 +1,12 @@
 //! LS2K SDIO 命令、响应和寄存器编码的宿主侧测试。
 
+// The harness imports complete production modules but exercises only their pure contracts.
+#[cfg(test)]
+#[allow(dead_code)]
 #[path = "../../src/protocol.rs"]
 mod protocol;
+#[cfg(test)]
+#[allow(dead_code)]
 #[path = "../../src/registers.rs"]
 mod registers;
 

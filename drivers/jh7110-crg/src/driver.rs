@@ -233,14 +233,12 @@ impl JhStgHardware {
 }
 
 struct JhCrgDriver {
-    osc_override: Option<u64>,
     device_mmio_to_virt: fn(usize) -> usize,
 }
 
 impl JhCrgDriver {
-    const fn new(osc_override: Option<u64>, device_mmio_to_virt: fn(usize) -> usize) -> Self {
+    const fn new(device_mmio_to_virt: fn(usize) -> usize) -> Self {
         Self {
-            osc_override,
             device_mmio_to_virt,
         }
     }
@@ -364,7 +362,7 @@ impl DriverFactory for JhCrgFactory {
     }
 
     fn create(&self, ctx: &DevInitContext) -> Result<Arc<dyn PnpDriver>, PnpError> {
-        Ok(Arc::new(JhCrgDriver::new(None, ctx.device_mmio_to_virt)))
+        Ok(Arc::new(JhCrgDriver::new(ctx.device_mmio_to_virt)))
     }
 }
 

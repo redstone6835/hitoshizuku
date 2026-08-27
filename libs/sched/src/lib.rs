@@ -189,10 +189,10 @@ pub use wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};
 /// 强制链接器保留调度子系统直接符号所在的代码生成单元。
 #[doc(hidden)]
 pub fn kernel_symbol_catalog_anchor() -> usize {
-    scheduler::current_cpu_id as usize
-        ^ spawn::spawn_child as usize
-        ^ operation::getpid as usize
-        ^ operation::spawn_user_process as usize
+    scheduler::current_cpu_id as *const () as usize
+        ^ spawn::spawn_child as *const () as usize
+        ^ operation::getpid as *const () as usize
+        ^ operation::spawn_user_process as *const () as usize
 }
 
 #[cfg(test)]

@@ -602,8 +602,8 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
             fn sheap();
             fn eheap();
         }
-        let heap_start = sheap as usize;
-        let heap_end = eheap as usize;
+        let heap_start = sheap as *const () as usize;
+        let heap_end = eheap as *const () as usize;
         allocator::KERNEL_ALLOCATOR.init_boot(heap_start, heap_end - heap_start);
         log::info!(
             "[loader] boot heap: {:#x}..{:#x} ({} MiB)",
@@ -638,8 +638,8 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
             fn ekernel();
         }
         let kernel_phys = general::StartPhysRange::new(
-            virt_to_phys(skernel as usize),
-            virt_to_phys(ekernel as usize),
+            virt_to_phys(skernel as *const () as usize),
+            virt_to_phys(ekernel as *const () as usize),
         );
 
         let context = StartContext {
@@ -676,9 +676,11 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
         };
 
         unsafe extern "C" {
-            fn __kernel_start_init(context: *const StartContext) -> !;
+            // `StartContext` contains Rust enums and callbacks. Keep the C ABI
+            // boundary pointer-only instead of claiming its pointee is a C type.
+            fn __kernel_start_init(context: *const core::ffi::c_void) -> !;
         }
         log::info!("[loader] → __kernel_start_init");
-        __kernel_start_init(&context);
+        __kernel_start_init(core::ptr::from_ref(&context).cast());
     }
 }

@@ -44,7 +44,7 @@ pub use state::{BlockBackend, BlockBackendError, FatFsDriver};
 /// 强制链接器保留 FAT 驱动直接符号目录。
 #[doc(hidden)]
 pub fn kernel_symbol_catalog_anchor() -> usize {
-    FatFsDriver::bind_backend as usize
+    FatFsDriver::bind_backend as *const () as usize
 }
 
 #[cfg(test)]

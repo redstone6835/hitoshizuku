@@ -37,9 +37,6 @@ pub const PTY_MAX: u32 = 256;
 /// 单向环形缓冲容量(与 Linux n_tty 输出缓冲同量级)。
 const PTY_RING_CAP: usize = 4096;
 
-/// pts slave 呈现主号(与 Linux 一致)。
-const PTY_MAJOR: u32 = 136;
-
 // ── pty ioctl 号(与 Linux 一致) ─────────────────────────────────────────────
 
 pub const TIOCGPTN: usize = 0x8004_5430;
@@ -511,7 +508,6 @@ impl crate::dev::char::CharDriver for PtySlaveCharDriver {
 /// pty 管理器(单例):分配/释放编号与配对,维护 devpts 节点投影。
 pub struct PtyManager {
     slots: Spinlock<Vec<Option<Arc<PtyPair>>>>,
-    next: AtomicU32,
 }
 
 static MANAGER: Spinlock<Option<&'static PtyManager>> = Spinlock::new(None);
@@ -523,7 +519,6 @@ fn pty_manager() -> &'static PtyManager {
     }
     let leaked: &'static PtyManager = Box::leak(Box::new(PtyManager {
         slots: Spinlock::new(Vec::new()),
-        next: AtomicU32::new(0),
     }));
     *slot = Some(leaked);
     leaked

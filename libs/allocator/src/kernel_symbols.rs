@@ -321,11 +321,11 @@ pub fn virtual_to_physical(
 
 /// 强制链接器抽取包含 allocator 符号目录的代码生成单元。
 pub fn catalog_anchor() -> usize {
-    <KernelMemorySubsystem as core::alloc::GlobalAlloc>::alloc as usize
-        ^ <KernelMemorySubsystem as core::alloc::GlobalAlloc>::dealloc as usize
-        ^ allocate as usize
-        ^ allocate_physical as usize
-        ^ query_physical_allocation as usize
-        ^ physical_to_virtual as usize
-        ^ virtual_to_physical as usize
+    <KernelMemorySubsystem as core::alloc::GlobalAlloc>::alloc as *const () as usize
+        ^ <KernelMemorySubsystem as core::alloc::GlobalAlloc>::dealloc as *const () as usize
+        ^ allocate as *const () as usize
+        ^ allocate_physical as *const () as usize
+        ^ query_physical_allocation as *const () as usize
+        ^ physical_to_virtual as *const () as usize
+        ^ virtual_to_physical as *const () as usize
 }

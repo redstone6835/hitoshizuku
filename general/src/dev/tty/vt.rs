@@ -574,7 +574,6 @@ fn map_tty_err(e: TtyIoError) -> CharIoError {
         TtyIoError::Io | TtyIoError::Invalid | TtyIoError::Unsupported | TtyIoError::Busy => {
             CharIoError::HardwareError
         }
-        TtyIoError::NoSpace => CharIoError::HardwareError,
     }
 }
 

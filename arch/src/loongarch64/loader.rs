@@ -27,9 +27,11 @@ use efi::{EfiSystemTable, EfiSystemTableView};
 use fdt::Fdt;
 use general::{
     StartAddressOps, StartAllocatorOps, StartArchitecture, StartBootInfo, StartContext,
-    StartFirmware, StartFirmwareSource, StartMemory, StartMemoryMap, StartMemoryRegion,
-    StartMemoryRegionKind, StartNoMapSupport, StartPhysRange,
+    StartFirmware, StartFirmwareSource, StartMemory, StartMemoryMap, StartNoMapSupport,
+    StartPhysRange,
 };
+#[cfg(mygo_la_board_ls2k1000)]
+use general::{StartMemoryRegion, StartMemoryRegionKind};
 use log::printk;
 
 // ─────────────────────────── 内部常量 ────────────────────────────────
@@ -41,8 +43,10 @@ const CMDLINE_BUF_SIZE: usize = 4096;
 /// DTB 快照缓冲区的最大容量（4 MiB）。
 const DTB_BUF_SIZE: usize = 4096 * 1024;
 /// 启动期可保留的最大板级内存区域数（2K1000 两段 DDR）。
+#[cfg(mygo_la_board_ls2k1000)]
 const BOARD_MEMORY_REGION_CAPACITY: usize = 4;
 /// 空的启动内存区域，占位用于静态数组初始化。
+#[cfg(mygo_la_board_ls2k1000)]
 const EMPTY_BOOT_MEMORY_REGION: StartMemoryRegion = StartMemoryRegion::new(
     StartPhysRange::new(0, 0),
     StartMemoryRegionKind::Reserved,
@@ -56,6 +60,7 @@ const EMPTY_BOOT_MEMORY_REGION: StartMemoryRegion = StartMemoryRegion::new(
 ///
 /// DTB 无 /memory 节点时作为直启内存回退；QEMU virt 的 DTB 自带 /memory，
 /// 不受影响。这是板级平台常量，不是 DTB 硬编码。
+#[cfg(mygo_la_board_ls2k1000)]
 const BOARD_MEMORY_RANGES: &[StartPhysRange] = &[
     StartPhysRange::new(0x0000_0000, 0x1000_0000),
     StartPhysRange::new(0x9000_0000, 0x1_0000_0000),
@@ -184,6 +189,7 @@ static KERNEL_FIRMWARE_STATE: KernelFirmwareState = KernelFirmwareState::new();
 /// 内核固件缓冲区的可变全局实例，仅在初始化阶段访问。
 static mut KERNEL_FIRMWARE_BUFFERS: KernelFirmwareBuffers = KernelFirmwareBuffers::new();
 /// 板级内存回退的归一化启动内存区域。
+#[cfg(mygo_la_board_ls2k1000)]
 static mut BOARD_MEMORY_REGIONS: [StartMemoryRegion; BOARD_MEMORY_REGION_CAPACITY] =
     [EMPTY_BOOT_MEMORY_REGION; BOARD_MEMORY_REGION_CAPACITY];
 

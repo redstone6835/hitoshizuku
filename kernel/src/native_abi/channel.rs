@@ -442,31 +442,6 @@ fn wait_for_message(
     }
 }
 
-pub(super) fn channel_send_memory(
-    channel: &ChannelObject,
-    memory: &Arc<MemoryObject>,
-    offset: u64,
-    length: u64,
-) -> NativeCallOutcome {
-    if length > u64::from(wire::MAX_CHANNEL_MESSAGE_BYTES) {
-        return native_return(status::CHANNEL_MESSAGE_TOO_LARGE, 0, 0);
-    }
-    let mut data = if length == 0 {
-        Vec::new()
-    } else {
-        let Ok(length) = usize::try_from(length) else {
-            return native_return(status::CORE_OUT_OF_RANGE, 0, 0);
-        };
-        let mut data = Vec::new();
-        if data.try_reserve_exact(length).is_err() {
-            return native_return(status::CORE_RESOURCE_EXHAUSTED, 0, 0);
-        }
-        data.resize(length, 0);
-        data
-    };
-    channel_send_memory_buffered(channel, memory, offset, &mut data)
-}
-
 pub(super) fn channel_send_memory_buffered(
     channel: &ChannelObject,
     memory: &Arc<MemoryObject>,

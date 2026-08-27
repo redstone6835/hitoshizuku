@@ -16,7 +16,7 @@ use errno::Errno;
 use crate::mount::Mount;
 use crate::superblock::Superblock;
 use crate::vfs::error::{VfsError, VfsResult};
-use crate::vfs::file::{DirEntry, File, FileOps, IoctlCmd, OpenOptions, PollEvents};
+use crate::vfs::file::{DirEntry, File, IoctlCmd, OpenOptions, PollEvents};
 use crate::vfs::mount::MountFlags;
 use crate::vfs::sync::Spinlock;
 

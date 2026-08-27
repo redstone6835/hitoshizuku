@@ -2,8 +2,13 @@
 
 extern crate alloc;
 
+// The harness imports complete production modules but exercises only their pure contracts.
+#[cfg(test)]
+#[allow(dead_code)]
 #[path = "../../src/gpio.rs"]
 mod gpio;
+#[cfg(test)]
+#[allow(dead_code)]
 #[path = "../../src/pinctrl.rs"]
 mod pinctrl;
 

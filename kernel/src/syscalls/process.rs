@@ -12,7 +12,6 @@ use general::syscall::SyscallContext;
 use general::vfs::nsfs::ProcNsKind;
 use general::vfs::pidfd;
 use general::vfs::{self, fdtable::Fd};
-use ns::UtsNamespace;
 use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::ids::{CapSet, Capability, Credentials, Gid, Uid};
 use sched::pid::PidT;
@@ -90,9 +89,6 @@ const PTRACE_GET_RSEQ_CONFIGURATION: usize = 0x420f;
 const PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG: usize = 0x4210;
 const PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG: usize = 0x4211;
 const PTRACE_SET_SYSCALL_INFO: usize = 0x4212;
-
-static UTS_HOSTNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_FIELD_LEN]);
-static UTS_DOMAINNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_FIELD_LEN]);
 
 #[cfg(target_arch = "riscv64")]
 fn validate_riscv_flush_icache_flags(flags: usize) -> Result<(), Errno> {
@@ -2914,8 +2910,6 @@ fn prctl_get_speculation_ctrl(
     feature: usize,
     out_user: usize,
 ) -> Result<usize, Errno> {
-    const PR_SPEC_STORE_BYPASS: usize = 0;
-    const PR_SPEC_INDIRECT_BRANCH: usize = 1;
     const PR_SPEC_L1D_FLUSH: usize = 2;
     if feature > PR_SPEC_L1D_FLUSH || out_user == 0 {
         return Err(Errno::EINVAL);
@@ -2931,8 +2925,6 @@ fn prctl_set_speculation_ctrl(
     feature: usize,
     value: usize,
 ) -> Result<usize, Errno> {
-    const PR_SPEC_STORE_BYPASS: usize = 0;
-    const PR_SPEC_INDIRECT_BRANCH: usize = 1;
     const PR_SPEC_L1D_FLUSH: usize = 2;
     const PR_SPEC_ENABLE: usize = 0;
     const PR_SPEC_DISABLE: usize = 1;
@@ -7736,43 +7728,10 @@ fn clock_settime_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Ok(0)
 }
 
-fn set_uts_field(
-    ctx: &mut SyscallContext<'_>,
-    field: &Spinlock<[u8; UTS_FIELD_LEN]>,
-) -> Result<usize, Errno> {
-    let user = ctx.args[0];
-    let len = ctx.args[1];
-    if len > UTS_NAME_MAX {
-        return Err(Errno::EINVAL);
-    }
-    require_cap(ctx.task(), Capability::SysAdmin)?;
-    let mut value = [0u8; UTS_FIELD_LEN];
-    if len != 0 {
-        copy_from_user(user, &mut value[..len]).map_err(|e| e.as_errno())?;
-    }
-    value[UTS_NAME_MAX] = 1;
-    *field.lock() = value;
-    Ok(0)
-}
-
 fn write_uts_field(out: &mut [u8], index: usize, value: &[u8]) {
     let start = index * 65;
     let n = value.len().min(64);
     out[start..start + n].copy_from_slice(&value[..n]);
-}
-
-fn write_uts_dynamic_field(
-    out: &mut [u8],
-    index: usize,
-    field: &Spinlock<[u8; UTS_FIELD_LEN]>,
-    default: &[u8],
-) {
-    let guard = field.lock();
-    if guard[UTS_NAME_MAX] == 0 {
-        write_uts_field(out, index, default);
-    } else {
-        write_uts_field(out, index, &guard[..]);
-    }
 }
 
 fn signal_arg(raw: usize) -> Result<Option<SignalNumber>, Errno> {
@@ -7825,10 +7784,6 @@ fn waitid_code(status: WaitStatus) -> i32 {
     } else {
         0
     }
-}
-
-fn write_i64(out: &mut [u8], off: usize, value: i64) {
-    out[off..off + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 fn write_i32(out: &mut [u8], off: usize, value: i32) {

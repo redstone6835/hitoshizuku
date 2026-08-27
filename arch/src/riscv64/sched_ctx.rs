@@ -56,7 +56,7 @@ unsafe fn init_kernel_context(ctx: NonNull<u8>, stack_top: usize, entry: KernelE
     unsafe {
         core::ptr::write_bytes(base, 0, KCTX_SIZE);
         let w = |off: usize, v: usize| (base.add(off) as *mut usize).write(v);
-        w(RA_OFFSET, __kthread_trampoline as usize);
+        w(RA_OFFSET, __kthread_trampoline as *const () as usize);
         w(SP_OFFSET, stack_top & !0xF); // 保证 16 字节对齐
         w(S0_OFFSET, entry as usize);
         w(S1_OFFSET, arg);

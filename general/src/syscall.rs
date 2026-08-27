@@ -946,6 +946,8 @@ where
                 nr,
             );
         }
+        #[cfg(feature = "performance-profile")]
+        drop(finalize_profile);
     }
     ctx.finish_borrowed();
     core::mem::forget(ctx);

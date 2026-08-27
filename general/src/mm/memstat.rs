@@ -130,9 +130,6 @@ static UNPRIVILEGED_USERFAULTFD: AtomicBool = AtomicBool::new(false);
 pub fn drop_caches_request() -> u32 {
     DROP_CACHES.load(Ordering::Acquire)
 }
-fn clear_drop_caches_request() {
-    DROP_CACHES.store(0, Ordering::Release);
-}
 static DROP_CACHES: AtomicU32 = AtomicU32::new(0);
 
 /// 读取一个 u32 vm 参数。

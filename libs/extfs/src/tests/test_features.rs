@@ -25,8 +25,11 @@ const RO_COMPAT_BIGALLOC: u32 = 0x0200;
 const RO_COMPAT_VERITY: u32 = 0x8000;
 
 struct Mounted {
+    /// Owns the backend binding for as long as the mounted superblock is exercised.
+    #[allow(dead_code)]
     driver: ExtFsDriver,
     sb: Arc<VfsSuperblock>,
+    /// Keeps the in-memory block device alive behind the trait object held by the driver.
     #[allow(dead_code)]
     disk: Arc<MemDisk>,
 }

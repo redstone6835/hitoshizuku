@@ -47,8 +47,6 @@ struct InotifyEvent {
 }
 
 pub struct InotifyInstance {
-    /// 全局实例序号（fdinfo/诊断用）。
-    id: u64,
     queue: Spinlock<VecDeque<InotifyEvent>>,
     overflow: core::sync::atomic::AtomicBool,
     /// wd → 监视（实例持有 Arc，保证监视在实例生命周期内有效）。
@@ -71,7 +69,6 @@ impl InotifyInstance {
 
     fn new() -> Arc<Self> {
         Arc::new_cyclic(|self_weak| InotifyInstance {
-            id: next_instance_id(),
             queue: Spinlock::new(VecDeque::new()),
             overflow: core::sync::atomic::AtomicBool::new(false),
             watches: Spinlock::new(BTreeMap::new()),
@@ -373,10 +370,4 @@ pub fn create(
 pub fn instance_from_file(file: &crate::vfs::file::File) -> Option<Arc<InotifyInstance>> {
     file.downcast_ops::<InotifyFileOps>()
         .map(|ops| Arc::clone(&ops.instance))
-}
-
-fn next_instance_id() -> u64 {
-    use core::sync::atomic::AtomicU64;
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
 }

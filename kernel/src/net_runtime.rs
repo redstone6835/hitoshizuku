@@ -2277,9 +2277,7 @@ const SIOCDELRT: u32 = 0x890c;
 // rt_pad3(8) rt_tos(1) rt_class(1) rt_pad4(6) rt_metric(2) pad(2) rt_dev(8)
 // rt_mtu(8) rt_window(8) rt_irtt(2) pad(6)
 const RTENTRY_LEN: usize = 112;
-const RTF_UP: u16 = 0x0001;
 const RTF_GATEWAY: u16 = 0x0002;
-const RTF_HOST: u16 = 0x0004;
 
 /// 从 rtentry 的 sockaddr 字段解析 IPv4 地址（family 校验；AF_UNSPEC=0.0.0.0）。
 fn rtentry_sockaddr_ipv4(rt: &[u8; RTENTRY_LEN], offset: usize) -> Result<Ipv4Addr, Errno> {
@@ -5613,7 +5611,7 @@ impl NetWorkerContext {
             .map(|entry| entry.mtu)
             .unwrap_or(1500);
         let current = self.config.snapshot();
-        let mut addresses = current.addresses.clone();
+        let addresses = current.addresses.clone();
         let mut routes = current.routes.entries().to_vec();
         let default = RouteEntry {
             table: 0,

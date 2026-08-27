@@ -357,22 +357,6 @@ fn commit_unregister_iommu_controller(handle: IommuControllerHandle) -> Result<(
     Ok(())
 }
 
-pub(crate) fn can_unregister_iommu_controller(
-    handle: IommuControllerHandle,
-) -> Result<(), IommuError> {
-    let registry = IOMMU_CONTROLLERS.lock();
-    let entry = registry
-        .controllers
-        .iter()
-        .find(|entry| entry.handle == handle)
-        .ok_or(IommuError::NotFound)?;
-    if entry.retiring || entry.attaches_in_flight != 0 || !entry.active_domains.is_empty() {
-        Err(IommuError::Busy)
-    } else {
-        Ok(())
-    }
-}
-
 fn prepare_iommu_controller(handle: IommuControllerHandle) -> bool {
     matches!(
         prepare_unregister_iommu_controller(handle),

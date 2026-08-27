@@ -13,7 +13,6 @@ use errno::Errno;
 use general::ipc::msg::MsgManager;
 use general::ipc::sem::SemManager;
 use general::ipc::shm::ShmManager;
-use ns::Namespace as _;
 use sched::Task;
 use sched::sync::Spinlock;
 

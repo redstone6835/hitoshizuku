@@ -8,7 +8,6 @@
 //! 寄存器与 ED/TD 位定义对照 Linux drivers/usb/host/ohci.h。
 
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::compiler_fence;
@@ -21,7 +20,6 @@ use crate::regs::*;
 
 const ED_COUNT: usize = 32;
 const TD_COUNT: usize = 128;
-const TRANSFER_TIMEOUT_LOOPS: u32 = 400_000;
 const RESET_TIMEOUT_LOOPS: u32 = 100_000;
 
 fn delay_ns(duration_ns: u64) {
@@ -92,24 +90,24 @@ impl OhciHcd {
         };
         hcd.hc_reset()?;
         // HCCA 与帧间隔（12MHz 位时间 12000-1，FSLargestDataPacket=90）。
-        hcd.write32(OHCI_HcHCCA, hcd.hcca.dma_addr() as u32);
-        hcd.write32(OHCI_HcFmInterval, (12000 - 1) | (90 << 16));
+        hcd.write32(OHCI_HC_HCCA, hcd.hcca.dma_addr() as u32);
+        hcd.write32(OHCI_HC_FM_INTERVAL, (12000 - 1) | (90 << 16));
         // 控制/批量表 anchor ED。
         hcd.control_ed = hcd.alloc_ed()?;
         hcd.bulk_ed = hcd.alloc_ed()?;
         hcd.ed_mut(hcd.control_ed).word0 = 0;
         hcd.ed_mut(hcd.bulk_ed).word0 = 0;
         hcd.write32(
-            OHCI_HcControl,
+            OHCI_HC_CONTROL,
             OHCI_CTRL_CBSR | OHCI_CTRL_HCFS_OPERATIONAL | OHCI_CTRL_RWE,
         );
         Ok(hcd)
     }
 
     fn hc_reset(&self) -> Result<(), &'static str> {
-        self.write32(OHCI_HcCommandStatus, OHCI_CMDSTAT_HCR);
+        self.write32(OHCI_HC_COMMAND_STATUS, OHCI_CMDSTAT_HCR);
         for _ in 0..RESET_TIMEOUT_LOOPS {
-            if self.read32(OHCI_HcCommandStatus) & OHCI_CMDSTAT_HCR == 0 {
+            if self.read32(OHCI_HC_COMMAND_STATUS) & OHCI_CMDSTAT_HCR == 0 {
                 return Ok(());
             }
             delay_ns(1_000);
@@ -128,7 +126,7 @@ impl OhciHcd {
     }
 
     fn port_reg(&self) -> usize {
-        OHCI_HcRhPortStatus
+        OHCI_HC_RH_PORT_STATUS
     }
 
     // ── 池管理 ──
@@ -222,15 +220,11 @@ impl OhciHcd {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 
-    fn queue_enabled(&self, mask: u32) -> bool {
-        self.read32(OHCI_HcControl) & mask != 0
-    }
-
     fn stop_queue(&self, mask: u32) {
-        self.write32(OHCI_HcControl, self.read32(OHCI_HcControl) & !mask);
+        self.write32(OHCI_HC_CONTROL, self.read32(OHCI_HC_CONTROL) & !mask);
         // 等待队列空：读 HcCommandStatus CLF/BLF 自清。
         for _ in 0..RESET_TIMEOUT_LOOPS {
-            if self.read32(OHCI_HcCommandStatus) & (OHCI_CMDSTAT_CLF | OHCI_CMDSTAT_BLF) == 0 {
+            if self.read32(OHCI_HC_COMMAND_STATUS) & (OHCI_CMDSTAT_CLF | OHCI_CMDSTAT_BLF) == 0 {
                 break;
             }
             delay_ns(100);
@@ -238,14 +232,14 @@ impl OhciHcd {
     }
 
     fn start_queue(&self, mask: u32) {
-        self.write32(OHCI_HcControl, self.read32(OHCI_HcControl) | mask);
+        self.write32(OHCI_HC_CONTROL, self.read32(OHCI_HC_CONTROL) | mask);
         // 置位对应命令位让 HC 处理队列。
         let command = if mask & OHCI_CTRL_CLE != 0 {
             OHCI_CMDSTAT_CLF
         } else {
             OHCI_CMDSTAT_BLF
         };
-        self.write32(OHCI_HcCommandStatus, command);
+        self.write32(OHCI_HC_COMMAND_STATUS, command);
     }
 
     // ── 传输 ──
@@ -347,9 +341,9 @@ impl OhciHcd {
     fn poll_completion(&self) -> Result<usize, &'static str> {
         let deadline = hal::time::monotonic_ns().saturating_add(2_000_000_000);
         loop {
-            let done_head = self.read32(OHCI_HcInterruptStatus);
+            let done_head = self.read32(OHCI_HC_INTERRUPT_STATUS);
             if done_head & OHCI_INTR_WDH != 0 {
-                self.write32(OHCI_HcInterruptStatus, OHCI_INTR_WDH);
+                self.write32(OHCI_HC_INTERRUPT_STATUS, OHCI_INTR_WDH);
             }
             let completed = {
                 let transfers = self.transfers.lock();
@@ -421,7 +415,7 @@ impl UsbHcd for OhciHcd {
     }
 
     fn port_power_on(&self, port: usize) -> Result<(), &'static str> {
-        self.write32(OHCI_HcRhStatus, OHCI_RHSTATUS_LPSC);
+        self.write32(OHCI_HC_RH_STATUS, OHCI_RHSTATUS_LPSC);
         self.port_owner_set.lock()[port] = true;
         Ok(())
     }

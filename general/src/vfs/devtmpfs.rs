@@ -1023,7 +1023,8 @@ impl InodeOps for MknodInodeOps {
 /// 和已打开 fd 都会通过同一状态停止访问底层驱动。
 struct DevCharOps {
     dev: CharDevice,
-    tty: Option<Arc<TtyCore>>,
+    // The inode keeps the shared line discipline alive even before the first open fd.
+    _tty: Option<Arc<TtyCore>>,
 }
 
 impl DevCharOps {
@@ -2342,7 +2343,7 @@ impl DevTmpfsSuperblockOps {
         };
 
         let tty = tty::shared_tty_core(&dev);
-        let ops = Arc::new(DevCharOps { dev, tty });
+        let ops = Arc::new(DevCharOps { dev, _tty: tty });
         let inode = Inode::new(
             InodeId {
                 fs_id,

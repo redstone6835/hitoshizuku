@@ -2744,8 +2744,6 @@ enum Dhcpv6Phase {
         server_id: alloc::vec::Vec<u8>,
         address: Option<Ipv6Addr>,
         prefix_len: u8,
-        valid_seconds: u32,
-        dns: alloc::vec::Vec<Ipv6Addr>,
     },
     /// 已获得租约：T1 到期 Renew，T2 到期 Rebind。
     Bound {
@@ -2753,7 +2751,6 @@ enum Dhcpv6Phase {
         server_id: alloc::vec::Vec<u8>,
         address: Ipv6Addr,
         prefix_len: u8,
-        dns: alloc::vec::Vec<Ipv6Addr>,
         renew_ns: u64,
         rebind_ns: u64,
     },
@@ -2820,6 +2817,7 @@ pub struct NetStackControlPlane {
 }
 
 impl NetStackControlPlane {
+    #[cfg(test)]
     fn new(shard_count: usize, rss_key: [u8; 40], hash_seed: &[u8; 16]) -> Self {
         Self::new_with_options(shard_count, rss_key, hash_seed, false)
     }
@@ -3097,7 +3095,7 @@ impl NetStackControlPlane {
     fn run_dhcpv6(&self, config: &ConfigSnapshot, now_ns: u64) -> Dhcpv6RunOutput {
         let mut dhcpv6 = self.dhcpv6.lock();
         let mut frames = Vec::new();
-        let mut changes = Vec::new();
+        let changes = Vec::new();
         let mut index = 0;
         while index < dhcpv6.len() {
             let client = &mut dhcpv6[index];
@@ -3212,8 +3210,6 @@ impl NetStackControlPlane {
                     server_id: reply.server_id.clone(),
                     address: reply.address,
                     prefix_len: 64,
-                    valid_seconds: reply.valid_seconds,
-                    dns: reply.dns.clone(),
                 };
                 client.next_action_ns = now_ns;
                 client.retry_seconds = 1;
@@ -3258,7 +3254,6 @@ impl NetStackControlPlane {
                         server_id: alloc::vec::Vec::new(),
                         address: lease.address,
                         prefix_len,
-                        dns: reply.dns.clone(),
                         renew_ns: now_ns
                             .saturating_add(u64::from(t1).saturating_mul(1_000_000_000)),
                         rebind_ns: now_ns

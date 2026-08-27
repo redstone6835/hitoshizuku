@@ -691,12 +691,6 @@ impl DmaByteRing {
         copied
     }
 
-    fn append_to_tail(&mut self, input: &[u8]) -> usize {
-        self.append_to_tail_with(input.len(), |output| {
-            output.copy_from_slice(&input[..output.len()]);
-        })
-    }
-
     fn append_to_tail_with(&mut self, input_len: usize, mut copy: impl FnMut(&mut [u8])) -> usize {
         let Some(tail) = self.chunks.back_mut() else {
             return 0;
@@ -905,6 +899,7 @@ impl ByteRing {
         self.head = 0;
     }
 
+    #[cfg(test)]
     fn push(&mut self, input: &[u8]) -> usize {
         self.push_with(input.len(), &mut |offset, output| {
             output.copy_from_slice(&input[offset..offset + output.len()]);
@@ -1000,6 +995,7 @@ impl StreamTxRing {
         }
     }
 
+    #[cfg(test)]
     fn push(&mut self, input: &[u8]) -> usize {
         match &mut self.bytes {
             StreamBytes::Heap(bytes) => bytes.push(input),
@@ -1263,12 +1259,6 @@ impl StreamRxBytes {
         }
         self.len += copied;
         copied
-    }
-
-    fn copy_range(&self, offset: usize, output: &mut [u8]) -> bool {
-        self.copy_range_with(offset, output.len(), &mut |copied, input| {
-            output[copied..copied + input.len()].copy_from_slice(input);
-        })
     }
 
     fn copy_range_with(

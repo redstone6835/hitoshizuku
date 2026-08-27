@@ -6,6 +6,7 @@
 #![allow(named_asm_labels)]
 
 use core::arch::{asm, naked_asm};
+use core::ffi::c_void;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 /// 当前处理器是否允许非对齐访存。
@@ -37,7 +38,11 @@ pub(crate) fn init_ual() {
 /// `[src, src + len)` 与 `[dst, dst + len)` 必须有效且不得重叠。
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memcpy(_dst: *mut u8, _src: *const u8, _len: usize) -> *mut u8 {
+pub unsafe extern "C" fn memcpy(
+    _dst: *mut c_void,
+    _src: *const c_void,
+    _len: usize,
+) -> *mut c_void {
     naked_asm!(
         r#"
         move    $t8, $a0
@@ -201,7 +206,7 @@ pub unsafe extern "C" fn memcpy(_dst: *mut u8, _src: *const u8, _len: usize) -> 
 /// `[dst, dst + len)` 必须有效且可写。
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memset(_dst: *mut u8, _value: i32, _len: usize) -> *mut u8 {
+pub unsafe extern "C" fn memset(_dst: *mut c_void, _value: i32, _len: usize) -> *mut c_void {
     naked_asm!(
         r#"
         move    $t8, $a0
@@ -317,7 +322,11 @@ pub unsafe extern "C" fn memset(_dst: *mut u8, _value: i32, _len: usize) -> *mut
 /// `[src, src + len)` 与 `[dst, dst + len)` 必须是有效内存区域，可以重叠。
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memmove(_dst: *mut u8, _src: *const u8, _len: usize) -> *mut u8 {
+pub unsafe extern "C" fn memmove(
+    _dst: *mut c_void,
+    _src: *const c_void,
+    _len: usize,
+) -> *mut c_void {
     naked_asm!(
         r#"
         beqz    $a2, .Lla_move_return
@@ -496,7 +505,7 @@ pub unsafe extern "C" fn memmove(_dst: *mut u8, _src: *const u8, _len: usize) ->
 /// `[lhs, lhs + len)` 与 `[rhs, rhs + len)` 必须有效可读。
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memcmp(_lhs: *const u8, _rhs: *const u8, _len: usize) -> i32 {
+pub unsafe extern "C" fn memcmp(_lhs: *const c_void, _rhs: *const c_void, _len: usize) -> i32 {
     naked_asm!(
         r#"
         beqz    $a2, .Lla_cmp_equal

@@ -445,12 +445,6 @@ impl Uart16550 {
         uart
     }
 
-    /// 返回 UART 寄存器组的虚拟基地址。
-    #[inline]
-    pub fn base(&self) -> usize {
-        self.registers.base
-    }
-
     #[inline]
     fn read_reg(&self, offset: usize) -> u8 {
         self.registers.read(offset)
@@ -902,8 +896,6 @@ fn register_uart_irq(
 pub enum UartRequest {
     /// 重新设置波特率。
     SetBaudRate { clock_hz: u32, baud: u32 },
-    /// 读取线路状态寄存器（LSR）原始值。
-    GetLineStatus,
 }
 
 /// UART 控制响应。
@@ -911,8 +903,6 @@ pub enum UartRequest {
 pub enum UartResponse {
     /// 操作已完成，无附加数据。
     Done,
-    /// LSR 原始字节。
-    LineStatus(u8),
 }
 
 /// UART 控制错误。
@@ -958,10 +948,6 @@ impl DriverControl for Uart16550 {
                 self.write_reg(REG_IER, dlm);
                 self.write_reg(REG_LCR, LCR_8N1);
                 Ok(UartResponse::Done)
-            }
-            UartRequest::GetLineStatus => {
-                let lsr = self.read_reg(REG_LSR);
-                Ok(UartResponse::LineStatus(lsr))
             }
         }
     }

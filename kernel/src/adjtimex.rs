@@ -58,6 +58,11 @@ const STA_RONLY: i32 = STA_PPSSIGNAL
     | STA_MODE
     | STA_CLK;
 
+/// 用户可通过 `ADJ_STATUS` 更新的 Linux 状态位。
+const STA_WRITABLE: i32 =
+    STA_PLL | STA_PPSFREQ | STA_PPSTIME | STA_FLL | STA_INS | STA_DEL | STA_UNSYNC | STA_FREQHOLD;
+const _: () = assert!(STA_WRITABLE & STA_RONLY == 0);
+
 /// 按 Linux `process_adjtimex_modes()` 语义合并 `ADJ_STATUS`：可写位来自请求，
 /// `STA_RONLY` 位（特别是 `STA_NANO`）始终保留内核当前值。
 const fn merge_status(current: i32, requested: i32) -> i32 {

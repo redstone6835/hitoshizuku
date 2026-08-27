@@ -12,11 +12,15 @@ use net::buf::{
 };
 #[cfg(not(feature = "elm-integrated"))]
 use net::device::PinnedNetQueueEndpoint;
+#[cfg(not(feature = "elm-integrated"))]
 use net::device::{
     NET_QUEUE_CALL_STATUS_INVALID, NET_QUEUE_CALL_STATUS_OK, NET_QUEUE_OP_HAS_PENDING,
     NET_QUEUE_OP_POLL_RX, NET_QUEUE_OP_QUIESCE, NET_QUEUE_OP_RECLAIM_TX, NET_QUEUE_OP_REFILL_RX,
-    NET_QUEUE_OP_SUBMIT_TX, NetDeviceHandle, NetDeviceRegisterErrorKind, NetDeviceRegistration,
-    NetDeviceRemoveError, NetQueueRegistration,
+    NET_QUEUE_OP_SUBMIT_TX,
+};
+use net::device::{
+    NetDeviceHandle, NetDeviceRegisterErrorKind, NetDeviceRegistration, NetDeviceRemoveError,
+    NetQueueRegistration,
 };
 use net::queue::{
     NetQueueCaps, NetQueuePair, QueueFatalError, RxBudget, RxPollResult, RxRefillResult,
@@ -29,6 +33,7 @@ const LOOPBACK_MTU: u32 = 65_536;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LoopbackError {
     Pool,
+    #[cfg(not(feature = "elm-integrated"))]
     Context,
     Register(NetDeviceRegisterErrorKind),
     Remove(NetDeviceRemoveError),
@@ -348,6 +353,7 @@ pub(crate) fn destroy_queue() {
     *QUEUE.lock() = None;
 }
 
+#[cfg(not(feature = "elm-integrated"))]
 #[elm::export(
     name = "net.loopback.queue-call",
     contract = "mygo.net.queue-call@1",

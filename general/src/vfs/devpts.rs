@@ -191,7 +191,6 @@ impl FileOps for DevPtsDirFileOps {
 /// 单个 `/dev/pts/N` 节点:open 时按编号解析 pty 对并复用字符设备投影。
 struct DevPtsNodeOps {
     index: u32,
-    node_mode: FileMode,
 }
 
 impl InodeOps for DevPtsNodeOps {
@@ -307,10 +306,7 @@ impl DevPtsSuperblockOps {
                 ctime: Timespec::now(),
                 blocks: 0,
             },
-            Arc::new(DevPtsNodeOps {
-                index,
-                node_mode: self.options.node_mode,
-            }),
+            Arc::new(DevPtsNodeOps { index }),
             Arc::downgrade(&sb),
         );
         let mut nodes = ops.nodes.lock();

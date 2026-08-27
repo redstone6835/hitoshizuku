@@ -35,7 +35,7 @@ pub use types::{AddressWidth, Arch, Segment, SegmentPerms};
 /// 强制链接器保留镜像解析直接符号目录。
 #[doc(hidden)]
 pub fn kernel_symbol_catalog_anchor() -> usize {
-    detect::parse as usize
+    detect::parse as *const () as usize
 }
 
 #[cfg(any(test, feature = "ktest-kernel"))]

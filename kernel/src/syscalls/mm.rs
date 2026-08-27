@@ -1,6 +1,5 @@
 //! 内存相关 syscall。
 
-use alloc::string::String;
 use alloc::sync::Arc;
 
 use errno::Errno;
@@ -1090,12 +1089,6 @@ fn read_user_usize(user: usize) -> Result<usize, Errno> {
     Ok(usize::from_le_bytes(raw))
 }
 
-fn read_user_i32(user: usize) -> Result<i32, Errno> {
-    let mut raw = [0u8; 4];
-    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
-    Ok(i32::from_le_bytes(raw))
-}
-
 pub(super) fn sys_process_vm_readv(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     process_vm_rw(ctx, false)
 }
@@ -1170,8 +1163,7 @@ fn process_vm_rw(ctx: &mut SyscallContext<'_>, write: bool) -> Result<usize, Err
             break;
         };
         let chunk = (*local_len).min(*remote_len);
-        let copied =
-            copy_process_vm_range(ctx, &remote_vm, *remote_base, *local_base, chunk, write)?;
+        let copied = copy_process_vm_range(&remote_vm, *remote_base, *local_base, chunk, write)?;
         total = total.saturating_add(copied);
         if copied < chunk {
             // 目标页不可访问：已拷贝部分成功返回，未开始则报 EFAULT（Linux 语义）。
@@ -1190,7 +1182,6 @@ fn process_vm_rw(ctx: &mut SyscallContext<'_>, write: bool) -> Result<usize, Err
 /// 单页内拷贝：先确保远程页驻留（含 COW），再在本地/远程用户地址与内核
 /// 直映页之间搬运。
 fn copy_process_vm_range(
-    ctx: &mut SyscallContext<'_>,
     remote: &VmSpace,
     remote_addr: usize,
     local_addr: usize,
@@ -1464,8 +1455,8 @@ fn map_range(
     let profile_image = profile_file_mapping(&file, range.start, offset);
     #[cfg(not(feature = "performance-profile"))]
     let _ = task;
-    let image_start = range.start;
-    let image_end = range.end;
+    #[cfg(feature = "performance-profile")]
+    let (image_start, image_end) = (range.start, range.end);
     let backing: Arc<dyn mm::FileLike> = file;
     vm.map_file(range, backing, offset, flags.with(VmFlags::USER))?;
     #[cfg(feature = "performance-profile")]

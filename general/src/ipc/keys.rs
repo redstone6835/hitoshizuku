@@ -22,9 +22,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use errno::Errno;
-use sched::current_task;
 use spin::Mutex;
-use vfs::cred::{Credentials, Gid, Uid};
+use vfs::cred::Credentials;
 
 /// `KEY_SPEC_*` 特殊 keyring 引用。
 pub const KEY_SPEC_THREAD_KEYRING: i32 = -1;
@@ -202,12 +201,6 @@ impl Key {
         self.is_live(now_sec)
     }
 
-    /// 当前时间是否已到期（`now_sec` 由调用方提供，统一时钟源）。
-    fn is_expired(&self, now_sec: u64) -> bool {
-        let inner = self.inner.lock();
-        inner.expiry.is_some_and(|expiry| now_sec >= expiry)
-    }
-
     /// key 是否"存在"（未撤销、未否定、未到期）。`KEYRING_SEARCH` 语义。
     fn is_live(&self, now_sec: u64) -> bool {
         let inner = self.inner.lock();
@@ -249,10 +242,6 @@ impl Key {
         self.inner.lock().restriction = restriction;
     }
 
-    fn payload(&self) -> Vec<u8> {
-        self.inner.lock().payload.clone()
-    }
-
     /// key 的描述字符串（授权 key 校验、`add_member` 等使用）。
     pub fn description(&self) -> String {
         self.inner.lock().description.clone()
@@ -274,10 +263,6 @@ impl Key {
         let before = inner.members.len();
         inner.members.retain(|(_, id)| *id != member);
         inner.members.len() != before
-    }
-
-    fn clear_members(&self) {
-        self.inner.lock().members.clear();
     }
 
     /// 迭代成员（供递归搜索；不可在遍历中修改）。
@@ -616,7 +601,7 @@ impl KeyManager {
             KEY_SPEC_PROCESS_KEYRING => {
                 // Linux `install_process_keyring`：进程没有显式 process keyring
                 // 时按需创建（描述 `_pid.<pid>`，权限走默认）。
-                let mut guard = process.process.lock();
+                let guard = process.process.lock();
                 if let Some(id) = *guard {
                     id
                 } else {
@@ -655,7 +640,7 @@ impl KeyManager {
 
     /// 每 uid 的 user keyring（不存在则创建）。
     pub fn user_keyring(&self, uid: u32, cred: &Credentials) -> Result<KeyId, Errno> {
-        let mut guard = self.state.lock();
+        let guard = self.state.lock();
         if let Some(id) = guard.user_keyring.get(&uid) {
             return Ok(*id);
         }
@@ -680,8 +665,13 @@ impl KeyManager {
     }
 
     /// 每 uid 的 user-session keyring（不存在则创建）。
-    pub fn user_session(&self, uid: u32, cred: &Credentials, now_sec: u64) -> Result<KeyId, Errno> {
-        let mut guard = self.state.lock();
+    pub fn user_session(
+        &self,
+        uid: u32,
+        _cred: &Credentials,
+        now_sec: u64,
+    ) -> Result<KeyId, Errno> {
+        let guard = self.state.lock();
         if let Some(id) = guard.user_session_keyring.get(&uid) {
             return Ok(*id);
         }
@@ -992,7 +982,7 @@ impl KeyManager {
 
     /// 惰性清理：从 keyring 摘除已撤销/到期成员（在遍历入口调用）。
     pub fn reap_expired(&self, now_sec: u64) {
-        let mut guard = self.state.lock();
+        let guard = self.state.lock();
         let keys: Vec<Arc<Key>> = guard.keys.values().cloned().collect();
         for key in keys {
             if !key.is_keyring() {

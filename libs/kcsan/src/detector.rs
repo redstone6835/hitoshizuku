@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use crate::{Access, AccessKind, Config, RuntimeHooks, Stats};
 
 const MAX_CPU_SLOTS: usize = 512;
+#[cfg(any(test, target_arch = "loongarch64", target_arch = "riscv64"))]
 const MIXED_CPU_SLOT: usize = MAX_CPU_SLOTS - 1;
 const WATCHPOINT_SLOTS: usize = 256;
 const WATCHPOINT_PROBES: usize = 2;

@@ -4,7 +4,6 @@
 //! 内存、BPF_ABS/IND 包字节读取（大端组合）、全部 ALU/JMP/MISC 指令。
 //! 用于 SO_ATTACH_FILTER（packet socket 与 INET socket 的接收过滤）。
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 /// 单条 cBPF 指令（struct sock_filter 布局：code/jt/jf/k）。
@@ -370,6 +369,7 @@ pub fn serialize_sock_filters(instructions: &[CbpfInsn]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     fn insn(code: u16, jt: u8, jf: u8, k: u32) -> CbpfInsn {
         CbpfInsn { code, jt, jf, k }

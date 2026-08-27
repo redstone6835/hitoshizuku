@@ -26,13 +26,13 @@ use general::ipc::mqueue::{
     MqAttr, MqNotifyKind, SI_MESGQ, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD,
 };
 use general::ipc::msg::{
-    MSG_COPY, MSG_EXCEPT, MSG_INFO, MSG_NOERROR, MSG_STAT, MSG_STAT_ANY, MSG_TRUNC, MSGMAX, MSGMNB,
-    MSGMNI, MsgId, MsgKey, MsgManager, MsgMetadata, MsgOpAttempt, MsgRecvOutcome, MsgSystemInfo,
+    MSG_INFO, MSG_STAT, MSG_STAT_ANY, MSG_TRUNC, MSGMAX, MSGMNB, MSGMNI, MsgId, MsgKey,
+    MsgMetadata, MsgOpAttempt, MsgRecvOutcome, MsgSystemInfo,
 };
 use general::ipc::sem::{
     SEM_INFO, SEM_STAT, SEM_STAT_ANY, SEM_UNDO, SEMCTL_GETALL, SEMCTL_GETNCNT, SEMCTL_GETPID,
     SEMCTL_GETVAL, SEMCTL_GETZCNT, SEMCTL_SETALL, SEMCTL_SETVAL, SEMOPM, SemBlockKind, SemId,
-    SemKey, SemManager, SemMetadata, SemOpAttempt, SemOperation, SemSystemInfo,
+    SemKey, SemMetadata, SemOpAttempt, SemOperation, SemSystemInfo,
 };
 use general::ipc::sem_undo::SemUndoTable;
 use general::ipc::shm::{
@@ -98,8 +98,6 @@ pub(crate) const TASKEXT_KEYRINGS: sched::TaskExtKey = 0x0004_0002;
 const KEY_DESC_MAX: usize = 4096;
 
 static SYSV_SHM_MANAGER: Spinlock<Option<Arc<ShmManager>>> = Spinlock::new(None);
-static SYSV_SEM_MANAGER: Spinlock<Option<Arc<SemManager>>> = Spinlock::new(None);
-static SYSV_MSG_MANAGER: Spinlock<Option<Arc<MsgManager>>> = Spinlock::new(None);
 static SYSV_KEYS_MANAGER: Spinlock<Option<Arc<KeyManager>>> = Spinlock::new(None);
 
 /// SysV shm 当前占用总字节数（`sysinfo` 的 `sharedram` 数据源）。
@@ -1995,26 +1993,6 @@ pub(super) fn sys_semtimedop_time64(ctx: &mut SyscallContext<'_>) -> Result<usiz
     sys_semop_common(ctx, Some(timeout))
 }
 
-fn shm_manager() -> Arc<ShmManager> {
-    let mut slot = SYSV_SHM_MANAGER.lock();
-    if let Some(manager) = slot.as_ref() {
-        return Arc::clone(manager);
-    }
-    let manager = Arc::new(ShmManager::default());
-    *slot = Some(Arc::clone(&manager));
-    manager
-}
-
-fn sem_manager() -> Arc<SemManager> {
-    let mut slot = SYSV_SEM_MANAGER.lock();
-    if let Some(manager) = slot.as_ref() {
-        return Arc::clone(manager);
-    }
-    let manager = Arc::new(SemManager::default());
-    *slot = Some(Arc::clone(&manager));
-    manager
-}
-
 /// 当前任务的 SysV IPC 命名空间（shm/sem/msg 管理器）。
 fn task_ipc(ctx: &SyscallContext<'_>) -> Arc<crate::ns::IpcNamespace> {
     Arc::clone(&crate::ns::task_ns(ctx.task()).ipc)
@@ -2052,16 +2030,6 @@ fn process_keyrings_of(task: &Arc<sched::Task>) -> Arc<ProcessKeyrings> {
 /// 单调时钟的当前秒数（key 到期时间戳使用）。
 fn now_sec_u64() -> u64 {
     crate::vdso::clock_time_ns(1).unwrap_or(0) as u64 / 1_000_000_000
-}
-
-fn msg_manager() -> Arc<MsgManager> {
-    let mut slot = SYSV_MSG_MANAGER.lock();
-    if let Some(manager) = slot.as_ref() {
-        return Arc::clone(manager);
-    }
-    let manager = Arc::new(MsgManager::default());
-    *slot = Some(Arc::clone(&manager));
-    manager
 }
 
 fn sys_semop_common(

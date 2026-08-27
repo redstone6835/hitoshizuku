@@ -1386,7 +1386,6 @@ fn wait_common(
                 );
             }
         }
-        drop(pred);
         drop(me);
         schedule_once(crate::scheduler::now_ns_public());
         me = current_task();
@@ -1914,7 +1913,7 @@ pub fn ptrace_detach(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> 
 }
 
 pub fn ptrace_kill(pid: PidT) -> Result<(), Errno> {
-    let target = ptrace_target(pid)?;
+    let _target = ptrace_target(pid)?;
     tkill(pid, Some(SignalNumber::SIGKILL))
 }
 

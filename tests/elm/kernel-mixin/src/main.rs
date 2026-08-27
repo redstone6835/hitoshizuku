@@ -94,6 +94,7 @@ impl ElmModule for KernelMixinTest {
 #[elm::mixin(target = "allocator")]
 impl KernelMixinTest {
     #[elm::inject(method = "GlobalAlloc.alloc", at = "head", priority = 300)]
+    #[cfg_attr(feature = "elm-integrated", allow(dead_code))]
     fn trace_alloc_head(&self, context: &mut KernelMixinContext<'_>) -> HookResult {
         if context.argument_count() != 2
             || context.argument::<Layout>(1).is_none()
@@ -105,6 +106,7 @@ impl KernelMixinTest {
     }
 
     #[elm::modify_arg(method = "GlobalAlloc.alloc", priority = 200)]
+    #[cfg_attr(feature = "elm-integrated", allow(dead_code))]
     fn validate_alloc_argument(&self, context: &mut KernelMixinContext<'_>) -> HookResult {
         let Some(layout) = context.argument_mut::<Layout>(1) else {
             return Err(HookError::new(-1));
@@ -114,12 +116,14 @@ impl KernelMixinTest {
     }
 
     #[elm::overwrite(method = "GlobalAlloc.alloc", priority = 100)]
+    #[cfg_attr(feature = "elm-integrated", allow(dead_code))]
     fn wrap_alloc(&self, context: &mut KernelMixinContext<'_>) -> HookResult {
         report_once(&OVERWRITE_REPORTED, "alloc-overwrite")?;
         context.proceed()
     }
 
     #[elm::modify_return(method = "GlobalAlloc.alloc", priority = 100)]
+    #[cfg_attr(feature = "elm-integrated", allow(dead_code))]
     fn validate_alloc_return(&self, context: &mut KernelMixinContext<'_>) -> HookResult {
         if context.result::<*mut u8>().is_none() {
             return Err(HookError::new(-1));
@@ -135,6 +139,7 @@ fn reset_reports() {
     RETURN_REPORTED.store(false, Ordering::Release);
 }
 
+#[cfg_attr(feature = "elm-integrated", allow(dead_code))]
 fn report_once(flag: &AtomicBool, event: &str) -> HookResult {
     if !flag.swap(true, Ordering::AcqRel) {
         report(event)?;

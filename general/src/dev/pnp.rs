@@ -4347,8 +4347,6 @@ mod tests {
 
     use super::*;
 
-    static TEST_ELM_CONTEXT_STATE: Spinlock<()> = Spinlock::new(());
-
     #[derive(Debug)]
     struct TestBusInfo;
 
@@ -4698,7 +4696,7 @@ mod tests {
 
     #[test]
     fn elm_driver_proxy_restores_complete_context_and_generation() {
-        let _context_state = TEST_ELM_CONTEXT_STATE.lock();
+        let _context_state = crate::elm_guard::TEST_ELM_CONTEXT_STATE.lock();
         assert!(elm_model::current_context().is_none());
         let owner = test_elm_context(
             0x4101,
@@ -4765,7 +4763,7 @@ mod tests {
 
     #[test]
     fn elm_driver_proxy_keeps_owner_context_through_unregister() {
-        let _context_state = TEST_ELM_CONTEXT_STATE.lock();
+        let _context_state = crate::elm_guard::TEST_ELM_CONTEXT_STATE.lock();
         assert!(elm_model::current_context().is_none());
         let owner = test_elm_context(
             0x4151,
@@ -4856,7 +4854,7 @@ mod tests {
 
     #[test]
     fn elm_device_function_proxy_restores_context_and_hides_dynamic_any() {
-        let _context_state = TEST_ELM_CONTEXT_STATE.lock();
+        let _context_state = crate::elm_guard::TEST_ELM_CONTEXT_STATE.lock();
         assert!(elm_model::current_context().is_none());
         let owner = test_elm_context(
             0x4181,
@@ -4926,7 +4924,7 @@ mod tests {
 
     #[test]
     fn elm_device_function_proxy_preserves_resident_typed_projection() {
-        let _context_state = TEST_ELM_CONTEXT_STATE.lock();
+        let _context_state = crate::elm_guard::TEST_ELM_CONTEXT_STATE.lock();
         assert!(elm_model::current_context().is_none());
         let owner = test_elm_context(0x4191, 41, elm_model::ElmLifecyclePhase::Initialize, 0, 1);
         let owner_snapshot = elm_model::ElmCurrentContext::from_context(&owner);
@@ -4958,7 +4956,7 @@ mod tests {
 
     #[test]
     fn dynamic_device_registration_installs_and_releases_function_proxy() {
-        let _context_state = TEST_ELM_CONTEXT_STATE.lock();
+        let _context_state = crate::elm_guard::TEST_ELM_CONTEXT_STATE.lock();
         assert!(elm_model::current_context().is_none());
         let owner = test_elm_context(
             0x41a1,
@@ -5022,7 +5020,7 @@ mod tests {
 
     #[test]
     fn elm_resource_proxy_restores_context_for_full_release_protocol() {
-        let _context_state = TEST_ELM_CONTEXT_STATE.lock();
+        let _context_state = crate::elm_guard::TEST_ELM_CONTEXT_STATE.lock();
         assert!(elm_model::current_context().is_none());
         let owner = test_elm_context(
             0x4201,
@@ -5089,7 +5087,7 @@ mod tests {
 
     #[test]
     fn stale_generation_cannot_attach_or_reserve_bound_driver_resources() {
-        let _context_state = TEST_ELM_CONTEXT_STATE.lock();
+        let _context_state = crate::elm_guard::TEST_ELM_CONTEXT_STATE.lock();
         assert!(elm_model::current_context().is_none());
         let owner = test_elm_context(0x4301, 3, elm_model::ElmLifecyclePhase::Initialize, 0, 1);
         let owner_snapshot = elm_model::ElmCurrentContext::from_context(&owner);
@@ -5134,7 +5132,7 @@ mod tests {
 
     #[test]
     fn builtin_provider_scope_authorizes_foreign_runtime_resource_registration() {
-        let _context_state = TEST_ELM_CONTEXT_STATE.lock();
+        let _context_state = crate::elm_guard::TEST_ELM_CONTEXT_STATE.lock();
         assert!(elm_model::current_context().is_none());
         let device = test_device(0x4302);
         device.begin_probe(None).unwrap();
@@ -5186,7 +5184,7 @@ mod tests {
 
     #[test]
     fn dynamic_provider_scope_wraps_resource_under_provider_context() {
-        let _context_state = TEST_ELM_CONTEXT_STATE.lock();
+        let _context_state = crate::elm_guard::TEST_ELM_CONTEXT_STATE.lock();
         assert!(elm_model::current_context().is_none());
         let provider = test_elm_context(
             0x4303,

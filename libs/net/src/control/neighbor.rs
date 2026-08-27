@@ -1,4 +1,3 @@
-use alloc::vec;
 use alloc::vec::Vec;
 use hashbrown::HashTable;
 use spin::Mutex;
@@ -41,7 +40,7 @@ pub fn clear_neighbor_snapshot() -> usize {
     removed
 }
 
-fn mirror_observe(key: NeighborKey, mac_address: [u8; 6], now_ns: u64, reachable: bool) {
+fn mirror_observe(key: NeighborKey, mac_address: [u8; 6], _now_ns: u64, reachable: bool) {
     // 邻居镜像属于常驻内核，不能把延迟扩容记到发起观察的可卸载 ELM。
     let _accounting = allocator::suspend_implicit_allocation_accounting();
     let mut mirror = NEIGHBOR_MIRROR.lock();

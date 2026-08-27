@@ -342,6 +342,7 @@ pub(crate) struct KernelSymbolAuthorization {
 }
 
 impl KernelSymbolAuthorization {
+    #[cfg(feature = "kernel-tests")]
     pub(crate) const fn none() -> Self {
         Self {
             requested: false,
@@ -414,6 +415,7 @@ struct RuntimePortBinding {
 #[derive(Debug, Clone, Copy)]
 enum ProviderBackend {
     Kernel(KernelProviderKind),
+    #[allow(dead_code)] // 仅 kernel-tests 当前会登记旧式内核 provider。
     KernelOps(&'static ElmKernelProviderSpec),
     ElmNative(NativeProviderBackend),
     ElmNativeTodo,
@@ -571,7 +573,6 @@ struct KernelSymbolImportRuntime {
     selected_version: u32,
     kind: u8,
     capabilities: u64,
-    descriptor_flags: u32,
     retained_argument_mask: u64,
     rust_abi_hash: [u8; 32],
     address: usize,
@@ -1269,6 +1270,7 @@ impl ElmMgrRuntime {
         take_monotonic_id(&mut self.next_event_subscription_id)
     }
 
+    #[cfg(feature = "kernel-tests")]
     fn alloc_kernel_provider_api_id(&mut self) -> Option<u64> {
         take_monotonic_id(&mut self.next_kernel_provider_api_id)
     }
@@ -2191,7 +2193,7 @@ impl ElmCore {
         }
     }
 
-    #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+    #[cfg(feature = "kernel-tests")]
     pub(crate) fn test_configured_build_bound_promotion(image: &ElmEbiImage) -> bool {
         let authorized = KernelSymbolAuthorization {
             requested: true,
@@ -2361,6 +2363,7 @@ impl ElmCore {
         true
     }
 
+    #[cfg(feature = "kernel-tests")]
     pub fn init_builtin_mgr(&mut self) -> Result<(), ElmError> {
         self.init_builtin_mgr_with_integrated_exports(&[])
     }
@@ -4932,6 +4935,7 @@ impl ElmCore {
         expired
     }
 
+    #[cfg(feature = "kernel-tests")]
     pub(crate) fn run_one_async_provider_job_at(&mut self, now_ns: u64) -> bool {
         // 局部测试入口复用正式 prepare/execute/complete 链路，不维护第二套外部执行语义。
         match self.prepare_one_async_provider_execution(now_ns) {
@@ -6332,6 +6336,7 @@ impl ElmCore {
         self.load_ebi_unit_under_parent(unit, arch, ELM_MGR_ID, ElmResourceBudget::DEFAULT)
     }
 
+    #[cfg(feature = "kernel-tests")]
     pub fn load_ebi_image(&mut self, image: ElmEbiImage, arch: ElmEbiArch) -> ElmLoadCellResponse {
         self.load_declarative_ebi_image_from_source_under_parent(
             image,
@@ -6361,6 +6366,7 @@ impl ElmCore {
         )
     }
 
+    #[cfg(feature = "kernel-tests")]
     pub(crate) fn load_declarative_ebi_image_from_source_under_parent(
         &mut self,
         image: ElmEbiImage,
@@ -7861,24 +7867,6 @@ impl ElmCore {
             outcome.migrated_len as u32,
             reason,
             blockers,
-        )
-    }
-
-    pub(crate) fn replace_declarative_cell_from_ebi_image_with_source(
-        &mut self,
-        id: ElmId,
-        image: ElmEbiImage,
-        arch: ElmEbiArch,
-        migration_limit: u32,
-        source: ElmEbiSourceKind,
-    ) -> ElmReplaceCellResponseV1 {
-        self.replace_declarative_cell_from_ebi_image_with_source_and_symbol_authorization(
-            id,
-            image,
-            arch,
-            migration_limit,
-            source,
-            KernelSymbolAuthorization::none(),
         )
     }
 
@@ -12106,7 +12094,7 @@ impl ElmCore {
             version: ELM_RUNTIME_LOG_EXPORT_VERSION,
             flags: 0,
             rust_abi_hash: [0; 32],
-            address: elm_runtime_log_v1 as usize,
+            address: elm_runtime_log_v1 as *const () as usize,
             bounds: None,
             integrated: None,
         });
@@ -12266,6 +12254,7 @@ impl ElmCore {
         Ok(registered)
     }
 
+    #[cfg(feature = "kernel-tests")]
     pub(crate) fn register_kernel_provider_specs(
         &mut self,
         specs: &'static [ElmKernelProviderSpec],
@@ -12282,15 +12271,7 @@ impl ElmCore {
         self.register_kernel_provider_specs_for_owner_inner(owner, specs)
     }
 
-    #[cfg(not(feature = "kernel-tests"))]
-    fn register_kernel_provider_specs_for_owner(
-        &mut self,
-        owner: ElmId,
-        specs: &'static [ElmKernelProviderSpec],
-    ) -> Result<usize, ElmError> {
-        self.register_kernel_provider_specs_for_owner_inner(owner, specs)
-    }
-
+    #[cfg(feature = "kernel-tests")]
     fn register_kernel_provider_specs_for_owner_inner(
         &mut self,
         owner: ElmId,
@@ -13014,7 +12995,6 @@ impl ElmCore {
                             selected_version: symbol.version,
                             kind: symbol.kind,
                             capabilities: symbol.capabilities,
-                            descriptor_flags: symbol.flags,
                             retained_argument_mask: symbol.retained_argument_mask,
                             rust_abi_hash: symbol.rust_abi_hash,
                             address: symbol.address,
@@ -17384,7 +17364,6 @@ impl ElmCore {
                 selected_version: 1,
                 kind: ::kernel_symbols::KERNEL_SYMBOL_KIND_FUNCTION,
                 capabilities: ::kernel_symbols::capability::ALLOCATOR_MEMORY,
-                descriptor_flags: 0,
                 retained_argument_mask: 0,
                 rust_abi_hash: [0; 32],
                 address,

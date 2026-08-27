@@ -173,35 +173,6 @@ impl IngressPayload<'_> {
         self.len() == 0
     }
 
-    fn copy_to_socket(
-        &mut self,
-        facade: &SocketFacade,
-        payload_offset: usize,
-    ) -> Result<StreamRxCommit, SocketError> {
-        let len = self.len().saturating_sub(payload_offset);
-        match self {
-            Self::Empty => Ok(StreamRxCommit {
-                len: 0,
-                storage: StreamRxStorageKind::Discarded,
-                low_water_fallback: false,
-            }),
-            #[cfg(test)]
-            Self::Owned(bytes) => facade.push_stream_rx_compact(&bytes[payload_offset..]),
-            Self::Packet {
-                chain,
-                offset,
-                pressure,
-                ..
-            } => facade.push_stream_rx_packet(chain, *offset + payload_offset, len, *pressure),
-            Self::Lease {
-                lease,
-                offset,
-                flush,
-                ..
-            } => facade.push_stream_rx_lease(lease, *offset + payload_offset, len, *flush),
-        }
-    }
-
     /// 把 [offset, offset+len) 子区间复制到 socket 接收流（紧急拆分用）。
     fn copy_range_to_socket(
         &mut self,
@@ -5789,7 +5760,7 @@ mod tests {
     fn fastopen_client_without_cookie_queues_data_and_returns_inprogress() {
         // 无 cookie：SYN 不带数据，数据排队（sendmsg 返回 EINPROGRESS 语义）。
         let mut table = TcpEndpointTable::new([7; 40], [9; 16]);
-        let pair = establish_local_pair(&mut table, None);
+        let _pair = establish_local_pair(&mut table, None);
         let client_endpoint = Endpoint {
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 41_127,

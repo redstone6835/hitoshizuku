@@ -68,7 +68,6 @@ pub enum Ls2kI2cError {
     Timeout,
     NoAck,
     ArbitrationLost,
-    Invalid,
 }
 
 fn delay_ns(duration_ns: u64) {
@@ -336,14 +335,14 @@ fn map_i2c_error(error: Ls2kI2cError) -> DeviceFunctionInvokeError {
     match error {
         Ls2kI2cError::Timeout => InvokeError::Busy,
         Ls2kI2cError::NoAck | Ls2kI2cError::ArbitrationLost => InvokeError::Fault,
-        Ls2kI2cError::Invalid => InvokeError::Invalid,
     }
 }
 
 // ─────────────────────────── PnP 驱动 ───────────────────────────
 
 struct Ls2kI2cBinding {
-    bus: Arc<Ls2xI2cBus>,
+    // Keep the registered device function's controller alive until remove.
+    _bus: Arc<Ls2xI2cBus>,
 }
 
 pub struct Ls2kI2cDriver {
@@ -426,7 +425,7 @@ impl PnpDriver for Ls2kI2cDriver {
             phys,
             clk_hz
         );
-        dev.set_driver_data(Arc::new(Ls2kI2cBinding { bus }));
+        dev.set_driver_data(Arc::new(Ls2kI2cBinding { _bus: bus }));
         Ok(())
     }
 

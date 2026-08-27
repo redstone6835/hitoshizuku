@@ -182,7 +182,8 @@ cargo install --locked --path ../hitoshizuku-soyo-linker
 
 ```sh
 cargo metadata --no-deps --format-version 1
-cargo check --workspace --lib --target loongarch64-unknown-none
+cargo check -p kernel --target loongarch64-unknown-none
+cargo check -p xtask --all-targets
 cargo elm --version
 ```
 

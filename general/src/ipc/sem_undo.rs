@@ -17,7 +17,6 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use errno::Errno;
 use sched::Task;
 use spin::Mutex;
 use vfs::cred::Credentials;

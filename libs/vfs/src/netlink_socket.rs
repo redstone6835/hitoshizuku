@@ -57,11 +57,6 @@ pub const NETLINK_MSG_RTM_DELROUTE: u16 = RTM_DELROUTE;
 
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_MULTI: u16 = 2;
-const NLM_F_ACK: u16 = 4;
-const NLM_F_REPLACE: u16 = 0x100;
-const NLM_F_EXCL: u16 = 0x200;
-const NLM_F_CREATE: u16 = 0x400;
-const NLM_F_APPEND: u16 = 0x800;
 
 // ── RTMGRP 组播组（订阅位）───────────────────────────────────────────────────
 
@@ -83,7 +78,6 @@ const IFLA_ADDRESS: u16 = 1;
 const IFLA_IFNAME: u16 = 3;
 const IFLA_MTU: u16 = 4;
 const RTA_DST: u16 = 1;
-const RTA_SRC: u16 = 2;
 const RTA_OIF: u16 = 4;
 const RTA_GATEWAY: u16 = 5;
 const RTA_PRIORITY: u16 = 9;
@@ -106,14 +100,6 @@ const IFF_BROADCAST: u32 = 2;
 const IFF_RUNNING: u32 = 0x40;
 const IFF_MULTICAST: u32 = 0x1000;
 const IFA_F_SECONDARY: u8 = 1;
-const NUD_INCOMPLETE: u16 = 0x01;
-const NUD_REACHABLE: u16 = 0x02;
-const NUD_STALE: u16 = 0x04;
-const NUD_DELAY: u16 = 0x08;
-const NUD_PROBE: u16 = 0x10;
-const NUD_FAILED: u16 = 0x20;
-const NUD_NOARP: u16 = 0x40;
-const NUD_PERMANENT: u16 = 0x80;
 const AF_NETLINK: u16 = 16;
 const SOL_NETLINK: i32 = 270;
 const NETLINK_ADD_MEMBERSHIP: i32 = 1;
@@ -1316,7 +1302,7 @@ mod tests {
             interface: net::InterfaceId(2),
             address: net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 2)),
             mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56],
-            nud_state: NUD_REACHABLE,
+            nud_state: 0x02, // NUD_REACHABLE
         };
         let message = build_ndmsg(neighbor, 5, 6);
         assert_eq!(message[16], AF_INET);

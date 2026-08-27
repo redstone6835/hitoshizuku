@@ -13,7 +13,7 @@
 //! - 队列名必须以 `/` 开头且不再含其它 `/`（Linux 校验）。
 
 use alloc::collections::{BTreeMap, VecDeque};
-use alloc::string::{String, ToString};
+use alloc::string::ToString;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 

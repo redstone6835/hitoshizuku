@@ -260,10 +260,8 @@ const BPF_JGT: u16 = 0x20;
 const BPF_JGE: u16 = 0x30;
 const BPF_JSET: u16 = 0x40;
 
+#[cfg(test)]
 const BPF_K: u16 = 0x00;
-const BPF_X: u16 = 0x08;
-
-const BPF_A: u16 = 0x10;
 const BPF_TAX: u16 = 0x00;
 const BPF_TXA: u16 = 0x80;
 

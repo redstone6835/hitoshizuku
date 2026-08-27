@@ -292,7 +292,7 @@ impl Runqueue {
     }
 
     /// 创建带有指定 RT bandwidth 的运行队列，仅供调度器初始化和测试使用。
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(crate) fn new_with_rt_bandwidth(period_ns: u64, runtime_ns: u64) -> Self {
         let period_ns = period_ns.max(1);
         Self {
@@ -407,6 +407,7 @@ impl Runqueue {
     }
 
     /// 按调度类统计允许迁移到指定 CPU 集的就绪负载。
+    #[cfg(test)]
     pub(crate) fn migratable_class_load_for(&self, allowed_cpu_mask: u64) -> RunqueueClassLoad {
         let inner = self.inner.lock();
         class_load_locked(&inner, Some(allowed_cpu_mask), false)

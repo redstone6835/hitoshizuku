@@ -731,7 +731,7 @@ unsafe extern "C" fn test_secondary_cpu_native_fault(_arg: usize) -> ! {
     SMP_NATIVE_FAULT_TEST_STATE.store(10, Ordering::Release);
     let cell = ElmId(0x7003);
     let result = super::native::test_call_native_entry(
-        test_native_entry_nested_fault as usize,
+        test_native_entry_nested_fault as *const () as usize,
         cell,
         Some(ELM_MGR_ID),
         Generation(3),
@@ -3980,7 +3980,7 @@ fn elm_native_entry_accepts_valid_frame() {
     TEST_NATIVE_ENTRY_CALLS.store(0, Ordering::Relaxed);
 
     let result = super::native::test_call_native_entry(
-        test_native_entry_ok as usize,
+        test_native_entry_ok as *const () as usize,
         ElmId(7),
         Some(ELM_MGR_ID),
         Generation(3),
@@ -3996,7 +3996,7 @@ fn elm_native_entry_rejects_error_return() {
     TEST_NATIVE_ENTRY_CALLS.store(0, Ordering::Relaxed);
 
     let result = super::native::test_call_native_entry(
-        test_native_entry_returns_error as usize,
+        test_native_entry_returns_error as *const () as usize,
         ElmId(7),
         Some(ELM_MGR_ID),
         Generation(3),
@@ -4012,7 +4012,7 @@ fn elm_native_entry_rejects_frame_mutation() {
     TEST_NATIVE_ENTRY_CALLS.store(0, Ordering::Relaxed);
 
     let result = super::native::test_call_native_entry(
-        test_native_entry_mutates_frame as usize,
+        test_native_entry_mutates_frame as *const () as usize,
         ElmId(7),
         Some(ELM_MGR_ID),
         Generation(3),
@@ -4026,7 +4026,7 @@ fn elm_native_entry_rejects_frame_mutation() {
 #[ktest]
 fn elm_native_entry_rejects_guard_abort() {
     let result = super::native::test_call_native_entry(
-        test_native_entry_requests_abort as usize,
+        test_native_entry_requests_abort as *const () as usize,
         ElmId(7),
         Some(ELM_MGR_ID),
         Generation(3),
@@ -4040,7 +4040,7 @@ fn elm_native_entry_rejects_guard_abort() {
 fn elm_native_panic_uses_controlled_recovery_exit() {
     let cell = ElmId(0x7001);
     let result = super::native::test_call_native_entry(
-        test_native_entry_panics as usize,
+        test_native_entry_panics as *const () as usize,
         cell,
         Some(ELM_MGR_ID),
         Generation(3),
@@ -4060,7 +4060,7 @@ fn elm_native_timeout_forces_controlled_exit() {
     let cell = ElmId(0x7002);
     let deadline = sched::now_ns_direct().saturating_add(50_000_000);
     let result = super::native::test_call_native_entry_with_deadline(
-        test_native_entry_spins as usize,
+        test_native_entry_spins as *const () as usize,
         cell,
         Some(ELM_MGR_ID),
         Generation(3),
@@ -4079,7 +4079,7 @@ fn elm_native_timeout_forces_controlled_exit() {
 #[ktest]
 fn elm_native_nested_fault_uses_controlled_recovery_exit() {
     let result = super::native::test_call_native_entry(
-        test_native_entry_nested_fault as usize,
+        test_native_entry_nested_fault as *const () as usize,
         ElmId(7),
         Some(ELM_MGR_ID),
         Generation(3),

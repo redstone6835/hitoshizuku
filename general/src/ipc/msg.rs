@@ -15,6 +15,7 @@
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
+#[cfg(feature = "kernel-tests")]
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -205,14 +206,6 @@ impl MsgQueue {
     /// 返回该队列的等待队列，供 syscall 层执行 prepare/recheck/sleep 协议。
     pub fn waiters(&self) -> &WaitQueue {
         &self.waiters
-    }
-
-    fn check_access(&self, access: Access, cred: &Credentials) -> Result<(), Errno> {
-        let inner = self.inner.lock();
-        if inner.removed {
-            return Err(Errno::EIDRM);
-        }
-        check_operation_permissions(cred, &inner.perm, access)
     }
 
     /// 原子尝试入队一条消息。
@@ -448,7 +441,7 @@ impl MsgQueue {
 /// `msgctl(IPC_STAT)` 快照。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MsgMetadata {
-    pub perm: MsgPerm,
+    perm: MsgPerm,
     pub stime: i64,
     pub rtime: i64,
     pub ctime: i64,
@@ -728,12 +721,14 @@ mod tests {
         let got = recv(&queue, -2, 16, 0, &cred, 2, 0);
         assert_eq!((got.mtype, got.data.as_slice()), (1, b"a".as_slice()));
 
-        // MSG_EXCEPT：类型 != 3 的第一条（现在队首是 3/c2）。
+        // MSG_EXCEPT：跳过队首的 type=3，选择第一条其它类型。
+        send(&manager, id, 4, b"except", 0);
         let got = recv(&queue, 3, 16, MSG_EXCEPT, &cred, 2, 0);
-        assert_eq!((got.mtype, got.data.as_slice()), (3, b"c2".as_slice()));
+        assert_eq!((got.mtype, got.data.as_slice()), (4, b"except".as_slice()));
 
+        // MSG_EXCEPT 不应移除被排除的队首消息。
         let got = recv(&queue, 0, 16, 0, &cred, 2, 0);
-        assert_eq!(got.mtype, 3);
+        assert_eq!((got.mtype, got.data.as_slice()), (3, b"c2".as_slice()));
     }
 
     #[ktest]
@@ -806,20 +801,24 @@ mod tests {
         let queue = manager.queue_for_operation(id).expect("查找队列");
 
         // 塞满 qbytes（默认 MSGMNB）后 NOWAIT 发送 → EAGAIN。
-        let chunk = vec![0u8; MSGMNB];
+        let chunk = vec![0u8; MSGMAX];
         assert_eq!(
             queue.try_send(1, &chunk, 0, &cred, 1, 0),
             Ok(MsgOpAttempt::Done)
         );
         assert_eq!(
-            queue.try_send(2, &[1u8], IPC_NOWAIT, &cred, 1, 0),
+            queue.try_send(2, &chunk, 0, &cred, 1, 0),
+            Ok(MsgOpAttempt::Done)
+        );
+        assert_eq!(
+            queue.try_send(3, &[1u8], IPC_NOWAIT, &cred, 1, 0),
             Err(Errno::EAGAIN)
         );
 
         // IPC_RMID 后稳定对象返回 EIDRM。
         manager.remove(id, &cred).expect("删除队列");
         assert_eq!(
-            queue.try_send(3, &[1u8], IPC_NOWAIT, &cred, 1, 0),
+            queue.try_send(4, &[1u8], IPC_NOWAIT, &cred, 1, 0),
             Err(Errno::EIDRM)
         );
         assert!(matches!(

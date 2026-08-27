@@ -81,8 +81,6 @@ struct VirtioBlkInner {
     queue_id: VirtioBlkQueueId,
     /// 热路径缓存：MMIO queue notify 寄存器地址。
     notify_addr: usize,
-    /// 热路径缓存：写入 notify 寄存器的队列号。
-    notify_value: u32,
     /// 中断状态/ACK 寄存器地址。中断路径也避免 dyn transport 调用。
     interrupt_status_addr: usize,
     interrupt_ack_addr: usize,
@@ -308,7 +306,6 @@ impl VirtioBlk {
             capabilities,
             queue_id,
             notify_addr: mmio_base + MMIO_QUEUE_NOTIFY,
-            notify_value: u32::from(queue_id.raw()),
             interrupt_status_addr: mmio_base + MMIO_INTERRUPT_STATUS,
             interrupt_ack_addr: mmio_base + MMIO_INTERRUPT_ACK,
             queue: IrqSafeMutex::new(Some(VirtioBlkQueueCore::new(split_queue))),
@@ -752,7 +749,7 @@ impl BlockDriver for VirtioBlkIo {
         unsafe {
             write_volatile(
                 self.driver.inner.notify_addr as *mut u32,
-                self.driver.inner.notify_value,
+                u32::from(self.driver.inner.queue_id.raw()),
             );
         }
         #[cfg(feature = "block-profile")]

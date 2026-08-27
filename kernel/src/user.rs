@@ -117,6 +117,7 @@ struct PreparedExecutableFile {
 struct LoadedImage {
     entry: usize,
     base: usize,
+    #[cfg_attr(not(feature = "performance-profile"), allow(dead_code))]
     end: usize,
     phdr: usize,
     phent: usize,
@@ -149,6 +150,7 @@ pub fn load_user_image_from_path(
     load_user_image_from_path_inner(task, path, argv, envp, 0)
 }
 
+#[allow(dead_code)] // File-based exec adapter retained for in-kernel callers.
 pub fn load_user_image_from_file(
     task: &Arc<Task>,
     file: Arc<File>,
@@ -237,12 +239,6 @@ fn load_user_image_from_file_inner(
     shebang_depth: usize,
 ) -> Result<LoadedUserImage, errno::Errno> {
     let prepared = prepare_executable_file(task, file)?;
-    let file_owner = prepared
-        .file
-        .inode()
-        .stat()
-        .ok()
-        .map(|stat| (stat.uid, stat.gid, stat.mode as u16));
     load_tomori_image_from_prepared(task, prepared, path, argv, envp, shebang_depth)
 }
 

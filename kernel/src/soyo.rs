@@ -45,6 +45,7 @@ pub(crate) struct PreparedSoyoImage {
     pub(crate) vm: Arc<VmSpace>,
     pub(crate) entry_pc: usize,
     pub(crate) image_base: usize,
+    #[cfg(feature = "performance-profile")]
     pub(crate) image_end: usize,
     pub(crate) user_sp: usize,
     pub(crate) tls_base: usize,
@@ -237,6 +238,7 @@ pub(crate) fn load_soyo_image_from_file(file: Arc<File>) -> Result<LoadedSoyoIma
     load_soyo_image_from_reader_with_backing(&reader, Some(backing))
 }
 
+#[cfg(any(feature = "kernel-tests", feature = "soyo-tests"))]
 pub(crate) fn load_soyo_image_from_reader<R>(reader: &R) -> Result<LoadedSoyoImage, Errno>
 where
     R: SoyoReadAt<Error = Errno>,
@@ -350,6 +352,7 @@ where
 }
 
 /// 补齐 SOYO 的运行时映射、初始 handle、StartInfo 与 personality payload。
+#[cfg(any(feature = "kernel-tests", feature = "soyo-tests"))]
 pub(crate) fn prepare_soyo_runtime(
     loaded: LoadedSoyoImage,
     argv: &[Vec<u8>],
@@ -552,6 +555,7 @@ pub(crate) fn prepare_soyo_runtime_with_vfs(
         vm,
         entry_pc,
         image_base,
+        #[cfg(feature = "performance-profile")]
         image_end: usize::try_from(process_layout.image.end).map_err(|_| Errno::ENOEXEC)?,
         user_sp: stack.end,
         tls_base: usize::try_from(tls_base).map_err(|_| Errno::ENOEXEC)?,

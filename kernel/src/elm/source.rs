@@ -29,6 +29,7 @@ pub(crate) enum ProjectionSourceRegistryError {
     Duplicate,
     Conflict,
     NotFound,
+    #[allow(dead_code)] // Returned by the explicit unregister API, currently exercised by tests.
     StaleGeneration,
     Busy,
     Capacity,
@@ -458,6 +459,7 @@ pub(crate) fn register_projection_source_owned(
 }
 
 /// 兼容内核内建与测试投影器的快捷登记入口。
+#[allow(dead_code)] // Convenience entry for in-kernel projection providers.
 pub(crate) fn register_projection_source(id: u64, provider: ElmProjectionSourceProvider) -> bool {
     register_projection_source_owned(id, ELM_MGR_BUILTIN_ID, Generation::FIRST, provider).is_ok()
 }
@@ -648,6 +650,7 @@ pub(crate) fn resume_projection_sources(
 }
 
 /// 注销一个精确代际的 Projection Source。
+#[allow(dead_code)] // Exact-generation unregister remains part of the source lifecycle contract.
 pub(crate) fn unregister_projection_source(
     id: u64,
     owner: ElmId,

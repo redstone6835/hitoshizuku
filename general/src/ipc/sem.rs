@@ -473,7 +473,7 @@ impl SemSet {
 /// `IPC_STAT`/`SEM_STAT` 快照。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SemMetadata {
-    pub perm: SemPerm,
+    perm: SemPerm,
     pub otime: i64,
     pub ctime: i64,
     pub nsems: usize,
@@ -911,6 +911,7 @@ mod tests {
         assert_eq!(manager.get_zcnt(id, 0, &cred), Ok(0));
 
         // 第二个任务等待归零。
+        manager.set_value(id, 0, 1, &cred, 8, 0).expect("SETVAL");
         assert!(matches!(
             set.try_apply(&[operation(0, 0, 0)], &cred, 8, 0),
             Ok(SemOpAttempt::WouldBlock {

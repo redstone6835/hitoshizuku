@@ -662,10 +662,6 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::vfs::sync::Spinlock;
-
-    static TEST_ELM_CONTEXT_STATE: Spinlock<()> = Spinlock::new(());
-
     struct ContextRecordingCharDriver {
         expected: elm_model::ElmCurrentContext,
         calls: Arc<AtomicUsize>,
@@ -781,7 +777,7 @@ mod tests {
 
     #[test]
     fn elm_proxy_restores_owner_context_without_wrapping_resident_driver() {
-        let _context_state = TEST_ELM_CONTEXT_STATE.lock();
+        let _context_state = crate::elm_guard::TEST_ELM_CONTEXT_STATE.lock();
         assert!(elm_model::current_context().is_none());
 
         let owner = test_elm_context(

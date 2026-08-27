@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use vfs::error::{VfsError, VfsResult};
 use vfs::xattr::{XATTR_CREATE, XATTR_REPLACE};
 
-use crate::state::{BlockBackendError, FsState};
+use crate::state::FsState;
 
 /// ext4 xattr 块魔数（`EXT4_XATTR_MAGIC`）。
 const XATTR_MAGIC: u32 = 0xea02_0000;
@@ -171,11 +171,6 @@ fn read_block(state: &FsState, block: u64) -> Result<Vec<u8>, VfsError> {
         .read_data_blocks(block, 1, &mut buf)
         .map_err(|_| VfsError::Io)?;
     Ok(buf)
-}
-
-fn map_backend_err(err: BlockBackendError) -> VfsError {
-    let _ = err;
-    VfsError::Io
 }
 
 /// 在块上执行 getxattr。

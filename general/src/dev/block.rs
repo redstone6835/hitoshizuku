@@ -983,9 +983,7 @@ impl BlockDevice {
             self.driver.queue_bio(bio)
         };
         if let Err((err, _bio)) = queue_result {
-            profile.queue_ns = sched::now_ns_public().saturating_sub(t0);
             self.io_stats.cancel(op);
-            profile.total_ns = sched::now_ns_public().saturating_sub(total_start);
             return Err(BioError::Submit(err));
         }
         profile.queue_ns = sched::now_ns_public().saturating_sub(t0);

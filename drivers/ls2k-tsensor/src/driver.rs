@@ -13,7 +13,7 @@
 //! 时清除状态并记录温度；设备函数暴露
 //! `mygo.device.thermal@1;1=read_temp_milli:i32` 供内核/用户态读取。
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use general::dev::function::{DeviceClassId, DeviceFunction, DeviceFunctionInvokeError};
@@ -121,7 +121,6 @@ impl Ls2kTsensor {
 
 struct Ls2kTsensorIrqHandler {
     sensor: Arc<Ls2kTsensor>,
-    dev: Weak<PnpDevice>,
 }
 
 impl IrqHandler for Ls2kTsensorIrqHandler {
@@ -268,7 +267,6 @@ impl PnpDriver for Ls2kTsensorDriver {
 
         let handler: Arc<dyn IrqHandler> = Arc::new(Ls2kTsensorIrqHandler {
             sensor: Arc::clone(&sensor),
-            dev: Arc::downgrade(dev),
         });
         let irq_handle = match info.register_first_irq_handler(handler) {
             Ok(handle) => handle,

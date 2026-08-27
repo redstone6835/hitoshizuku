@@ -70,7 +70,7 @@ pub use state::{BlockBackend, BlockBackendError, ExtFsDriver};
 /// 强制链接器保留 Ext 驱动直接符号目录。
 #[doc(hidden)]
 pub fn kernel_symbol_catalog_anchor() -> usize {
-    ExtFsDriver::bind_backend as usize
+    ExtFsDriver::bind_backend as *const () as usize
 }
 
 #[cfg(test)]

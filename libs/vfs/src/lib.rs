@@ -90,12 +90,12 @@ pub static FS_REGISTRY: superblock::FsRegistry = superblock::FsRegistry::new();
 /// 强制链接器保留 VFS 直接符号所在的代码生成单元。
 #[doc(hidden)]
 pub fn kernel_symbol_catalog_anchor() -> usize {
-    vfs_context_diag as usize
-        ^ file::file_diag as usize
-        ^ path::normalize_path as usize
-        ^ operation::openat as usize
-        ^ operation::close_for_owner as usize
-        ^ superblock::FsRegistry::register as usize
+    vfs_context_diag as *const () as usize
+        ^ file::file_diag as *const () as usize
+        ^ path::normalize_path as *const () as usize
+        ^ operation::openat as *const () as usize
+        ^ operation::close_for_owner as *const () as usize
+        ^ superblock::FsRegistry::register as *const () as usize
 }
 
 static VFS_CONTEXT_LIVE: AtomicUsize = AtomicUsize::new(0);

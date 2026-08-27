@@ -6,8 +6,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::{ControlFlow, Deref};
 
-use log::printk;
-
 use errno::Errno;
 use general::mm::{VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
@@ -123,10 +121,7 @@ const MOUNT_ATTR_NOSUID: usize = 0x0000_0002;
 const MOUNT_ATTR_NODEV: usize = 0x0000_0004;
 const MOUNT_ATTR_NOEXEC: usize = 0x0000_0008;
 const MOUNT_ATTR_NOATIME: usize = 0x0000_0010;
-const MOUNT_ATTR_STRICTATIME: usize = 0x0000_0020;
 const MOUNT_ATTR_NODIRATIME: usize = 0x0000_0080;
-const MOUNT_ATTR_IDMAP: usize = 0x0010_0000;
-const MOUNT_ATTR_NOSYMFOLLOW: usize = 0x0020_0000;
 // 本内核可映射到 VFS MountFlags 的挂载属性位；其余返回 EOPNOTSUPP。
 const MOUNT_ATTR_SUPPORTED: usize = MOUNT_ATTR_RDONLY
     | MOUNT_ATTR_NOSUID
@@ -3558,7 +3553,7 @@ pub(super) fn sys_inotify_add_watch(ctx: &mut SyscallContext<'_>) -> Result<usiz
     if mask & IN_EVENT_BITS == 0 {
         return Err(Errno::EINVAL);
     }
-    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let _fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let file = file_for_fd(fd)?;
     let instance = vfs::inotify::instance_from_file(&file).ok_or(Errno::EINVAL)?;
@@ -5169,14 +5164,13 @@ const FILE_ATTR_SIZE: usize = 80;
 const FILE_ATTR_VALID_MODE: u64 = 1 << 0;
 const FILE_ATTR_VALID_UID: u64 = 1 << 1;
 const FILE_ATTR_VALID_GID: u64 = 1 << 2;
-const FILE_ATTR_VALID_XFLAGS: u64 = 1 << 3;
 const FILE_ATTR_VALID_SIZE: u64 = 1 << 4;
 const FILE_ATTR_VALID_ATIME: u64 = 1 << 5;
 const FILE_ATTR_VALID_MTIME: u64 = 1 << 6;
 const FILE_ATTR_VALID_CTIME: u64 = 1 << 7;
 
 pub(super) fn sys_file_getattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let _vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
     let fa_user = ctx.args[3];

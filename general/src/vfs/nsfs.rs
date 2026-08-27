@@ -3,15 +3,12 @@
 //! 文件打开时绑定一个具体的命名空间对象；`setns(fd)` 从文件操作层取回该
 //! 对象。ioctl 支持 Linux `NS_GET_*` 系列（`NS_GET_NSTYPE` 等）。
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::any::Any;
 
 use errno::Errno;
 use ns::{Namespace, NsType};
-use sched::Task;
 use vfs::file::{FileOps, IoctlCmd, PollEvents};
-use vfs::poll_source::PollSource;
 use vfs::stat::FileType;
 
 /// `setns(2)` 的 fd 校验：文件必须来自 nsfs。
@@ -32,15 +29,11 @@ pub const NS_GET_TGID_IN_PIDNS: u64 = 0xb707;
 /// nsfs 文件的打开描述：绑定一个命名空间。
 pub struct NsfsFileOps {
     namespace: Arc<dyn Namespace>,
-    poll_source: PollSource,
 }
 
 impl NsfsFileOps {
     pub fn new(namespace: Arc<dyn Namespace>) -> Self {
-        Self {
-            namespace,
-            poll_source: PollSource::new(vfs::file::PollEvents(0)),
-        }
+        Self { namespace }
     }
 
     pub fn namespace(&self) -> &Arc<dyn Namespace> {

@@ -8,7 +8,7 @@ use crate::transport::{
     ControlErrorTarget, ControlPacketResult, LocalUdpIngressError, PreparedRawTx, PreparedTcpTx,
     PreparedUdpTx, RawBindError, RawEndpointTable, TcpBindError, TcpEndpointTable, TcpIngressError,
     TcpPacket, TcpPath, UdpBindError, UdpDatagram, UdpEndpointTable, UdpTxError,
-    build_port_unreachable, build_tcp_reset, build_udp_packet, handle_control_packet,
+    build_port_unreachable, build_tcp_reset, handle_control_packet,
 };
 use crate::{Endpoint, FlowId, InterfaceId, IpAddr, ListenGroup, ListenGroupId, ShardId};
 use crate::{OwnerRef, SocketError, SocketFacade, TcpTxLease, UdpTxLease};
@@ -412,7 +412,7 @@ impl FlowShard {
         path: TcpPath,
         facade: Arc<SocketFacade>,
         control_sequence: u64,
-        local_transport: bool,
+        _local_transport: bool,
         now_ns: u64,
     ) -> Result<FlowId, TcpBindError> {
         let id = self.tcp.connect_fastopen(

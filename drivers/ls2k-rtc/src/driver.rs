@@ -107,19 +107,6 @@ pub struct Ls2kRtc {
 }
 
 impl Ls2kRtc {
-    pub const fn new(base: usize, size: usize, pm_base: Option<usize>) -> Self {
-        Self {
-            base,
-            size,
-            pm_base,
-            alarm_irq_available: AtomicBool::new(false),
-            alarm_enabled: AtomicBool::new(false),
-            alarm_match: AtomicU32::new(0),
-            fix_year_offset: AtomicU32::new(0),
-            pm_lock: Spinlock::new(()),
-        }
-    }
-
     /// 在已经分配但尚未初始化的 Arc 存储中逐字段构造 RTC 对象。
     ///
     /// 这里不能把整个 `Ls2kRtc` 当作一个普通聚合值复制：结构体中包含

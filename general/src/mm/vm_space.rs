@@ -4056,7 +4056,6 @@ impl VmSpace {
                     flags: last.flags,
                     backing,
                 };
-                let files = Self::collect_file_backings(core::iter::once(&tail));
                 vmas.insert(tail.clone())?;
                 Some(tail)
             } else {
@@ -4199,7 +4198,7 @@ impl VmSpace {
             } else {
                 None
             };
-            let removed_pages = self.unmap_page_mappings(new_range.clone())?;
+            let _removed_pages = self.unmap_page_mappings(new_range.clone())?;
             let moved_pages =
                 self.move_page_mappings_locked(&vmas, old_range.start, new_range.start, old_len)?;
             (removed_target, empty_anon, tail, moved_pages)
@@ -5162,7 +5161,7 @@ impl VmSpace {
                 return Err(Errno::EINVAL);
             }
         }
-        let mut set = self.vmas.lock();
+        let set = self.vmas.lock();
         let mut pages = self.pages.lock();
         let mut batch: Option<(usize, usize, VmFlags)> = None;
         let mut protect_error = None;

@@ -47,6 +47,9 @@ license = "GPL-3.0-only"
 license-file = "LICENSE"
 repository = "https://github.com/redstone6835/hitoshizuku"
 
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(elm_integrated_phase, values("device", "runtime"))'] }
+
 [profile.dev]
 panic = "abort"
 

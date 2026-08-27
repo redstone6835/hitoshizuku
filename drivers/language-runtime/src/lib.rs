@@ -1333,6 +1333,7 @@ impl RuntimeRegistry {
         self.backends.retain(|backend| backend.owner != owner);
     }
 
+    #[cfg(test)]
     fn initialize(&mut self) {
         self.initialize_delegation_secret(0);
         self.accepting = true;
@@ -1418,6 +1419,7 @@ pub fn catalog() -> LanguageRuntimeCatalogV1 {
 }
 
 /// 使运行时开始接受新对象。
+#[cfg(test)]
 pub fn initialize() {
     REGISTRY.lock().initialize();
 }
@@ -1439,11 +1441,6 @@ fn owner_accepts_calls(owner: LanguageOwnerV1) -> bool {
 /// 停止接受新对象并使未完成请求过期。
 pub fn quiesce() {
     REGISTRY.lock().quiesce();
-}
-
-/// 恢复此前暂停的运行时。
-pub fn resume() {
-    REGISTRY.lock().initialize();
 }
 
 /// 使用当前 runtime provider generation 恢复运行时。

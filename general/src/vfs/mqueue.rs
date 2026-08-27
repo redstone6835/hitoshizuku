@@ -33,7 +33,7 @@ use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
 use vfs::superblock::{FsDriver, FsDriverFlags, Superblock, SuperblockOps};
 use vfs::sync::Spinlock;
 
-use crate::ipc::mqueue::{MqAttr, MqNotification, MqObject, MqRegistry, MqStateObserver};
+use crate::ipc::mqueue::{MqNotification, MqObject, MqRegistry, MqStateObserver};
 
 static MQ_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static MQ_REGISTRY: Spinlock<Option<Arc<MqRegistry>>> = Spinlock::new(None);
@@ -128,7 +128,7 @@ impl FileOps for MqFileOps {
         let message = self
             .shared
             .queue
-            .try_receive(buf.len(), true)
+            .try_receive(buf.len(), self.shared.nonblock)
             .map_err(errno_to_vfs)?;
         let Some(message) = message else {
             return Err(VfsError::WouldBlock);
@@ -143,7 +143,7 @@ impl FileOps for MqFileOps {
         let (sent, notify) = self
             .shared
             .queue
-            .try_send(0, buf, 0, 0, true)
+            .try_send(0, buf, 0, 0, self.shared.nonblock)
             .map_err(errno_to_vfs)?;
         if !sent {
             return Err(VfsError::WouldBlock);

@@ -12,7 +12,6 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use errno::Errno;
@@ -33,8 +32,7 @@ use sched::task::{
     TaskExitAccountingHook, TaskExtCloneHook, TaskExtExitHook, TaskExtKey, TaskPreExitHook,
 };
 use sched::{
-    SchedParams, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE,
-    TASKEXT_VM_SPACE, Task,
+    TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task,
 };
 use vfs::Arc as VfsArc;
 
@@ -1665,9 +1663,7 @@ fn enter_loaded_user_image(
 
 /// 启动期自检：数据结构 + pid + 真实上下文切换 + POSIX 动词场景 + ext fork。
 #[cfg(debug_assertions)]
+#[allow(dead_code)] // Opt-in boot smoke test; the normal boot path leaves it disabled.
 pub fn smoketest() {
     sched::operation::smoketest::run();
 }
-
-#[cfg(not(debug_assertions))]
-pub fn smoketest() {}

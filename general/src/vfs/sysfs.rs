@@ -3888,31 +3888,31 @@ impl FileOps for SysRegFileOps {
                 // 两次 write。第一段已经完成控制操作；后续纯空白片段应像
                 // Linux sysfs 的单次文本事务一样被接纳，不能让 shell 误判
                 // 整个控制命令失败。
-                return if _buf.iter().all(u8::is_ascii_whitespace) {
-                    Ok(_buf.len())
+                return if buf.iter().all(u8::is_ascii_whitespace) {
+                    Ok(buf.len())
                 } else {
                     Err(VfsError::InvalidArgument)
                 };
             }
-            let command = core::str::from_utf8(_buf)
+            let command = core::str::from_utf8(buf)
                 .map_err(|_| VfsError::InvalidArgument)?
                 .trim();
             if let Some(mask) = command.strip_prefix("events=") {
                 let mask = mask.strip_prefix("0x").unwrap_or(mask);
                 let mask = u64::from_str_radix(mask, 16).map_err(|_| VfsError::InvalidArgument)?;
                 profiling::set_event_mask(mask);
-                return Ok(_buf.len());
+                return Ok(buf.len());
             }
             if let Some(mask) = command.strip_prefix("events_high=") {
                 let mask = mask.strip_prefix("0x").unwrap_or(mask);
                 let mask = u64::from_str_radix(mask, 16).map_err(|_| VfsError::InvalidArgument)?;
                 profiling::set_event_masks(profiling::event_mask(), mask);
-                return Ok(_buf.len());
+                return Ok(buf.len());
             }
             if let Some(name) = command.strip_prefix("preset=") {
                 let preset = profiling::Preset::from_name(name).ok_or(VfsError::InvalidArgument)?;
                 profiling::set_event_preset(preset);
-                return Ok(_buf.len());
+                return Ok(buf.len());
             }
             if let Some(value) = command.strip_prefix("phase=") {
                 let phase = value
@@ -3921,7 +3921,7 @@ impl FileOps for SysRegFileOps {
                 if !profiling::set_phase(phase) {
                     return Err(VfsError::InvalidArgument);
                 }
-                return Ok(_buf.len());
+                return Ok(buf.len());
             }
             if let Some(value) = command.strip_prefix("root=") {
                 let pid = value
@@ -3948,7 +3948,7 @@ impl FileOps for SysRegFileOps {
                     task.profile_interpreter_image(),
                 );
                 profiling::set_workload_root(pid as u64);
-                return Ok(_buf.len());
+                return Ok(buf.len());
             }
             if let Some(enabled) = command.strip_prefix("samples=") {
                 match enabled {
@@ -3957,7 +3957,7 @@ impl FileOps for SysRegFileOps {
                     _ => return Err(VfsError::InvalidArgument),
                 }
                 sched::reprogram_current_deadline(None);
-                return Ok(_buf.len());
+                return Ok(buf.len());
             }
             if let Some(value) = command.strip_prefix("sample_hz=") {
                 let hz = value
@@ -3967,7 +3967,7 @@ impl FileOps for SysRegFileOps {
                     return Err(VfsError::InvalidArgument);
                 }
                 sched::reprogram_current_deadline(None);
-                return Ok(_buf.len());
+                return Ok(buf.len());
             }
             if let Some(enabled) = command.strip_prefix("trace=") {
                 match enabled {
@@ -3975,7 +3975,7 @@ impl FileOps for SysRegFileOps {
                     "1" | "on" => profiling::set_trace_enabled(true),
                     _ => return Err(VfsError::InvalidArgument),
                 }
-                return Ok(_buf.len());
+                return Ok(buf.len());
             }
             if let Some(shift) = command.strip_prefix("timing_shift=") {
                 let shift = shift
@@ -3985,7 +3985,7 @@ impl FileOps for SysRegFileOps {
                     return Err(VfsError::InvalidArgument);
                 }
                 profiling::set_timing_shift(shift);
-                return Ok(_buf.len());
+                return Ok(buf.len());
             }
             match command {
                 "start" => profiling::start(),
@@ -3996,7 +3996,7 @@ impl FileOps for SysRegFileOps {
                 _ => return Err(VfsError::InvalidArgument),
             }
             sched::reprogram_current_deadline(None);
-            return Ok(_buf.len());
+            return Ok(buf.len());
         }
         Err(VfsError::ReadOnlyFilesystem)
     }

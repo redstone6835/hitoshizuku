@@ -41,7 +41,6 @@ const PACKET_HOST: u8 = 0;
 const PACKET_BROADCAST: u8 = 1;
 const PACKET_MULTICAST: u8 = 2;
 const PACKET_OTHERHOST: u8 = 3;
-const PACKET_OUTGOING: u8 = 4;
 
 // SOL_PACKET 选项
 const PACKET_ADD_MEMBERSHIP: i32 = 1;
@@ -530,7 +529,7 @@ impl PacketSocketFileOps {
             self.deliver_frame(frame);
             return;
         };
-        let mut group = group.lock();
+        let group = group.lock();
         if group.members.len() <= 1 {
             drop(group);
             self.deliver_frame(frame);
@@ -542,6 +541,9 @@ impl PacketSocketFileOps {
             PACKET_FANOUT_LB | PACKET_FANOUT_ROLLOVER => {
                 let cursor = group.cursor.fetch_add(1, Ordering::Relaxed);
                 cursor % group.members.len() as u32
+            }
+            PACKET_FANOUT_HASH | PACKET_FANOUT_RNG => {
+                packet_fanout_hash(&frame) % group.members.len() as u32
             }
             _ => packet_fanout_hash(&frame) % group.members.len() as u32,
         };
@@ -646,7 +648,7 @@ fn error_to_vfs(error: Errno) -> VfsError {
         Errno::EINTR => VfsError::Interrupted,
         Errno::EINVAL => VfsError::InvalidArgument,
         Errno::ENODEV => VfsError::NoDevice,
-        Errno::ENOTSUP | Errno::EOPNOTSUPP => VfsError::NotSupported,
+        Errno::ENOTSUP => VfsError::NotSupported,
         _ => VfsError::Io,
     }
 }

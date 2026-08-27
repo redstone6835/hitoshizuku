@@ -309,6 +309,7 @@ dependencies = [
  "fdt",
  "hashbrown",
  "kernel-symbols",
+ "ktest",
  "log",
  "mm",
  "native-abi",

@@ -13,6 +13,9 @@ use elm_model::{
 };
 use sched::sync::Spinlock;
 
+#[cfg(test)]
+pub(crate) static TEST_ELM_CONTEXT_STATE: Spinlock<()> = Spinlock::new(());
+
 pub const ELM_GUARD_PHASE_NONE: u32 = 0;
 pub const ELM_GUARD_PHASE_HOOK: u32 = 1;
 pub const ELM_GUARD_PHASE_MIGRATION: u32 = 2;

@@ -157,7 +157,6 @@ struct FanMark {
 struct QueuedEvent {
     perm_id: Option<u64>,
     mask: u32,
-    cookie: u32,
     name: Vec<u8>,
     inode: Weak<Inode>,
     dentry: Weak<crate::vfs::dentry::Dentry>,
@@ -195,7 +194,6 @@ impl PermPending {
 }
 
 pub struct FanotifyGroup {
-    id: u64,
     class: FanClass,
     nonblock: bool,
     event_f_flags: u32,
@@ -228,7 +226,6 @@ impl FanotifyGroup {
     ) -> Arc<Self> {
         let _ = unlimited_marks;
         Arc::new_cyclic(|self_weak| FanotifyGroup {
-            id: next_group_id(),
             class,
             nonblock,
             event_f_flags,
@@ -425,7 +422,6 @@ impl FanotifyGroup {
         self.queue.lock().push_back(QueuedEvent {
             perm_id: Some(perm_id),
             mask,
-            cookie: 0,
             name: Vec::new(),
             inode: Arc::downgrade(inode),
             dentry: Weak::new(),
@@ -543,7 +539,6 @@ impl FanotifyGroup {
                 queue.push_front(QueuedEvent {
                     perm_id: None,
                     mask: FAN_Q_OVERFLOW,
-                    cookie: 0,
                     name: Vec::new(),
                     inode: Weak::new(),
                     dentry: Weak::new(),
@@ -672,7 +667,6 @@ impl WatchTarget for FanotifyGroup {
         self.enqueue(QueuedEvent {
             perm_id: None,
             mask: event.mask,
-            cookie: event.cookie,
             name: event.name.clone(),
             inode: event.obj_inode.clone().unwrap_or_else(Weak::new),
             dentry: Weak::new(),
@@ -908,11 +902,6 @@ pub fn mark(
     }
 }
 
-fn next_group_id() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,7 +910,6 @@ mod tests {
         QueuedEvent {
             perm_id: Some(perm_id),
             mask: FAN_OPEN_PERM,
-            cookie: 0,
             name: Vec::new(),
             inode: Weak::new(),
             dentry: Weak::new(),

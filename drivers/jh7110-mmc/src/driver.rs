@@ -110,19 +110,15 @@ const BMOD_IDMAC_EN: u32 = 1 << 7;
 
 // IDMAC 描述符控制位（DES0）。
 const IDMAC_OWN: u32 = 1 << 31;
-const IDMAC_CH: u32 = 1 << 4;
 const IDMAC_FS: u32 = 1 << 3;
 const IDMAC_LD: u32 = 1 << 2;
 // IDSTS 位布局（与 U-Boot dwmmc.h 及 Debian 清除掩码 0x337 一致）：
 // TI=0, RI=1, FBE=2, DU=3, CES=4, NI=8, AI=9；bit 13/15 本 SoC 未定义，
 // 实测常驻置位（0xa000），不得当作错误。
-const IDSTS_TI: u32 = 1 << 0;
 const IDSTS_RI: u32 = 1 << 1;
 const IDSTS_FBE: u32 = 1 << 2;
 const IDSTS_DU: u32 = 1 << 3;
 const IDSTS_CES: u32 = 1 << 4;
-const IDSTS_NI: u32 = 1 << 8;
-const IDSTS_AI: u32 = 1 << 9;
 // 真正的错误只有 FBE/DU/CES；NI/AI 是汇总位（完成时正常置位），不得判错。
 const IDSTS_ERR_MASK: u32 = IDSTS_FBE | IDSTS_DU | IDSTS_CES;
 
@@ -232,7 +228,6 @@ fn busy_delay_ms(ms: u64) {
 struct JhMmcHost {
     base: usize,
     fifo_data: usize,
-    fifo_depth: u32,
     ciu_hz: u32,
     /// IDMAC 传输页：(物理地址, 虚拟地址)。
     idmac_page: (usize, usize),
@@ -340,12 +335,10 @@ impl JhMmcHost {
 }
 
 struct CardInfo {
-    rca: u32,
     /// 总块数（512 字节块）。
     block_count: u64,
     /// 是否块寻址（SDHC/XC 与 eMMC 为真，SDSC 为假）。
     block_addressed: bool,
-    is_mmc: bool,
 }
 
 impl JhMmcHost {
@@ -375,7 +368,7 @@ impl JhMmcHost {
                 Err(_) => busy_delay_ms(2),
             }
         }
-        let (is_mmc, ocr) = if sd_v2 {
+        if sd_v2 {
             // SD：CMD55 + ACMD41 循环等待上电完成。每次尝试间隔 5ms，
             // 避免在卡上电期间连续快速重试导致总线状态恶化。
             let mut ocr = 0u32;
@@ -402,7 +395,6 @@ impl JhMmcHost {
                 );
                 return Err(MmcError::NoCard);
             }
-            (false, ocr)
         } else {
             // eMMC：先回到 idle，再 CMD1 循环。
             if !self.send_raw(CMD_INIT | 0, 0) {
@@ -429,9 +421,7 @@ impl JhMmcHost {
                 );
                 return Err(MmcError::NoCard);
             }
-            (true, ocr)
-        };
-        let _ = ocr;
+        }
 
         // CMD2 取 CID。
         let _cid = self.send_cmd(2, 0, CMD_RESP_EXP | CMD_RESP_LONG | CMD_RESP_CRC)?;
@@ -463,10 +453,8 @@ impl JhMmcHost {
         busy_delay_ms(2);
 
         Ok(CardInfo {
-            rca,
             block_count,
             block_addressed,
-            is_mmc,
         })
     }
 
@@ -854,7 +842,8 @@ impl BlockDriver for JhMmcIo {
 }
 
 struct JhMmcBinding {
-    io: Arc<JhMmcIo>,
+    // Hold the registered block controller until the PnP device is removed.
+    _io: Arc<JhMmcIo>,
 }
 
 struct JhMmcDriver {
@@ -937,7 +926,6 @@ impl PnpDriver for JhMmcDriver {
         let host = JhMmcHost {
             base,
             fifo_data,
-            fifo_depth,
             ciu_hz,
             idmac_page,
             dma_coherent: info.dma.constraints().coherent,
@@ -1022,7 +1010,7 @@ impl PnpDriver for JhMmcDriver {
             io.card.block_count,
             name
         );
-        dev.set_driver_data(Arc::new(JhMmcBinding { io }));
+        dev.set_driver_data(Arc::new(JhMmcBinding { _io: io }));
         Ok(())
     }
 

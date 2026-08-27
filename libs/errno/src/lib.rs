@@ -92,7 +92,7 @@ pub enum Errno {
 /// 强制链接器保留错误码转换直接符号目录。
 #[doc(hidden)]
 pub fn kernel_symbol_catalog_anchor() -> usize {
-    Errno::from_i32 as usize ^ Errno::as_i32 as usize
+    Errno::from_i32 as *const () as usize ^ Errno::as_i32 as *const () as usize
 }
 
 #[kernel_symbols::export]

@@ -7,7 +7,7 @@ output/
 .config
 *.img
 *.cpio
-kernel-*
+/kernel-*
 
 # IDE
 .idea
@@ -30,3 +30,5 @@ tests/elm/*/.elm/
 tests/elm/*/dist/
 tests/elm/*/elm.ld
 tests/elm/*/rust-toolchain.toml
+
+Cargo.lock

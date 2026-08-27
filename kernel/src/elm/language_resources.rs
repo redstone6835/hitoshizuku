@@ -46,8 +46,11 @@ const MAX_GLOBAL_RESOURCES: usize = 4096;
 const MAX_OWNER_RESOURCES: usize = 256;
 const MAX_OWNER_DMA_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_OWNER_BUFFER_BYTES: u64 = 16 * 1024 * 1024;
+#[allow(dead_code)] // Privileged grant control plane is not exposed by the current manager.
 const MAX_MMIO_GRANTS: usize = 256;
+#[allow(dead_code)] // Privileged grant control plane is not exposed by the current manager.
 const MAX_IRQ_GRANTS: usize = 512;
+#[allow(dead_code)] // Privileged operation registration is reserved for the managed profile.
 const MAX_KERNEL_OPERATIONS: usize = 256;
 
 #[derive(Clone, Copy)]
@@ -471,6 +474,7 @@ fn decode_u64_payload(request: &LanguageResourceRequestV1) -> Result<u64, Langua
     Ok(u64::from_le_bytes(bytes))
 }
 
+#[allow(dead_code)]
 fn ranges_overlap(left: u64, left_len: u64, right: u64, right_len: u64) -> bool {
     let Some(left_end) = left.checked_add(left_len) else {
         return true;
@@ -482,6 +486,7 @@ fn ranges_overlap(left: u64, left_len: u64, right: u64, right_len: u64) -> bool 
 }
 
 /// 设备层把已取得的 MMIO lease 委派给一个 ELM owner。
+#[allow(dead_code)]
 pub(crate) fn grant_mmio_window(
     owner: LanguageOwnerV1,
     physical_base: u64,
@@ -570,6 +575,7 @@ fn irq_grant_for(grants: &[IrqGrant], owner: LanguageOwnerV1, source_id: u64) ->
 ///
 /// `source_id` 仅在该 owner/generation 内有意义。wire 侧只能提交该 opaque ID，不能
 /// 构造 [`IrqLine`] 或注册函数指针；真正的 handler 由内核在 subscribe 时创建。
+#[allow(dead_code)]
 pub(crate) fn grant_irq_line(
     owner: LanguageOwnerV1,
     source_id: u64,
@@ -1625,6 +1631,7 @@ pub fn reset() -> LanguageRuntimeStatus {
 }
 
 /// 注册一个静态、受审核的 kernel operation。重复 ID 或非法边界一律拒绝。
+#[allow(dead_code)]
 pub(crate) fn register_kernel_operation(spec: KernelOperationSpec) -> bool {
     if spec.operation_id == 0
         || spec.required_rights == 0

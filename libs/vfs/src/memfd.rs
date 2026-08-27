@@ -33,7 +33,6 @@ pub const F_SEAL_ALL: u32 =
 // fallocate(2) 的 Linux FALLOC_FL_* 位。fs 层把用户态位原样传给
 // `FallocateMode::from_bits`，因此这里按 Linux ABI 值匹配。
 const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
-const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
 const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
 const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
 const FALLOC_FL_INSERT_RANGE: u32 = 0x20;

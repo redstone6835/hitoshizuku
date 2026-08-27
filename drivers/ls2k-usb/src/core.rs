@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use general::dev::pnp::{PNP_DEVICES, PNP_DRIVERS, PnpDevice, PnpError, PnpId};
+use general::dev::pnp::{PNP_DEVICES, PNP_DRIVERS, PnpDevice, PnpId};
 use general::dev::usb::{
     UsbDevice, UsbDeviceInfo, UsbEndpointDesc, UsbInterfaceInfo, UsbSpeed,
     usb_device_pnp_info_boxed,
@@ -48,6 +48,7 @@ pub trait UsbHcd: Send + Sync {
         data_in: bool,
     ) -> Result<usize, &'static str>;
     /// 批量传输（整包，调用方保证 ≤ 端点最大包）。
+    #[allow(dead_code)]
     fn bulk_transfer(
         &self,
         dev_addr: u8,
@@ -55,7 +56,8 @@ pub trait UsbHcd: Send + Sync {
         data: &mut [u8],
         data_in: bool,
     ) -> Result<usize, &'static str>;
-    /// 中断传输。
+    /// 中断传输。两项数据传输能力由后续 USB class 驱动消费。
+    #[allow(dead_code)]
     fn interrupt_transfer(
         &self,
         dev_addr: u8,
@@ -123,15 +125,15 @@ impl UsbBus {
         length: u16,
     ) -> Result<usize, &'static str> {
         let setup = UsbSetup {
-            bmRequestType: if data_in {
+            request_type: if data_in {
                 USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_DEVICE
             } else {
                 USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE
             },
-            bRequest: request,
-            wValue: value,
-            wIndex: index,
-            wLength: length,
+            request,
+            value,
+            index,
+            length,
         };
         self.hcd.control_transfer(address, &setup, data, data_in)
     }
@@ -232,22 +234,22 @@ impl UsbBus {
                 match kind {
                     USB_DT_INTERFACE if length >= 9 => {
                         let desc = UsbInterfaceDesc {
-                            bLength: config[position],
-                            bDescriptorType: config[position + 1],
-                            bInterfaceNumber: config[position + 2],
-                            bAlternateSetting: config[position + 3],
-                            bNumEndpoints: config[position + 4],
-                            bInterfaceClass: config[position + 5],
-                            bInterfaceSubClass: config[position + 6],
-                            bInterfaceProtocol: config[position + 7],
-                            iInterface: config[position + 8],
+                            length: config[position],
+                            descriptor_type: config[position + 1],
+                            interface_number: config[position + 2],
+                            alternate_setting: config[position + 3],
+                            num_endpoints: config[position + 4],
+                            interface_class: config[position + 5],
+                            interface_subclass: config[position + 6],
+                            interface_protocol: config[position + 7],
+                            interface_string: config[position + 8],
                         };
                         let info = UsbInterfaceInfo {
-                            class: desc.bInterfaceClass,
-                            subclass: desc.bInterfaceSubClass,
-                            protocol: desc.bInterfaceProtocol,
-                            interface_number: desc.bInterfaceNumber,
-                            num_endpoints: desc.bNumEndpoints,
+                            class: desc.interface_class,
+                            subclass: desc.interface_subclass,
+                            protocol: desc.interface_protocol,
+                            interface_number: desc.interface_number,
+                            num_endpoints: desc.num_endpoints,
                             endpoints: Vec::new(),
                             vendor,
                             product,
@@ -361,14 +363,5 @@ impl UsbBus {
             usb_device.interfaces().len(),
         );
         Ok(())
-    }
-}
-
-/// 把 PnpError 映射成静态错误描述（probe 用）。
-pub fn pnp_error_message(error: PnpError) -> &'static str {
-    match error {
-        PnpError::OutOfMemory => "out of memory",
-        PnpError::ProbeDeferred => "deferred",
-        _ => "pnp error",
     }
 }

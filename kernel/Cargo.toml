@@ -33,6 +33,7 @@ allocator-tests = [
 ]
 kernel-tests = [
     "ktest/kernel",
+    "general/kernel-tests",
     "errno/ktest-kernel",
     "elf/ktest-kernel",
     "mm/ktest-kernel",

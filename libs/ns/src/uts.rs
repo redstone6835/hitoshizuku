@@ -1,7 +1,5 @@
 //! UTS 命名空间：hostname 与 domainname。
 
-use core::sync::atomic::{AtomicU64, Ordering};
-
 use spin::Mutex;
 
 use crate::{Namespace, NsType, allocate_ns_inum};

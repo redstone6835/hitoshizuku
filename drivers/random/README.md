@@ -10,7 +10,7 @@
 - 累计至少 256 bit **已声明信用**后完成安全播种并唤醒等待者。
 - 使用 256-bit key、96-bit nonce 的 20-round ChaCha20 生成输出；每 1 MiB 或 counter
   边界前重新播种。
-- 提供硬件熵、bootloader seed、用户写入、强制 reseed 和内核随机填充入口。
+- 通过 `RandomBackend` 实现熵注入、用户写入和 reseed，并由通用随机服务暴露稳定入口。
 - 注册一个 `RandomBackend`，由通用设备层决定具体字符设备投影。
 
 本 crate 不直接读取特定 CSR、RDRAND、TPM 或 virtio-rng，也不判断硬件采样质量。架构
@@ -42,7 +42,8 @@
 ## 读取与熵信用语义
 
 - secure/entropy 读取在未安全播种时：阻塞模式进入 `WaitQueue`，非阻塞模式返回零长度。
-- insecure（`/dev/urandom` 语义）和 `fill_kernel_random` 不等待 `secure_ready`，极早期
+- insecure（`/dev/urandom` 语义）和
+  `general::dev::random::fill(..., RandomReadMode::Insecure)` 不等待 `secure_ready`，极早期
   调用可能只基于弱启动状态；需要密钥安全的调用方必须选择 secure 路径或确认就绪。
 - 只有调用者显式提供的 `entropy_bits` 会推进安全就绪。普通启动 hint 可以混入，但默认
   记为 0 bit。

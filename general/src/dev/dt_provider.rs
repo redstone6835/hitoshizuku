@@ -399,24 +399,6 @@ fn commit_unregister(handle: DtbProviderHandle) -> Result<(), DtbProviderError> 
     Ok(())
 }
 
-pub(crate) fn can_unregister(handle: DtbProviderHandle) -> Result<(), DtbProviderError> {
-    let registry = PROVIDERS.lock();
-    let entry = registry
-        .providers
-        .iter()
-        .find(|entry| entry.handle == handle)
-        .ok_or(DtbProviderError::NotFound)?;
-    if entry.retiring
-        || entry.active_leases != 0
-        || entry.acquires_in_flight != 0
-        || entry.controls_in_flight != 0
-    {
-        Err(DtbProviderError::Busy)
-    } else {
-        Ok(())
-    }
-}
-
 fn prepare_provider_handle(handle: DtbProviderHandle) -> bool {
     matches!(
         prepare_unregister(handle),

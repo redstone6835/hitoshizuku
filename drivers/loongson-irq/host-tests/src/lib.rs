@@ -1,5 +1,8 @@
 //! Loongson 中断控制器驱动的宿主侧寄存器契约测试。
 
+// The harness imports the complete production module but exercises only its pure contracts.
+#[cfg(test)]
+#[allow(dead_code)]
 #[path = "../../src/ls2k_icu_layout.rs"]
 mod ls2k_icu_layout;
 

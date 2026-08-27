@@ -14,11 +14,15 @@ use net::buf::{
 };
 #[cfg(not(feature = "elm-integrated"))]
 use net::device::PinnedNetQueueEndpoint;
+#[cfg(not(feature = "elm-integrated"))]
 use net::device::{
     NET_QUEUE_CALL_STATUS_INVALID, NET_QUEUE_CALL_STATUS_OK, NET_QUEUE_OP_HAS_PENDING,
     NET_QUEUE_OP_POLL_RX, NET_QUEUE_OP_QUIESCE, NET_QUEUE_OP_RECLAIM_TX, NET_QUEUE_OP_REFILL_RX,
-    NET_QUEUE_OP_SUBMIT_TX, NetDeviceHandle, NetDeviceRegisterErrorKind, NetDeviceRegistration,
-    NetDeviceRemoveError, NetQueueEndpoint, NetQueueRegistration, QueueIrqControl,
+    NET_QUEUE_OP_SUBMIT_TX,
+};
+use net::device::{
+    NetDeviceHandle, NetDeviceRegisterErrorKind, NetDeviceRegistration, NetDeviceRemoveError,
+    NetQueueEndpoint, NetQueueRegistration, QueueIrqControl,
 };
 use net::queue::{
     NetQueueCaps, NetQueuePair, QueueFatalError, RxBudget, RxPollResult, RxRefillResult,
@@ -183,14 +187,6 @@ impl VirtioNetQueue {
             udp_segmentation: false,
             max_udp_segments: 0,
         }
-    }
-
-    pub(crate) fn rx_avail_flags_addr(&self) -> usize {
-        self.rx.avail_flags_addr()
-    }
-
-    pub(crate) fn tx_avail_flags_addr(&self) -> usize {
-        self.tx.avail_flags_addr()
     }
 
     fn clear_pending(&mut self) {
@@ -660,10 +656,12 @@ impl NetQueuePair for VirtioNetQueue {
     }
 }
 
+#[cfg(feature = "elm-integrated")]
 struct SharedVirtioNetQueue {
     inner: Arc<Mutex<VirtioNetQueue>>,
 }
 
+#[cfg(feature = "elm-integrated")]
 impl NetQueuePair for SharedVirtioNetQueue {
     fn id(&self) -> QueuePairId {
         self.inner.lock().id()
@@ -895,6 +893,7 @@ pub(crate) fn remove_active_from_pnp() -> Result<(), NetDeviceRemoveError> {
     Ok(())
 }
 
+#[cfg(not(feature = "elm-integrated"))]
 #[elm::export(
     name = "net.virtio.queue-call",
     contract = "mygo.net.queue-call@1",
