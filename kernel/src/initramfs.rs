@@ -15,6 +15,7 @@ use general::vfs::{self, VfsContext};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitramfsSource {
+    #[cfg(feature = "embedded-initramfs")]
     Embedded,
     External,
 }

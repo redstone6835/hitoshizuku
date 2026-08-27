@@ -12,7 +12,8 @@
 | `vfs`、`fatfs`、`extfs`、`elf` | 文件系统、镜像和可执行文件解析 |
 | `elm`、`elm-loader`、`kernel-symbols` | ELM 运行时、装载和内核符号导出 |
 | `native-abi`、`soyo` | Native ABI 与 SOYO wire 格式 |
-| `efi` | 固件和启动辅助；ACPI 表与 AML 解析器直接使用 crates.io 依赖 |
+| `fdt` | 无分配 FDT 校验视图，以及可选的索引、地址翻译和 overlay 支持 |
+| `efi` | 固件和启动辅助；ACPI 表与 AML 解析器直接使用 workspace 中锁定的 crates.io 依赖 |
 | `log`、`errno`、`profiling`、`kcsan`、`ktest` | 基础设施、诊断和测试支持 |
 
 新增 crate 时优先保持单一职责，并把跨 crate 的 ABI 变更写入根目录协议文档。主机端

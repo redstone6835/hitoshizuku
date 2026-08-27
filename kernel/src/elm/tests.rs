@@ -731,7 +731,7 @@ unsafe extern "C" fn test_secondary_cpu_native_fault(_arg: usize) -> ! {
     SMP_NATIVE_FAULT_TEST_STATE.store(10, Ordering::Release);
     let cell = ElmId(0x7003);
     let result = super::native::test_call_native_entry(
-        test_native_entry_nested_fault as usize,
+        test_native_entry_nested_fault as *const () as usize,
         cell,
         Some(ELM_MGR_ID),
         Generation(3),
@@ -3980,7 +3980,7 @@ fn elm_native_entry_accepts_valid_frame() {
     TEST_NATIVE_ENTRY_CALLS.store(0, Ordering::Relaxed);
 
     let result = super::native::test_call_native_entry(
-        test_native_entry_ok as usize,
+        test_native_entry_ok as *const () as usize,
         ElmId(7),
         Some(ELM_MGR_ID),
         Generation(3),
@@ -3996,7 +3996,7 @@ fn elm_native_entry_rejects_error_return() {
     TEST_NATIVE_ENTRY_CALLS.store(0, Ordering::Relaxed);
 
     let result = super::native::test_call_native_entry(
-        test_native_entry_returns_error as usize,
+        test_native_entry_returns_error as *const () as usize,
         ElmId(7),
         Some(ELM_MGR_ID),
         Generation(3),
@@ -4012,7 +4012,7 @@ fn elm_native_entry_rejects_frame_mutation() {
     TEST_NATIVE_ENTRY_CALLS.store(0, Ordering::Relaxed);
 
     let result = super::native::test_call_native_entry(
-        test_native_entry_mutates_frame as usize,
+        test_native_entry_mutates_frame as *const () as usize,
         ElmId(7),
         Some(ELM_MGR_ID),
         Generation(3),
@@ -4026,7 +4026,7 @@ fn elm_native_entry_rejects_frame_mutation() {
 #[ktest]
 fn elm_native_entry_rejects_guard_abort() {
     let result = super::native::test_call_native_entry(
-        test_native_entry_requests_abort as usize,
+        test_native_entry_requests_abort as *const () as usize,
         ElmId(7),
         Some(ELM_MGR_ID),
         Generation(3),
@@ -4040,7 +4040,7 @@ fn elm_native_entry_rejects_guard_abort() {
 fn elm_native_panic_uses_controlled_recovery_exit() {
     let cell = ElmId(0x7001);
     let result = super::native::test_call_native_entry(
-        test_native_entry_panics as usize,
+        test_native_entry_panics as *const () as usize,
         cell,
         Some(ELM_MGR_ID),
         Generation(3),
@@ -4060,7 +4060,7 @@ fn elm_native_timeout_forces_controlled_exit() {
     let cell = ElmId(0x7002);
     let deadline = sched::now_ns_direct().saturating_add(50_000_000);
     let result = super::native::test_call_native_entry_with_deadline(
-        test_native_entry_spins as usize,
+        test_native_entry_spins as *const () as usize,
         cell,
         Some(ELM_MGR_ID),
         Generation(3),
@@ -4079,7 +4079,7 @@ fn elm_native_timeout_forces_controlled_exit() {
 #[ktest]
 fn elm_native_nested_fault_uses_controlled_recovery_exit() {
     let result = super::native::test_call_native_entry(
-        test_native_entry_nested_fault as usize,
+        test_native_entry_nested_fault as *const () as usize,
         ElmId(7),
         Some(ELM_MGR_ID),
         Generation(3),
@@ -5329,16 +5329,23 @@ fn elm_msi_pnp_resource_retires_after_last_vector() {
     let controller_handle =
         general::dev::msi::register_msi_controller(RETIRING_MSI_CONTROLLER_ID, controller).unwrap();
     let vector = general::dev::msi::allocate_msi(RETIRING_MSI_CONTROLLER_ID, 42).unwrap();
-    let resource =
+    let vector_resource = general::dev::msi::vector_pnp_resource(vector, "elm-test-msi-vector");
+    let controller_resource =
         general::dev::msi::controller_pnp_resource(controller_handle, "elm-test-msi-controller");
 
-    general::dev::pnp::PnpResource::release(alloc::boxed::Box::new(resource)).unwrap();
+    assert!(
+        general::dev::pnp::PnpResource::release(alloc::boxed::Box::new(controller_resource))
+            .is_err()
+    );
+    general::dev::pnp::PnpResource::release(alloc::boxed::Box::new(vector_resource)).unwrap();
+    let controller_resource =
+        general::dev::msi::controller_pnp_resource(controller_handle, "elm-test-msi-controller");
+    general::dev::pnp::PnpResource::release(alloc::boxed::Box::new(controller_resource)).unwrap();
     assert_eq!(
         general::dev::msi::allocate_msi(RETIRING_MSI_CONTROLLER_ID, 43),
         Err(general::dev::msi::MsiError::NotFound)
     );
 
-    general::dev::msi::free_msi(vector).unwrap();
     assert_eq!(releases.load(Ordering::Acquire), 1);
     assert_eq!(
         general::dev::msi::unregister_msi_controller(controller_handle),

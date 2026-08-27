@@ -20,8 +20,9 @@
 //!
 //! ## 不做
 //!
-//! - 不做 exFAT(不同格式);不做日志(FAT 本就不带);不做 Windows
-//!   时间戳(项目中 `Timespec::now()` 占位,落盘时用 1980-01-01)。
+//! - 不做 exFAT(不同格式);不做日志(FAT 本就不带)。时间戳按 Linux vfat 语义
+//!   真实化:写入用 `Timespec::now()` 编码为 DOS 日期/时间(2 秒粒度),读取解码回
+//!   `stat` 的 atime/mtime/ctime;未安装实时时钟时编码结果自然落到 1980-01-01。
 
 #![no_std]
 
@@ -43,7 +44,7 @@ pub use state::{BlockBackend, BlockBackendError, FatFsDriver};
 /// 强制链接器保留 FAT 驱动直接符号目录。
 #[doc(hidden)]
 pub fn kernel_symbol_catalog_anchor() -> usize {
-    FatFsDriver::bind_backend as usize
+    FatFsDriver::bind_backend as *const () as usize
 }
 
 #[cfg(test)]

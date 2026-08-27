@@ -2,7 +2,7 @@
 //!
 //! 本模块是 `general::PagingArch` 在 LoongArch64 上的具体落地，主要负责：
 //! - 约定并编码 LoongArch64 的 PTE 位语义；
-//! - 生成硬件页表遍历参数（`PWCL/PWCH/STLBPS`）；
+//! - 生成硬件页表遍历参数（`PWCL/PWCH`）并统一配置 TLB 页大小；
 //! - 切换地址空间（`PGDL/PGDH/ASID/CRMD`）与执行 TLB 失效；
 //! - 提供启动阶段段权限自检辅助函数。
 //!
@@ -35,6 +35,13 @@ const PAGE_TABLE_BASE_SHIFT: usize = 12;
 const PAGE_TABLE_INDEX_BITS: usize = 9;
 /// LoongArch 64-bit PTE 宽度编码（0 表示 64bit）。
 const PAGE_TABLE_PTE_WIDTH_64: usize = 0;
+
+/// `TLBIDX.PS` 页大小字段位移。
+const TLBIDX_PS_SHIFT: usize = 24;
+/// `TLBIDX.PS` 与 `TLBREHI.PS` 均为 6 位页大小编码。
+const TLB_PAGE_SIZE_MASK: usize = 0x3f;
+/// `IMPCTL1.STFILL`：Loongson STLB 填充策略位。
+const IMPCTL1_STFILL: usize = 1 << 8;
 
 const LA64_PAGE_TABLE_LEVELS: usize = 4;
 const SUPPORTED_LEAF_LEVELS: [usize; 3] = [1, 2, 3];
@@ -309,6 +316,44 @@ impl LoongArch64Paging {
         PAGE_TABLE_BASE_SHIFT
     }
 
+    /// 初始化当前 CPU 的 4KiB TLB 工作模式及各类 TLB 页大小。
+    ///
+    /// Linux 在 4KiB 配置的 BSP/AP 入口先清除 `IMPCTL1.STFILL`，随后由
+    /// `tlb_init(cpu)` 设置三个页大小 CSR。二者都属于 per-CPU 初始化，不能
+    /// 继承使用 16KiB 页的固件或前一个内核留下的实现相关状态。
+    pub(crate) fn initialize_tlb_page_sizes() {
+        let page_size = Self::stlb_page_size();
+        let stfill = 0usize;
+        let stfill_mask = IMPCTL1_STFILL;
+        let tlbidx_ps = page_size << TLBIDX_PS_SHIFT;
+        let tlbidx_ps_mask = TLB_PAGE_SIZE_MASK << TLBIDX_PS_SHIFT;
+        let stlbps = page_size;
+        let tlbrehi_ps = page_size;
+        let tlbrehi_ps_mask = TLB_PAGE_SIZE_MASK;
+        // Safety: 这些 CSR 均为当前 CPU 私有的 TLB 配置；调用点位于该 CPU
+        // 第一次启用正式页表之前，尚不存在并发地址空间切换。
+        unsafe {
+            core::arch::asm!(
+                "csrxchg {stfill}, {stfill_mask}, {csr_impctl1}",
+                "csrxchg {tlbidx_ps}, {tlbidx_ps_mask}, {csr_tlbidx}",
+                "csrwr {stlbps}, {csr_stlbps}",
+                "csrxchg {tlbrehi_ps}, {tlbrehi_ps_mask}, {csr_tlbrehi}",
+                stfill = inout(reg) stfill => _,
+                stfill_mask = in(reg) stfill_mask,
+                tlbidx_ps = inout(reg) tlbidx_ps => _,
+                tlbidx_ps_mask = in(reg) tlbidx_ps_mask,
+                stlbps = inout(reg) stlbps => _,
+                tlbrehi_ps = inout(reg) tlbrehi_ps => _,
+                tlbrehi_ps_mask = in(reg) tlbrehi_ps_mask,
+                csr_impctl1 = const CSR_IMPCTL1,
+                csr_tlbidx = const CSR_TLBIDX,
+                csr_stlbps = const CSR_STLBPS,
+                csr_tlbrehi = const CSR_TLBREHI,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+
     /// 从物理地址中提取并对齐 PPN 位。
     const fn make_ppn_bits(paddr: usize) -> usize {
         paddr & PPN_MASK
@@ -579,7 +624,8 @@ impl LoongArch64Paging {
         let asid_mask = CSR_ASID_ASID_MASK;
         let pwcl = Self::page_walk_pwcl();
         let pwch = Self::page_walk_pwch();
-        let stlbps = Self::stlb_page_size();
+        // 首次地址空间激活也执行一次，覆盖不经过标准 BSP/AP 启动入口的调用者。
+        Self::initialize_tlb_page_sizes();
         let mut crmd: usize;
         unsafe {
             core::arch::asm!(
@@ -591,7 +637,6 @@ impl LoongArch64Paging {
                 // 配置硬件页表遍历参数。
                 "csrwr {pwcl}, {csr_pwcl}",
                 "csrwr {pwch}, {csr_pwch}",
-                "csrwr {stlbps}, {csr_stlbps}",
                 // 读取 CRMD 用于后续修改 PG/DA 位。
                 "csrrd {crmd}, {csr_crmd}",
                 pgdl = inout(reg) pgdl => _,
@@ -600,14 +645,12 @@ impl LoongArch64Paging {
                 asid_mask = in(reg) asid_mask,
                 pwcl = inout(reg) pwcl => _,
                 pwch = inout(reg) pwch => _,
-                stlbps = inout(reg) stlbps => _,
                 crmd = lateout(reg) crmd,
                 csr_pgdl = const CSR_PGDL,
                 csr_pgdh = const CSR_PGDH,
                 csr_asid = const CSR_ASID,
                 csr_pwcl = const CSR_PWCL,
                 csr_pwch = const CSR_PWCH,
-                csr_stlbps = const CSR_STLBPS,
                 csr_crmd = const CSR_CRMD,
                 options(nostack, preserves_flags)
             );

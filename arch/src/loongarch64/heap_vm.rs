@@ -237,6 +237,7 @@
 use crate::loongarch64::paging::LoongArch64Paging;
 use crate::loongarch64::specific::phys_to_virt;
 use crate::loongarch64::task::LoongArch64TaskOps;
+use crate::loongarch64::trap::LoongArch64InterruptOps;
 use allocator::{PAGE_SIZE, PagePolicy, PhysicalAllocRequest};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use general::{
@@ -276,6 +277,24 @@ static KERNEL_MAPPING_GENERATION: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_MAPPING_OBSERVED: [AtomicUsize; sched::NR_CPUS] =
     [const { AtomicUsize::new(0) }; sched::NR_CPUS];
 
+/// 在页表锁临界区内屏蔽本地中断。
+///
+/// 页表更新可能分配中间页表页，而分配器的自旋等待路径允许中断/紧急工作继续进入
+/// 内核。若本地中断在持有 `KERNEL_PAGE_TABLE_LOCK` 时重入同一条映射路径，原来的普通
+/// `Mutex` 会把当前 CPU 永久困在自旋中。这里采用与 Linux `spin_lock_irqsave` 相同的
+/// 契约：只保存并关闭 IE 位，离开临界区后恢复调用方原状态。
+#[inline]
+fn with_kernel_page_table_lock<T>(f: impl FnOnce() -> T) -> T {
+    let interrupt_state = unsafe { LoongArch64InterruptOps::save_interrupt_state() };
+    unsafe { LoongArch64InterruptOps::disable_interrupts() };
+    let result = {
+        let _guard = KERNEL_PAGE_TABLE_LOCK.lock();
+        f()
+    };
+    unsafe { LoongArch64InterruptOps::restore_interrupt_state(interrupt_state) };
+    result
+}
+
 /// 返回内核堆虚拟地址区域
 pub fn kernel_heap_region() -> (usize, usize) {
     (KERNEL_HEAP_BASE, KERNEL_HEAP_SIZE)
@@ -309,11 +328,11 @@ pub fn kernel_virt_to_phys(vaddr: usize) -> usize {
         return vaddr & 0x0000_FFFF_FFFF_FFFF;
     }
 
-    let _page_table_guard = KERNEL_PAGE_TABLE_LOCK.lock();
-    let root_vaddr = phys_to_virt(root_paddr);
-    let Ok((level, _pte_ptr, pte)) =
+    let leaf = with_kernel_page_table_lock(|| {
+        let root_vaddr = phys_to_virt(root_paddr);
         find_leaf::<LoongArch64Paging>(root_vaddr, vaddr, phys_to_virt)
-    else {
+    });
+    let Ok((level, _pte_ptr, pte)) = leaf else {
         return vaddr & 0x0000_FFFF_FFFF_FFFF;
     };
     let page_size = LoongArch64Paging::leaf_page_size(level).unwrap_or(PAGE_SIZE);
@@ -444,6 +463,7 @@ pub fn init_kernel_page_table() {
 
     // 激活页表
     // 注意：DMW 窗口优先级高于页表，所以激活页表不会影响 DMW 区域的访问
+    LoongArch64Paging::initialize_tlb_page_sizes();
     unsafe {
         LoongArch64Paging::activate(PhysPageTableRoot::new(root_paddr));
     }
@@ -479,15 +499,23 @@ pub fn activate_kernel_page_table() {
 /// 分配页表页
 fn allocate_page_table_page() -> Result<usize, MapError> {
     let request = PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE);
+    // 页表中间页是内核地址空间的内部元数据，不属于普通调用方的物理页账本。
+    // 走 untracked 入口可以避免在 KERNEL_PAGE_TABLE_LOCK 内递归进入 registry/
+    // owner-index；后者的元数据补货还可能再次获取 allocator 的物理锁，形成锁环。
     let allocation = allocator::KERNEL_ALLOCATOR
-        .allocate_physical(request)
+        .allocate_untracked_physical(request)
         .map_err(|_| MapError::OutOfMemory)?;
     Ok(allocation.paddr)
 }
 
 fn free_page_table_page(paddr: usize) -> bool {
     allocator::KERNEL_ALLOCATOR
-        .try_free_physical_addr(paddr)
+        .try_free_untracked_physical(allocator::PhysicalAllocation {
+            paddr,
+            size: PAGE_SIZE,
+            order: 0,
+            page_size: PAGE_SIZE,
+        })
         .is_ok()
 }
 
@@ -858,10 +886,8 @@ pub fn map_kernel_heap_range(
         return false;
     }
 
-    let result = {
-        let _page_table_guard = KERNEL_PAGE_TABLE_LOCK.lock();
-        map_range_with_policy(vaddr, paddr, size, page_policy)
-    };
+    let result =
+        with_kernel_page_table_lock(|| map_range_with_policy(vaddr, paddr, size, page_policy));
     match result {
         Ok(()) => {
             // log::debug!(
@@ -970,8 +996,7 @@ pub fn unmap_kernel_heap_range(vaddr: usize, size: usize) -> bool {
         return false;
     }
 
-    let update_result = {
-        let _page_table_guard = KERNEL_PAGE_TABLE_LOCK.lock();
+    let update_result = with_kernel_page_table_lock(|| {
         let root_vaddr = phys_to_virt(root_paddr);
         unmap_range_entries::<LoongArch64Paging>(root_vaddr, vaddr, size, false, phys_to_virt)
             .and_then(|_| {
@@ -984,7 +1009,7 @@ pub fn unmap_kernel_heap_range(vaddr: usize, size: usize) -> bool {
                 )
             })
             .map(|()| flush_local_kernel_translation_state())
-    };
+    });
 
     if let Err(err) = update_result {
         log::error!(
@@ -1038,8 +1063,7 @@ pub fn protect_kernel_heap_range(
         return false;
     }
 
-    let update_result = {
-        let _page_table_guard = KERNEL_PAGE_TABLE_LOCK.lock();
+    let update_result = with_kernel_page_table_lock(|| {
         protect_range_entries::<LoongArch64Paging>(
             phys_to_virt(root_paddr),
             vaddr,
@@ -1052,7 +1076,7 @@ pub fn protect_kernel_heap_range(
             phys_to_virt,
         )
         .map(|()| flush_local_kernel_translation_state())
-    };
+    });
     if let Err(err) = update_result {
         log::error!(
             "[arch][heap_vm] failed to protect kernel heap range: vaddr={:#x} size={:#x} error={:?}",
@@ -1087,17 +1111,18 @@ pub fn validate_kernel_heap_range(
     if root_paddr == 0 {
         return false;
     }
-    let _page_table_guard = KERNEL_PAGE_TABLE_LOCK.lock();
-    validate_range_permissions::<LoongArch64Paging>(
-        phys_to_virt(root_paddr),
-        vaddr,
-        size,
-        read,
-        write,
-        execute,
-        phys_to_virt,
-    )
-    .is_ok()
+    with_kernel_page_table_lock(|| {
+        validate_range_permissions::<LoongArch64Paging>(
+            phys_to_virt(root_paddr),
+            vaddr,
+            size,
+            read,
+            write,
+            execute,
+            phys_to_virt,
+        )
+        .is_ok()
+    })
 }
 
 /// 尝试收敛当前 CPU 对新内核堆映射缓存的无效 translation。

@@ -10,6 +10,7 @@ bench = false
 
 [features]
 block-profile = []
+kernel-tests = ["dep:ktest"]
 trace-syscall = []
 trace-task-lifecycle = ["sched/trace-task-lifecycle"]
 performance-profile = ["dep:profiling", "sched/performance-profile"]
@@ -22,10 +23,13 @@ elm-language-abi = { path = "../libs/elm-language-abi", default-features = false
 errno = { path = "../libs/errno" }
 extfs = { path = "../libs/extfs" }
 fatfs = { path = "../libs/fatfs" }
+fdt = { path = "../libs/fdt", features = ["alloc"] }
 hashbrown = { version = "0.17.1", default-features = false, features = ["inline-more"] }
 log = { path = "../libs/log" }
 kernel-symbols = { path = "../libs/kernel-symbols" }
+ktest = { path = "../libs/ktest", optional = true }
 mm = { path = "../libs/mm" }
+ns = { path = "../libs/ns", default-features = false }
 native-abi = { path = "../libs/native-abi" }
 net = { path = "../libs/net" }
 profiling = { path = "../libs/profiling", optional = true }

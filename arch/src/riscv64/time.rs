@@ -2,8 +2,6 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
-use crate::set_csr;
-
 use super::csr::SIE_STIE;
 use super::sbi;
 
@@ -157,7 +155,7 @@ pub fn init_periodic_timer(timer_hz: usize) {
 
     TIMER_HZ.store(timer_hz, Ordering::Relaxed);
     TIMER_PERIOD_TICKS.store(period, Ordering::Relaxed);
-    set_csr!(sie, SIE_STIE);
+    crate::set_csr!(sie, SIE_STIE);
     let deadline = stable_counter_raw().saturating_add(period);
     NEXT_TIMER_DEADLINES[current_timer_cpu()].store(deadline, Ordering::Release);
     arm_timer_at(deadline);

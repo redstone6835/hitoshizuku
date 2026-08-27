@@ -13,7 +13,7 @@ use core::sync::atomic::AtomicU64;
 use spin::mutex::Mutex;
 
 use crate::dev::block::BlockDevice;
-use crate::dev::char::CharDevice;
+use crate::dev::char::{CharDevice, CharDriver};
 use crate::dev::dma::DmaContext;
 pub use crate::dev::naming::{
     StableName as FunctionProjectionName, StableNameAllocError as FunctionProjectionNameAllocError,
@@ -78,6 +78,7 @@ impl DeviceClassId {
     pub const CHAR: Self = Self::new("char");
     pub const BLOCK: Self = Self::new("block");
     pub const RTC: Self = Self::new("rtc");
+    pub const WDT: Self = Self::new("wdt");
 
     pub const fn new(name: &'static str) -> Self {
         Self {
@@ -333,6 +334,31 @@ impl CharFunction {
         dev: CharDevice,
     ) -> Arc<dyn DeviceFunction> {
         Arc::new(Self::with_projection_name(dev_name, projection_name, dev))
+    }
+
+    /// 在常驻 General 侧同时构造字符设备及其完成类型擦除的 function。
+    ///
+    /// 动态 ELM 不应持有 [`CharDevice`]，否则其失败路径会生成指向 General
+    /// 私有 `CharDeviceInner` 的析构链接依赖。
+    #[kernel_symbols::export(
+        name = "general.dev.function.CharFunction.from_driver_arc",
+        contract = "kernel.general.device-function@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+        retained_args = 2u64
+    )]
+    pub fn from_driver_arc(
+        fw_name: Box<str>,
+        driver: Arc<dyn CharDriver>,
+        dev_name: &str,
+        projection_name: &str,
+    ) -> Arc<dyn DeviceFunction> {
+        Arc::new(Self::with_projection_name(
+            dev_name,
+            projection_name,
+            CharDevice::from_arc(fw_name, driver),
+        ))
     }
 
     /// 返回内部字符设备句柄。

@@ -15,6 +15,7 @@ use ktest::ktest;
 fn policy_from_raw_valid() {
     assert_eq!(SchedPolicy::from_raw(0), Some(SchedPolicy::Fair));
     assert_eq!(SchedPolicy::from_raw(4), Some(SchedPolicy::Idle));
+    assert_eq!(SchedPolicy::from_raw(5), Some(SchedPolicy::Batch));
 }
 
 /// from_raw 对未定义值返回 None。
@@ -27,6 +28,12 @@ fn policy_from_raw_invalid() {
 #[ktest]
 fn policy_class_fair() {
     assert_eq!(SchedPolicy::Fair.class(), SchedClass::Fair);
+}
+
+/// Batch 策略也映射到 Fair 调度类（nice 权重调度）。
+#[ktest]
+fn policy_class_batch() {
+    assert_eq!(SchedPolicy::Batch.class(), SchedClass::Fair);
 }
 
 /// RtFifo 和 RtRoundRobin 均映射到 Realtime 调度类。

@@ -229,6 +229,8 @@ unsafe fn invoke_on_native_stack<T>(
     let Some(_domain) = guard.enter_domain(ElmExecutionDomain::ElmCode) else {
         return ELM_CALL_STATUS_PROVIDER_FAULT;
     };
+    #[cfg(not(feature = "performance-profile"))]
+    let _ = observe_pinned_call;
     #[cfg(feature = "performance-profile")]
     let body_start = observe_pinned_call.then(profiling::read_counter);
     // 安全性：调用方保证入口地址与上下文 ABI；架构调用门只使用本对象持有的隔离栈。

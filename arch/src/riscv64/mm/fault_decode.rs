@@ -111,8 +111,8 @@ pub(super) fn validate_exception_table() {
     assert_eq!(start % core::mem::align_of::<ExTableEntry>(), 0);
     assert_eq!((end - start) % entry_size, 0);
 
-    let text_start = stext as usize;
-    let text_end = etext as usize;
+    let text_start = stext as *const () as usize;
+    let text_end = etext as *const () as usize;
     let count = (end - start) / entry_size;
     let table = start as *const ExTableEntry;
     for index in 0..count {

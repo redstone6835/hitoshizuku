@@ -33,9 +33,8 @@
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::collections::VecDeque;
 use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -60,6 +59,7 @@ use crate::dev::enumerate::{
     DEVICES, DeviceFunctionEvent, DeviceFunctionEventKind, subscribe_function_events,
 };
 use crate::dev::function::DeviceFunction;
+use crate::dev::tty::{self, TtyCore};
 use crate::vfs::device_files::projection::{
     devnodes_for_function, forget_published_devnodes, mark_projection_bound,
     mark_projection_failed, mark_projection_pending, mark_projection_unbound,
@@ -69,18 +69,14 @@ use crate::vfs::device_files::spec::{
     CustomDevNodeKind, CustomDevNodeNumbering, CustomDevNodeSpec, DevNodeSet, DevNodeSpec,
 };
 use crate::vfs::user_api::block_device::{BlockDeviceIoctlContext, handle_block_ioctl};
-use crate::vfs::user_api::tty::{
-    TtyIoctlContext, TtyIoctlState, UserTermios, UserWinSize, handle_tty_ioctl,
-};
+use crate::vfs::user_api::device_numbers::DeviceNumberKind;
+use crate::vfs::user_api::tty::{TtyIoctlContext, TtyIoctlState, UserTermios, handle_tty_ioctl};
 
 // ───────── 全局实例计数器 ─────────
 
 static DEVTMPFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 static DEVTMPFS_SINGLETON_SB: Spinlock<Option<&'static Arc<Superblock>>> = Spinlock::new(None);
-static TTY_SHARED_STATES: Spinlock<BTreeMap<String, Weak<TtySharedState>>> =
-    Spinlock::new(BTreeMap::new());
-const TTY_ASYNC_PUMP_LIMIT: usize = 256;
 // 无 PnP backing 的内核服务由 VFS device_files 层注册静态投影。devtmpfs 只维护
 // 这张声明表和事务绑定逻辑，不直接知道 null/zero/random/loop-control 等具体设备。
 static STATIC_DEV_NODES: Spinlock<Vec<DevTmpfsStaticNode>> = Spinlock::new(Vec::new());
@@ -380,7 +376,7 @@ impl DevTmpfsNodePolicy {
         Self {
             dir_mode: FileMode::new(0o755),
             symlink_mode: FileMode::new(0o777),
-            device_mode: FileMode::new(0o660),
+            device_mode: FileMode::new(0o600),
             regular_mode: FileMode::new(0o644),
             uid: Uid::ROOT,
             gid: Gid::ROOT,
@@ -411,6 +407,46 @@ impl DevTmpfsNodePolicy {
 }
 
 const DEVTMPFS_STANDARD_POLICY: DevTmpfsNodePolicy = DevTmpfsNodePolicy::standard();
+
+/// 按节点名注册的设备节点权限(与 Linux devtmpfs 的 devnode 回调对应)。
+///
+/// 设备身份与权限策略分离:驱动声明功能,投影层按名查策略;未注册的
+/// 节点使用默认 0600 root:root(Linux devtmpfs 默认)。
+#[derive(Clone, Copy, Debug)]
+pub struct DevNodePolicy {
+    pub mode: FileMode,
+    pub uid: Uid,
+    pub gid: Gid,
+}
+
+impl DevNodePolicy {
+    pub const fn new(mode: u16) -> Self {
+        Self {
+            mode: FileMode::new(mode),
+            uid: Uid::ROOT,
+            gid: Gid::ROOT,
+        }
+    }
+}
+
+static NODE_POLICIES: Spinlock<BTreeMap<String, DevNodePolicy>> = Spinlock::new(BTreeMap::new());
+
+/// 注册节点权限策略(幂等;同名覆盖)。
+pub fn register_node_policy(name: &str, policy: DevNodePolicy) -> VfsResult<()> {
+    let mut out = String::new();
+    out.try_reserve(name.len()).map_err(|_| VfsError::NoSpace)?;
+    out.push_str(name);
+    NODE_POLICIES.lock().insert(out, policy);
+    Ok(())
+}
+
+fn node_policy(name: &str) -> DevNodePolicy {
+    NODE_POLICIES
+        .lock()
+        .get(name)
+        .copied()
+        .unwrap_or(DevNodePolicy::new(0o600))
+}
 
 fn devtmpfs_fallible_string(value: &str) -> VfsResult<String> {
     let mut out = String::new();
@@ -643,6 +679,7 @@ fn remember_bound_projection_nodes(func: &dyn DeviceFunction, nodes: &DevNodeSet
 
 fn map_char_err(e: CharIoError) -> VfsError {
     match e {
+        CharIoError::NoSpace => VfsError::NoSpace,
         CharIoError::HardwareError => VfsError::Io,
         CharIoError::Unavailable => VfsError::NoDevice,
         CharIoError::Interrupted => VfsError::Interrupted,
@@ -672,105 +709,16 @@ fn map_control_vfs(e: ControlError) -> VfsError {
     }
 }
 
-#[derive(Default)]
-struct TtyLineState {
-    line: Vec<u8>,
-    ready: VecDeque<u8>,
-    eof_pending: bool,
-}
-
-impl TtyLineState {
-    fn clear(&mut self) {
-        self.line.clear();
-        self.ready.clear();
-        self.eof_pending = false;
-    }
-}
-
-/// 一个底层 TTY 设备的共享行规程状态。
-///
-/// devtmpfs 可能把同一个串口同时投影成 `/dev/console` 和 `/dev/uart0`。
-/// termios、窗口大小、前台进程组和规范模式行缓冲都属于控制终端本身，
-/// 必须在这些节点和所有 open fd 之间共享；每个 fd 只保留自己的状态标志。
-struct TtySharedState {
-    dev: CharDevice,
-    termios: Spinlock<UserTermios>,
-    winsize: Spinlock<UserWinSize>,
-    foreground_pgrp: Spinlock<i32>,
-    line_state: Spinlock<TtyLineState>,
-}
-
-impl TtySharedState {
-    fn new(dev: CharDevice) -> Self {
-        Self {
-            dev,
-            termios: Spinlock::new(UserTermios::new_default()),
-            winsize: Spinlock::new(UserWinSize::default_console()),
-            foreground_pgrp: Spinlock::new(0),
-            line_state: Spinlock::new(TtyLineState::default()),
-        }
-    }
-}
-
-impl TtyIoctlState for TtySharedState {
-    fn termios(&self) -> UserTermios {
-        *self.termios.lock()
-    }
-
-    fn set_termios(&self, termios: UserTermios) {
-        *self.termios.lock() = termios;
-    }
-
-    fn winsize(&self) -> UserWinSize {
-        *self.winsize.lock()
-    }
-
-    fn set_winsize(&self, winsize: UserWinSize) {
-        *self.winsize.lock() = winsize;
-    }
-
-    fn clear_line_state(&self) {
-        self.line_state.lock().clear();
-    }
-
-    fn foreground_pgrp(&self) -> i32 {
-        *self.foreground_pgrp.lock()
-    }
-
-    fn set_foreground_pgrp(&self, pgrp: i32) {
-        *self.foreground_pgrp.lock() = pgrp;
-    }
-}
-
-fn shared_tty_state(dev: &CharDevice) -> Option<Arc<TtySharedState>> {
-    if !dev.is_tty() {
-        return None;
-    }
-
-    let mut states = TTY_SHARED_STATES.lock();
-    if let Some(state) = states.get(dev.fw_name()).and_then(Weak::upgrade) {
-        return Some(state);
-    }
-
-    // 同一个底层 TTY 可能被投影成多个 `/dev` 节点，例如稳定的 console 别名
-    // 和驱动自己的串口节点。行规程状态必须按设备共享，不能按 open fd 分裂。
-    let state = Arc::new(TtySharedState::new(dev.clone()));
-    // 共享状态缓存只是优化；如果名称键分配失败，当前 open fd 仍可持有独立
-    // 状态继续工作，不能因为缓存失败阻断字符设备打开路径。
-    if let Ok(key) = devtmpfs_fallible_string(dev.fw_name()) {
-        states.insert(key, Arc::downgrade(&state));
-    }
-    Some(state)
-}
-
 struct CharDevFileOps {
     dev: CharDevice,
     nonblock: AtomicBool,
-    tty: Option<Arc<TtySharedState>>,
+    tty: Option<Arc<TtyCore>>,
 }
 
 impl CharDevFileOps {
-    fn new(dev: CharDevice, nonblock: bool, tty: Option<Arc<TtySharedState>>) -> Self {
+    fn new(dev: CharDevice, nonblock: bool, tty: Option<Arc<TtyCore>>) -> Self {
+        crate::dev::tty::vt::note_vt_opened(&dev, 1);
+        crate::dev::tty::pty::note_pty_opened(&dev, 1);
         Self {
             dev,
             nonblock: AtomicBool::new(nonblock),
@@ -783,366 +731,53 @@ impl CharDevFileOps {
     }
 
     fn current_or_stored_pgrp(&self) -> Result<i32, Errno> {
-        let stored = self
-            .tty
-            .as_deref()
-            .map(|tty| *tty.foreground_pgrp.lock())
-            .unwrap_or(0);
-        if stored > 0 {
-            Ok(stored)
-        } else {
-            operation::getpgid(0)
+        match self.tty.as_deref() {
+            Some(tty) => tty.current_or_stored_pgrp(),
+            None => operation::getpgid(0),
         }
     }
 
-    fn remember_reader_pgrp(&self, tty: &TtySharedState) {
-        let Ok(pgrp) = operation::getpgid(0) else {
-            return;
-        };
-        if pgrp <= 0 {
-            return;
-        }
-        let mut foreground = tty.foreground_pgrp.lock();
-        if *foreground <= 0 {
-            // 某些 shell 在当前作业控制尚不完整时不会显式 TIOCSPGRP。
-            // 记录最近的 tty reader 进程组，供 timer 输入泵在没有 reader
-            // 调用栈时仍能把 Ctrl-C 发给合理的前台组。
-            *foreground = pgrp;
+    fn remember_reader_pgrp(&self) {
+        if let Some(tty) = self.tty.as_deref() {
+            tty.remember_reader_pgrp();
         }
     }
 
-    fn write_tty_bytes(&self, buf: &[u8], termios: UserTermios) -> VfsResult<()> {
-        if buf.is_empty() {
-            return Ok(());
-        }
-        if !termios.opost_onlcr() {
-            return self.dev.write_all(buf).map_err(map_char_err);
-        }
-
-        let mut cooked = Vec::with_capacity(buf.len());
-        for &byte in buf {
-            if byte == b'\n' {
-                cooked.push(b'\r');
-                cooked.push(b'\n');
-            } else {
-                cooked.push(byte);
-            }
-        }
-        self.dev.write_all(&cooked).map_err(map_char_err)
-    }
-
-    fn dequeue_ready(&self, tty: &TtySharedState, buf: &mut [u8]) -> Option<usize> {
-        let mut state = tty.line_state.lock();
-        if state.eof_pending {
-            state.eof_pending = false;
-            return Some(0);
-        }
-        if state.ready.is_empty() {
-            return None;
-        }
-        let mut n = 0usize;
-        while n < buf.len() {
-            let Some(byte) = state.ready.pop_front() else {
-                break;
-            };
-            buf[n] = byte;
-            n += 1;
-        }
-        Some(n)
-    }
-
-    fn dequeue_pending_bytes(&self, tty: &TtySharedState, buf: &mut [u8]) -> usize {
-        let mut state = tty.line_state.lock();
-        let mut n = 0usize;
-        while n < buf.len() {
-            let Some(byte) = state.ready.pop_front() else {
-                break;
-            };
-            buf[n] = byte;
-            n += 1;
-        }
-        n
-    }
-
-    fn send_fg_signal(&self, sig: sched::SignalNumber) {
-        let stored = self
-            .tty
-            .as_deref()
-            .map(|tty| *tty.foreground_pgrp.lock())
-            .unwrap_or(0);
-        let current = operation::getpgid(0).ok().filter(|pgrp| *pgrp > 0);
-        let primary = if stored > 0 { Some(stored) } else { current };
-
-        if let Some(pgrp) = primary {
-            // 前台进程组是 TTY 的内部对象关系，不应通过 kill(-PGID) 的
-            // 用户态 pid 编码间接表达；PGID==1 会与特殊广播形式冲突。
-            let _ = operation::kill_process_group(pgrp, Some(sig));
-        }
-
-        if stored > 0 {
-            if let Some(current_pgrp) = current {
-                if current_pgrp != stored {
-                    // 当前作业控制还不完整：某些 shell 会把 TTY 前台组留在 shell 自己，
-                    // 但前台程序已经在这个读路径里消费到 VINTR/VQUIT/VSUSP。补发给当前
-                    // 读者进程组，避免 Ctrl-C 只打到 shell，真正阻塞的程序继续睡眠。
-                    let _ = operation::kill_process_group(current_pgrp, Some(sig));
-                }
-            }
-        }
-    }
-
-    fn echo_signal_char(&self, sig: sched::SignalNumber, termios: UserTermios) {
-        if !termios.echo() {
-            return;
-        }
-        let bytes = if sig == sched::SignalNumber::SIGINT {
-            &b"^C\n"[..]
-        } else if sig == sched::SignalNumber::SIGQUIT {
-            &b"^\\\n"[..]
-        } else if sig == sched::SignalNumber::SIGTSTP {
-            &b"^Z\n"[..]
-        } else {
-            &b"\n"[..]
-        };
-        let _ = self.write_tty_bytes(bytes, termios);
-    }
-
-    fn handle_input_signal(
-        &self,
-        tty: &TtySharedState,
-        ch: u8,
-        termios: UserTermios,
-    ) -> VfsResult<()> {
-        let Some(sig) = termios.signal_for_input(ch) else {
-            return Ok(());
-        };
-        self.send_fg_signal(sig);
-        tty.line_state.lock().clear();
-        self.echo_signal_char(sig, termios);
-        Err(VfsError::Interrupted)
-    }
-
-    fn handle_async_input_signal(
-        &self,
-        tty: &TtySharedState,
-        ch: u8,
-        termios: UserTermios,
-    ) -> VfsResult<()> {
-        // 异步输入泵没有用户态 read() 调用栈，不能完全依赖当前 termios 的
-        // ISIG 状态：BusyBox shell 在启动前台命令前可能短暂把终端切到 raw
-        // 模式。此时 Ctrl-C 如果按普通字节排队，就会等到前台命令结束后才
-        // 被 shell 读到。这里仅对 VINTR/VQUIT/VSUSP 做兜底信号化，普通字节
-        // 仍进入行规程 pending 队列，避免破坏 raw 模式数据流。
-        let sig = termios.signal_for_input(ch).or_else(|| {
-            if ch == 0 {
-                None
-            } else if ch == termios.vintr() {
-                Some(sched::SignalNumber::SIGINT)
-            } else if ch == termios.vquit() {
-                Some(sched::SignalNumber::SIGQUIT)
-            } else if ch == termios.vsusp() {
-                Some(sched::SignalNumber::SIGTSTP)
-            } else {
-                None
-            }
-        });
-        let Some(sig) = sig else {
-            return Ok(());
-        };
-        self.send_fg_signal(sig);
-        tty.line_state.lock().clear();
-        self.echo_signal_char(sig, termios);
-        Err(VfsError::Interrupted)
-    }
-
-    fn pump_tty_canonical_once(
-        &self,
-        tty: &TtySharedState,
-        termios: UserTermios,
-    ) -> VfsResult<bool> {
-        let mut byte = [0u8; 1];
-        let n = self.dev.read(&mut byte).map_err(map_char_err)?;
-        if n == 0 {
-            return Ok(false);
-        }
-
-        let mut ch = byte[0];
-        if termios.icrnl() && ch == b'\r' {
-            ch = b'\n';
-        }
-        if termios.ixon() && (ch == 17 || ch == 19) {
-            return Ok(true);
-        }
-        self.handle_input_signal(tty, ch, termios)?;
-
-        let mut echo_bytes: Option<Vec<u8>> = None;
-        {
-            let mut state = tty.line_state.lock();
-            if ch == termios.verase() && ch != 0 {
-                if state.line.pop().is_some() && termios.echo() {
-                    echo_bytes = Some(if termios.echoe() {
-                        Vec::from(&b"\x08 \x08"[..])
-                    } else {
-                        Vec::from(&[ch][..])
-                    });
-                }
-            } else if ch == termios.vkill() && ch != 0 {
-                let erased = state.line.len();
-                state.line.clear();
-                if erased != 0 && termios.echo() {
-                    let mut out = Vec::new();
-                    if termios.echoe() {
-                        out.reserve(erased * 3);
-                        for _ in 0..erased {
-                            out.extend_from_slice(b"\x08 \x08");
-                        }
-                    }
-                    if termios.echok() {
-                        out.push(b'\n');
-                    }
-                    if !out.is_empty() {
-                        echo_bytes = Some(out);
-                    }
-                }
-            } else if ch == termios.veof() && ch != 0 {
-                if state.line.is_empty() {
-                    state.eof_pending = true;
-                } else {
-                    while let Some(byte) = state.line.first().copied() {
-                        state.ready.push_back(byte);
-                        state.line.remove(0);
-                    }
-                }
-            } else {
-                state.line.push(ch);
-                if termios.echo() {
-                    echo_bytes = Some(Vec::from(&[ch][..]));
-                }
-                if ch == b'\n' {
-                    while let Some(byte) = state.line.first().copied() {
-                        state.ready.push_back(byte);
-                        state.line.remove(0);
-                    }
-                }
-            }
-        }
-
-        if let Some(bytes) = echo_bytes.as_deref() {
-            let _ = self.write_tty_bytes(bytes, termios);
-        }
-        Ok(true)
-    }
-
-    fn process_raw_input_bytes(
-        &self,
-        tty: &TtySharedState,
-        termios: UserTermios,
-        buf: &mut [u8],
-        force_control_signal: bool,
-    ) -> VfsResult<usize> {
-        let mut out = 0usize;
-        for idx in 0..buf.len() {
-            let mut ch = buf[idx];
-            if termios.icrnl() && ch == b'\r' {
-                ch = b'\n';
-            }
-            if termios.ixon() && (ch == 17 || ch == 19) {
-                continue;
-            }
-            if force_control_signal {
-                self.handle_async_input_signal(tty, ch, termios)?;
-            } else {
-                self.handle_input_signal(tty, ch, termios)?;
-            }
-            buf[out] = ch;
-            out += 1;
-        }
-        if out != 0 && termios.echo() {
-            let _ = self.write_tty_bytes(&buf[..out], termios);
-        }
-        Ok(out)
-    }
-
-    fn pump_tty_raw_once(&self, tty: &TtySharedState, termios: UserTermios) -> VfsResult<bool> {
-        let mut byte = [0u8; 1];
-        let n = self.dev.read(&mut byte).map_err(map_char_err)?;
-        if n == 0 {
-            return Ok(false);
-        }
-
-        let produced = self.process_raw_input_bytes(tty, termios, &mut byte, true)?;
-        if produced == 0 {
-            return Ok(true);
-        }
-        let mut state = tty.line_state.lock();
-        state
-            .ready
-            .try_reserve(produced)
-            .map_err(|_| VfsError::NoSpace)?;
-        for &byte in &byte[..produced] {
-            state.ready.push_back(byte);
-        }
-        Ok(true)
-    }
-
-    fn drain_tty_input(&self, tty: &TtySharedState, termios: UserTermios) {
-        for _ in 0..TTY_ASYNC_PUMP_LIMIT {
-            let result = if termios.canonical() {
-                self.pump_tty_canonical_once(tty, termios)
-            } else {
-                self.pump_tty_raw_once(tty, termios)
-            };
-            match result {
-                Ok(true) | Err(VfsError::Interrupted) => {}
-                Ok(false) | Err(_) => break,
-            }
+    fn map_tty_err(err: tty::TtyIoError) -> VfsError {
+        match err {
+            tty::TtyIoError::WouldBlock => VfsError::WouldBlock,
+            tty::TtyIoError::Interrupted => VfsError::Interrupted,
+            tty::TtyIoError::NoSpace => VfsError::NoSpace,
+            tty::TtyIoError::Io => VfsError::Io,
+            tty::TtyIoError::NoDevice => VfsError::NoDevice,
+            tty::TtyIoError::TimedOut => VfsError::TimedOut,
+            tty::TtyIoError::Unsupported => VfsError::NotSupported,
+            tty::TtyIoError::Busy => VfsError::DeviceBusy,
+            tty::TtyIoError::Invalid => VfsError::InvalidArgument,
         }
     }
 
     fn read_tty_canonical(
         &self,
-        tty: &TtySharedState,
+        tty: &TtyCore,
         buf: &mut [u8],
         termios: UserTermios,
     ) -> VfsResult<usize> {
-        loop {
-            if let Some(n) = self.dequeue_ready(tty, buf) {
-                return Ok(n);
-            }
-            if !self.pump_tty_canonical_once(tty, termios)? {
-                return Err(VfsError::WouldBlock);
-            }
-        }
+        tty.read_tty_canonical(buf, termios)
+            .map_err(Self::map_tty_err)
     }
 
     fn read_tty_raw(
         &self,
-        tty: &TtySharedState,
+        tty: &TtyCore,
         buf: &mut [u8],
         termios: UserTermios,
     ) -> VfsResult<usize> {
-        let want = termios.vmin().max(1) as usize;
-        let mut filled = self.dequeue_pending_bytes(tty, buf);
-        if filled >= want || filled == buf.len() {
-            return Ok(filled);
-        }
-        loop {
-            let start = filled;
-            let n = self.dev.read(&mut buf[start..]).map_err(map_char_err)?;
-            if n != 0 {
-                let produced =
-                    self.process_raw_input_bytes(tty, termios, &mut buf[start..start + n], false)?;
-                filled += produced;
-                if filled >= want || filled == buf.len() {
-                    return Ok(filled);
-                }
-            } else {
-                if filled != 0 && termios.vtime() == 0 {
-                    return Ok(filled);
-                }
-                return Err(VfsError::WouldBlock);
-            }
-        }
+        tty.read_tty_raw(buf, termios).map_err(Self::map_tty_err)
+    }
+
+    fn write_tty_bytes(&self, tty: &TtyCore, buf: &[u8], termios: UserTermios) -> VfsResult<()> {
+        tty.write_tty_bytes(buf, termios).map_err(Self::map_tty_err)
     }
 }
 
@@ -1154,6 +789,24 @@ impl TtyIoctlContext for CharDevFileOps {
     fn session_id(&self) -> Result<i32, Errno> {
         operation::getsid(0)
     }
+
+    fn is_session_leader(&self) -> bool {
+        sched::operation::is_current_session_leader()
+    }
+
+    fn session_ctty(&self) -> Option<u64> {
+        sched::operation::current_session_ctty()
+    }
+
+    fn set_session_ctty(&self, cookie: Option<u64>) -> Result<(), Errno> {
+        sched::operation::set_current_session_ctty(cookie)
+    }
+
+    fn has_sys_admin(&self) -> bool {
+        crate::vfs::current_vfs_context()
+            .map(|ctx| ctx.cred().has_cap(vfs::cred::Capability::SysAdmin))
+            .unwrap_or(false)
+    }
 }
 
 /// 从已打开的 TTY 中主动拉取输入，供 timer tick 路径调用。
@@ -1164,25 +817,37 @@ impl TtyIoctlContext for CharDevFileOps {
 /// 非规范模式下普通字节会进入 TTY pending 队列，由之后的 read() 取走；
 /// 控制字符则立即处理，避免 raw-mode shell 启动前台程序后 Ctrl-C 滞留。
 pub fn poll_tty_input() {
-    let mut active = Vec::new();
+    // VT 串口输入模式(console=ttyN):物理控制台字节属于活动 VT,由 VT 泵
+    // 消费;此时不能按通用路径 drain 控制台核心,否则同一 FIFO 会被
+    // console/uart 的行规程与活动 VT 竞争读取。其余终端(pty slave 等)
+    // 仍需要 tick 泵推进其行规程。
+    if let Some(manager) = crate::dev::tty::vt::VtManager::global()
+        && manager.pump_console()
     {
-        let mut states = TTY_SHARED_STATES.lock();
-        states.retain(|_, weak| {
-            let Some(tty) = weak.upgrade() else {
-                return false;
-            };
-            active.push(tty);
-            true
-        });
+        // VT 串口输入模式:物理控制台字节已由 VT 泵消费;此时不能按通用路径
+        // drain 控制台核心,否则同一 FIFO 会被 console/uart 的行规程与活动
+        // VT 竞争读取。其余终端(pty slave 等)仍需要 tick 泵推进。
+        let console_name = manager
+            .console_device()
+            .map(|dev| alloc::string::String::from(dev.fw_name()));
+        for tty in tty::active_tty_cores() {
+            if !tty.is_active() {
+                continue;
+            }
+            if console_name.as_deref() == Some(tty.name()) {
+                continue;
+            }
+            let termios = tty.termios();
+            tty.drain_tty_input(termios);
+        }
+        return;
     }
-
-    for tty in active {
-        if !tty.dev.is_active() {
+    for tty in tty::active_tty_cores() {
+        if !tty.is_active() {
             continue;
         }
-        let termios = *tty.termios.lock();
-        let ops = CharDevFileOps::new(tty.dev.clone(), false, Some(Arc::clone(&tty)));
-        ops.drain_tty_input(&tty, termios);
+        let termios = tty.termios();
+        tty.drain_tty_input(termios);
     }
 }
 
@@ -1197,8 +862,8 @@ impl FileOps for CharDevFileOps {
         // O_NONBLOCK 只影响没有完整输入时是否等待，不能绕过 TTY 行规程。
         // Ctrl-C/Ctrl-D 等控制字符必须先经过 ISIG/ICANON 处理，再由 syscall
         // 层把 WouldBlock 按文件状态转换成 EAGAIN 或阻塞等待。
-        self.remember_reader_pgrp(tty);
-        let termios = *tty.termios.lock();
+        self.remember_reader_pgrp();
+        let termios = tty.termios();
         if termios.canonical() {
             self.read_tty_canonical(tty, buf, termios)
         } else {
@@ -1213,8 +878,8 @@ impl FileOps for CharDevFileOps {
             self.dev.write_all(buf).map_err(map_char_err)?;
             return Ok(buf.len());
         };
-        let termios = *tty.termios.lock();
-        self.write_tty_bytes(buf, termios)?;
+        let termios = tty.termios();
+        self.write_tty_bytes(tty, buf, termios)?;
         Ok(buf.len())
     }
     fn readdir(
@@ -1232,15 +897,12 @@ impl FileOps for CharDevFileOps {
             return PollEvents::POLLERR.with(PollEvents::POLLHUP);
         }
         if let Some(tty) = self.tty.as_deref() {
-            let line_readable = {
-                let state = tty.line_state.lock();
-                state.eof_pending || !state.ready.is_empty()
-            };
+            let line_readable = tty.has_ready_input();
             // 规范模式同样要暴露底层 FIFO 的“有字节可取”状态。阻塞 read()
             // 在无完整行时会先返回 WouldBlock，再由 syscall 层按 poll() 等待；
             // 若这里只看行缓冲，UART 字节永远不会被重新拉进行规程，shell 会像
             // 串口输入失效一样卡住。
-            let dev_readable = self.dev.poll_read();
+            let dev_readable = tty.poll_read();
             let readable = line_readable || dev_readable;
             return if readable {
                 PollEvents::POLLIN.with(PollEvents::POLLOUT)
@@ -1276,13 +938,78 @@ impl FileOps for CharDevFileOps {
         if !self.dev.is_active() {
             return Err(Errno::ENODEV);
         }
+        // VT 设备优先走 VT/KD ioctl 表;非 VT 命令回落 TTY 表。
+        if let Some(vt) = crate::dev::tty::vt::vt_from_char_device(&self.dev) {
+            if let Some(result) = crate::dev::tty::vt::handle_vt_ioctl(&vt, cmd, arg)? {
+                return Ok(result);
+            }
+        }
         let Some(tty) = self.tty.as_deref() else {
             return Err(Errno::ENOTTY);
         };
 
-        handle_tty_ioctl(tty, self, &self.dev, cmd, arg)
+        handle_tty_ioctl(tty, self, cmd, arg)
     }
-    fn release(&self) {}
+    fn release(&self) {
+        crate::dev::tty::vt::note_vt_opened(&self.dev, -1);
+        crate::dev::tty::pty::note_pty_opened(&self.dev, -1);
+        if let Some(tty) = self.tty.as_deref() {
+            tty.release_open();
+        }
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+// ───────── mknod 节点 InodeOps ─────────
+
+/// 用户 mknod 创建的设备节点:open 时按投影名委托给已绑定设备。
+///
+/// 未绑定设备时按设备号反查(呈现层索引);仍未命中返回 ENXIO。
+struct MknodInodeOps {
+    target_name: String,
+    /// 节点类别,供设备号反查使用(呈现层索引)。
+    kind: DeviceNumberKind,
+    /// 用户 mknod 时指定的设备号。
+    dev: DevId,
+}
+
+impl InodeOps for MknodInodeOps {
+    fn lookup(&self, _inode: &Inode, _name: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+
+    fn open(
+        &self,
+        _inode: &Inode,
+        opts: &OpenOptions,
+        cred: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        let sb = mounted_devtmpfs_sb().ok_or(VfsError::NoDevice)?;
+        let sb_ops = sb
+            .downcast_ops::<DevTmpfsSuperblockOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+
+        // 先按 mknod 时登记的投影名委托;找不到时按保存的设备号反查呈现层,
+        // 支持 initramfs 按正确 dev_t 预建节点、驱动随后以不同投影名绑定的场景。
+        let target = sb_ops.lookup_node_at(&self.target_name).or_else(|_| {
+            let record = super::user_api::device_numbers::lookup_rdev(self.kind, self.dev)
+                .ok_or(VfsError::NoSuchDeviceOrAddress)?;
+            sb_ops
+                .lookup_node_at(&record.node_name)
+                .map_err(|_| VfsError::NoSuchDeviceOrAddress)
+        })?;
+
+        if let Some(ops) = target.downcast_ops::<DevCharOps>() {
+            return ops.open(&target, opts, cred);
+        }
+        if let Some(ops) = target.downcast_ops::<DevBlockOps>() {
+            return ops.open(&target, opts, cred);
+        }
+        Err(VfsError::NoSuchDeviceOrAddress)
+    }
+
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
@@ -1296,7 +1023,8 @@ impl FileOps for CharDevFileOps {
 /// 和已打开 fd 都会通过同一状态停止访问底层驱动。
 struct DevCharOps {
     dev: CharDevice,
-    tty: Option<Arc<TtySharedState>>,
+    // The inode keeps the shared line discipline alive even before the first open fd.
+    _tty: Option<Arc<TtyCore>>,
 }
 
 impl DevCharOps {
@@ -1319,16 +1047,34 @@ impl InodeOps for DevCharOps {
         if !self.dev.is_active() {
             return Err(VfsError::NoDevice);
         }
-        Ok(Box::new(CharDevFileOps::new(
-            self.dev.clone(),
-            opts.nonblock,
-            self.tty.clone(),
-        )))
+        char_dev_file_ops(self.dev.clone(), opts.nonblock)
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
+}
+
+/// 构造字符设备的 FileOps(带共享行规程)。
+///
+/// devtmpfs 节点与 devpts 节点共用;`tty` 实例按设备 fw_name 共享,
+/// 因此同一终端的多个节点/多次打开拿到同一行规程状态。
+pub(crate) fn char_dev_file_ops(
+    dev: CharDevice,
+    nonblock: bool,
+) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+    if !dev.is_active() {
+        return Err(VfsError::NoDevice);
+    }
+    let tty = tty::shared_tty_core(&dev);
+    // TIOCEXCL 独占语义:已有打开者且独占标志置位时,新 open 返回 EBUSY。
+    if let Some(tty) = tty.as_deref() {
+        tty.try_open().map_err(|err| match err {
+            errno::Errno::EBUSY => VfsError::DeviceBusy,
+            _ => VfsError::InvalidArgument,
+        })?;
+    }
+    Ok(Box::new(CharDevFileOps::new(dev, nonblock, tty)))
 }
 
 // ───────── 块设备 InodeOps ─────────
@@ -1786,6 +1532,42 @@ impl InodeOps for DevDirOps {
             .get(name)
             .cloned()
             .ok_or(VfsError::NotFound)
+    }
+
+    fn mknod(
+        &self,
+        dir: &Inode,
+        name: &str,
+        kind: FileType,
+        mode: FileMode,
+        dev: DevId,
+        cred: &Credentials,
+    ) -> VfsResult<Arc<Inode>> {
+        if !matches!(kind, FileType::CharDevice | FileType::BlockDevice) {
+            // devtmpfs 只投影设备节点;其他 mknod 类型不支持。
+            return Err(VfsError::NotSupported);
+        }
+        validate_devtmpfs_component(name)?;
+
+        let sb = dir.superblock().ok_or(VfsError::InvalidArgument)?;
+        let sb_ops = sb
+            .downcast_ops::<DevTmpfsSuperblockOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+
+        // 设备号只作呈现层键:经 device_numbers 反查投影节点名,open 时
+        // 委托给已绑定设备;未登记的设备号在 open 时返回 ENXIO(Linux 语义)。
+        let node_kind = match kind {
+            FileType::CharDevice => super::user_api::device_numbers::DeviceNumberKind::Char,
+            _ => super::user_api::device_numbers::DeviceNumberKind::Block,
+        };
+        let Some(record) = super::user_api::device_numbers::lookup_rdev(node_kind, dev) else {
+            // 允许先建节点后绑定设备:open 时再解析。
+            let inode = sb_ops.new_mknod_inode(name, kind, mode, dev, cred, name)?;
+            return sb_ops.insert_mknod(dir, name, inode);
+        };
+
+        let inode = sb_ops.new_mknod_inode(name, kind, mode, dev, cred, &record.node_name)?;
+        sb_ops.insert_mknod(dir, name, inode)
     }
 
     fn mkdir(
@@ -2279,6 +2061,7 @@ impl DevTmpfsSuperblockOps {
     }
 
     fn new_custom_inode(&self, spec: &CustomDevNodeSpec, rdev: DevId) -> VfsResult<Arc<Inode>> {
+        let policy = node_policy(spec.name());
         split_devtmpfs_path(spec.name())?;
         let block_size = DEVTMPFS_STANDARD_POLICY.block_size;
         let nlink = DEVTMPFS_STANDARD_POLICY.custom_nlink(spec.kind());
@@ -2294,9 +2077,32 @@ impl DevTmpfsSuperblockOps {
         let meta = InodeMeta {
             size: 0,
             nlink,
-            mode: DEVTMPFS_STANDARD_POLICY.custom_mode(spec.kind()),
-            uid: DEVTMPFS_STANDARD_POLICY.uid,
-            gid: DEVTMPFS_STANDARD_POLICY.gid,
+            // 设备节点优先使用按名登记的节点策略(如 ptmx 0666);目录/普通
+            // 文件保持标准策略。
+            mode: if matches!(
+                spec.kind(),
+                CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice
+            ) {
+                policy.mode
+            } else {
+                DEVTMPFS_STANDARD_POLICY.custom_mode(spec.kind())
+            },
+            uid: if matches!(
+                spec.kind(),
+                CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice
+            ) {
+                policy.uid
+            } else {
+                DEVTMPFS_STANDARD_POLICY.uid
+            },
+            gid: if matches!(
+                spec.kind(),
+                CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice
+            ) {
+                policy.gid
+            } else {
+                DEVTMPFS_STANDARD_POLICY.gid
+            },
             atime: now,
             mtime: now,
             ctime: now,
@@ -2503,29 +2309,41 @@ impl DevTmpfsSuperblockOps {
         if !dev.is_active() {
             return Err(VfsError::NoDevice);
         }
+        // 节点已存在且设备号一致时幂等复用(initramfs 预建节点/重复绑定)。
+        // register_char 对同名已登记记录返回其原设备号,因此这里同时完成
+        // 复用判定与(必要时)设备号登记。
         if self.lookup_node_at(user_name).is_ok() {
-            return Err(VfsError::AlreadyExists);
+            let expected = super::user_api::device_numbers::register_char(user_name, dev.fw_name())
+                .ok_or(VfsError::NoSpace)?;
+            let existing_rdev =
+                super::user_api::device_numbers::lookup_node(user_name).map(|record| record.rdev);
+            return if existing_rdev == Some(expected) {
+                Ok(())
+            } else {
+                Err(VfsError::AlreadyExists)
+            };
         }
-        let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
-        let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
         let rdev = super::user_api::device_numbers::register_char(user_name, dev.fw_name())
             .ok_or(VfsError::NoSpace)?;
+        let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
+        let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
+        let policy = node_policy(user_name);
 
         let now = Timespec::now();
         let meta = InodeMeta {
             size: 0,
             nlink: 1,
-            mode: DEVTMPFS_STANDARD_POLICY.device_mode,
-            uid: DEVTMPFS_STANDARD_POLICY.uid,
-            gid: DEVTMPFS_STANDARD_POLICY.gid,
+            mode: policy.mode,
+            uid: policy.uid,
+            gid: policy.gid,
             atime: now,
             mtime: now,
             ctime: now,
             blocks: 0,
         };
 
-        let tty = shared_tty_state(&dev);
-        let ops = Arc::new(DevCharOps { dev, tty });
+        let tty = tty::shared_tty_core(&dev);
+        let ops = Arc::new(DevCharOps { dev, _tty: tty });
         let inode = Inode::new(
             InodeId {
                 fs_id,
@@ -2584,20 +2402,28 @@ impl DevTmpfsSuperblockOps {
             return Err(VfsError::NoDevice);
         }
         if self.lookup_node_at(user_name).is_ok() {
-            return Err(VfsError::AlreadyExists);
+            let expected = super::user_api::device_numbers::register_block(user_name, dev.name())
+                .ok_or(VfsError::NoSpace)?;
+            let existing_rdev =
+                super::user_api::device_numbers::lookup_node(user_name).map(|record| record.rdev);
+            if existing_rdev != Some(expected) {
+                return Err(VfsError::AlreadyExists);
+            }
+            return self.ensure_block_symlink(user_name, expected);
         }
         let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
         let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
         let rdev = super::user_api::device_numbers::register_block(user_name, dev.name())
             .ok_or(VfsError::NoSpace)?;
+        let policy = node_policy(user_name);
 
         let now = Timespec::now();
         let meta = InodeMeta {
             size: 0,
             nlink: 1,
-            mode: DEVTMPFS_STANDARD_POLICY.device_mode,
-            uid: DEVTMPFS_STANDARD_POLICY.uid,
-            gid: DEVTMPFS_STANDARD_POLICY.gid,
+            mode: policy.mode,
+            uid: policy.uid,
+            gid: policy.gid,
             atime: now,
             mtime: now,
             ctime: now,
@@ -2628,7 +2454,27 @@ impl DevTmpfsSuperblockOps {
             super::user_api::device_numbers::unregister_node(user_name);
             return Err(err);
         }
+        if let Err(err) = self.ensure_block_symlink(user_name, rdev) {
+            let _ = self.remove_node_at(user_name);
+            self.rollback_numbered_node(user_name);
+            return Err(err);
+        }
         Ok(())
+    }
+
+    /// 为块设备节点创建 Linux 兼容的 `/dev/block/<major>:<minor>` 符号链接。
+    ///
+    /// 目标采用相对路径 `../<user_name>`(块设备节点都投影在 devtmpfs 顶层),
+    /// 与 Linux devtmpfs 在创建设备节点时同步创建链接的行为一致。已存在同名
+    /// 链接时按幂等处理,不覆盖既有投影。
+    fn ensure_block_symlink(&self, user_name: &str, rdev: DevId) -> VfsResult<()> {
+        let link_path = alloc::format!("block/{}:{}", rdev.major, rdev.minor);
+        let target = alloc::format!("../{user_name}");
+        match self.bind_symlink(&link_path, &target) {
+            Ok(()) => Ok(()),
+            Err(VfsError::AlreadyExists) => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
     /// 在 devtmpfs 相对路径上创建一个符号链接节点。
@@ -2649,6 +2495,73 @@ impl DevTmpfsSuperblockOps {
     ///
     /// 自定义节点的底层 function 只提交 opaque payload；这里作为 VFS 用户接口
     /// 适配层负责解释 payload、分配兼容 `dev_t` 并创建 inode。
+    /// 构造一个用户 mknod 的设备节点 inode。
+    ///
+    /// open 时按 `target_name`(已登记投影)或设备号(open 时反查)解析设备。
+    fn new_mknod_inode(
+        &self,
+        _name: &str,
+        kind: FileType,
+        mode: FileMode,
+        dev: DevId,
+        cred: &Credentials,
+        target_name: &str,
+    ) -> VfsResult<Arc<Inode>> {
+        let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
+        let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
+        let now = Timespec::now();
+        let meta = InodeMeta {
+            size: 0,
+            nlink: 1,
+            mode,
+            uid: cred.euid,
+            gid: cred.egid,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            blocks: 0,
+        };
+        let node_kind = match kind {
+            FileType::CharDevice => DeviceNumberKind::Char,
+            _ => DeviceNumberKind::Block,
+        };
+        let ops = Arc::new(MknodInodeOps {
+            target_name: devtmpfs_fallible_string(target_name)?,
+            kind: node_kind,
+            dev,
+        });
+        Ok(Inode::new(
+            InodeId {
+                fs_id,
+                ino: self.alloc_ino(),
+            },
+            kind,
+            dev,
+            DEVTMPFS_STANDARD_POLICY.block_size,
+            None,
+            meta,
+            ops,
+            sb_weak,
+        ))
+    }
+
+    /// 把 mknod 节点插入父目录。
+    fn insert_mknod(&self, dir: &Inode, name: &str, inode: Arc<Inode>) -> VfsResult<Arc<Inode>> {
+        let parent_ops = dir
+            .downcast_ops::<DevDirOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+        let mut children = parent_ops.children.lock();
+        if children.contains_key(name) {
+            return Err(VfsError::AlreadyExists);
+        }
+        children.insert(devtmpfs_fallible_string(name)?, Arc::clone(&inode));
+        drop(children);
+        dir.inc_nlink();
+        dir.touch_mtime();
+        dir.touch_ctime();
+        Ok(inode)
+    }
+
     pub fn bind_custom(&self, spec: &CustomDevNodeSpec) -> VfsResult<()> {
         split_devtmpfs_path(spec.name())?;
         if self.lookup_node_at(spec.name()).is_ok() {
@@ -2847,6 +2760,39 @@ impl SuperblockOps for DevTmpfsSuperblockOps {
 /// ops.bind_block("block/root", block_dev)?;  // 目录化块设备节点
 /// ops.bind_symlink("disk/root", "../block/root")?; // 可选符号链接投影
 /// ```
+/// 解析 devtmpfs 挂载选项(与 Linux 同键名)。
+///
+/// 只消费 `mode=/uid=/gid=`;其余常见选项接受但忽略。
+fn parse_devtmpfs_mount_options(data: &str) -> VfsResult<FileMode> {
+    let mut mode = DEVTMPFS_STANDARD_POLICY.dir_mode;
+    for item in data.split(',').filter(|item| !item.is_empty()) {
+        let (key, value) = item.split_once('=').unwrap_or((item, ""));
+        match key {
+            "mode" => mode = FileMode::new(parse_octal_mount_mode(value)?),
+            "uid" | "gid" | "nosuid" | "nodev" | "noexec" | "rw" | "ro" | "defaults" => {}
+            _ => return Err(VfsError::InvalidArgument),
+        }
+    }
+    Ok(mode)
+}
+
+fn parse_octal_mount_mode(value: &str) -> VfsResult<u16> {
+    if value.is_empty() {
+        return Err(VfsError::InvalidArgument);
+    }
+    let mut result = 0u16;
+    for byte in value.bytes() {
+        if !(b'0'..=b'7').contains(&byte) {
+            return Err(VfsError::InvalidArgument);
+        }
+        result = result
+            .checked_mul(8)
+            .and_then(|value| value.checked_add((byte - b'0') as u16))
+            .ok_or(VfsError::InvalidArgument)?;
+    }
+    Ok(result)
+}
+
 pub struct DevTmpfsDriver;
 
 impl FsDriver for DevTmpfsDriver {
@@ -2858,13 +2804,14 @@ impl FsDriver for DevTmpfsDriver {
         FsDriverFlags::NODEV.with(FsDriverFlags::SINGLE)
     }
 
-    fn mount(&self, _dev: Option<&str>, _data: &str) -> VfsResult<Arc<Superblock>> {
+    fn mount(&self, _dev: Option<&str>, data: &str) -> VfsResult<Arc<Superblock>> {
         // devtmpfs 是内核设备树的用户可见投影，不能像 tmpfs 一样每次 mount
         // 都创建空实例。启动期 PnP bridge 安装后，用户态再次挂载 devtmpfs
         // 应复用同一个 superblock，否则会覆盖掉已经绑定的 console/uart/vd0 等节点。
         if let Some(sb) = mounted_devtmpfs_sb() {
             return Ok(sb);
         }
+        let mount_root_mode = parse_devtmpfs_mount_options(data)?;
 
         let fs_id = FsId::new(DEVTMPFS_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed));
 
@@ -2887,7 +2834,7 @@ impl FsDriver for DevTmpfsDriver {
             let root_meta = InodeMeta {
                 size: 0,
                 nlink: 2,
-                mode: DEVTMPFS_STANDARD_POLICY.dir_mode,
+                mode: mount_root_mode,
                 uid: DEVTMPFS_STANDARD_POLICY.uid,
                 gid: DEVTMPFS_STANDARD_POLICY.gid,
                 atime: now,
@@ -2937,4 +2884,235 @@ impl FsDriver for DevTmpfsDriver {
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
+}
+
+// ───────── 虚拟终端节点投影 ─────────
+
+const VT_DEVNODE_OWNER: &'static str = "vt-devnode";
+
+/// tty0 / VT console 节点:open 时解析为当前活动 VT。
+///
+/// 与 Linux 的 `/dev/tty0` 语义一致:它是活动 VT 的别名,切换后重新打开
+/// 即得到新活动 VT。
+struct VtZeroInodeOps {
+    manager: &'static crate::dev::tty::VtManager,
+}
+
+impl InodeOps for VtZeroInodeOps {
+    fn lookup(&self, _inode: &Inode, _name: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+
+    fn open(
+        &self,
+        _inode: &Inode,
+        opts: &OpenOptions,
+        _cred: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        let Some(fg) = self.manager.fg_vt() else {
+            return Err(VfsError::NoDevice);
+        };
+        let Some(dev) = fg.char_device() else {
+            return Err(VfsError::NoDevice);
+        };
+        if !dev.is_active() {
+            return Err(VfsError::NoDevice);
+        }
+        let tty = tty::shared_tty_core(&dev);
+        Ok(Box::new(CharDevFileOps::new(dev, opts.nonblock, tty)))
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn vt_zero_node_build(
+    spec: &CustomDevNodeSpec,
+) -> VfsResult<Option<Arc<dyn InodeOps + Send + Sync>>> {
+    // 适配器按注册顺序逐个尝试;不属于自己的 spec 返回 None 交给下一个。
+    let payload = spec.payload();
+    let Some(manager) = payload
+        .as_ref()
+        .downcast_ref::<&'static crate::dev::tty::VtManager>()
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(VtZeroInodeOps { manager: *manager })))
+}
+
+fn bind_vt_zero_node(
+    dev_ops: &DevTmpfsSuperblockOps,
+    name: &'static str,
+    manager: &'static crate::dev::tty::VtManager,
+) -> VfsResult<()> {
+    register_custom_devnode_adapter(DevTmpfsCustomNodeAdapter::new(
+        VT_DEVNODE_OWNER,
+        name,
+        vt_zero_node_build,
+    ))?;
+    let payload: Arc<dyn core::any::Any + Send + Sync> = Arc::new(manager);
+    let spec = CustomDevNodeSpec::try_new(name, CustomDevNodeKind::CharDevice, payload)?;
+    dev_ops.bind_custom(&spec)
+}
+
+/// `/dev/tty`(5:0)别名节点:open 时解析为当前会话的控制终端。
+///
+/// 无控制终端返回 ENXIO(Linux 语义);控制终端必须是 CharDevice 承载
+/// 的 tty(当前全部后端均满足)。
+pub fn register_tty_alias_devnode() -> VfsResult<()> {
+    register_custom_devnode_adapter(DevTmpfsCustomNodeAdapter::new(
+        "tty-alias-devnode",
+        "tty",
+        tty_alias_node_build,
+    ))?;
+    register_static_dev_node(DevTmpfsStaticNode::new(
+        "tty-alias-devnode",
+        "tty",
+        build_tty_alias_node,
+    ))?;
+    Ok(())
+}
+
+fn build_tty_alias_node() -> VfsResult<DevNodeSpec> {
+    let payload: Arc<dyn core::any::Any + Send + Sync> = Arc::new(());
+    Ok(DevNodeSpec::custom(CustomDevNodeSpec::try_new(
+        "tty",
+        CustomDevNodeKind::CharDevice,
+        payload,
+    )?))
+}
+
+fn tty_alias_node_build(
+    spec: &CustomDevNodeSpec,
+) -> VfsResult<Option<Arc<dyn InodeOps + Send + Sync>>> {
+    if spec.name() != "tty" {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(TtyAliasInodeOps)))
+}
+
+/// 会话控制终端别名节点(tty0 式 open 时解析,但目标是会话 ctty)。
+struct TtyAliasInodeOps;
+
+impl InodeOps for TtyAliasInodeOps {
+    fn lookup(&self, _inode: &Inode, _name: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+
+    fn open(
+        &self,
+        _inode: &Inode,
+        opts: &OpenOptions,
+        _cred: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        let Some(cookie) = sched::operation::current_session_ctty() else {
+            return Err(VfsError::NoSuchDeviceOrAddress);
+        };
+        let Some(core) = tty::resolve_ctty_cookie(cookie) else {
+            return Err(VfsError::NoSuchDeviceOrAddress);
+        };
+        // 会话退出后惰性释放:ctty 指向的会话已不存在时按无控制终端处理。
+        if let Some(sid) = core.session_sid()
+            && !sched::operation::session_exists(sid)
+        {
+            let _ = sched::operation::set_current_session_ctty(None);
+            return Err(VfsError::NoSuchDeviceOrAddress);
+        }
+        let Some(dev) = core.char_device() else {
+            return Err(VfsError::NoSuchDeviceOrAddress);
+        };
+        char_dev_file_ops(dev, opts.nonblock)
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+/// `/dev/ptmx` 节点:open 时分配 pty 对并返回 master。
+pub fn register_pty_devnode() -> VfsResult<()> {
+    register_custom_devnode_adapter(DevTmpfsCustomNodeAdapter::new(
+        "ptmx-devnode",
+        "ptmx",
+        ptmx_node_build,
+    ))?;
+    register_static_dev_node(DevTmpfsStaticNode::new(
+        "ptmx-devnode",
+        "ptmx",
+        build_ptmx_node,
+    ))?;
+    Ok(())
+}
+
+fn build_ptmx_node() -> VfsResult<DevNodeSpec> {
+    let payload: Arc<dyn core::any::Any + Send + Sync> = Arc::new(());
+    Ok(DevNodeSpec::custom(CustomDevNodeSpec::try_new(
+        "ptmx",
+        CustomDevNodeKind::CharDevice,
+        payload,
+    )?))
+}
+
+fn map_pty_open_err(err: Errno) -> VfsError {
+    match err {
+        Errno::ENOMEM => VfsError::OutOfMemory,
+        Errno::EAGAIN => VfsError::NoSpace,
+        _ => VfsError::NoDevice,
+    }
+}
+
+fn ptmx_node_build(spec: &CustomDevNodeSpec) -> VfsResult<Option<Arc<dyn InodeOps + Send + Sync>>> {
+    if spec.name() != "ptmx" {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(PtyMasterInodeOps)))
+}
+
+struct PtyMasterInodeOps;
+
+impl InodeOps for PtyMasterInodeOps {
+    fn lookup(&self, _inode: &Inode, _name: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+
+    fn open(
+        &self,
+        _inode: &Inode,
+        opts: &OpenOptions,
+        _cred: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        crate::dev::tty::pty::open_ptmx(opts.nonblock).map_err(map_pty_open_err)
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+/// 安装虚拟终端节点投影:tty0(活动 VT 别名)+ tty1..tty7。
+///
+/// `bind_console` 为 true 时(`console=ttyN`)把 `/dev/console` 重绑为
+/// 活动 VT 别名;否则 console 保持指向物理串口。节点创建与 VT 管理器
+/// 安装分离,便于启动期按 console= 参数决定输入路由与 console 绑定。
+pub fn install_virtual_terminal_nodes(
+    dev_ops: &DevTmpfsSuperblockOps,
+    manager: &'static crate::dev::tty::VtManager,
+    bind_console: bool,
+) -> VfsResult<()> {
+    bind_vt_zero_node(dev_ops, "tty0", manager)?;
+    for index in 1..crate::dev::tty::vt::VT_COUNT {
+        let Some(vt) = manager.vt(index as u8) else {
+            continue;
+        };
+        let Some(dev) = vt.char_device() else {
+            continue;
+        };
+        dev_ops.bind_char(&vt.name(), dev)?;
+    }
+    if bind_console {
+        let _ = dev_ops.unbind("console");
+        bind_vt_zero_node(dev_ops, "console", manager)?;
+    }
+    Ok(())
 }

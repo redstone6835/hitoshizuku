@@ -18,6 +18,7 @@ pub(super) struct ElmBuildBoundRecord {
 }
 
 impl ElmBuildBoundRecord {
+    #[allow(dead_code)] // Generated build-bound manifests call this only when records exist.
     pub const fn new(
         order: u32,
         name: &'static str,

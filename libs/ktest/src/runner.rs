@@ -49,13 +49,19 @@ fn tap_write(bytes: &[u8]) {
 #[cfg(feature = "kernel")]
 pub fn run_all() -> KtestReport {
     unsafe extern "C" {
-        static __start_ktest: KtestEntry;
-        static __stop_ktest: KtestEntry;
+        static __start_ktest: u8;
+        static __stop_ktest: u8;
     }
 
-    let start = &raw const __start_ktest as *const KtestEntry;
-    let end = &raw const __stop_ktest as *const KtestEntry;
-    let count = unsafe { end.offset_from(start) } as usize;
+    let start = (&raw const __start_ktest).cast::<KtestEntry>();
+    let end = (&raw const __stop_ktest).cast::<KtestEntry>();
+    let byte_len = end.addr() - start.addr();
+    assert_eq!(
+        byte_len % core::mem::size_of::<KtestEntry>(),
+        0,
+        "ktest linker section has a partial entry"
+    );
+    let count = byte_len / core::mem::size_of::<KtestEntry>();
 
     let header = alloc::format!("TAP version 14\n1..{}\n", count);
     tap_write(header.as_bytes());

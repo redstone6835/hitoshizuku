@@ -34,7 +34,7 @@
 //! 1. `RT_SCHEDULING_CONFIG` —— 仅 sysctl 更新路径持有；可依次进入各 CPU
 //!    `Runqueue::inner`，反向获取禁止。
 //! 2. `Runqueue::inner` —— 每 CPU 一把，严禁跨 rq 反序。
-//! 3. `Task::rel` —— 亲子关系（parent / children / tg_link / pid_in_ns）。
+//! 3. `Task::rel` —— 亲子关系、进程组和 PID 命名空间状态。
 //! 4. `Task::creds` / `Task::kstack` / `Task::ctx` / `Task::ext` —— 同一
 //!    Task 内的次级字段锁，彼此独立，禁止互相嵌套。`Task::shared_signal`
 //!    是稳定的 `Arc`，其内部状态按自身规则同步。
@@ -56,8 +56,10 @@
 extern crate alloc;
 
 pub mod arch_hooks;
+pub mod avenrun;
 pub mod clone_flags;
 pub mod cpu;
+pub mod cpu_itimer;
 mod deadline_admission;
 pub mod eevdf;
 pub mod group;
@@ -68,6 +70,7 @@ pub mod mutex;
 pub mod operation;
 pub mod pid;
 pub mod placement;
+pub mod posix_timer;
 pub mod process_ops;
 pub mod rlimit;
 pub mod rseq;
@@ -91,6 +94,7 @@ pub use cpu::{
     CpuId, CpuMask, MAX_SCHED_DOMAINS, SCHED_CAPACITY_SCALE, SchedDomain, SchedPlacement,
     SchedTopology,
 };
+pub use cpu_itimer::{CpuItimerKind, CpuItimerSpec, account_tick_user_system};
 pub use eevdf::{SchedEntity, SchedParams, Weight};
 pub use group::{
     GroupExitStatus, ProcessExitObserver, ProcessGroup, ProcessPersonalityState, Session,
@@ -121,7 +125,7 @@ pub use sched_class::{
 pub use scheduler::current_task_epoch;
 pub use scheduler::{
     BorrowedCurrentTask, NR_CPUS, acknowledge_resched_notification, activate_cpu, active_cpu_mask,
-    balance_once, borrow_current_task_internal, current_cpu_id, current_task,
+    balance_once, boot_pid_ns, borrow_current_task_internal, current_cpu_id, current_task,
     current_task_cpu_time_ns, current_task_direct, current_task_fast, current_task_fast_direct,
     current_task_fast_internal, current_task_handoff_target, current_task_id, current_task_on,
     current_task_ref, deadline_timer_fired, defer_pi_effective_update, defer_task_wake,
@@ -171,12 +175,13 @@ pub use spawn::{
 pub use task::{
     DEFAULT_TIMER_SLACK_NS, ExecutionActionClaim, ExecutionScopeKind, ExitCode, RobustListState,
     RseqRegistration, SigAltStack, TASK_COMM_LEN, TASKEXT_ELM_EXECUTION, TASKEXT_EXEC_ACCESS,
-    TASKEXT_EXEC_ARGS, TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_RISCV_VECTOR_SIGNAL_STACK,
-    TASKEXT_RISCV_VECTOR_STATE, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE,
-    TASKEXT_VM_SPACE, Task, TaskDiag, TaskExitAccountingHook, TaskExt, TaskExtCloneHook,
-    TaskExtExitHook, TaskExtKey, TaskKind, TaskPreExitHook, TaskState, TaskUsage, WaitReason,
-    ext_clone_hook, ext_exit_hook, pre_exit_hook, register_exit_accounting_hook,
-    register_ext_clone_hook, register_ext_exit_hook, register_pre_exit_hook, task_diag,
+    TASKEXT_EXEC_ARGS, TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_PTRACE_FRAME,
+    TASKEXT_RISCV_VECTOR_SIGNAL_STACK, TASKEXT_RISCV_VECTOR_STATE, TASKEXT_USER_TRAP_FRAME,
+    TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task, TaskDiag,
+    TaskExitAccountingHook, TaskExt, TaskExtCloneHook, TaskExtExitHook, TaskExtKey, TaskKind,
+    TaskPreExitHook, TaskState, TaskUsage, WaitReason, ext_clone_hook, ext_exit_hook,
+    pre_exit_hook, register_exit_accounting_hook, register_ext_clone_hook, register_ext_exit_hook,
+    register_pre_exit_hook, task_diag,
 };
 pub use wait::{WaitQueue, WaitQueueEntry};
 pub use wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};
@@ -184,10 +189,10 @@ pub use wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};
 /// 强制链接器保留调度子系统直接符号所在的代码生成单元。
 #[doc(hidden)]
 pub fn kernel_symbol_catalog_anchor() -> usize {
-    scheduler::current_cpu_id as usize
-        ^ spawn::spawn_child as usize
-        ^ operation::getpid as usize
-        ^ operation::spawn_user_process as usize
+    scheduler::current_cpu_id as *const () as usize
+        ^ spawn::spawn_child as *const () as usize
+        ^ operation::getpid as *const () as usize
+        ^ operation::spawn_user_process as *const () as usize
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ use native_abi::{NativeHandle, OperationId};
 use super::NativeProcessState;
 use super::operations::{PinnedNativeHandle, execute_native_operation};
 
+#[cfg(any(feature = "kernel-tests", feature = "soyo-tests"))]
 pub(super) fn dispatch_native_call(
     task: &Arc<sched::Task>,
     call: NativeCallFrame,

@@ -43,7 +43,6 @@ pub const EXT4_VERITY_FL: u32 = 0x0010_0000;
 
 pub const S_IFREG: u16 = 0x8000;
 pub const S_IFDIR: u16 = 0x4000;
-pub const S_IFLNK: u16 = 0xa000;
 
 pub const COMPAT_HAS_JOURNAL: u32 = 0x0004;
 pub const COMPAT_ORPHAN_FILE: u32 = 0x1000;
@@ -86,10 +85,6 @@ pub fn le32(b: &mut [u8], off: usize, v: u32) {
 #[inline]
 pub fn le64(b: &mut [u8], off: usize, v: u64) {
     b[off..off + 8].copy_from_slice(&v.to_le_bytes());
-}
-#[inline]
-pub fn be16(b: &mut [u8], off: usize, v: u16) {
-    b[off..off + 2].copy_from_slice(&v.to_be_bytes());
 }
 #[inline]
 pub fn be32(b: &mut [u8], off: usize, v: u32) {
@@ -338,13 +333,6 @@ impl ExtImg {
         le32(sb, 0x3fc, sum);
     }
 
-    pub fn state_flags(&self) -> u16 {
-        u16::from_le_bytes([self.data[1024 + 0x3a], self.data[1024 + 0x3b]])
-    }
-    pub fn incompat_features(&self) -> u32 {
-        rd32(&self.data[1024..2048], 0x60)
-    }
-
     fn write_gdt(&mut self) {
         let _ = self.csum_seed;
         let mut desc = [0u8; 64];
@@ -398,14 +386,6 @@ impl ExtImg {
         } else {
             bm[byte] &= !mask;
         }
-    }
-
-    pub fn block_used(&self, blk: u32) -> bool {
-        self.block(BLOCK_BITMAP)[(blk / 8) as usize] & (1u8 << (blk % 8)) != 0
-    }
-    pub fn inode_used(&self, ino: u32) -> bool {
-        let bit = ino - 1;
-        self.block(INODE_BITMAP)[(bit / 8) as usize] & (1u8 << (bit % 8)) != 0
     }
 
     /// 写一个 inode(自动处理 METADATA_CSUM)。
@@ -595,13 +575,6 @@ impl ExtImg {
         self.block_mut(Self::journal_phys(0)).copy_from_slice(&jsb);
     }
 
-    pub fn jsb_start(&self) -> u32 {
-        rdb32(self.block(Self::journal_phys(0)), 0x1c)
-    }
-    pub fn jsb_sequence(&self) -> u32 {
-        rdb32(self.block(Self::journal_phys(0)), 0x18)
-    }
-
     fn journal_csum_seed(&self) -> u32 {
         crc::crc32c(&self.uuid)
     }
@@ -741,17 +714,6 @@ impl ExtImg {
         le32(&mut v, 16, pblk as u32);
         v
     }
-    /// FC DEL_RANGE tag。
-    pub fn fc_del_range(ino: u32, lblk: u32, len: u32) -> Vec<u8> {
-        let mut v = vec![0u8; 4 + 12];
-        le16(&mut v, 0, 2); // EXT4_FC_TAG_DEL_RANGE
-        le16(&mut v, 2, 12);
-        le32(&mut v, 4, ino);
-        le32(&mut v, 8, lblk);
-        le32(&mut v, 12, len);
-        v
-    }
-
     /// 把一串 FC tag(不含 TAIL)打包进一个 fc 块并自动追加合法 TAIL。
     /// 返回块内容。`tid` 同时用于 HEAD 与 TAIL。
     pub fn fc_block(&self, tid: u32, tags: &[Vec<u8>]) -> Vec<u8> {

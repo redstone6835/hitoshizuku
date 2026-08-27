@@ -21,6 +21,7 @@ use aml::value::{Args, RegionSpace, StatusObject};
 use aml::{AmlContext, AmlError, AmlName, AmlValue, DebugVerbosity, LevelType};
 
 use allocator::KERNEL_ALLOCATOR;
+use general::dev::dma::DmaContext;
 use general::dev::platform::{
     DeviceMatchId, DeviceProperties, DeviceResource, IrqPolarity, IrqResourceAttributes,
     IrqSharing, IrqTrigger, PlatformDeviceInfo, PlatformProbeStatus,
@@ -134,10 +135,6 @@ impl AcpiMapper {
         };
         unsafe { ptr::write_volatile(virtual_address as *mut T, value) };
         true
-    }
-
-    fn pci_backend_available(self) -> bool {
-        self.host_ops.pci.is_some() || self.mcfg_entries().next().is_some()
     }
 
     fn mcfg_entries(self) -> impl Iterator<Item = &'static [u8]> {
@@ -672,19 +669,21 @@ pub fn kernel_start_init(context: &StartContext) {
     let stdout_phys = console_serial_port_phys;
     let mut platform_bound = 0usize;
     for device in &serial_devices {
-        let port = device.port;
+        let port = &device.port;
         let mut ids = Vec::new();
         ids.push(DeviceMatchId::AcpiHid(ACPI_HID_PNP0500.into()));
         ids.push(DeviceMatchId::AcpiHid(ACPI_HID_PNP0501.into()));
         let info = PlatformDeviceInfo {
-            fw_name: port.name.into(),
+            fw_name: port.name.clone(),
             fw_path: None,
             fw_parent_path: None,
             ids,
             resources: device.resources.clone(),
+            irq_names: Vec::new(),
             properties: DeviceProperties {
                 clock_hz: port.clock_hz,
                 baud: port.baud,
+                numa_node_id: None,
                 fw_phandle: None,
                 fw_interrupt_parent: None,
                 interrupt_controller: false,
@@ -695,6 +694,10 @@ pub fn kernel_start_init(context: &StartContext) {
                 stdout: stdout_phys == Some(port.phys_addr),
             },
             fw_properties: Vec::new(),
+            dma: DmaContext::default_coherent(),
+            dtb_bindings: None,
+            dtb_pcie_host: None,
+            dtb_owned_nodes: None,
         };
         if register_platform_device(info, "acpi") {
             platform_bound += 1;
@@ -709,8 +712,13 @@ pub fn kernel_start_init(context: &StartContext) {
             fw_parent_path: None,
             ids,
             resources: device.resources.clone(),
+            irq_names: Vec::new(),
             properties: DeviceProperties::default(),
             fw_properties: Vec::new(),
+            dma: DmaContext::default_coherent(),
+            dtb_bindings: None,
+            dtb_pcie_host: None,
+            dtb_owned_nodes: None,
         };
         if register_platform_device(info, "acpi") {
             platform_bound += 1;
@@ -733,6 +741,7 @@ pub fn kernel_start_init(context: &StartContext) {
         Arc::clone(&root_mount),
         Arc::clone(&mount_ns),
         Arc::new(cred.clone()),
+        false,
     );
 
     printk!(
@@ -756,7 +765,7 @@ pub fn kernel_start_init(context: &StartContext) {
             device.port.name
         );
         Some(crate::device_init::BootConsoleSelector::FirmwareName(
-            String::from(device.port.name),
+            String::from(device.port.name.as_ref()),
         ))
     } else {
         None
@@ -898,7 +907,7 @@ fn discover_acpi_namespace_devices(
                 );
                 serial_devices.push(FirmwareSerialDevice {
                     port: SerialPortInfo {
-                        name,
+                        name: name.into(),
                         phys_addr,
                         reg_size: Some(size),
                         clock_hz: None,
@@ -1761,7 +1770,7 @@ fn serial_device_from_spcr(tables: &acpi::AcpiTables<AcpiMapper>) -> Option<Firm
 
     Some(FirmwareSerialDevice {
         port: SerialPortInfo {
-            name,
+            name: name.into(),
             phys_addr,
             reg_size: None,
             clock_hz,
@@ -1976,7 +1985,7 @@ mod tests {
             StartAcpiHostOps::NONE,
         );
 
-        assert!(mapper.pci_backend_available());
+        assert!(mapper.host_ops.pci.is_some() || mapper.mcfg_entries().next().is_some());
         assert_eq!(
             mapper.pci_ecam_address(2, 0x21, 3, 2, 0x120),
             Some(0x8011_a120)
@@ -2014,7 +2023,7 @@ mod tests {
             StartAcpiHostOps::NONE,
         );
 
-        assert!(!mapper.pci_backend_available());
+        assert!(!(mapper.host_ops.pci.is_some() || mapper.mcfg_entries().next().is_some()));
         assert_eq!(mapper.pci_ecam_address(0, 0x20, 0, 0, 0), None);
     }
 

@@ -22,6 +22,7 @@ pub enum Errno {
     EEXIST = 17,
     ENODEV = 19,
     ENOTDIR = 20,
+    ENOKEY = 126,
     EISDIR = 21,
     EXDEV = 18,
     ENFILE = 23,
@@ -59,6 +60,7 @@ pub enum Errno {
     EPROTOTYPE = 91,
     ENOPROTOOPT = 92,
     EPROTONOSUPPORT = 93,
+    ESOCKTNOSUPPORT = 94,
     EAFNOSUPPORT = 97,
     EADDRINUSE = 98,
     EADDRNOTAVAIL = 99,
@@ -73,6 +75,7 @@ pub enum Errno {
     EMSGSIZE = 90,
     EISCONN = 106,
     ENOTCONN = 107,
+    ESHUTDOWN = 108,
     ETIMEDOUT = 110,
     ECONNREFUSED = 111,
     EHOSTUNREACH = 113,
@@ -89,7 +92,7 @@ pub enum Errno {
 /// 强制链接器保留错误码转换直接符号目录。
 #[doc(hidden)]
 pub fn kernel_symbol_catalog_anchor() -> usize {
-    Errno::from_i32 as usize ^ Errno::as_i32 as usize
+    Errno::from_i32 as *const () as usize ^ Errno::as_i32 as *const () as usize
 }
 
 #[kernel_symbols::export]
@@ -120,6 +123,7 @@ impl Errno {
             18 => Errno::EXDEV,
             19 => Errno::ENODEV,
             20 => Errno::ENOTDIR,
+            126 => Errno::ENOKEY,
             21 => Errno::EISDIR,
             23 => Errno::ENFILE,
             24 => Errno::EMFILE,
@@ -158,6 +162,7 @@ impl Errno {
             91 => Errno::EPROTOTYPE,
             92 => Errno::ENOPROTOOPT,
             93 => Errno::EPROTONOSUPPORT,
+            94 => Errno::ESOCKTNOSUPPORT,
             95 => Errno::EOPNOTSUPP,
             97 => Errno::EAFNOSUPPORT,
             98 => Errno::EADDRINUSE,
@@ -170,6 +175,7 @@ impl Errno {
             105 => Errno::ENOBUFS,
             106 => Errno::EISCONN,
             107 => Errno::ENOTCONN,
+            108 => Errno::ESHUTDOWN,
             110 => Errno::ETIMEDOUT,
             111 => Errno::ECONNREFUSED,
             113 => Errno::EHOSTUNREACH,
@@ -208,6 +214,7 @@ impl Errno {
             Errno::EXDEV => 18,
             Errno::ENODEV => 19,
             Errno::ENOTDIR => 20,
+            Errno::ENOKEY => 126,
             Errno::EISDIR => 21,
             Errno::ENFILE => 23,
             Errno::EMFILE => 24,
@@ -246,6 +253,7 @@ impl Errno {
             Errno::EPROTOTYPE => 91,
             Errno::ENOPROTOOPT => 92,
             Errno::EPROTONOSUPPORT => 93,
+            Errno::ESOCKTNOSUPPORT => 94,
             Errno::EOPNOTSUPP => 95,
             Errno::EAFNOSUPPORT => 97,
             Errno::EADDRINUSE => 98,
@@ -258,6 +266,7 @@ impl Errno {
             Errno::ENOBUFS => 105,
             Errno::EISCONN => 106,
             Errno::ENOTCONN => 107,
+            Errno::ESHUTDOWN => 108,
             Errno::ETIMEDOUT => 110,
             Errno::ECONNREFUSED => 111,
             Errno::EHOSTUNREACH => 113,

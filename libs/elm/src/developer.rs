@@ -934,6 +934,7 @@ pub struct ManagedRequest {
 
 impl ManagedRequest {
     /// 返回调用帧中前 `payload_len` 字节的有效载荷。
+    #[inline(always)]
     pub fn payload(&self) -> &[u8] {
         &self.frame.payload[..usize::from(self.frame.payload_len)]
     }
@@ -977,6 +978,7 @@ impl ProviderReply {
     ///
     /// `payload` 超过 [`ELM_FRAME_PAYLOAD_LEN`](crate::ELM_FRAME_PAYLOAD_LEN) 时返回
     /// [`PayloadError::BufferTooSmall`]，不会截断数据。
+    #[inline(always)]
     pub fn bytes(status: i32, payload: &[u8]) -> Result<Self, PayloadError> {
         if payload.len() > ELM_FRAME_PAYLOAD_LEN {
             return Err(PayloadError::BufferTooSmall);
@@ -1971,6 +1973,7 @@ pub mod __private {
         }
     }
 
+    #[inline(always)]
     pub unsafe fn managed_trampoline(
         raw: *mut ElmNativeManagedCallV1,
         handler: fn(&ManagedRequest) -> ManagedResult,

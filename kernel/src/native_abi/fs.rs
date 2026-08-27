@@ -211,27 +211,6 @@ pub(super) fn validate_file_io_flags(flags: u64) -> Result<(), u32> {
         .ok_or(status::CORE_INVALID_ARGUMENT)
 }
 
-pub(super) fn file_read_memory(
-    file: &FileObject,
-    memory: &Arc<super::memory::MemoryObject>,
-    memory_offset: u64,
-    length: u64,
-    file_offset: u64,
-) -> NativeCallOutcome {
-    let Ok(length) = usize::try_from(length) else {
-        return native_return(status::CORE_OUT_OF_RANGE, 0, 0);
-    };
-    if length == 0 {
-        return native_return(status::OK, 0, 0);
-    }
-    let mut buffer = alloc::vec::Vec::new();
-    if buffer.try_reserve_exact(length).is_err() {
-        return native_return(status::CORE_RESOURCE_EXHAUSTED, 0, 0);
-    }
-    buffer.resize(length, 0);
-    file_read_memory_buffered(file, memory, memory_offset, file_offset, &mut buffer)
-}
-
 pub(super) fn file_read_memory_buffered(
     file: &FileObject,
     memory: &Arc<super::memory::MemoryObject>,
@@ -250,27 +229,6 @@ pub(super) fn file_read_memory_buffered(
         return native_return(error, 0, 0);
     }
     native_return(status::OK, count as u64, 0)
-}
-
-pub(super) fn file_write_memory(
-    file: &FileObject,
-    memory: &Arc<super::memory::MemoryObject>,
-    memory_offset: u64,
-    length: u64,
-    file_offset: u64,
-) -> NativeCallOutcome {
-    let Ok(length) = usize::try_from(length) else {
-        return native_return(status::CORE_OUT_OF_RANGE, 0, 0);
-    };
-    if length == 0 {
-        return native_return(status::OK, 0, 0);
-    }
-    let mut buffer = alloc::vec::Vec::new();
-    if buffer.try_reserve_exact(length).is_err() {
-        return native_return(status::CORE_RESOURCE_EXHAUSTED, 0, 0);
-    }
-    buffer.resize(length, 0);
-    file_write_memory_buffered(file, memory, memory_offset, file_offset, &mut buffer)
 }
 
 pub(super) fn file_write_memory_buffered(

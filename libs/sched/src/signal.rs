@@ -69,7 +69,12 @@ sig_const!(
     SIGTTIN = 21,
     SIGTTOU = 22,
     SIGURG = 23,
+    SIGXCPU = 24,
+    SIGXFSZ = 25,
+    SIGVTALRM = 26,
+    SIGPROF = 27,
     SIGWINCH = 28,
+    SIGSYS = 31,
 );
 
 /// 64 位信号位集。Linux/POSIX sigset 编码用 bit(signo - 1) 表示信号 signo。
@@ -425,6 +430,11 @@ impl SignalState {
         SigSet(self.pending_bits.load(Ordering::Acquire))
     }
 
+    /// 排队 siginfo 的非破坏性快照（`PTRACE_PEEKSIGINFO` 用）。
+    pub fn pending_infos_snapshot(&self) -> Vec<SigInfo> {
+        self.pending_infos.lock().clone()
+    }
+
     /// blocked 位图快照。
     pub fn blocked_snapshot(&self) -> SigSet {
         SigSet(self.blocked.load(Ordering::Acquire))
@@ -722,6 +732,11 @@ impl SharedSignal {
 
     pub fn pending_len_hint(&self) -> usize {
         self.shared_pending_infos.lock().len()
+    }
+
+    /// 进程级排队 siginfo 的非破坏性快照（`PTRACE_PEEKSIGINFO` SHARED 用）。
+    pub fn shared_pending_infos_snapshot(&self) -> Vec<SigInfo> {
+        self.shared_pending_infos.lock().clone()
     }
 }
 

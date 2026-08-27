@@ -34,7 +34,7 @@ use crate::signal::{
     DefaultAction, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet,
     SignalNumber, default_action,
 };
-use crate::spawn::{abort_new_task, activate_task, clone_task, exit_task, reap_matching};
+use crate::spawn::{abort_new_task, activate_task, clone_task, exit_task, reap_matching_across};
 use crate::task::{Task, TaskUsage};
 use crate::wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};
 use crate::{ExitCode, TaskState};
@@ -86,15 +86,24 @@ pub fn getegid() -> Gid {
 
 // ── 进程组 / 会话 ────────────────────────────────────────────────────────────
 
-fn lookup_pid(pid: PidT) -> Result<Arc<Task>, Errno> {
+/// 按 pid 查找任务：从调用者自身的 pid 命名空间向根逐层解析
+/// （Linux `find_task_by_vpid` 语义）。
+pub fn lookup_pid(pid: PidT) -> Result<Arc<Task>, Errno> {
     if pid == 0 {
         return Ok(current_task());
     }
-    root_pid_ns()
-        .registry()
-        .lookup(pid)
-        .and_then(|w| w.upgrade())
-        .ok_or(Errno::ESRCH)
+    let me = current_task();
+    let mut ns = me.pid_ns();
+    loop {
+        if let Some(task) = ns.registry().lookup(pid).and_then(|w| w.upgrade()) {
+            return Ok(task);
+        }
+        match ns.parent() {
+            Some(parent) => ns = Arc::clone(parent),
+            None => break,
+        }
+    }
+    Err(Errno::ESRCH)
 }
 
 pub fn getpgid(pid: PidT) -> Result<PidT, Errno> {
@@ -116,19 +125,78 @@ pub fn getsid(pid: PidT) -> Result<PidT, Errno> {
         .ok_or(Errno::ESRCH)
 }
 
+/// 当前任务所在会话的 sid(无会话返回 None)。
+pub fn current_session_id() -> Option<PidT> {
+    let me = current_task();
+    let pg = me.process_group();
+    let session = pg.session()?;
+    (session.sid() > 0).then_some(session.sid())
+}
+
+/// 当前会话是否为调用者(会话首进程)。
+pub fn is_current_session_leader() -> bool {
+    let Some(sid) = current_session_id() else {
+        return false;
+    };
+    getpid() == sid
+}
+
+/// 当前会话的控制终端 cookie。
+pub fn current_session_ctty() -> Option<u64> {
+    current_task().process_group().session()?.ctty()
+}
+
+/// 设置当前会话的控制终端 cookie。
+pub fn set_current_session_ctty(cookie: Option<u64>) -> Result<(), Errno> {
+    let session = current_task()
+        .process_group()
+        .session()
+        .ok_or(Errno::EPERM)?;
+    session.set_ctty(cookie);
+    Ok(())
+}
+
+/// 会话是否仍然存活(惰性释放检查用)。
+pub fn session_exists(sid: PidT) -> bool {
+    getsid(sid).is_ok()
+}
+
 /// 设置 pid 所在的进程组为 pgid。POSIX 语义：
 /// - pid==0 → 当前线程
 /// - pgid==0 → pgid 等于 pid（自成一组 leader）
-/// - target 与 caller 必须在同一 session
+/// - target 必须为线程组 leader，且与 caller 在同一 session
+/// - caller 只能改自身或其尚未 exec 的直接子进程；target 不得是会话首进程
 pub fn setpgid(pid: PidT, pgid: PidT) -> Result<(), Errno> {
     let target = lookup_pid(pid)?;
     let me = current_task();
+
+    // Linux `setpgid`：目标必须是线程组 leader，否则 EINVAL。
+    if !target.is_thread_group_leader() {
+        return Err(Errno::EINVAL);
+    }
 
     // 必须同 session。
     let my_session = me.process_group().session().ok_or(Errno::EPERM)?;
     let target_session = target.process_group().session().ok_or(Errno::EPERM)?;
     if !Arc::ptr_eq(&my_session, &target_session) {
         return Err(Errno::EPERM);
+    }
+
+    // 调用者只能改自身，或其尚未 exec 的直接子进程；否则 EPERM。
+    // “尚未 exec”用线程组 exec_generation 判定（fork 新建线程组时为 0，exec
+    // 时 advance_generation 递增）；不用 TASKEXT_EXEC_PATH，因为 fork 的 ext
+    // clone hook 会把父进程的 exec 路径整体共享给子进程，无法区分是否已 exec。
+    let is_self = Arc::ptr_eq(&target, &me);
+    let is_unexeced_child = me.has_child(&target) && target.thread_group().exec_generation() == 0;
+    if !is_self && !is_unexeced_child {
+        return Err(Errno::EPERM);
+    }
+
+    // 目标不得是会话首进程；否则 EPERM。
+    if let Some(leader) = target_session.leader() {
+        if Arc::ptr_eq(&leader.thread_group(), &target.thread_group()) {
+            return Err(Errno::EPERM);
+        }
     }
 
     // 决定实际 pgid：0 → target 自己的 pid。
@@ -243,11 +311,20 @@ fn deliver_to_process_group(pg: Arc<ProcessGroup>, sig: Option<SignalNumber>) ->
     let Some(sig) = sig else { return Ok(()) };
     let info = make_siginfo(sig);
 
+    // `ProcessGroup::snapshot()` 以线程为粒度返回成员，多线程进程会出现多个
+    // 成员；同一线程组共享 pending，必须按 `ThreadGroup` 去重，否则一条信号
+    // 会被重复投进同一进程。
+    let mut delivered_groups: Vec<Arc<ThreadGroup>> = Vec::new();
     for m in pg.snapshot() {
         if m.is_kernel_task() {
             continue;
         }
+        let group = m.thread_group();
+        if delivered_groups.iter().any(|g| Arc::ptr_eq(g, &group)) {
+            continue;
+        }
         if check_kill_permission(&m).is_ok() {
+            delivered_groups.push(group);
             let _ = deliver_to_thread_group(&m, info);
         }
     }
@@ -928,10 +1005,11 @@ impl PreparedClone {
                     wait_child.vfork_done.finish_wait(&entry);
                 }
             }
-        } else if !self.args.flags.has(CloneFlags::CLONE_THREAD) {
+        } else {
             // 不在 clone syscall 尚未返回时直接重入调度：父进程的 trap frame
-            // 仍由 syscall 出口负责写返回值和推进 PC。这里只登记一次收尾后的
-            // 启动交接，由 syscall dispatcher 在安全边界切给新子进程。
+            // 仍由 syscall 出口负责写返回值和推进 PC。线程 clone 也必须登记一次
+            // 收尾后的启动交接，否则连续 pthread_create 会让父线程长期独占 CPU，
+            // 子线程无法及时运行和退出清理。
             request_post_syscall_handoff();
         }
 
@@ -1018,15 +1096,13 @@ pub(crate) fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
         | CloneFlags::CLONE_NEWNET
         | CloneFlags::CLONE_IO
         | CloneFlags::CLONE_CLEAR_SIGHAND;
-    const UNSUPPORTED: u64 = CloneFlags::CLONE_PTRACE
-        | CloneFlags::CLONE_NEWNS
-        | CloneFlags::CLONE_NEWCGROUP
-        | CloneFlags::CLONE_NEWUTS
-        | CloneFlags::CLONE_NEWIPC
-        | CloneFlags::CLONE_NEWUSER
-        | CloneFlags::CLONE_NEWPID
-        | CloneFlags::CLONE_NEWNET
-        | CloneFlags::CLONE_IO;
+    // NEWUSER/NEWNET 未实现（能力语义改造/网络栈 per-ns）；NEWTIME 只能经
+    // unshare(2) 使用（clone 报 EINVAL）。NEWNS/NEWCGROUP/NEWUTS/NEWIPC/
+    // NEWPID 由 kernel 侧在 clone 完成后安装命名空间。CLONE_PTRACE 在
+    // spawn 路径处理（父被追踪时子也被追踪）；CLONE_IO 无 io_context 记账，
+    // 作为 no-op 接受。
+    const UNSUPPORTED: u64 =
+        CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWTIME;
     if flags.has(CloneFlags::CLONE_NEWNS) && flags.has(CloneFlags::CLONE_FS) {
         return Err(Errno::EINVAL);
     }
@@ -1075,7 +1151,11 @@ pub(crate) fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
 
 // ── wait4 / waitid ───────────────────────────────────────────────────────────
 
-fn matches_waitid(child: &Arc<Task>, target: &WaitId, parent: &Arc<Task>) -> bool {
+/// `waitid` 目标匹配。
+///
+/// `caller` 是实际发起 wait 的线程；`WaitId::SameGroup` 与 `caller` 的进程组
+/// 比较（线程组全体成员共享同一进程组，因此用 caller 与用任一成员等价）。
+fn matches_waitid(child: &Arc<Task>, target: &WaitId, caller: &Arc<Task>) -> bool {
     if child.is_kernel_task() {
         return false;
     }
@@ -1083,23 +1163,59 @@ fn matches_waitid(child: &Arc<Task>, target: &WaitId, parent: &Arc<Task>) -> boo
         WaitId::All => true,
         WaitId::Pid(pid) => child.pid_root() == Some(*pid),
         WaitId::Pgid(pgid) => child.process_group().pgid() == *pgid,
-        WaitId::SameGroup => Arc::ptr_eq(&child.process_group(), &parent.process_group()),
+        WaitId::SameGroup => Arc::ptr_eq(&child.process_group(), &caller.process_group()),
         WaitId::Pidfd(group) => Arc::ptr_eq(&child.thread_group(), group),
     }
 }
 
+/// 按 `__WNOTHREAD` / `__WCLONE` 过滤出 wait 范围内的线程组成员。
+///
+/// 语义取舍（本内核的简化模型）：
+/// - 默认（无这些标志）及 `__WALL`：匹配线程组全体成员名下 children 的并集，
+///   即 `wait4(pid=-1)` 的默认行为；
+/// - `__WNOTHREAD`：只匹配线程组 leader 名下的 children，跳过 CLONE_THREAD 兄弟
+///   线程各自登记的 children；
+/// - `__WCLONE`：只匹配非 leader（CLONE_THREAD 兄弟）名下的 children；
+/// - 两者同时给出时退化为空集（没有成员在范围内）。
+fn wait_scope_members(me: &Arc<Task>, options: WaitOptions) -> Vec<Arc<Task>> {
+    let only_leader = options.has(WaitOptions::__WNOTHREAD);
+    let only_clone = options.has(WaitOptions::__WCLONE);
+    me.thread_group()
+        .snapshot()
+        .into_iter()
+        .filter(|member| {
+            let is_leader = member.is_thread_group_leader();
+            !(only_leader && !is_leader) && !(only_clone && is_leader)
+        })
+        .collect()
+}
+
+/// 线程组视角下可等待 children 的并集（去重）。POSIX wait 看到的是整个进程
+/// （线程组）名下 children 的并集，而非单个线程自己的 children 表。
+fn group_wait_children(scope: &[Arc<Task>]) -> Vec<Arc<Task>> {
+    let mut out: Vec<Arc<Task>> = Vec::new();
+    for member in scope {
+        for child in member.snapshot_children() {
+            if !out.iter().any(|c| Arc::ptr_eq(c, &child)) {
+                out.push(child);
+            }
+        }
+    }
+    out
+}
+
 fn wait_child_observable(
-    parent: &Arc<Task>,
-    target: WaitId,
+    children: &[Arc<Task>],
+    target: &WaitId,
+    caller: &Arc<Task>,
     wait_exited: bool,
     wait_stopped: bool,
     wait_continued: bool,
 ) -> bool {
-    let children = parent.snapshot_children();
     let mut any_match = false;
     for child in children
         .iter()
-        .filter(|c| matches_waitid(c, &target, parent))
+        .filter(|c| matches_waitid(c, target, caller))
     {
         any_match = true;
         if wait_exited && child.is_waitable_zombie() {
@@ -1151,26 +1267,27 @@ fn wait_common(
     let nowait = options.has(WaitOptions::WNOWAIT);
 
     loop {
-        // 1. 先看是否有退出事件匹配。wait4 的 options=0 隐含 WEXITED；
-        //    waitid 必须由调用方显式传 WEXITED/WSTOPPED/WCONTINUED。
+        // 1. 线程组视角：先算出 wait 范围内的 owner 成员与可等待 children 并集。
+        //    wait4 的 options=0 隐含 WEXITED；waitid 必须由调用方显式传
+        //    WEXITED/WSTOPPED/WCONTINUED。
+        let scope = wait_scope_members(&me, options);
+        let children = group_wait_children(&scope);
         let pred = |c: &Arc<Task>| matches_waitid(c, &target, &me);
+
         if wait_exited {
             if nowait {
-                if let Some(child) = me
-                    .snapshot_children()
-                    .into_iter()
-                    .find(|c| c.is_waitable_zombie() && pred(c))
-                {
+                if let Some(child) = children.iter().find(|c| c.is_waitable_zombie() && pred(c)) {
                     let code = child
                         .exit_code()
                         .expect("[sched][wait] zombie without exit code");
                     return Ok(WaitResult {
                         pid: child.pid_root().unwrap_or(0),
-                        status: child_exit_status(&child, code),
+                        status: child_exit_status(child, code),
                         usage: child.usage_snapshot(crate::scheduler::now_ns_public()),
+                        child_uid: child.credentials().uid,
                     });
                 }
-            } else if let Some((child, code)) = reap_matching(&me, pred) {
+            } else if let Some((child, code)) = reap_matching_across(&scope, &pred) {
                 #[cfg(feature = "trace-task-lifecycle")]
                 log::info!(
                     "[sched][wait] reap parent={:?} child={:?} target={:?}",
@@ -1182,37 +1299,39 @@ fn wait_common(
                     pid: child.pid_root().unwrap_or(0),
                     status: child_exit_status(&child, code),
                     usage: child.usage_snapshot(crate::scheduler::now_ns_public()),
+                    child_uid: child.credentials().uid,
                 });
             }
         }
 
         // 2. stopped / continued 是父侧可消费的状态变化事件，不会 reap child。
-        let children = me.snapshot_children();
-        for child in children.iter().filter(|c| matches_waitid(c, &target, &me)) {
+        for child in children.iter().filter(|c| pred(c)) {
             if wait_stopped || child.is_ptrace_traced() {
                 if let Some(status) = child.wait_stopped_status(nowait) {
                     return Ok(WaitResult {
                         pid: child.pid_root().unwrap_or(0),
                         status,
                         usage: child.usage_snapshot(crate::scheduler::now_ns_public()),
+                        child_uid: child.credentials().uid,
                     });
                 }
             }
         }
         if wait_continued {
-            for child in children.iter().filter(|c| matches_waitid(c, &target, &me)) {
+            for child in children.iter().filter(|c| pred(c)) {
                 if let Some(status) = child.wait_continued_status(nowait) {
                     return Ok(WaitResult {
                         pid: child.pid_root().unwrap_or(0),
                         status,
                         usage: child.usage_snapshot(crate::scheduler::now_ns_public()),
+                        child_uid: child.credentials().uid,
                     });
                 }
             }
         }
 
         // 3. 是否还有匹配的子？没有任何匹配子 → ECHILD。
-        let any_match = children.iter().any(|c| matches_waitid(c, &target, &me));
+        let any_match = children.iter().any(|c| pred(c));
         if !any_match {
             return Err(Errno::ECHILD);
         }
@@ -1223,6 +1342,7 @@ fn wait_common(
                 pid: 0,
                 status: WaitStatus(0),
                 usage: TaskUsage::default(),
+                child_uid: Uid::ROOT,
             });
         }
 
@@ -1238,8 +1358,9 @@ fn wait_common(
             return Err(Errno::EINTR);
         }
         if wait_child_observable(
+            &children,
+            &target,
             &me,
-            target.clone(),
             wait_exited,
             wait_stopped,
             wait_continued,
@@ -1255,10 +1376,7 @@ fn wait_common(
                 target,
                 children.len(),
             );
-            for child in children
-                .iter()
-                .filter(|child| matches_waitid(child, &target, &me))
-            {
+            for child in children.iter().filter(|child| pred(child)) {
                 log::info!(
                     "[sched][wait] child={:?} state={:?} exit_ready={} threads={}",
                     child.pid_root(),
@@ -1347,6 +1465,8 @@ fn terminate_thread_group_identity_by_signal_from(
     info: SigInfo,
     current: &Arc<Task>,
 ) -> bool {
+    // 取舍：core dump 文件写入（ELF 头 + 内存段）为 P2，未实现；仅按默认动作
+    // 分类置 WCOREDUMP 位，让 wait 状态与 Linux 语义一致。
     let core_dumped = matches!(default_action(info.sig), DefaultAction::Core);
     // 与 CLONE_THREAD 登记通过 members 锁排序：先登记者会进入本次 snapshot，
     // 后到者被拒绝，避免 SIGKILL 之后仍产生未收到终止请求的新线程。
@@ -1410,8 +1530,11 @@ fn deliver_to_thread_group(target: &Arc<Task>, info: SigInfo) -> bool {
 }
 
 fn check_pidfd_group_permission(group: &Arc<ThreadGroup>) -> Result<(), Errno> {
+    // pidfd_send_signal 对已退出（僵尸）进程应成功返回 0：稳定身份仍存在，
+    // 信号被静默丢弃，不再报 ESRCH（Linux 语义）。仅 terminated 组跳过权限
+    // 检查；非 terminated 路径的权限检查保持不变。
     if group.is_terminated() {
-        return Err(Errno::ESRCH);
+        return Ok(());
     }
     let target = group.leader().ok_or(Errno::ESRCH)?;
     check_kill_permission(&target)
@@ -1462,6 +1585,7 @@ pub fn kill(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
         let info = make_siginfo(sig);
         let my_tg = me.thread_group();
         let mut delivered = false;
+        let mut delivered_groups: Vec<Arc<ThreadGroup>> = Vec::new();
         for (p, weak) in root_pid_ns().registry().snapshot() {
             if p == 1 {
                 continue;
@@ -1470,21 +1594,24 @@ pub fn kill(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
             if t.is_kernel_task() {
                 continue;
             }
-            // 同 tg 直接跳过（覆盖 init 整个线程组）。
-            if Arc::ptr_eq(&t.thread_group(), &my_tg) {
+            let group = t.thread_group();
+            // registry 快照逐线程枚举：同一线程组只投一次，避免多线程进程
+            // 的共享 pending 被重复投递。
+            if delivered_groups.iter().any(|g| Arc::ptr_eq(g, &group)) {
                 continue;
             }
-            let tg_leader_pid = t
-                .thread_group()
-                .leader()
-                .and_then(|l| l.pid_root())
-                .unwrap_or(0);
+            // 同 tg 直接跳过（覆盖 init 整个线程组）。
+            if Arc::ptr_eq(&group, &my_tg) {
+                continue;
+            }
+            let tg_leader_pid = group.leader().and_then(|l| l.pid_root()).unwrap_or(0);
             if tg_leader_pid == 1 {
                 continue;
             }
             if check_kill_permission(&t).is_err() {
                 continue;
             }
+            delivered_groups.push(group);
             delivered |= deliver_to_thread_group(&t, info);
         }
         return if delivered { Ok(()) } else { Err(Errno::EPERM) };
@@ -1501,6 +1628,10 @@ pub fn kill(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
 
 /// `tkill(tid, sig)`：投递到**特定线程**（per-task pending）。
 pub fn tkill(tid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
+    // Linux `tkill`：tid==0 无效（`lookup_pid(0)` 会返回 current，需显式拒绝）。
+    if tid <= 0 {
+        return Err(Errno::EINVAL);
+    }
     let target = lookup_pid(tid)?;
     if target.is_kernel_task() {
         return Err(Errno::ESRCH);
@@ -1519,6 +1650,10 @@ pub fn tkill(tid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
 
 /// `tgkill(tgid, tid, sig)`：tid 的 thread_group 必须等于 tgid。
 pub fn tgkill(tgid: PidT, tid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
+    // Linux `tgkill`：tgid/tid==0 无效（`lookup_pid(0)` 会返回 current，需显式拒绝）。
+    if tgid <= 0 || tid <= 0 {
+        return Err(Errno::EINVAL);
+    }
     let target = lookup_pid(tid)?;
     if target.is_kernel_task() {
         return Err(Errno::ESRCH);
@@ -1581,62 +1716,180 @@ pub fn queueinfo(pid: PidT, info: SigInfo) -> Result<(), Errno> {
     Ok(())
 }
 
-// ── ptrace 最小兼容层 ───────────────────────────────────────────────────────
+// ── ptrace 完整层 ────────────────────────────────────────────────────────────
+
+/// ptrace 访问权限检查（Linux `ptrace_may_access` 语义）：
+/// 凭据 uid/euid/suid 与 gid/egid/sgid 全等、或调用者拥有 `CAP_SYS_PTRACE`；
+/// 目标 `dumpable != 1`（0 或 `SUID_DUMP_ROOT`=2）时仅限特权追踪者。
+pub fn ptrace_may_access(tracer: &Arc<Task>, target: &Arc<Task>) -> bool {
+    let tracer_cred = tracer.credentials();
+    let target_cred = target.credentials();
+    let has_cap = tracer_cred.has_cap(crate::ids::Capability::SysPtrace);
+    let uid_ok = tracer_cred.uid == target_cred.uid
+        && tracer_cred.euid == target_cred.euid
+        && tracer_cred.suid == target_cred.suid;
+    let gid_ok = tracer_cred.gid == target_cred.gid
+        && tracer_cred.egid == target_cred.egid
+        && tracer_cred.sgid == target_cred.sgid;
+    if !(uid_ok && gid_ok) && !has_cap {
+        return false;
+    }
+    if target.dumpable() != 1 && !has_cap {
+        return false;
+    }
+    true
+}
+
+/// 标记任务进入 ptrace stop（`PTRACE_EVENT_*` 编码由调用方提前设置；
+/// `raw_sig` 允许 `0x80|SIGTRAP` 这类 TRACESYSGOOD 编码）。
+pub fn ptrace_mark_stopped_raw(task: &Arc<Task>, raw_sig: i32) -> bool {
+    task.mark_stopped_with_raw_sig(raw_sig)
+}
+
+/// 标记任务进入 ptrace stop（普通信号编码）。
+pub fn ptrace_mark_stopped(task: &Arc<Task>, sig: SignalNumber) -> bool {
+    task.mark_stopped_with_raw_sig(sig.raw() as i32)
+}
+
+/// 恢复被 `PTRACE_SINGLESTEP` 停止的任务（单步补丁由调用方布置）。
+pub fn ptrace_continue(task: &Arc<Task>) -> bool {
+    continue_task(task)
+}
+
+fn ptrace_target(pid: PidT) -> Result<Arc<Task>, Errno> {
+    let target = lookup_pid(pid)?;
+    if target.is_kernel_task() || !target.is_ptrace_traced() {
+        return Err(Errno::ESRCH);
+    }
+    let me = current_task();
+    if !ptrace_may_access(&me, &target) {
+        return Err(Errno::EPERM);
+    }
+    // 仅允许记录的 tracer 对目标执行 cont/syscall/detach 等操作。
+    if !target.ptracer_is(&me) {
+        return Err(Errno::EPERM);
+    }
+    Ok(target)
+}
 
 pub fn ptrace_traceme() -> Result<(), Errno> {
     let me = current_task();
-    if me.is_kernel_task() || me.parent().is_none() {
+    if me.is_kernel_task() {
         return Err(Errno::EPERM);
     }
+    let Some(parent) = me.parent() else {
+        return Err(Errno::EPERM);
+    };
     if !me.enable_ptrace_traced() {
         return Err(Errno::EPERM);
     }
+    me.set_ptracer(Some(Arc::downgrade(&parent)));
     Ok(())
 }
 
+/// `PTRACE_ATTACH`：发 `SIGSTOP` 并等待目标进入 stop 后才返回（Linux 语义）。
 pub fn ptrace_attach(pid: PidT) -> Result<(), Errno> {
     let target = lookup_pid(pid)?;
     let me = current_task();
     if target.is_kernel_task() || Arc::ptr_eq(&target, &me) {
         return Err(Errno::EPERM);
     }
-    check_kill_permission(&target)?;
+    if !ptrace_may_access(&me, &target) {
+        return Err(Errno::EPERM);
+    }
     if !target.enable_ptrace_traced() {
         return Err(Errno::EPERM);
     }
+    target.set_ptracer(Some(Arc::downgrade(&me)));
+    target.set_ptrace_seized(false);
     let _ = mark_task_stopped(&target, SignalNumber::SIGSTOP);
+    // 等待 stop 生效（Linux `PTRACE_ATTACH` 在目标停下后才返回）。
+    while target.state() != crate::TaskState::Stopped {
+        schedule_once(now_ns_public());
+    }
     Ok(())
 }
 
+/// `PTRACE_SEIZE`：附着但不停止目标（后续用 `PTRACE_INTERRUPT` 停下）。
 pub fn ptrace_seize(pid: PidT) -> Result<(), Errno> {
     let target = lookup_pid(pid)?;
     let me = current_task();
     if target.is_kernel_task() || Arc::ptr_eq(&target, &me) {
         return Err(Errno::EPERM);
     }
-    check_kill_permission(&target)?;
+    if !ptrace_may_access(&me, &target) {
+        return Err(Errno::EPERM);
+    }
     if !target.enable_ptrace_traced() {
         return Err(Errno::EPERM);
     }
+    target.set_ptracer(Some(Arc::downgrade(&me)));
+    target.set_ptrace_seized(true);
     Ok(())
 }
 
+/// `PTRACE_INTERRUPT` 产生的 group-stop 事件号（`PTRACE_EVENT_STOP`）。
+const PTRACE_EVENT_STOP: u16 = 128;
+
 pub fn ptrace_interrupt(pid: PidT) -> Result<(), Errno> {
-    let target = lookup_pid(pid)?;
-    if target.is_kernel_task() || !target.is_ptrace_traced() {
-        return Err(Errno::ESRCH);
+    let target = ptrace_target(pid)?;
+    // PTRACE_INTERRUPT 仅对 PTRACE_SEIZE 附着的目标有效（Linux 返回 EIO）。
+    if !target.is_ptrace_seized() {
+        return Err(Errno::EIO);
     }
-    check_kill_permission(&target)?;
+    target.set_ptrace_stop_event(PTRACE_EVENT_STOP);
     let _ = mark_task_stopped(&target, SignalNumber::SIGTRAP);
     Ok(())
 }
 
+/// `PTRACE_CONT`：恢复执行（清除 syscall-stop 与单步状态）。
+///
+/// `sig == Some(n)` 时按 tracer 指定信号投递（覆盖信号投递停里保存的那条）。
+/// `sig == None`（data == 0）时，本内核选择**重投**语义：把信号投递停里保存的
+/// siginfo 重新投回目标而不是丢弃（Linux 的 PTRACE_CONT(0) 会丢弃该信号），
+/// 避免 tracer 简单续跑时把原信号弄丢。
 pub fn ptrace_cont(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
-    let target = lookup_pid(pid)?;
-    if target.is_kernel_task() || !target.is_ptrace_traced() {
-        return Err(Errno::ESRCH);
+    let target = ptrace_target(pid)?;
+    target.set_ptrace_syscall_stop(false);
+    target.clear_singlestep();
+    target.set_ptrace_stop_event(0);
+    let saved = target.take_ptrace_last_siginfo();
+    let _ = continue_task(&target);
+    match sig {
+        Some(sig) => {
+            tkill(pid, Some(sig))?;
+        }
+        None => {
+            if let Some(info) = saved {
+                target.signal.deliver(info);
+                signal_wakeup(&target, &info);
+            }
+        }
     }
-    check_kill_permission(&target)?;
+    Ok(())
+}
+
+/// `PTRACE_SYSCALL`：恢复执行并在每个 syscall 边界停止。
+pub fn ptrace_syscall(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
+    let target = ptrace_target(pid)?;
+    target.set_ptrace_syscall_stop(true);
+    target.clear_singlestep();
+    target.set_ptrace_stop_event(0);
+    target.clear_ptrace_last_siginfo();
+    let _ = continue_task(&target);
+    if let Some(sig) = sig {
+        tkill(pid, Some(sig))?;
+    }
+    Ok(())
+}
+
+/// `PTRACE_SINGLESTEP`：布置单步断点（指令补丁由 kernel 层经
+/// `arm_singlestep` 完成）后恢复执行。
+pub fn ptrace_singlestep(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
+    let target = ptrace_target(pid)?;
+    target.set_ptrace_syscall_stop(false);
+    target.set_ptrace_stop_event(0);
+    target.clear_ptrace_last_siginfo();
     let _ = continue_task(&target);
     if let Some(sig) = sig {
         tkill(pid, Some(sig))?;
@@ -1645,12 +1898,13 @@ pub fn ptrace_cont(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
 }
 
 pub fn ptrace_detach(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
-    let target = lookup_pid(pid)?;
-    if target.is_kernel_task() || !target.is_ptrace_traced() {
-        return Err(Errno::ESRCH);
-    }
-    check_kill_permission(&target)?;
+    let target = ptrace_target(pid)?;
     target.clear_ptrace_traced();
+    target.clear_ptracer();
+    target.set_ptrace_syscall_stop(false);
+    target.clear_singlestep();
+    target.set_ptrace_stop_event(0);
+    target.clear_ptrace_last_siginfo();
     let _ = continue_task(&target);
     if let Some(sig) = sig {
         tkill(pid, Some(sig))?;
@@ -1659,11 +1913,66 @@ pub fn ptrace_detach(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> 
 }
 
 pub fn ptrace_kill(pid: PidT) -> Result<(), Errno> {
-    let target = lookup_pid(pid)?;
-    if target.is_kernel_task() || !target.is_ptrace_traced() {
-        return Err(Errno::ESRCH);
-    }
+    let _target = ptrace_target(pid)?;
     tkill(pid, Some(SignalNumber::SIGKILL))
+}
+
+/// `PTRACE_SETOPTIONS`（kernel 层校验具体位）。
+pub fn ptrace_set_options(pid: PidT, options: u64) -> Result<(), Errno> {
+    let target = ptrace_target(pid)?;
+    target.set_ptrace_options(options);
+    Ok(())
+}
+
+/// `PTRACE_GETEVENTMSG`。
+pub fn ptrace_geteventmsg(pid: PidT) -> Result<i64, Errno> {
+    let target = ptrace_target(pid)?;
+    Ok(target.ptrace_event_msg())
+}
+
+/// `PTRACE_GETSIGINFO`（仅在 stop 期间有效）。
+pub fn ptrace_getsiginfo(pid: PidT) -> Result<crate::signal::SigInfo, Errno> {
+    let target = ptrace_target(pid)?;
+    target.take_ptrace_last_siginfo().ok_or(Errno::EINVAL)
+}
+
+/// `PTRACE_SETSIGINFO`。
+pub fn ptrace_setsiginfo(pid: PidT, info: crate::signal::SigInfo) -> Result<(), Errno> {
+    let target = ptrace_target(pid)?;
+    target.set_ptrace_last_siginfo(info);
+    Ok(())
+}
+
+/// `PTRACE_GETSIGMASK`/`PTRACE_SETSIGMASK`。
+pub fn ptrace_get_sigmask(pid: PidT) -> Result<crate::signal::SigSet, Errno> {
+    let target = ptrace_target(pid)?;
+    Ok(target.signal.blocked_snapshot())
+}
+
+pub fn ptrace_set_sigmask(pid: PidT, mask: crate::signal::SigSet) -> Result<(), Errno> {
+    let target = ptrace_target(pid)?;
+    target
+        .signal
+        .block(mask, crate::signal::SigProcMaskHow::SetMask);
+    Ok(())
+}
+
+/// 单步断点命中检查（arch 的 break trap 钩子调用）：命中则恢复原指令、
+/// 清除单步状态并把任务置为 `SIGTRAP` stop。返回 `true` 表示已消费该陷阱。
+pub fn ptrace_singlestep_hit_check(task: &Arc<Task>, pc: usize) -> bool {
+    if !task.singlestep_armed() {
+        return false;
+    }
+    if task.singlestep_addr() == pc {
+        task.clear_singlestep();
+        task.set_ptrace_stop_event(0);
+        task.clear_ptrace_last_siginfo();
+        mark_task_stopped(task, SignalNumber::SIGTRAP);
+        return true;
+    }
+    // 断点出现在非预期地址：清除单步状态，按普通断点处理。
+    task.clear_singlestep();
+    false
 }
 
 // ── sigaction / sigprocmask / sigpending ─────────────────────────────────────
@@ -1884,6 +2193,7 @@ fn rlimit_err_to_errno(e: RlimitError) -> Errno {
     match e {
         RlimitError::InvalidResource => Errno::EINVAL,
         RlimitError::ExceedsHard => Errno::EINVAL,
+        RlimitError::PermissionDenied => Errno::EPERM,
     }
 }
 
@@ -1898,16 +2208,17 @@ pub fn get_rlimit(resource: Resource) -> Result<RlimitPair, Errno> {
 /// `setrlimit(resource, new)` 写调用者 tg 的 rlimit。
 ///
 /// 校验规则照搬 Linux 6.x `kernel/sys.c::do_prlimit`：
-///   1. `new.soft ≤ new.hard`（基础不变量）
-///   2. `new.hard ≤ cur.hard`（无 CAP_SYS_RESOURCE 时硬限制不可逆降不到
-///      "原值以下"——但硬限制是允许降到任何更小的值，包括小于当前 soft）
-///   3. `new.soft ≤ cur.hard`（软限制不能超过当前硬限制）
+///   1. `new.soft ≤ new.hard`（基础不变量，违反 → EINVAL）
+///   2. `new.hard ≤ cur.hard`（无 CAP_SYS_RESOURCE 时不可提升硬限制，
+///      违反 → EPERM；持 CAP_SYS_RESOURCE 时可任意调整 hard）
 ///
 /// 关键点：**不检查** `new.hard < cur.soft`。POSIX 允许"硬限制降到
 /// ≥ 0 的任意值"，glibc 旧 ABI setrlimit 也支持；libctest 的
 /// `setrlim.c:21` 典型用法 `setrlimit(RLIMIT_STACK, 102400)` 会把
 /// `rlim_max = 102400`，当前 soft 可能是 8MB，老式"hard 不能降到
-/// 软以下"校验会误返 EINVAL。
+/// 软以下"校验会误返 EINVAL。规则 1 已蕴含"软限制不能超过当前硬限制"
+/// （无特权时 hard ≤ cur.hard 且 soft ≤ hard），故不单独校验
+/// `new.soft ≤ cur.hard`，以免特权路径错误拒绝"同时提升 soft+hard"。
 #[kernel_symbols::export(name = "sched.operation.set_rlimit", contract = "kernel.sched.rlimit@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn set_rlimit(resource: Resource, new: RlimitPair) -> Result<RlimitPair, Errno> {
     let me = current_task();
@@ -1915,17 +2226,13 @@ pub fn set_rlimit(resource: Resource, new: RlimitPair) -> Result<RlimitPair, Err
     let mut guard = tg.rlimits().lock();
     let cur = guard.get(resource);
 
-    // (1) 软限制必须 ≤ 硬限制。
+    // (1) 软限制必须 ≤ 硬限制 → EINVAL
     if new.soft.0 > new.hard.0 {
         return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
     }
-    // (2) 无 CAP 时硬限制不可调高（只能降或保留）。
-    if new.hard.0 > cur.hard.0 {
-        return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
-    }
-    // (3) 软限制不能超当前硬限制。
-    if new.soft.0 > cur.hard.0 {
-        return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
+    // (2) 无 CAP_SYS_RESOURCE 时不可提升硬限制 → EPERM
+    if new.hard.0 > cur.hard.0 && !me.credentials().has_cap(Capability::SysResource) {
+        return Err(rlimit_err_to_errno(RlimitError::PermissionDenied));
     }
     let old = cur;
     guard.set(resource, new);
@@ -1934,7 +2241,9 @@ pub fn set_rlimit(resource: Resource, new: RlimitPair) -> Result<RlimitPair, Err
 
 /// `prlimit64(pid, resource, new, old)`：
 /// - `pid == 0`：当前进程；
-/// - `pid > 0`：指定 TGID。
+/// - `pid > 0`：指定 TGID（调用者须持 CAP_SYS_RESOURCE 或与目标同 uid，
+///   否则返回 EPERM）；
+/// - `pid < 0`：无对应进程 → ESRCH。
 /// `new == None` 表示只读；`old != None` 写到该地址（call-site 决定）。
 pub fn prlimit64(
     pid: i32,
@@ -1942,8 +2251,9 @@ pub fn prlimit64(
     new: Option<RlimitPair>,
 ) -> Result<RlimitPair, Errno> {
     let me = current_task();
-    let target_tg = if pid == 0 {
-        me.thread_group()
+    // 解析目标 task：pid == 0 走当前进程，pid > 0 查注册表，pid < 0 → ESRCH。
+    let target = if pid == 0 {
+        None
     } else if pid > 0 {
         let root = root_pid_ns();
         let Some(weak) = root.registry().lookup(pid) else {
@@ -1952,23 +2262,39 @@ pub fn prlimit64(
         let Some(task) = weak.upgrade() else {
             return Err(Errno::ESRCH);
         };
-        task.thread_group()
+        Some(task)
     } else {
-        return Err(Errno::EINVAL);
+        return Err(Errno::ESRCH);
     };
-    // 权限：调用方需是同 uid 或具 CAP_SYS_RESOURCE。本仓库尚未实现
-    // capability 模型，按"同进程/同 uid 直通"处理。
+    // F1：pid > 0 时，读写目标 rlimit 前都必须校验权限。这里的"同 uid"判定
+    // 采用 Linux `ptrace_may_access(PTRACE_MODE_READ_REALCREDS)` 的 uid 语义
+    // （对 READ_REALCREDS 的近似）：调用者 euid 与目标的 uid、euid、suid 三者
+    // 全等。本仓库凭据模型刻意用 euid 而非 real uid，且不校验 gid。
+    if let Some(task) = &target {
+        let me_creds = me.credentials();
+        let t_creds = task.credentials();
+        if !me_creds.has_cap(Capability::SysResource)
+            && !(me_creds.euid == t_creds.uid
+                && me_creds.euid == t_creds.euid
+                && me_creds.euid == t_creds.suid)
+        {
+            return Err(Errno::EPERM);
+        }
+    }
+    let target_tg = match &target {
+        Some(task) => task.thread_group(),
+        None => me.thread_group(),
+    };
     if let Some(n) = new {
         let mut guard = target_tg.rlimits().lock();
         let cur = guard.get(resource);
+        // (1) 软限制必须 ≤ 硬限制 → EINVAL
         if n.soft.0 > n.hard.0 {
             return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
         }
-        if n.hard.0 > cur.hard.0 {
-            return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
-        }
-        if n.soft.0 > cur.hard.0 {
-            return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
+        // (2) 无 CAP_SYS_RESOURCE 时不可提升硬限制 → EPERM
+        if n.hard.0 > cur.hard.0 && !me.credentials().has_cap(Capability::SysResource) {
+            return Err(rlimit_err_to_errno(RlimitError::PermissionDenied));
         }
         let old = cur;
         guard.set(resource, n);
@@ -2012,6 +2338,9 @@ pub fn consume_native_external_control_for_task(task: &Arc<Task>) -> NativeExter
 
     let _ = task.consume_pending_signal(|info| {
         if task.is_ptrace_traced() && info.sig != SignalNumber::SIGKILL {
+            // 保留完整 siginfo 供 PTRACE_GETSIGINFO 读取，并在 PTRACE_CONT(0)
+            // 时重投（见 `ptrace_cont`），避免信号投递停把信号整条丢弃。
+            task.set_ptrace_last_siginfo(info);
             let _ = mark_task_stopped(task, info.sig);
             return;
         }
@@ -2061,6 +2390,9 @@ pub fn deliver_pending_signals_for_task(
     }
     me.consume_pending_signal(|info| {
         if me.is_ptrace_traced() && info.sig != SignalNumber::SIGKILL {
+            // 保留完整 siginfo 供 PTRACE_GETSIGINFO 读取，并在 PTRACE_CONT(0)
+            // 时重投（见 `ptrace_cont`），避免信号投递停把信号整条丢弃。
+            me.set_ptrace_last_siginfo(info);
             let _ = mark_task_stopped(me, info.sig);
             return None;
         }

@@ -12,6 +12,17 @@
 
 use core::mem::offset_of;
 
+/// 对普通内存、DMA 访问与设备 MMIO 执行一次保守的全顺序屏障。
+///
+/// 驱动在发布 DMA descriptor 后敲 doorbell，或观察到设备完成标志后读取 DMA
+/// 数据时使用该入口；ISA 细节留在 arch 层，ELM 驱动不嵌入目标专属汇编。
+#[inline]
+pub fn device_io_barrier() {
+    // Safety: `dbar 0` 只约束当前处理器的访存/设备访问顺序，不访问任意地址，
+    // 也不改变通用寄存器或特权状态。
+    unsafe { core::arch::asm!("dbar 0", options(nostack, preserves_flags)) };
+}
+
 // CSR 中各个寄存器的定义。
 //
 // 这些编号本身只是常量，但它们背后代表的子系统完全不同：
@@ -54,6 +65,7 @@ pub const CSR_TVAL: usize = 0x42;
 pub const CSR_CNTC: usize = 0x43;
 pub const CSR_TICLR: usize = 0x44;
 pub const CSR_LLBCTL: usize = 0x60;
+pub const CSR_IMPCTL1: usize = 0x80;
 pub const CSR_TLBRENTRY: usize = 0x88;
 pub const CSR_TLBRBADV: usize = 0x89;
 pub const CSR_TLBRERA: usize = 0x8a;

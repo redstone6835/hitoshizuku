@@ -835,6 +835,16 @@ impl TxPlanPayload {
 }
 
 /// `net.stack.shard-turn` 返回的一份完整报文发送计划。
+/// SOL_RAW IPV6_CHECKSUM 回填：payload 内校验和字段偏移与 pseudo-header 参数。
+/// 设备路径在物化帧时清零、计算并回填（RFC 3542 §8.1）。
+#[derive(Clone, Copy, Debug)]
+pub struct RawTxChecksumFixup {
+    pub payload_offset: u16,
+    pub source: IpAddr,
+    pub destination: IpAddr,
+    pub protocol: u8,
+}
+
 pub struct TxPlan {
     pub interface: InterfaceId,
     pub facade: Arc<SocketFacade>,
@@ -847,6 +857,8 @@ pub struct TxPlan {
     pub checksum: TxChecksum,
     pub layout: PacketLayout,
     pub low_latency: bool,
+    /// raw IPv6 发送时内核计算的传输层校验和回填（None = 关闭）。
+    pub checksum_fixup: Option<RawTxChecksumFixup>,
 }
 
 impl TxPlan {
@@ -1281,24 +1293,27 @@ fn build_tcp_tx_plan(work: PreparedTcpTx) -> Result<TxPlan, SocketError> {
     header[6..12].copy_from_slice(&work.path.source_mac);
     let header_len = match (work.path.route.source, work.remote.addr) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
-            let total_len = 20usize
+            let ip_opt_len = work.ip_options.wire_len();
+            let total_len = (20usize + ip_opt_len)
                 .checked_add(tcp_header_len)
                 .and_then(|len| len.checked_add(payload.len()))
                 .and_then(|len| u16::try_from(len).ok())
                 .ok_or(SocketError::MessageTooLarge)?;
             header[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
-            let ip = &mut header[14..34];
-            ip[0] = 0x45;
+            let ip = &mut header[14..34 + ip_opt_len];
+            ip[0] = 0x45 | ((ip_opt_len / 4) as u8) << 4;
             ip[2..4].copy_from_slice(&total_len.to_be_bytes());
             ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
             ip[8] = 64;
             ip[9] = 6;
             ip[12..16].copy_from_slice(&source.0);
             ip[16..20].copy_from_slice(&destination.0);
+            ip[20..20 + ip_opt_len].copy_from_slice(work.ip_options.wire_slice());
             let checksum = checksum_bytes(ip);
             ip[10..12].copy_from_slice(&checksum.to_be_bytes());
-            header[34..34 + tcp_header_len].copy_from_slice(&tcp[..tcp_header_len]);
-            34 + tcp_header_len
+            header[34 + ip_opt_len..34 + ip_opt_len + tcp_header_len]
+                .copy_from_slice(&tcp[..tcp_header_len]);
+            34 + ip_opt_len + tcp_header_len
         }
         (IpAddr::V6(source), IpAddr::V6(destination)) => {
             let transport_len = tcp_header_len
@@ -1330,6 +1345,7 @@ fn build_tcp_tx_plan(work: PreparedTcpTx) -> Result<TxPlan, SocketError> {
         checksum: TxChecksum::Complete,
         layout: PacketLayout::Plain,
         low_latency: work.low_latency,
+        checksum_fixup: None,
     })
 }
 
@@ -1355,14 +1371,15 @@ fn build_udp_tx_plan(work: PreparedUdpTx) -> Result<TxPlan, SocketError> {
     header[6..12].copy_from_slice(&work.source_mac);
     let header_len = match (work.route.source, work.destination.addr) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
+            let ip_opt_len = work.ip_options.wire_len();
             let total_len = payload
                 .len()
-                .checked_add(28)
+                .checked_add(28 + ip_opt_len)
                 .and_then(|len| u16::try_from(len).ok())
                 .ok_or(SocketError::MessageTooLarge)?;
             header[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
-            let ip = &mut header[14..34];
-            ip[0] = 0x45;
+            let ip = &mut header[14..34 + ip_opt_len];
+            ip[0] = 0x45 | ((ip_opt_len / 4) as u8) << 4;
             ip[1] = work.traffic_class;
             ip[2..4].copy_from_slice(&total_len.to_be_bytes());
             ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
@@ -1370,10 +1387,11 @@ fn build_udp_tx_plan(work: PreparedUdpTx) -> Result<TxPlan, SocketError> {
             ip[9] = 17;
             ip[12..16].copy_from_slice(&source.0);
             ip[16..20].copy_from_slice(&destination.0);
+            ip[20..20 + ip_opt_len].copy_from_slice(work.ip_options.wire_slice());
             let checksum = checksum_bytes(ip);
             ip[10..12].copy_from_slice(&checksum.to_be_bytes());
-            header[34..42].copy_from_slice(&udp);
-            42
+            header[34 + ip_opt_len..34 + ip_opt_len + 8].copy_from_slice(&udp);
+            42 + ip_opt_len
         }
         (IpAddr::V6(source), IpAddr::V6(destination)) => {
             header[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
@@ -1403,6 +1421,7 @@ fn build_udp_tx_plan(work: PreparedUdpTx) -> Result<TxPlan, SocketError> {
         checksum: TxChecksum::Complete,
         layout: PacketLayout::Plain,
         low_latency: false,
+        checksum_fixup: None,
     })
 }
 
@@ -1478,6 +1497,7 @@ fn append_udp_fragment_plans(
                 checksum: TxChecksum::Complete,
                 layout: PacketLayout::Plain,
                 low_latency: false,
+                checksum_fixup: None,
             })
             .map_err(|_| SocketError::WouldBlock)?;
         if fragment.more_fragments == 0 {
@@ -1521,7 +1541,7 @@ fn build_raw_tx_plan(work: PreparedRawTx) -> Result<TxPlan, SocketError> {
     let mut header = [0u8; NET_STACK_TX_HEADER_CAPACITY];
     header[..6].copy_from_slice(&work.destination_mac);
     header[6..12].copy_from_slice(&work.source_mac);
-    let (header_len, payload_offset, payload_len) = if work.header_included {
+    let (header_len, payload_offset, payload_len, checksum_fixup) = if work.header_included {
         let mut ip = [0u8; 60];
         work.payload.copy_range(0, &mut ip[..20])?;
         let ip_header_len = usize::from(ip[0] & 0x0f) * 4;
@@ -1558,21 +1578,23 @@ fn build_raw_tx_plan(work: PreparedRawTx) -> Result<TxPlan, SocketError> {
             14 + ip_header_len,
             ip_header_len as u32,
             u32::from(work.payload.len) - ip_header_len as u32,
+            None,
         )
     } else {
         let payload_len = usize::from(work.payload.len);
         match (work.route.source, work.destination) {
             (IpAddr::V4(source), IpAddr::V4(destination)) => {
+                let ip_opt_len = work.ip_options.wire_len();
                 let total_len = payload_len
-                    .checked_add(20)
+                    .checked_add(20 + ip_opt_len)
                     .and_then(|len| u16::try_from(len).ok())
                     .ok_or(SocketError::MessageTooLarge)?;
-                if payload_len + 20 > work.route.mtu as usize {
+                if payload_len + 20 + ip_opt_len > work.route.mtu as usize {
                     return Err(SocketError::MessageTooLarge);
                 }
                 header[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
-                let ip = &mut header[14..34];
-                ip[0] = 0x45;
+                let ip = &mut header[14..34 + ip_opt_len];
+                ip[0] = 0x45 | ((ip_opt_len / 4) as u8) << 4;
                 ip[1] = work.traffic_class;
                 ip[2..4].copy_from_slice(&total_len.to_be_bytes());
                 ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
@@ -1580,9 +1602,10 @@ fn build_raw_tx_plan(work: PreparedRawTx) -> Result<TxPlan, SocketError> {
                 ip[9] = work.protocol;
                 ip[12..16].copy_from_slice(&source.0);
                 ip[16..20].copy_from_slice(&destination.0);
+                ip[20..20 + ip_opt_len].copy_from_slice(work.ip_options.wire_slice());
                 let checksum = checksum_bytes(ip);
                 ip[10..12].copy_from_slice(&checksum.to_be_bytes());
-                (34, 0, payload_len as u32)
+                (34 + ip_opt_len, 0, payload_len as u32, None)
             }
             (IpAddr::V6(source), IpAddr::V6(destination)) => {
                 let payload_len_u16 =
@@ -1600,7 +1623,19 @@ fn build_raw_tx_plan(work: PreparedRawTx) -> Result<TxPlan, SocketError> {
                 ip[7] = work.hop_limit;
                 ip[8..24].copy_from_slice(&source.0);
                 ip[24..40].copy_from_slice(&destination.0);
-                (54, 0, payload_len as u32)
+                // SOL_RAW IPV6_CHECKSUM：物化帧时内核计算并回填传输层校验和。
+                let checksum_fixup = work.ipv6_checksum_offset.and_then(|offset| {
+                    usize::from(offset)
+                        .checked_add(2)
+                        .is_some_and(|end| end <= payload_len)
+                        .then_some(RawTxChecksumFixup {
+                            payload_offset: offset,
+                            source: IpAddr::V6(source),
+                            destination: IpAddr::V6(destination),
+                            protocol: work.protocol,
+                        })
+                });
+                (54, 0, payload_len as u32, checksum_fixup)
             }
             _ => return Err(SocketError::InvalidState),
         }
@@ -1617,6 +1652,7 @@ fn build_raw_tx_plan(work: PreparedRawTx) -> Result<TxPlan, SocketError> {
         checksum: TxChecksum::Complete,
         layout: PacketLayout::Plain,
         low_latency: false,
+        checksum_fixup,
     })
 }
 
@@ -1664,6 +1700,7 @@ fn append_raw_fragment_plans(
                 checksum: TxChecksum::Complete,
                 layout: PacketLayout::Plain,
                 low_latency: false,
+                checksum_fixup: None,
             })
             .map_err(|_| SocketError::WouldBlock)?;
         if fragment.more_fragments == 0 {
@@ -2259,6 +2296,8 @@ pub enum NetStackFlowCommand {
         facade: Arc<SocketFacade>,
         control_sequence: u64,
         local_transport: bool,
+        /// TCP Fast Open（sendmsg(MSG_FASTOPEN)）：SYN 携带缓存 cookie，数据随 SYN 发出。
+        fastopen: bool,
         now_ns: u64,
         output: Option<Result<FlowId, TcpBindError>>,
     },
@@ -2480,6 +2519,39 @@ pub enum NetStackControlCommand {
         now_ns: u64,
         output: Option<DhcpRunOutput>,
     },
+    RunRouterSolicit {
+        now_ns: u64,
+        output: Option<RouterSolicitRunOutput>,
+    },
+    RunDhcpv6 {
+        config: *const ConfigSnapshot,
+        now_ns: u64,
+        output: Option<Dhcpv6RunOutput>,
+    },
+    HandleDhcpv6Packet {
+        interface: InterfaceId,
+        packet: Option<FrontendPacket>,
+        now_ns: u64,
+        output: Option<Dhcpv6PacketOutput>,
+    },
+    EnableDhcpv6 {
+        interface: InterfaceId,
+        config: *const ConfigSnapshot,
+        now_ns: u64,
+        output: Option<()>,
+    },
+    HandleRouterAdvertisement {
+        interface: InterfaceId,
+        packet: Option<FrontendPacket>,
+        now_ns: u64,
+        output: Option<RouterAdvertisementOutput>,
+    },
+    AddDadState {
+        interface: InterfaceId,
+        address: Ipv6Addr,
+        now_ns: u64,
+        output: Option<()>,
+    },
     HandleDhcpPacket {
         interface: InterfaceId,
         packet: Option<FrontendPacket>,
@@ -2626,6 +2698,102 @@ pub struct DhcpPacketOutput {
     pub lease_change: Option<DhcpLeaseChange>,
 }
 
+/// DHCPv6（RFC 8415）租约。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dhcpv6Lease {
+    pub address: Ipv6Addr,
+    pub prefix_len: u8,
+    pub dns: alloc::vec::Vec<Ipv6Addr>,
+    pub valid_seconds: u32,
+}
+
+pub struct Dhcpv6LeaseChange {
+    pub interface: InterfaceId,
+    pub old: Option<Dhcpv6Lease>,
+    pub new: Option<Dhcpv6Lease>,
+}
+
+pub struct Dhcpv6RunOutput {
+    pub frames: Vec<(InterfaceId, Vec<u8>)>,
+    pub lease_changes: Vec<Dhcpv6LeaseChange>,
+    pub next_deadline_ns: Option<u64>,
+}
+
+pub struct Dhcpv6PacketOutput {
+    pub handled: bool,
+    pub lease_change: Option<Dhcpv6LeaseChange>,
+}
+
+/// DHCPv6 客户端（RFC 8415 §18）。
+struct Dhcpv6Client {
+    interface: InterfaceId,
+    mac_address: [u8; 6],
+    transaction_id: u32,
+    iaid: u32,
+    phase: Dhcpv6Phase,
+    next_action_ns: u64,
+    retry_seconds: u32,
+}
+
+enum Dhcpv6Phase {
+    /// 发送 Solicit，等待 Advertise。
+    Solicit,
+    /// 已选择服务器，发送 Request（携带 server-id 与 IA_NA）。
+    Requesting {
+        server: Ipv6Addr,
+        server_id: alloc::vec::Vec<u8>,
+        address: Option<Ipv6Addr>,
+        prefix_len: u8,
+    },
+    /// 已获得租约：T1 到期 Renew，T2 到期 Rebind。
+    Bound {
+        server: Ipv6Addr,
+        server_id: alloc::vec::Vec<u8>,
+        address: Ipv6Addr,
+        prefix_len: u8,
+        renew_ns: u64,
+        rebind_ns: u64,
+    },
+}
+
+/// Router Solicitation（RFC 4861 §6.3.7）本轮输出。
+/// RFC 4861 §6.3.7：最多重试次数。
+pub const MAX_ROUTER_SOLICITATIONS: u8 = 3;
+
+pub struct RouterSolicitRunOutput {
+    /// 需要发出 RS 的接口。
+    pub probes: Vec<InterfaceId>,
+    pub next_deadline_ns: Option<u64>,
+}
+
+/// Router Advertisement（RFC 4861 §4.2）解析出的前缀。
+pub struct SlaacPrefix {
+    pub prefix: Ipv6Addr,
+    pub prefix_len: u8,
+    /// L 标志：on-link。
+    pub onlink: bool,
+    /// A 标志：可用于 SLAAC。
+    pub autonomous: bool,
+    pub valid_seconds: u32,
+}
+
+/// Router Advertisement 的解析结果（控制面不保存路由器状态，由 host 持有）。
+pub struct RouterAdvertisementOutput {
+    pub router: Ipv6Addr,
+    pub mac: Option<[u8; 6]>,
+    pub lifetime_seconds: u32,
+    pub prefixes: alloc::vec::Vec<SlaacPrefix>,
+    /// M 标志：地址由有状态 DHCPv6 管理（RFC 4861 §4.2）。
+    pub managed: bool,
+}
+
+/// Router Solicitation 重试状态（RFC 4861：最多 3 次，间隔 1s/2s/4s）。
+struct RouterSolicitState {
+    interface: InterfaceId,
+    attempts: u8,
+    next_send_ns: u64,
+}
+
 /// 由 `net.stack` ELM 独占的全局控制面状态。
 pub struct NetStackControlPlane {
     bind_registry: BindRegistry,
@@ -2638,12 +2806,28 @@ pub struct NetStackControlPlane {
     dad: Mutex<Vec<DadState>>,
     dad_errors: Mutex<BTreeMap<InterfaceId, SocketError>>,
     dhcp: Mutex<Vec<DhcpClient>>,
+    /// 内核 DHCP 客户端关闭开关（启动参数 net.dhcp=0）。
+    dhcp_disabled: bool,
+    /// IPv6 Router Solicitation（无默认路由器时发现路由器）。
+    router_solicits: Mutex<alloc::vec::Vec<RouterSolicitState>>,
+    /// DHCPv6 客户端（RA M 标志启用）。
+    dhcpv6: Mutex<alloc::vec::Vec<Dhcpv6Client>>,
     multicast_refs: Mutex<BTreeMap<(InterfaceId, IpAddr), usize>>,
     multicast_bindings: Mutex<BTreeMap<(SocketId, MulticastMembership), InterfaceId>>,
 }
 
 impl NetStackControlPlane {
+    #[cfg(test)]
     fn new(shard_count: usize, rss_key: [u8; 40], hash_seed: &[u8; 16]) -> Self {
+        Self::new_with_options(shard_count, rss_key, hash_seed, false)
+    }
+
+    fn new_with_options(
+        shard_count: usize,
+        rss_key: [u8; 40],
+        hash_seed: &[u8; 16],
+        dhcp_disabled: bool,
+    ) -> Self {
         Self {
             bind_registry: BindRegistry::new(shard_count, hash_seed),
             bindings: Mutex::new(BTreeMap::new()),
@@ -2655,6 +2839,9 @@ impl NetStackControlPlane {
             dad: Mutex::new(Vec::new()),
             dad_errors: Mutex::new(BTreeMap::new()),
             dhcp: Mutex::new(Vec::new()),
+            dhcp_disabled,
+            router_solicits: Mutex::new(Vec::new()),
+            dhcpv6: Mutex::new(Vec::new()),
             multicast_refs: Mutex::new(BTreeMap::new()),
             multicast_bindings: Mutex::new(BTreeMap::new()),
         }
@@ -2729,7 +2916,27 @@ impl NetStackControlPlane {
     fn initialize_autoconfig(&self, config: &ConfigSnapshot, now_ns: u64) {
         *self.dad.lock() = initial_dad_states(config, now_ns);
         self.dad_errors.lock().clear();
-        *self.dhcp.lock() = initial_dhcp_clients(config, now_ns);
+        // 内核 DHCP 客户端可由启动参数 net.dhcp=0 关闭：无静态 IPv4 地址的
+        // 接口也不发起 DHCP（SLAAC/DAD 等 IPv6 自动配置不受影响）。
+        *self.dhcp.lock() = if self.dhcp_disabled {
+            Vec::new()
+        } else {
+            initial_dhcp_clients(config, now_ns)
+        };
+        // IPv6 Router Solicitation：运行中的非回环接口（有 link-local）在未发现
+        // 默认路由器前周期性重试（RFC 4861 §6.3.7，最多 3 次）。
+        *self.router_solicits.lock() = config
+            .interfaces
+            .iter()
+            .filter(|interface| {
+                !interface.loopback && interface.running && interface.mac_address != [0; 6]
+            })
+            .map(|interface| RouterSolicitState {
+                interface: interface.id,
+                attempts: 0,
+                next_send_ns: now_ns,
+            })
+            .collect();
     }
 
     fn run_dad(&self, now_ns: u64) -> DadRunOutput {
@@ -2856,6 +3063,351 @@ impl NetStackControlPlane {
             lease_changes,
             next_deadline_ns: dhcp.iter().map(|client| client.next_action_ns).min(),
         }
+    }
+
+    /// 启动/确保 DHCPv6 客户端（RA M 标志触发）。
+    fn enable_dhcpv6(&self, interface: InterfaceId, config: &ConfigSnapshot, now_ns: u64) {
+        let mut clients = self.dhcpv6.lock();
+        if clients.iter().any(|client| client.interface == interface) {
+            return;
+        }
+        let Some(snapshot) = config.interfaces.iter().find(|entry| entry.id == interface) else {
+            return;
+        };
+        if snapshot.loopback || !snapshot.running || snapshot.mac_address == [0; 6] {
+            return;
+        }
+        let mut transaction_id = interface.0.wrapping_mul(0x9e37_79b9);
+        for byte in snapshot.mac_address {
+            transaction_id = transaction_id.rotate_left(5) ^ u32::from(byte);
+        }
+        clients.push(Dhcpv6Client {
+            interface,
+            mac_address: snapshot.mac_address,
+            transaction_id: (transaction_id.max(1)) & 0x00ff_ffff,
+            iaid: transaction_id.max(1),
+            phase: Dhcpv6Phase::Solicit,
+            next_action_ns: now_ns,
+            retry_seconds: 1,
+        });
+    }
+
+    fn run_dhcpv6(&self, config: &ConfigSnapshot, now_ns: u64) -> Dhcpv6RunOutput {
+        let mut dhcpv6 = self.dhcpv6.lock();
+        let mut frames = Vec::new();
+        let changes = Vec::new();
+        let mut index = 0;
+        while index < dhcpv6.len() {
+            let client = &mut dhcpv6[index];
+            if client.next_action_ns > now_ns {
+                index += 1;
+                continue;
+            }
+            let retry = client.retry_seconds.clamp(1, 64);
+            client.next_action_ns =
+                now_ns.saturating_add(u64::from(retry).saturating_mul(1_000_000_000));
+            client.retry_seconds = retry.saturating_mul(2).min(64);
+            match &client.phase {
+                Dhcpv6Phase::Solicit => {
+                    if let Some(frame) = build_dhcpv6_frame(client, config, 1, None, None) {
+                        frames.push((client.interface, frame));
+                    }
+                    index += 1;
+                }
+                Dhcpv6Phase::Requesting {
+                    server,
+                    server_id,
+                    address,
+                    ..
+                } => {
+                    if let Some(frame) =
+                        build_dhcpv6_frame(client, config, 3, Some(server_id), *address)
+                    {
+                        frames.push((client.interface, frame));
+                    }
+                    let _ = server;
+                    index += 1;
+                }
+                Dhcpv6Phase::Bound {
+                    server,
+                    server_id,
+                    address,
+                    renew_ns,
+                    rebind_ns,
+                    ..
+                } => {
+                    if now_ns >= *rebind_ns {
+                        // Rebind（type 4，不带 server-id）。
+                        if let Some(frame) =
+                            build_dhcpv6_frame(client, config, 4, None, Some(*address))
+                        {
+                            frames.push((client.interface, frame));
+                        }
+                    } else if now_ns >= *renew_ns {
+                        // Renew（type 3，带 server-id）。
+                        if let Some(frame) =
+                            build_dhcpv6_frame(client, config, 3, Some(server_id), Some(*address))
+                        {
+                            frames.push((client.interface, frame));
+                        }
+                    }
+                    let _ = server;
+                    index += 1;
+                }
+            }
+        }
+        Dhcpv6RunOutput {
+            frames,
+            lease_changes: changes,
+            next_deadline_ns: dhcpv6.iter().map(|client| client.next_action_ns).min(),
+        }
+    }
+
+    fn handle_dhcpv6_packet(
+        &self,
+        interface: InterfaceId,
+        packet: &FrontendPacket,
+        now_ns: u64,
+    ) -> Dhcpv6PacketOutput {
+        let Some(reply) = parse_dhcpv6_reply(packet) else {
+            return Dhcpv6PacketOutput {
+                handled: false,
+                lease_change: None,
+            };
+        };
+        let mut dhcpv6 = self.dhcpv6.lock();
+        let Some(client) = dhcpv6.iter_mut().find(|client| {
+            client.interface == interface && client.transaction_id == reply.transaction_id
+        }) else {
+            return Dhcpv6PacketOutput {
+                handled: false,
+                lease_change: None,
+            };
+        };
+        let mut change = None;
+        match reply.message_type {
+            2 => {
+                // Advertise → Request。
+                if !matches!(client.phase, Dhcpv6Phase::Solicit) || reply.server_id.is_empty() {
+                    return Dhcpv6PacketOutput {
+                        handled: true,
+                        lease_change: None,
+                    };
+                }
+                let IpAddr::V6(server) = packet
+                    .parsed
+                    .ip
+                    .map(|ip| ip.source)
+                    .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+                else {
+                    return Dhcpv6PacketOutput {
+                        handled: true,
+                        lease_change: None,
+                    };
+                };
+                client.phase = Dhcpv6Phase::Requesting {
+                    server,
+                    server_id: reply.server_id.clone(),
+                    address: reply.address,
+                    prefix_len: 64,
+                };
+                client.next_action_ns = now_ns;
+                client.retry_seconds = 1;
+            }
+            7 => {
+                // Reply → Bound / 续约更新。
+                let (requesting_prefix, bound_prefix) = match &client.phase {
+                    Dhcpv6Phase::Requesting { prefix_len, .. } => (Some(*prefix_len), None),
+                    Dhcpv6Phase::Bound { prefix_len, .. } => (None, Some(*prefix_len)),
+                    _ => (None, None),
+                };
+                if let Some(prefix_len) = requesting_prefix.or(bound_prefix) {
+                    let old_address = match &client.phase {
+                        Dhcpv6Phase::Bound { address, .. } => Some(*address),
+                        _ => None,
+                    };
+                    let lease = Dhcpv6Lease {
+                        address: reply
+                            .address
+                            .unwrap_or(old_address.unwrap_or(Ipv6Addr::UNSPECIFIED)),
+                        prefix_len,
+                        dns: reply.dns.clone(),
+                        valid_seconds: reply.valid_seconds,
+                    };
+                    change = Some(Dhcpv6LeaseChange {
+                        interface,
+                        old: None,
+                        new: Some(lease.clone()),
+                    });
+                    let t1 = if reply.t1_seconds != 0 {
+                        reply.t1_seconds
+                    } else {
+                        reply.valid_seconds / 2
+                    };
+                    let t2 = if reply.t2_seconds != 0 {
+                        reply.t2_seconds
+                    } else {
+                        (reply.valid_seconds * 4) / 5
+                    };
+                    client.phase = Dhcpv6Phase::Bound {
+                        server: Ipv6Addr::UNSPECIFIED,
+                        server_id: alloc::vec::Vec::new(),
+                        address: lease.address,
+                        prefix_len,
+                        renew_ns: now_ns
+                            .saturating_add(u64::from(t1).saturating_mul(1_000_000_000)),
+                        rebind_ns: now_ns
+                            .saturating_add(u64::from(t2).saturating_mul(1_000_000_000)),
+                    };
+                }
+                client.next_action_ns = now_ns.saturating_add(1_000_000_000);
+                client.retry_seconds = 1;
+            }
+            _ => {
+                return Dhcpv6PacketOutput {
+                    handled: true,
+                    lease_change: None,
+                };
+            }
+        }
+        Dhcpv6PacketOutput {
+            handled: true,
+            lease_change: change,
+        }
+    }
+
+    fn run_router_solicit(&self, now_ns: u64) -> RouterSolicitRunOutput {
+        let mut router_solicits = self.router_solicits.lock();
+        let mut probes = Vec::new();
+        let mut next = None;
+        let mut index = 0;
+        while index < router_solicits.len() {
+            let state = &mut router_solicits[index];
+            if state.attempts >= MAX_ROUTER_SOLICITATIONS {
+                router_solicits.remove(index);
+                continue;
+            }
+            if state.next_send_ns > now_ns {
+                next = Some(next.map_or(state.next_send_ns, |n: u64| n.min(state.next_send_ns)));
+                index += 1;
+                continue;
+            }
+            probes.push(state.interface);
+            state.attempts += 1;
+            // RFC 4861 §6.3.7：重试间隔 1s、2s、4s。
+            let delay = 1_000_000_000u64 << (state.attempts - 1);
+            state.next_send_ns = now_ns.saturating_add(delay);
+            next = Some(next.map_or(state.next_send_ns, |n: u64| n.min(state.next_send_ns)));
+            index += 1;
+        }
+        RouterSolicitRunOutput {
+            probes,
+            next_deadline_ns: next,
+        }
+    }
+
+    fn handle_router_advertisement(
+        &self,
+        interface: InterfaceId,
+        packet: &FrontendPacket,
+        now_ns: u64,
+    ) -> RouterAdvertisementOutput {
+        let _ = interface;
+        let _ = now_ns;
+        let empty = RouterAdvertisementOutput {
+            router: Ipv6Addr::UNSPECIFIED,
+            mac: None,
+            lifetime_seconds: 0,
+            prefixes: Vec::new(),
+            managed: false,
+        };
+        let Some(ip) = packet.parsed.ip else {
+            return empty;
+        };
+        let IpAddr::V6(router) = ip.source else {
+            return empty;
+        };
+        let offset = usize::from(ip.payload_offset);
+        let len = ip.payload_len as usize;
+        // ICMPv6 RA：type(1) code(1) checksum(2) hoplimit(1) flags(1) lifetime(2)
+        // reachable(4) retrans(4) = 16 字节，随后是选项。
+        if len < 16 {
+            return empty;
+        }
+        let mut header = [0u8; 16];
+        if packet.chain.copy_out(offset, &mut header).is_err() || header[0] != 134 {
+            return empty;
+        }
+        let lifetime_seconds = u32::from(u16::from_be_bytes([header[6], header[7]]));
+        // M 标志（RFC 4861 §4.2：flags 字节 bit7）。
+        let managed = header[5] & 0x80 != 0;
+        let mut mac = None;
+        let mut prefixes = Vec::new();
+        let mut cursor = offset + 16;
+        let end = offset + len;
+        while cursor + 8 <= end {
+            let mut option = [0u8; 32];
+            let available = (end - cursor).min(32);
+            if packet
+                .chain
+                .copy_out(cursor, &mut option[..available])
+                .is_err()
+            {
+                break;
+            }
+            let kind = option[0];
+            let option_len = usize::from(option[1]) * 8;
+            if option_len < 8 || cursor + option_len > end {
+                break;
+            }
+            match kind {
+                1 if option_len == 8 => {
+                    // Source Link-Layer Address。
+                    mac = Some(option[2..8].try_into().unwrap());
+                }
+                3 if option_len == 32 => {
+                    // Prefix Information。
+                    let prefix_len = option[2];
+                    let flags = option[3];
+                    let valid_seconds = u32::from_be_bytes(option[4..8].try_into().unwrap());
+                    if prefix_len <= 128 {
+                        prefixes.push(SlaacPrefix {
+                            prefix: Ipv6Addr(option[16..32].try_into().unwrap()),
+                            prefix_len,
+                            onlink: flags & 0x80 != 0,
+                            autonomous: flags & 0x40 != 0,
+                            valid_seconds,
+                        });
+                    }
+                }
+                _ => {}
+            }
+            cursor += option_len;
+        }
+        RouterAdvertisementOutput {
+            router,
+            mac,
+            lifetime_seconds,
+            prefixes,
+            managed,
+        }
+    }
+
+    fn add_dad_state(&self, interface: InterfaceId, address: Ipv6Addr, now_ns: u64) {
+        let mut dad = self.dad.lock();
+        if dad
+            .iter()
+            .any(|state| state.interface == interface && state.address == address)
+        {
+            return;
+        }
+        dad.push(DadState {
+            interface,
+            address,
+            probe_sent: false,
+            conflict: false,
+            deadline_ns: now_ns.saturating_add(1_000_000_000),
+        });
     }
 
     fn handle_dhcp_packet(
@@ -3006,6 +3558,12 @@ impl NetStackControlPlane {
     fn remove_autoconfig_interface(&self, interface: InterfaceId) -> Option<DhcpLeaseChange> {
         self.dad.lock().retain(|state| state.interface != interface);
         self.dad_errors.lock().remove(&interface);
+        self.router_solicits
+            .lock()
+            .retain(|state| state.interface != interface);
+        self.dhcpv6
+            .lock()
+            .retain(|client| client.interface != interface);
         let mut dhcp = self.dhcp.lock();
         let index = dhcp
             .iter()
@@ -3303,6 +3861,173 @@ fn parse_dhcp_reply(packet: &FrontendPacket) -> Option<DhcpReply> {
     (reply.message_type != 0).then_some(reply)
 }
 
+struct Dhcpv6Reply {
+    message_type: u8,
+    transaction_id: u32,
+    server_id: Vec<u8>,
+    address: Option<Ipv6Addr>,
+    valid_seconds: u32,
+    t1_seconds: u32,
+    t2_seconds: u32,
+    dns: Vec<Ipv6Addr>,
+}
+
+/// 构建 DHCPv6 客户端帧（Solicit/Request/Renew/Rebind，RFC 8415 §7）。
+fn build_dhcpv6_frame(
+    client: &Dhcpv6Client,
+    config: &ConfigSnapshot,
+    message_type: u8,
+    server_id: Option<&[u8]>,
+    address: Option<Ipv6Addr>,
+) -> Option<Vec<u8>> {
+    let snapshot = config
+        .interfaces
+        .iter()
+        .find(|entry| entry.id == client.interface)?;
+    let IpAddr::V6(source) = config.addresses.iter().find_map(|entry| {
+        (entry.interface == client.interface && matches!(entry.address, IpAddr::V6(_)))
+            .then_some(entry.address)
+    })?
+    else {
+        return None;
+    };
+    let mut payload = Vec::with_capacity(64);
+    payload.push(message_type);
+    payload.extend_from_slice(&client.transaction_id.to_be_bytes()[1..]);
+    // Client Identifier（option 1，DUID-LL：type 3，hw-type 1，MAC，共 10 字节）。
+    payload.extend_from_slice(&[0, 1, 0, 10, 0, 3, 0, 1]);
+    payload.extend_from_slice(&client.mac_address);
+    // Server Identifier（option 2；Rebind 不带）。
+    if let Some(server_id) = server_id {
+        payload.extend_from_slice(&[0, 2]);
+        payload.extend_from_slice(&(server_id.len() as u16).to_be_bytes());
+        payload.extend_from_slice(server_id);
+    }
+    // IA_NA（option 3）：iaid + t1 + t2 + IAADDR（option 5）。
+    let preferred: u32 = if address.is_some() { 0xffff_ffff } else { 0 };
+    let valid: u32 = if address.is_some() { 0xffff_ffff } else { 0 };
+    payload.extend_from_slice(&[0, 3, 0, 40]);
+    payload.extend_from_slice(&client.iaid.to_be_bytes());
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    payload.extend_from_slice(&[0, 5, 0, 24]);
+    payload.extend_from_slice(&address.unwrap_or(Ipv6Addr::UNSPECIFIED).0);
+    payload.extend_from_slice(&preferred.to_be_bytes());
+    payload.extend_from_slice(&valid.to_be_bytes());
+    if message_type == 1 {
+        // Option Request Option（option 6）：DNS servers（23）、domain（24）。
+        payload.extend_from_slice(&[0, 6, 0, 4, 0, 23, 0, 24]);
+    }
+    // Elapsed Time（option 8）。
+    payload.extend_from_slice(&[0, 8, 0, 2, 0, 0]);
+    let udp_len = 8 + payload.len();
+    let mut frame = alloc::vec![0; 14 + 40 + udp_len];
+    // ff02::1:2 组播 MAC。
+    frame[0..6].copy_from_slice(&[0x33, 0x33, 0, 0, 0, 0x02]);
+    frame[6..12].copy_from_slice(&snapshot.mac_address);
+    frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+    frame[14..18].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+    frame[18..20].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    frame[20] = 17;
+    frame[21] = 255;
+    frame[22..38].copy_from_slice(&source.0);
+    frame[38..54].copy_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]);
+    // UDP：客户端 546 → 服务器 547。
+    frame[54..56].copy_from_slice(&546u16.to_be_bytes());
+    frame[56..58].copy_from_slice(&547u16.to_be_bytes());
+    frame[58..60].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    frame[62..].copy_from_slice(&payload);
+    let chain = PacketChain::from_owned(frame.clone());
+    let destination = Ipv6Addr([0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]);
+    let checksum = crate::pipeline::transport_checksum(
+        &chain,
+        54,
+        udp_len,
+        IpAddr::V6(source),
+        IpAddr::V6(destination),
+        17,
+    )
+    .ok()?;
+    frame[60..62].copy_from_slice(&checksum.to_be_bytes());
+    Some(frame)
+}
+
+/// 解析 DHCPv6 应答（Advertise/Reply，RFC 8415 §7）。
+fn parse_dhcpv6_reply(packet: &FrontendPacket) -> Option<Dhcpv6Reply> {
+    let udp = packet.parsed.udp?;
+    if udp.source_port != 547 || udp.destination_port != 546 || udp.payload_len < 12 {
+        return None;
+    }
+    let mut payload = alloc::vec![0; usize::from(udp.payload_len)];
+    packet
+        .chain
+        .copy_out(usize::from(udp.payload_offset), &mut payload)
+        .ok()?;
+    let message_type = payload[0];
+    if !matches!(message_type, 2 | 7) {
+        return None;
+    }
+    let transaction_id = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
+    let mut reply = Dhcpv6Reply {
+        message_type,
+        transaction_id,
+        server_id: Vec::new(),
+        address: None,
+        valid_seconds: 0,
+        t1_seconds: 0,
+        t2_seconds: 0,
+        dns: Vec::new(),
+    };
+    let mut cursor = 4usize;
+    while cursor + 4 <= payload.len() {
+        let code = u16::from_be_bytes([payload[cursor], payload[cursor + 1]]);
+        let len = usize::from(u16::from_be_bytes([
+            payload[cursor + 2],
+            payload[cursor + 3],
+        ]));
+        if cursor + 4 + len > payload.len() {
+            break;
+        }
+        let option = &payload[cursor + 4..cursor + 4 + len];
+        match code {
+            2 => reply.server_id = option.to_vec(),
+            3 => {
+                // IA_NA：iaid(4) + t1(4) + t2(4) + 子选项。
+                if len >= 12 {
+                    reply.t1_seconds = u32::from_be_bytes(option[4..8].try_into().ok()?);
+                    reply.t2_seconds = u32::from_be_bytes(option[8..12].try_into().ok()?);
+                    let mut sub = 12usize;
+                    while sub + 4 <= option.len() {
+                        let sub_code = u16::from_be_bytes([option[sub], option[sub + 1]]);
+                        let sub_len =
+                            usize::from(u16::from_be_bytes([option[sub + 2], option[sub + 3]]));
+                        if sub + 4 + sub_len > option.len() {
+                            break;
+                        }
+                        if sub_code == 5 && sub_len >= 24 {
+                            // IAADDR：地址(16) + preferred(4) + valid(4)。
+                            reply.address =
+                                Some(Ipv6Addr(option[sub + 4..sub + 20].try_into().ok()?));
+                            reply.valid_seconds =
+                                u32::from_be_bytes(option[sub + 24..sub + 28].try_into().ok()?);
+                        }
+                        sub += 4 + sub_len;
+                    }
+                }
+            }
+            23 => {
+                // DNS servers：16 字节一组。
+                for chunk in option.chunks_exact(16) {
+                    reply.dns.push(Ipv6Addr(chunk.try_into().ok()?));
+                }
+            }
+            _ => {}
+        }
+        cursor += 4 + len;
+    }
+    Some(reply)
+}
+
 fn ipv4_mask_prefix(mask: Ipv4Addr) -> Option<u8> {
     let value = mask.as_u32();
     let prefix = value.leading_ones() as u8;
@@ -3334,7 +4059,9 @@ pub fn create_control_plane(
     rss_key: [u8; 40],
     hash_seed: &[u8; 16],
 ) -> NetStackControlPlane {
-    NetStackControlPlane::new(shard_count, rss_key, hash_seed)
+    // 内核 DHCP 关闭开关随启动配置（net.dhcp=0）进入控制面。
+    let dhcp_disabled = boot_config().is_some_and(|boot| boot.dhcp_disabled());
+    NetStackControlPlane::new_with_options(shard_count, rss_key, hash_seed, dhcp_disabled)
 }
 
 #[kernel_symbols::export(
@@ -3405,6 +4132,66 @@ pub fn dispatch_control_plane_call(
                 return;
             };
             *output = Some(plane.handle_dhcp_packet(*interface, packet, *now_ns));
+        }
+        NetStackControlCommand::RunRouterSolicit { now_ns, output } => {
+            *output = Some(plane.run_router_solicit(*now_ns));
+        }
+        NetStackControlCommand::RunDhcpv6 {
+            config,
+            now_ns,
+            output,
+        } => {
+            if config.is_null() || !config.is_aligned() {
+                return;
+            }
+            // Safety: config 只在同步 control-call 期间借用。
+            let config = unsafe { &**config };
+            *output = Some(plane.run_dhcpv6(config, *now_ns));
+        }
+        NetStackControlCommand::HandleDhcpv6Packet {
+            interface,
+            packet,
+            now_ns,
+            output,
+        } => {
+            let Some(packet) = packet.as_ref() else {
+                return;
+            };
+            *output = Some(plane.handle_dhcpv6_packet(*interface, packet, *now_ns));
+        }
+        NetStackControlCommand::EnableDhcpv6 {
+            interface,
+            config,
+            now_ns,
+            output,
+        } => {
+            if config.is_null() || !config.is_aligned() {
+                return;
+            }
+            // Safety: config 只在同步 control-call 期间借用。
+            let config = unsafe { &**config };
+            plane.enable_dhcpv6(*interface, config, *now_ns);
+            *output = Some(());
+        }
+        NetStackControlCommand::HandleRouterAdvertisement {
+            interface,
+            packet,
+            now_ns,
+            output,
+        } => {
+            let Some(packet) = packet.as_ref() else {
+                return;
+            };
+            *output = Some(plane.handle_router_advertisement(*interface, packet, *now_ns));
+        }
+        NetStackControlCommand::AddDadState {
+            interface,
+            address,
+            now_ns,
+            output,
+        } => {
+            plane.add_dad_state(*interface, *address, *now_ns);
+            *output = Some(());
         }
         NetStackControlCommand::RemoveAutoconfigInterface { interface, output } => {
             *output = Some(plane.remove_autoconfig_interface(*interface));
@@ -3859,7 +4646,7 @@ fn process_local_tcp_work(
         acknowledgement: work.acknowledgement,
         flags: work.flags,
         window: work.window,
-        urgent_pointer: 0,
+        urgent_pointer: work.urgent_pointer,
         header_len: 20 + u16::from(work.options_len),
         payload_offset: 0,
         payload_len: work
@@ -4035,18 +4822,31 @@ pub fn dispatch_flow_shard_command(
             facade,
             control_sequence,
             local_transport,
+            fastopen,
             now_ns,
             output,
         } => {
-            *output = Some(shard.connect_tcp(
-                *local,
-                *remote,
-                *path,
-                Arc::clone(facade),
-                *control_sequence,
-                *local_transport,
-                *now_ns,
-            ));
+            *output = Some(if *fastopen {
+                shard.connect_tcp_fastopen(
+                    *local,
+                    *remote,
+                    *path,
+                    Arc::clone(facade),
+                    *control_sequence,
+                    *local_transport,
+                    *now_ns,
+                )
+            } else {
+                shard.connect_tcp(
+                    *local,
+                    *remote,
+                    *path,
+                    Arc::clone(facade),
+                    *control_sequence,
+                    *local_transport,
+                    *now_ns,
+                )
+            });
         }
         NetStackFlowCommand::CloseTcp { flow, now_ns } => {
             reconcile_local_tcp_direct_pair(shard, *flow, *now_ns);
@@ -5352,6 +6152,8 @@ mod tests {
         let source = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let destination = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let plan = build_tcp_tx_plan(PreparedTcpTx {
+            urgent_pointer: 0,
+            ip_options: crate::ip_options::IpOptions::empty(),
             flow: FlowId(1),
             flow_generation: 1,
             facade_generation: 1,
@@ -5392,6 +6194,73 @@ mod tests {
         assert_eq!(
             crate::pipeline::transport_checksum(&packet, 34, 20, source, destination, 6),
             Ok(0)
+        );
+    }
+
+    #[test]
+    fn tcp_tx_plan_includes_ip_options() {
+        // IP_OPTIONS：选项出现在 IPv4 头中，IHL/total_len/校验和与 TCP 偏移同步。
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 2,
+                counter: 1,
+            },
+            crate::AddressFamily::Ipv4,
+            crate::SocketKind::Stream,
+        ));
+        let source = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let destination = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        // RR（7 字节）→ 4 字节对齐后 8 字节。
+        let options = crate::ip_options::IpOptions::parse(&[7, 7, 4, 0, 0, 0, 0]).unwrap();
+        assert_eq!(options.wire_len(), 8);
+        let plan = build_tcp_tx_plan(PreparedTcpTx {
+            urgent_pointer: 0,
+            ip_options: options,
+            flow: FlowId(1),
+            flow_generation: 1,
+            facade_generation: 1,
+            facade,
+            payload: None,
+            path: TcpPath {
+                route: crate::control::RouteDecision {
+                    interface: InterfaceId(1),
+                    source,
+                    next_hop: destination,
+                    mtu: 65_535,
+                    table: 0,
+                },
+                source_mac: [0x02, 0, 0, 0, 0, 1],
+                destination_mac: [0x02, 0, 0, 0, 0, 2],
+                unresolved_neighbor: None,
+                config_generation: 1,
+            },
+            remote: Endpoint {
+                addr: destination,
+                port: 19_004,
+            },
+            local_port: 40_000,
+            sequence: crate::transport::TcpSequence(10),
+            acknowledgement: crate::transport::TcpSequence(20),
+            flags: TcpFlags::ACK | TcpFlags::PSH,
+            window: 32_768,
+            options: [0; 40],
+            options_len: 0,
+            parsed_options: crate::transport::TcpOptions::default(),
+            completion: 8,
+            low_latency: false,
+        })
+        .unwrap();
+        // 14(eth) + 28(IP 含 8 字节选项) + 20(TCP)。
+        assert_eq!(plan.header_len, 62);
+        let ip = &plan.header[14..42];
+        assert_eq!(ip[0], 0x45 | (2 << 4), "IHL 必须包含选项");
+        assert_eq!(&ip[20..28], options.wire_slice(), "选项原样携带");
+        assert_eq!(crate::pipeline::checksum_bytes(ip), 0, "IP 校验和覆盖选项");
+        let packet = PacketChain::from_owned(plan.header_bytes().to_vec());
+        assert_eq!(
+            crate::pipeline::transport_checksum(&packet, 42, 20, source, destination, 6),
+            Ok(0),
+            "TCP 校验和按偏移 42 计算",
         );
     }
 
@@ -5777,6 +6646,7 @@ mod tests {
             unresolved_neighbor: None,
             hop_limit: 64,
             traffic_class: 7,
+            ip_options: crate::ip_options::IpOptions::empty(),
             mark: 0,
             completion: CompletionToken(1),
         };
@@ -5802,6 +6672,53 @@ mod tests {
         assert_eq!(work.payload.copy_out(&mut copied), Ok(bytes.len()));
         assert_eq!(copied, bytes);
         work.payload.complete();
+    }
+
+    #[test]
+    fn udp_tx_plan_includes_ip_options() {
+        // UDP 计划同样携带 IP_OPTIONS：IHL、total_len、校验和与 UDP 偏移同步。
+        let sender = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 6,
+                counter: 9,
+            },
+            crate::AddressFamily::Ipv4,
+            crate::SocketKind::Datagram,
+        ));
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            port: 9_000,
+        };
+        let bytes = [0x4d; 32];
+        let payload = sender.test_udp_tx_lease(&bytes, destination);
+        let options = crate::ip_options::IpOptions::parse(&[7, 7, 4, 0, 0, 0, 0]).unwrap();
+        let work = PreparedUdpTx {
+            payload,
+            route: crate::control::RouteDecision {
+                interface: InterfaceId(1),
+                source: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                next_hop: destination.addr,
+                mtu: 65_535,
+                table: 0,
+            },
+            destination,
+            source_port: 40_000,
+            source_mac: [0; 6],
+            destination_mac: [0; 6],
+            unresolved_neighbor: None,
+            hop_limit: 64,
+            traffic_class: 0,
+            ip_options: options,
+            mark: 0,
+            completion: CompletionToken(3),
+        };
+        let plan = build_udp_tx_plan(work).unwrap();
+        // 14(eth) + 28(IP 含选项) + 8(UDP)。
+        assert_eq!(plan.header_len, 50);
+        let ip = &plan.header[14..42];
+        assert_eq!(ip[0], 0x45 | (2 << 4));
+        assert_eq!(&ip[20..28], options.wire_slice());
+        assert_eq!(crate::pipeline::checksum_bytes(ip), 0);
     }
 
     #[test]
@@ -5986,6 +6903,308 @@ mod tests {
             Some(30_000_000_400)
         );
         assert_eq!(dhcp_rebind_seconds(800, 400, Some(1)), 401);
+    }
+
+    #[test]
+    fn dhcp_client_disabled_by_boot_switch() {
+        // 启动参数 net.dhcp=0：无静态 IPv4 的接口也不发起 DHCP discover。
+        let config = ConfigSnapshot::new(
+            1,
+            alloc::vec![crate::control::InterfaceSnapshot {
+                id: InterfaceId(1),
+                device: crate::NetDeviceId(1),
+                mac_address: [0x02, 0, 0, 0, 0, 1],
+                mtu: 1500,
+                running: true,
+                loopback: false,
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let plane = NetStackControlPlane::new_with_options(1, [3; 40], &[5; 16], true);
+        plane.initialize_autoconfig(&config, 100);
+        assert!(plane.run_dhcp(&config, 100).frames.is_empty());
+        // 关闭开关不影响 DAD（IPv6 自动配置）。
+        assert_eq!(plane.run_dad(100).probes.len(), 1);
+    }
+
+    #[test]
+    fn router_solicit_retries_three_times_then_stops() {
+        // RFC 4861 §6.3.7：最多 3 次 RS，间隔 1s/2s/4s。
+        let config = ConfigSnapshot::new(
+            1,
+            alloc::vec![crate::control::InterfaceSnapshot {
+                id: InterfaceId(1),
+                device: crate::NetDeviceId(1),
+                mac_address: [0x02, 0, 0, 0, 0, 1],
+                mtu: 1500,
+                running: true,
+                loopback: false,
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let plane = NetStackControlPlane::new_with_options(1, [3; 40], &[5; 16], true);
+        plane.initialize_autoconfig(&config, 100);
+        let first = plane.run_router_solicit(100);
+        assert_eq!(first.probes.len(), 1);
+        assert_eq!(plane.run_router_solicit(100).probes.len(), 0, "同刻不重发");
+        let second = plane.run_router_solicit(1_100_000_100);
+        assert_eq!(second.probes.len(), 1, "1s 后重试");
+        let third = plane.run_router_solicit(3_100_000_100);
+        assert_eq!(third.probes.len(), 1, "3s 后（2s 间隔）重试");
+        let exhausted = plane.run_router_solicit(7_100_000_100);
+        assert_eq!(exhausted.probes.len(), 0, "3 次后停止");
+        assert_eq!(exhausted.next_deadline_ns, None);
+    }
+
+    #[test]
+    fn router_advertisement_parses_prefixes_and_router() {
+        // 构造一个 RA 帧：type 134 + 源链路层 + 前缀信息（L/A 标志，/64）。
+        let interface = InterfaceId(1);
+        let mac = [0x02, 0, 0, 0, 0, 0x01];
+        let router = Ipv6Addr([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let mut frame = alloc::vec![0u8; 14 + 40 + 16 + 8 + 32];
+        frame[14..18].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+        frame[18..20].copy_from_slice(&((16 + 8 + 32) as u16).to_be_bytes());
+        frame[20] = 58;
+        frame[22..38].copy_from_slice(&router.0);
+        let offset = 54usize;
+        frame[offset] = 134;
+        frame[offset + 6..offset + 8].copy_from_slice(&1800u16.to_be_bytes());
+        // 选项 1：源链路层。
+        frame[offset + 16] = 1;
+        frame[offset + 17] = 1;
+        frame[offset + 18..offset + 24].copy_from_slice(&mac);
+        // 选项 3：前缀信息。
+        frame[offset + 24] = 3;
+        frame[offset + 25] = 4;
+        frame[offset + 26] = 64;
+        frame[offset + 27] = 0xC0; // L + A
+        frame[offset + 28..offset + 32].copy_from_slice(&604_800u32.to_be_bytes());
+        let prefix = Ipv6Addr([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        frame[offset + 40..offset + 56].copy_from_slice(&prefix.0);
+        let chain = crate::buf::PacketChain::from_owned(frame);
+        let parsed = crate::pipeline::ParsedPacket {
+            ethernet: crate::pipeline::EthernetHeader {
+                destination: [0x33, 0x33, 0, 0, 0, 0x01],
+                source: mac,
+                ethertype: 0x86dd,
+            },
+            ip: Some(crate::pipeline::IpPacket {
+                source: IpAddr::V6(router),
+                destination: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                next_header: 58,
+                header_len: 40,
+                payload_offset: 54,
+                payload_len: (16 + 8 + 32) as u32,
+                hop_limit: 255,
+                traffic_class: 0,
+                fragment: None,
+            }),
+            tcp: None,
+            udp: None,
+            flow: None,
+            rss_hash: None,
+            disposition: crate::pipeline::FrontendDisposition::Control(
+                crate::pipeline::ControlPacket::Icmp {
+                    ipv6: true,
+                    packet_offset: 54,
+                    packet_len: (16 + 8 + 32) as u32,
+                },
+            ),
+        };
+        let packet = crate::pipeline::FrontendPacket {
+            chain,
+            parsed,
+            metadata: crate::buf::PacketMetadata::default(),
+        };
+        let plane = NetStackControlPlane::new_with_options(1, [3; 40], &[5; 16], true);
+        let output = plane.handle_router_advertisement(interface, &packet, 200);
+        assert_eq!(output.router, router);
+        assert_eq!(output.mac, Some(mac));
+        assert_eq!(output.lifetime_seconds, 1800);
+        assert_eq!(output.prefixes.len(), 1);
+        assert!(output.prefixes[0].onlink);
+        assert!(output.prefixes[0].autonomous);
+        assert_eq!(output.prefixes[0].prefix, prefix);
+        assert_eq!(output.prefixes[0].prefix_len, 64);
+        assert_eq!(output.prefixes[0].valid_seconds, 604_800);
+    }
+
+    #[test]
+    fn add_dad_state_queues_duplicate_free_probe() {
+        let plane = NetStackControlPlane::new_with_options(1, [3; 40], &[5; 16], true);
+        let address = Ipv6Addr([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        plane.add_dad_state(InterfaceId(1), address, 100);
+        plane.add_dad_state(InterfaceId(1), address, 200);
+        assert_eq!(
+            plane.run_dad(1_100_000_100).probes.len(),
+            1,
+            "重复地址只排一次"
+        );
+    }
+
+    #[test]
+    fn dhcpv6_reply_parser_extracts_address_and_dns() {
+        let server_mac = [0x02, 0, 0, 0, 0, 0x02];
+        let server = Ipv6Addr([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let offered = Ipv6Addr([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+        ]);
+        let dns = Ipv6Addr([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53,
+        ]);
+        let packet = build_dhcpv6_reply_frame(7, 0x123456, server_mac, server, offered, dns, 3600);
+        let reply = parse_dhcpv6_reply(&packet).expect("解析应答");
+        assert_eq!(reply.transaction_id, 0x123456);
+        assert_eq!(reply.address, Some(offered));
+        assert_eq!(reply.valid_seconds, 3600);
+        assert_eq!(reply.dns, alloc::vec![dns]);
+    }
+
+    /// 测试辅助：构造 DHCPv6 服务器应答帧（Advertise/Reply）。
+    fn build_dhcpv6_reply_frame(
+        message_type: u8,
+        transaction_id: u32,
+        server_mac: [u8; 6],
+        server: Ipv6Addr,
+        address: Ipv6Addr,
+        dns: Ipv6Addr,
+        valid_seconds: u32,
+    ) -> FrontendPacket {
+        let mut payload = Vec::new();
+        payload.push(message_type);
+        payload.extend_from_slice(&transaction_id.to_be_bytes()[1..]);
+        // Server Identifier（DUID-LL，10 字节）。
+        payload.extend_from_slice(&[0, 2, 0, 10, 0, 3, 0, 1]);
+        payload.extend_from_slice(&server_mac);
+        // IA_NA：t1/t2 + IAADDR。
+        payload.extend_from_slice(&[0, 3, 0, 40]);
+        payload.extend_from_slice(&[0, 0, 0, 1]); // iaid
+        payload.extend_from_slice(&(valid_seconds / 2).to_be_bytes());
+        payload.extend_from_slice(&((valid_seconds * 4) / 5).to_be_bytes());
+        payload.extend_from_slice(&[0, 5, 0, 24]);
+        payload.extend_from_slice(&address.0);
+        payload.extend_from_slice(&valid_seconds.to_be_bytes());
+        payload.extend_from_slice(&valid_seconds.to_be_bytes());
+        // DNS servers。
+        payload.extend_from_slice(&[0, 23, 0, 16]);
+        payload.extend_from_slice(&dns.0);
+        let udp_len = 8 + payload.len();
+        let mut frame = alloc::vec![0; 14 + 40 + udp_len];
+        frame[14..18].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+        frame[18..20].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        frame[20] = 17;
+        frame[22..38].copy_from_slice(&server.0);
+        frame[54..56].copy_from_slice(&547u16.to_be_bytes());
+        frame[56..58].copy_from_slice(&546u16.to_be_bytes());
+        frame[58..60].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        frame[62..].copy_from_slice(&payload);
+        FrontendPacket {
+            chain: crate::buf::PacketChain::from_owned(frame),
+            parsed: crate::pipeline::ParsedPacket {
+                ethernet: crate::pipeline::EthernetHeader {
+                    destination: [0x33, 0x33, 0, 0, 0, 0x02],
+                    source: server_mac,
+                    ethertype: 0x86dd,
+                },
+                ip: Some(crate::pipeline::IpPacket {
+                    source: IpAddr::V6(server),
+                    destination: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                    next_header: 17,
+                    header_len: 40,
+                    payload_offset: 54,
+                    payload_len: udp_len as u32,
+                    hop_limit: 255,
+                    traffic_class: 0,
+                    fragment: None,
+                }),
+                tcp: None,
+                udp: Some(crate::pipeline::UdpPacket {
+                    source_port: 547,
+                    destination_port: 546,
+                    payload_offset: 62,
+                    payload_len: payload.len() as u16,
+                }),
+                flow: None,
+                rss_hash: None,
+                disposition: crate::pipeline::FrontendDisposition::Udp,
+            },
+            metadata: crate::buf::PacketMetadata::default(),
+        }
+    }
+
+    #[test]
+    fn dhcpv6_solicit_request_reply_roundtrip() {
+        // DHCPv6 端到端（控制面内）：Solicit → Advertise → Request → Reply → Bound。
+        let config = ConfigSnapshot::new(
+            1,
+            alloc::vec![crate::control::InterfaceSnapshot {
+                id: InterfaceId(1),
+                device: crate::NetDeviceId(1),
+                mac_address: [0x02, 0, 0, 0, 0, 1],
+                mtu: 1500,
+                running: true,
+                loopback: false,
+            }],
+            alloc::vec![crate::control::AddressEntry {
+                interface: InterfaceId(1),
+                address: IpAddr::V6(Ipv6Addr([
+                    0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ])),
+                prefix_len: 64,
+                primary: true,
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let plane = NetStackControlPlane::new_with_options(1, [3; 40], &[5; 16], true);
+        plane.enable_dhcpv6(InterfaceId(1), &config, 100);
+        // Solicit 帧发出。
+        let solicit = plane.run_dhcpv6(&config, 100);
+        assert_eq!(solicit.frames.len(), 1);
+        let frame = &solicit.frames[0].1;
+        assert_eq!(frame[62], 1, "Solicit 消息类型");
+        assert_eq!(frame[56..58], 547u16.to_be_bytes(), "发往服务器端口");
+        // 构造 Advertise 应答。
+        let transaction_id = u32::from_be_bytes([0, frame[63], frame[64], frame[65]]);
+        let server_mac = [0x02, 0, 0, 0, 0, 0x02];
+        let server = Ipv6Addr([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let offered = Ipv6Addr([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+        ]);
+        let dns = Ipv6Addr([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53,
+        ]);
+        let reply =
+            build_dhcpv6_reply_frame(2, transaction_id, server_mac, server, offered, dns, 3600);
+        let advertise = plane.handle_dhcpv6_packet(InterfaceId(1), &reply, 200);
+        assert!(advertise.handled);
+        assert!(advertise.lease_change.is_none(), "Advertise 不安装租约");
+        // Request 发出。
+        let request = plane.run_dhcpv6(&config, 200);
+        assert_eq!(request.frames.len(), 1);
+        let frame = &request.frames[0].1;
+        assert_eq!(frame[62], 3, "Request 消息类型");
+        // 服务器 Reply。
+        let reply =
+            build_dhcpv6_reply_frame(7, transaction_id, server_mac, server, offered, dns, 3600);
+        let bound = plane.handle_dhcpv6_packet(InterfaceId(1), &reply, 300);
+        assert!(bound.handled);
+        let lease = bound.lease_change.unwrap().new.unwrap();
+        assert_eq!(lease.address, offered);
+        assert_eq!(lease.dns, alloc::vec![dns]);
+        assert_eq!(lease.valid_seconds, 3600);
+        // T1 = 3600/2 = 1800s：到期后 Renew（type 3）。
+        let renew = plane.run_dhcpv6(&config, 1_800_000_000_300);
+        assert_eq!(renew.frames.len(), 1);
+        assert_eq!(renew.frames[0].1[62], 3, "T1 续约发 Renew");
     }
 
     #[test]
@@ -6241,5 +7460,193 @@ mod tests {
             lifecycle.activate(NetStackHandle(2), 11, 2),
             Err(NetStackRegisterErrorKind::AlreadyActive)
         );
+    }
+
+    /// ICMP6_FILTER 位图语义（RFC 3542 §3.1 / glibc icmp6.h）：
+    /// 位 = 1 阻止、位 = 0 放行（ICMP6_FILTER_SETPASS 清位）。
+    #[test]
+    fn icmp6_filter_blocks_set_bits_and_passes_cleared_bits() {
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 2,
+                counter: 2,
+            },
+            crate::AddressFamily::Ipv6,
+            crate::SocketKind::Raw,
+        ));
+        // busybox ping6 风格：SETBLOCKALL（全 1）+ SETPASS(ICMP6_ECHO_REPLY)。
+        let mut filter = [0xffff_ffffu32; 8];
+        filter[129 / 32] &= !(1 << (129 % 32));
+        facade.set_icmp6_filter(filter);
+
+        let echo_reply = build_icmp6_test_packet(129);
+        assert!(
+            !facade.icmp6_filter_rejects(&echo_reply),
+            "129（echo reply）位已清，应放行"
+        );
+        let echo_request = build_icmp6_test_packet(128);
+        assert!(
+            facade.icmp6_filter_rejects(&echo_request),
+            "128（echo request）位已置，应阻止"
+        );
+        // 未设置过滤器时全部放行。
+        let unfiltered = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 2,
+                counter: 3,
+            },
+            crate::AddressFamily::Ipv6,
+            crate::SocketKind::Raw,
+        ));
+        assert!(!unfiltered.icmp6_filter_rejects(&build_icmp6_test_packet(128)));
+    }
+
+    /// 构造 ICMPv6 类型为 kind 的入站包（以太网 + IPv6 + ICMPv6 头）。
+    fn build_icmp6_test_packet(kind: u8) -> crate::pipeline::FrontendPacket {
+        let source = IpAddr::V6(Ipv6Addr([
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+        ]));
+        let destination = IpAddr::V6(Ipv6Addr([
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ]));
+        let mut frame = alloc::vec![0u8; 14 + 40 + 8];
+        frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+        frame[14..18].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+        frame[18..20].copy_from_slice(&8u16.to_be_bytes());
+        frame[20] = 58;
+        frame[21] = 64;
+        let IpAddr::V6(source_v6) = source else {
+            unreachable!()
+        };
+        let IpAddr::V6(destination_v6) = destination else {
+            unreachable!()
+        };
+        frame[22..38].copy_from_slice(&source_v6.0);
+        frame[38..54].copy_from_slice(&destination_v6.0);
+        frame[54] = kind;
+        let chain = PacketChain::from_owned(frame);
+        crate::pipeline::FrontendPacket {
+            chain,
+            parsed: crate::pipeline::ParsedPacket {
+                ethernet: crate::pipeline::EthernetHeader {
+                    destination: [0x02, 0, 0, 0, 0, 1],
+                    source: [0x02, 0, 0, 0, 0, 2],
+                    ethertype: 0x86dd,
+                },
+                ip: Some(crate::pipeline::IpPacket {
+                    source,
+                    destination,
+                    next_header: 58,
+                    header_len: 40,
+                    payload_offset: 54,
+                    payload_len: 8,
+                    hop_limit: 64,
+                    traffic_class: 0,
+                    fragment: None,
+                }),
+                tcp: None,
+                udp: None,
+                flow: None,
+                rss_hash: None,
+                disposition: crate::pipeline::FrontendDisposition::Control(
+                    crate::pipeline::ControlPacket::Icmp {
+                        ipv6: true,
+                        packet_offset: 54,
+                        packet_len: 8,
+                    },
+                ),
+            },
+            metadata: PacketMetadata::default(),
+        }
+    }
+
+    /// SOL_RAW IPV6_CHECKSUM：plan 携带校验和回填参数（RFC 3542 §8.1）。
+    #[test]
+    fn raw_ipv6_plan_carries_checksum_fixup() {
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 2,
+                counter: 1,
+            },
+            crate::AddressFamily::Ipv6,
+            crate::SocketKind::Raw,
+        ));
+        facade.set_ipv6_checksum_offset(Some(2));
+        let source = IpAddr::V6(Ipv6Addr([
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ]));
+        let destination = IpAddr::V6(Ipv6Addr([
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+        ]));
+        let payload = facade.test_udp_tx_lease(
+            &[128, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+            Endpoint {
+                addr: destination,
+                port: 0,
+            },
+        );
+        let plan = build_raw_tx_plan(PreparedRawTx {
+            payload,
+            route: crate::control::RouteDecision {
+                interface: InterfaceId(1),
+                source,
+                next_hop: destination,
+                mtu: 1280,
+                table: 0,
+            },
+            destination,
+            source_mac: [0x02, 0, 0, 0, 0, 1],
+            destination_mac: [0x02, 0, 0, 0, 0, 2],
+            unresolved_neighbor: None,
+            protocol: 58,
+            header_included: false,
+            hop_limit: 64,
+            traffic_class: 0,
+            ip_options: crate::ip_options::IpOptions::empty(),
+            ipv6_checksum_offset: Some(2),
+            completion: CompletionToken(1),
+        })
+        .expect("IPv6 raw plan 应构建成功");
+        let fixup = plan
+            .checksum_fixup
+            .expect("启用 IPV6_CHECKSUM 应带回填参数");
+        assert_eq!(fixup.payload_offset, 2);
+        assert_eq!(fixup.source, source);
+        assert_eq!(fixup.destination, destination);
+        assert_eq!(fixup.protocol, 58);
+        assert_eq!(plan.payload_offset, 0);
+        assert_eq!(plan.header_len, 54);
+        // 未启用时无回填参数。
+        facade.set_ipv6_checksum_offset(None);
+        let payload = facade.test_udp_tx_lease(
+            &[128, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+            Endpoint {
+                addr: destination,
+                port: 0,
+            },
+        );
+        let plan = build_raw_tx_plan(PreparedRawTx {
+            payload,
+            route: crate::control::RouteDecision {
+                interface: InterfaceId(1),
+                source,
+                next_hop: destination,
+                mtu: 1280,
+                table: 0,
+            },
+            destination,
+            source_mac: [0x02, 0, 0, 0, 0, 1],
+            destination_mac: [0x02, 0, 0, 0, 0, 2],
+            unresolved_neighbor: None,
+            protocol: 58,
+            header_included: false,
+            hop_limit: 64,
+            traffic_class: 0,
+            ip_options: crate::ip_options::IpOptions::empty(),
+            ipv6_checksum_offset: None,
+            completion: CompletionToken(1),
+        })
+        .expect("IPv6 raw plan 应构建成功");
+        assert!(plan.checksum_fixup.is_none());
     }
 }

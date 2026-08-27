@@ -16,9 +16,9 @@ RUSTC_WRAPPER="$PWD/scripts/kcsan-rustc-wrapper.sh" \
 
 `xtask` 使用按架构隔离的 Cargo 目录，产物分别位于
 `target/loongarch64/loongarch64-unknown-none/release/kernel` 和
-`target/riscv64/riscv64gc-unknown-none-elf/release/kernel`。RISC-V 产物是带调试信息的
-ELF；LoongArch64 启动镜像是 PE。当前构建入口不会自动生成 `kernel.map` 或 KCSAN
-快照目录。KCSAN 构建会显著改变时序和性能，不得用于性能基准或发布镜像。
+`target/riscv64/riscv64gc-unknown-none-elf/release/kernel`。两者都是带调试信息的 ELF；
+raw 和 U-Boot 镜像只由 `cargo xtask image` 派生。当前构建入口不会自动生成 KCSAN 快照
+目录。KCSAN 构建会显著改变时序和性能，不得用于性能基准或发布镜像。
 
 例如 LoongArch64 可将普通 QEMU 命令中的 `-kernel` 参数替换为对应 KCSAN 构建产物，保留 `-smp 8`。慢宿主复现可在运行环境中限制 CPU 数量。
 
@@ -30,7 +30,7 @@ ELF；LoongArch64 启动镜像是 PE。当前构建入口不会自动生成 `ker
 [kcsan] data race seq=7 address=0x... first(kind=write size=8 cpu=1 task=42 pc=0x...) second(kind=read size=8 cpu=6 task=65 pc=0x...)
 ```
 
-必须使用与运行镜像同一次构建的符号产物解析两个 PC。RISC-V64 镜像是保留符号的 ELF，可直接执行：
+必须使用与运行镜像同一次构建的 ELF 解析两个 PC。例如 RISC-V64 可直接执行：
 
 ```sh
 riscv64-linux-gnu-addr2line \
@@ -39,11 +39,11 @@ riscv64-linux-gnu-addr2line \
 ```
 
 也可使用 `llvm-addr2line`；当前 LLVM 版本可能对部分 DWARF range 发出警告，但仍能给出
-函数和源码行。LoongArch64 的可启动产物是 PE，不能直接交给常见的 `addr2line`。若调用方
-在同一次链接中另行保存了 LLD map、kernel 副本及哈希清单，可用仓库脚本做函数级定位：
+函数和源码行。LoongArch64 同样直接使用对应的 Cargo ELF：
 
 ```sh
-scripts/kcsan-symbolize.py build/kcsan/loongarch64/kernel.map \
+llvm-addr2line \
+    -e target/loongarch64/loongarch64-unknown-none/release/kernel -f -C -p \
     0xFIRST_PC 0xSECOND_PC
 ```
 

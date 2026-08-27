@@ -11,10 +11,13 @@ bench = false
 
 [lib]
 name = "test_kernel_mixin"
-path = "src/main.rs"
+path = "src/lib_entry.rs"
 test = false
 doctest = false
 bench = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(elm_integrated_phase, values("device", "runtime"))'] }
 
 [features]
 default = []

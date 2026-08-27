@@ -8,7 +8,8 @@ use core::mem;
 use core::num::NonZeroU32;
 use core::ops::{Deref, DerefMut};
 #[cfg(feature = "block-profile")]
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use general::dev::bio::{
     BIO_MAX_BORROWED_SEGMENTS, Bio, BioBuffer, BioIoError, BioOp, BioReqError, SubmitError,
@@ -17,8 +18,8 @@ use general::dev::block::{BlockFeatures, BlockLimits, BlockRangeLimits};
 use general::dev::dma::{DmaBorrowedMapping, DmaBuffer, DmaContext, DmaDirection};
 use spin::mutex::{Mutex, MutexGuard};
 use virtio::{
-    DescriptorChain, INLINE_DESCRIPTOR_CHAIN, SplitVirtQueue, VIRTIO_F_VERSION_1,
-    VIRTQ_DESC_F_WRITE, VirtqDescUpdate,
+    DescriptorChain, INLINE_DESCRIPTOR_CHAIN, SplitVirtQueue, VIRTIO_F_ACCESS_PLATFORM,
+    VIRTIO_F_VERSION_1, VIRTQ_DESC_F_WRITE, VirtqDescUpdate, access_platform_compatible,
 };
 
 use super::VIRTIO_BLK_SECTOR_SIZE;
@@ -86,6 +87,59 @@ impl<T> Deref for IrqSafeMutexGuard<'_, T> {
 impl<T> DerefMut for IrqSafeMutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.guard
+    }
+}
+
+/// 队列数据路径与热拔 shutdown 之间的无分配门禁。
+pub(super) struct VirtioBlkOperationGate {
+    quiescing: AtomicBool,
+    active: AtomicUsize,
+}
+
+impl VirtioBlkOperationGate {
+    pub(super) const fn new() -> Self {
+        Self {
+            quiescing: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+        }
+    }
+
+    pub(super) fn enter(&self) -> Option<VirtioBlkOperationGuard<'_>> {
+        if self.quiescing.load(Ordering::Acquire) {
+            return None;
+        }
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_add(1)
+            })
+            .ok()?;
+        if self.quiescing.load(Ordering::Acquire) {
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(VirtioBlkOperationGuard { gate: self })
+    }
+
+    pub(super) fn quiesce(&self, spin_limit: u32) -> bool {
+        self.quiescing.store(true, Ordering::Release);
+        for _ in 0..spin_limit {
+            if self.active.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        self.active.load(Ordering::Acquire) == 0
+    }
+}
+
+pub(super) struct VirtioBlkOperationGuard<'a> {
+    gate: &'a VirtioBlkOperationGate,
+}
+
+impl Drop for VirtioBlkOperationGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.gate.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0);
     }
 }
 
@@ -535,6 +589,7 @@ const FEATURE_WRITE_ZEROES: u64 = 1 << 14;
 /// 传输层只读取设备 feature 并写回协商结果；具体哪些 feature 属于块协议能力，
 /// 统一在这里维护，避免 MMIO/PCI 路径出现不同的能力选择策略。
 const SUPPORTED_FEATURES: u64 = VIRTIO_F_VERSION_1
+    | VIRTIO_F_ACCESS_PLATFORM
     | FEATURE_SIZE_MAX
     | FEATURE_SEG_MAX
     | FEATURE_RO
@@ -630,9 +685,13 @@ impl VirtioBlkNegotiatedFeatures {
 pub(super) fn negotiate_supported_features(
     device_features: u64,
     require_version_1: bool,
+    require_access_platform: bool,
 ) -> Result<u64, &'static str> {
     if require_version_1 && device_features & VIRTIO_F_VERSION_1 == 0 {
         return Err("virtio-blk: VERSION_1 feature is missing");
+    }
+    if !access_platform_compatible(device_features, require_access_platform) {
+        return Err("virtio-blk: device cannot honor platform DMA/IOMMU addresses");
     }
     let supported = if require_version_1 {
         SUPPORTED_FEATURES
@@ -1334,13 +1393,13 @@ pub(super) fn allocate_request<Q: VirtioBlkDmaQueue>(
         return Err(SubmitError::QueueFull);
     }
     let dma_context = queue.split_queue().dma_context();
-    let direct_layout = direct_bio_layout_eligible(dma_context, plan, bio, capabilities);
+    let direct_layout = direct_bio_layout_eligible(&dma_context, plan, bio, capabilities);
     let direct_descriptor_count = bio.buffer.segment_count().checked_add(2);
     let direct_resources_available =
         direct_layout && direct_descriptor_count.is_some_and(|count| free_descriptors >= count);
     let direct_bio_mappings = if direct_resources_available {
         plan.data_direction
-            .and_then(|direction| prepare_direct_bio_mappings(dma_context, bio, direction))
+            .and_then(|direction| prepare_direct_bio_mappings(&dma_context, bio, direction))
     } else {
         None
     };
@@ -1371,7 +1430,7 @@ pub(super) fn allocate_request<Q: VirtioBlkDmaQueue>(
     let meta_dma = match queue.take_meta_dma() {
         Some(buffer) => buffer,
         None => match DmaBuffer::new_in(
-            dma_context,
+            dma_context.clone(),
             mem::size_of::<VirtioBlkReqMeta>(),
             mem::align_of::<VirtioBlkReqMeta>(),
             DmaDirection::Bidirectional,
@@ -1427,7 +1486,7 @@ pub(super) fn allocate_request<Q: VirtioBlkDmaQueue>(
 }
 
 fn direct_bio_layout_eligible(
-    dma_context: DmaContext,
+    dma_context: &DmaContext,
     plan: VirtioBlkRequestPlan,
     bio: &Bio,
     capabilities: VirtioBlkCapabilities,
@@ -1457,12 +1516,12 @@ fn direct_bio_layout_eligible(
 }
 
 fn prepare_direct_bio_mappings(
-    dma_context: DmaContext,
+    dma_context: &DmaContext,
     bio: &Bio,
     direction: DmaDirection,
 ) -> Option<DirectBioMappings> {
     let segment_count = bio.buffer.segment_count();
-    let mut mappings = [None; BIO_MAX_BORROWED_SEGMENTS];
+    let mut mappings = [const { None }; BIO_MAX_BORROWED_SEGMENTS];
     for (index, slot) in mappings.iter_mut().take(segment_count).enumerate() {
         let segment = bio.buffer.segment(index)?;
         *slot = Some(dma_context.map_borrowed(segment.vaddr(), segment.len(), direction)?);
@@ -1485,6 +1544,19 @@ pub(super) fn free_allocated_request<Q: VirtioBlkDmaQueue>(
     );
     let _ = queue.split_queue().free_chain(request.chain);
     queue.recycle_request_dma(request.meta_dma, request.data_dma);
+}
+
+/// shutdown 已取走整个队列后释放尚未发布的请求。
+///
+/// 此时 descriptor free-list 已随队列销毁，不再需要归还 chain；但请求缓冲可能
+/// 已经转交给 DMA 同步域，仍需先归还 CPU ownership 并撤销 direct 映射。
+pub(super) fn abandon_allocated_request(mut request: VirtioBlkAllocatedRequest) {
+    request.meta_dma.sync_for_cpu();
+    reclaim_request_payload_for_cpu(
+        request.data_dma.as_ref(),
+        request.direct_bio_mappings.as_ref(),
+    );
+    drop(request.direct_bio_mappings.take());
 }
 
 /// 在提交锁外写入数据 DMA payload。

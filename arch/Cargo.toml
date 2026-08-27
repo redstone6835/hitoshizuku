@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-test = false
+test = true
 doctest = false
 bench = false
 
@@ -16,6 +16,7 @@ syscall-model-markers = ["performance-profile", "profiling/syscall-model-markers
 general = { path = "../general" }
 allocator = { path = "../libs/allocator" }
 efi = { path = "../libs/efi" }
+fdt = { path = "../libs/fdt", features = ["alloc"] }
 log = { path = "../libs/log" }
 mm = { path = "../libs/mm" }
 native-abi = { path = "../libs/native-abi" }
@@ -25,3 +26,6 @@ spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 sbi-rt = { version = "0.0.4", features = ["legacy"] }
+
+[build-dependencies]
+xtask = { path = "../xtask", default-features = false }

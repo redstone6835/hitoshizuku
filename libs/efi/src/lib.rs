@@ -8,7 +8,7 @@
 /// 强制链接器保留 EFI 查询直接符号目录。
 #[doc(hidden)]
 pub fn kernel_symbol_catalog_anchor() -> usize {
-    status_success as usize ^ guid_equal as usize
+    status_success as *const () as usize ^ guid_equal as *const () as usize
 }
 
 use core::ffi::c_void;

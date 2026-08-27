@@ -5,6 +5,15 @@
 #![no_std]
 extern crate alloc;
 
+// LoongArch 直启在堆初始化前使用的零分配 16550 DT 配置解析。
+#[cfg(any(test, target_arch = "loongarch64"))]
+#[path = "loongarch64/early_console_config.rs"]
+pub(crate) mod early_console_config;
+
+// LoongArch U-Boot 直启协议决策；host 单测可直接覆盖纯逻辑部分。
+#[cfg(any(test, target_arch = "loongarch64"))]
+pub(crate) mod boot_protocol;
+
 #[cfg(target_arch = "riscv64")]
 pub mod riscv64;
 #[cfg(target_arch = "riscv64")]

@@ -16,6 +16,7 @@ struct LoopbackElm {
 fn map_net_error(error: driver::LoopbackError) -> HookError {
     let code = match error {
         driver::LoopbackError::Pool => -12,
+        #[cfg(not(feature = "elm-integrated"))]
         driver::LoopbackError::Context => -22,
         driver::LoopbackError::Register(
             net::device::NetDeviceRegisterErrorKind::RegistrarNotReady,

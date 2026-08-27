@@ -1,0 +1,11 @@
+[elm]
+name = "platform.pci-host-ecam"
+version = "0.1.0"
+kind = "driver"
+source = "kernel-tree:drivers.pci-host-ecam"
+mode = "m"
+integrated_phase = "device"
+
+[[profiles]]
+id = "hitoshizuku-default"
+priority = "100"

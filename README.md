@@ -187,7 +187,8 @@ cargo install --locked --path ../hitoshizuku-soyo-linker
 
 ```sh
 cargo metadata --no-deps --format-version 1
-cargo check --workspace --lib --target loongarch64-unknown-none
+cargo check -p kernel --target loongarch64-unknown-none
+cargo check -p xtask --all-targets
 cargo elm --version
 ```
 
@@ -211,12 +212,17 @@ cargo xtask build --target loongarch64-unknown-none
 
 `xtask modules` 会先构建用于接口导出的 kernel，生成
 `build/elm-interface/loongarch64` 下的 Kernel API Profile，再按 `.config` 构建 `y/m/n`
-模块集合。`xtask build` 消费已有模块清单和集成归档完成最终链接；仅当对应模块清单尚不
-存在时，它才先补跑 `modules`。两个步骤共用 `target/loongarch64` 缓存。最终镜像位于：
+模块集合。`xtask build` 消费已有模块清单和集成归档完成最终 ELF 链接；仅当对应模块清单
+尚不存在时，它才先补跑 `modules`。两个步骤共用 `target/loongarch64` 缓存。Cargo 内部
+ELF 位于：
 
 ```text
 target/loongarch64/loongarch64-unknown-none/release/kernel
 ```
+
+需要可部署产物时运行 `cargo xtask image --board <board>`。该命令按
+[`configs/platforms.toml`](configs/platforms.toml) 校验 ELF，并发布 `kernel.elf`、
+`kernel.bin` 或 `uImage`；它不制作 rootfs 或磁盘镜像。
 
 ### 4. 运行测试和外部工具
 
@@ -234,6 +240,8 @@ rootfs 或磁盘镜像；需要嵌入 initramfs 时，把外部工程生成的 C
 
 ```sh
 cargo xtask build --target riscv64gc-unknown-none-elf
+cargo xtask build --board ls2k1000
+cargo xtask build --board visionfive2
 cargo check --workspace --lib --target loongarch64-unknown-none
 cargo check -p platform-uart16550 --lib --target loongarch64-unknown-none
 cargo check -p virtio-block --lib --target riscv64gc-unknown-none-elf
@@ -254,17 +262,22 @@ cargo xtask config
 cargo xtask modules --target loongarch64-unknown-none
 ```
 
-目标、链接脚本、交叉 C 编译器和 Rust 编译参数位于 [`.cargo/config.toml`](.cargo/config.toml)；EFI
-路径所需的少量 C 辅助代码由 [`libs/efi/build.rs`](libs/efi/build.rs) 通过 Cargo 编译。
+目标、交叉 C 编译器和 Rust 编译参数位于 [`.cargo/config.toml`](.cargo/config.toml)。
+[`configs/platforms.toml`](configs/platforms.toml) 保存板卡地址与镜像配方，
+`kernel/build.rs` 只选择架构级链接布局并注入平台参数。LS2K1000 只保留 U-Boot/DTB
+直接入口，不包含 EFI stub、PE/COFF 头或 EFI 入口。
 
 ## Initramfs 边界
 
-内核保留外部和嵌入式 initramfs 的加载接口，但镜像生成、rootfs 和 CPIO 打包不属于当前
-仓库。启用 `embedded-initramfs` 时，由调用方通过 `INITRAMFS` 环境变量提供 CPIO 镜像路径。
+内核保留外部和嵌入式 initramfs 的加载接口；`xtask image` 只封装内核 ELF，不生成
+rootfs、CPIO 或磁盘镜像。启用 `embedded-initramfs` 时，由调用方通过 `INITRAMFS`
+环境变量提供 CPIO 镜像路径。
 
 ## 文档入口
 
 - [架构设计](ARCHITECTURE.md)：crate 依赖、驱动边界和构建产物。
+- [LS2K1000LA 板级指南](BOARD_LS2K1000.md)：U-Boot/DTB 直启、镜像制作和驱动验证。
+- [VisionFive 2 板级指南](BOARD_VISIONFIVE2.md)：OpenSBI/U-Boot 交接、板级 preset 和驱动边界。
 - [设备抽象](DEVICE_ABSTRACTION.md)：PnP、DeviceFunction、资源租约、驱动匹配和热拔契约。
 - [ELM 设计](ELM.md)：单元、端口、租约、DeviceFunction 和 EBI。
 - [Language Runtime](LANGUAGE_RUNTIME.md)：通用外语 ELM 底层 ABI、所有权、安全与仓库边界。

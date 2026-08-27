@@ -126,6 +126,8 @@ pub struct SchedEntity {
     rr_remaining_ns: AtomicU64,
     rq_vruntime: AtomicU64,
     rq_weight: AtomicU64,
+    /// 当前 fair rq 索引使用的 deadline 快照；任务离队后清零。
+    rq_fair_deadline: AtomicU64,
     vruntime: AtomicU64,
     deadline: AtomicU64,
     lag: AtomicI64,
@@ -175,6 +177,7 @@ impl SchedEntity {
             rr_remaining_ns: AtomicU64::new(attr.slice_ns),
             rq_vruntime: AtomicU64::new(0),
             rq_weight: AtomicU64::new(0),
+            rq_fair_deadline: AtomicU64::new(0),
             vruntime: AtomicU64::new(0),
             deadline: AtomicU64::new(0),
             lag: AtomicI64::new(0),
@@ -361,6 +364,15 @@ impl SchedEntity {
     pub(crate) fn clear_rq_account(&self) {
         self.rq_weight.store(0, Ordering::Release);
         self.rq_vruntime.store(0, Ordering::Release);
+        self.rq_fair_deadline.store(0, Ordering::Release);
+    }
+
+    pub(crate) fn store_rq_fair_deadline(&self, deadline: u64) {
+        self.rq_fair_deadline.store(deadline, Ordering::Release);
+    }
+
+    pub(crate) fn rq_fair_deadline(&self) -> u64 {
+        self.rq_fair_deadline.load(Ordering::Acquire)
     }
 
     /// `vruntime_delta = delta_exec * NICE_0_WEIGHT / weight`。

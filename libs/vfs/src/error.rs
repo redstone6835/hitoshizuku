@@ -119,6 +119,12 @@ pub enum VfsError {
     /// 当前文件系统或驱动不支持该操作（ENOSYS / EOPNOTSUPP）。
     NotSupported,
 
+    /// 访问加密文件但缺少解密密钥（ENOKEY）。
+    ///
+    /// 与 Linux fscrypt 无密钥访问语义一致：ext4/f2fs 等加密 inode 在未加载
+    /// 密钥时 read/write/truncate 返回 `ENOKEY`，而非 `EOPNOTSUPP`。
+    Enokey,
+
     /// 文件类型不支持按偏移定位的 I/O（ESPIPE）。
     IllegalSeek,
 
@@ -136,8 +142,28 @@ pub enum VfsError {
     /// 管道写端已关闭，读端返回 EOF；或读端已关闭，写端收到 SIGPIPE（EPIPE）。
     BrokenPipe,
 
+    /// 消息（mqueue）长度超过接收缓冲区上限（EMSGSIZE）。
+    MessageTooLong,
+
+    /// 需要先指定目标地址（EDESTADDRREQ）。
+    ///
+    /// 例如未连接的 socket 在 `send` 时未提供目的地址。
+    DestinationRequired,
+
+    /// 套接字尚未建立连接（ENOTCONN）。
+    ///
+    /// 例如对未连接的面向连接套接字执行 `shutdown`。
+    ConnectionMissing,
+
     /// 连接被对端重置（ECONNRESET）。
     ConnectionReset,
+
+    /// 操作被取消（ECANCELED）。例如实时钟被设置后，
+    /// `TFD_TIMER_CANCEL_ON_SET` 的 timerfd 读取返回此错误。
+    Canceled,
+
+    /// 请求的属性不存在（ENODATA）：getxattr/removexattr 语义。
+    NoData,
 }
 
 impl VfsError {
@@ -169,12 +195,18 @@ impl VfsError {
             VfsError::TextFileBusy => Errno::ETXTBSY,
             VfsError::InvalidArgument => Errno::EINVAL,
             VfsError::NotSupported => Errno::EOPNOTSUPP,
+            VfsError::Enokey => Errno::ENOKEY,
             VfsError::IllegalSeek => Errno::ESPIPE,
             VfsError::Interrupted => Errno::EINTR,
             VfsError::WouldBlock => Errno::EAGAIN,
             VfsError::TimedOut => Errno::ETIMEDOUT,
             VfsError::BrokenPipe => Errno::EPIPE,
+            VfsError::MessageTooLong => Errno::EMSGSIZE,
+            VfsError::DestinationRequired => Errno::EDESTADDRREQ,
+            VfsError::ConnectionMissing => Errno::ENOTCONN,
             VfsError::ConnectionReset => Errno::ECONNRESET,
+            VfsError::Canceled => Errno::ECANCELED,
+            VfsError::NoData => Errno::ENODATA,
         }
     }
 }

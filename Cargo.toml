@@ -2,6 +2,7 @@
 resolver = "2"
 default-members = ["kernel"]
 members = [
+    "libs/fdt",
     "libs/ktest",
     "libs/ktest/ktest-mock",
     "libs/errno",
@@ -48,6 +49,9 @@ edition = "2024"
 license = "GPL-3.0-only"
 license-file = "LICENSE"
 repository = "https://github.com/redstone6835/hitoshizuku"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(elm_integrated_phase, values("device", "runtime"))'] }
 
 [profile.dev]
 panic = "abort"

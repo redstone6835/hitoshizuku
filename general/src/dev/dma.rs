@@ -5,10 +5,14 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt;
 
 use allocator::{KERNEL_ALLOCATOR, PAGE_SIZE, PhysicalAllocRequest, PhysicalAllocation};
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::mutex::Mutex;
+
+use super::iommu::IommuConsumerLease;
+use super::pnp::PnpResource;
 
 /// CPU 与设备之间的 DMA 所有权转移方向。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +114,54 @@ pub trait DmaMapper: Send + Sync {
     fn sync_for_device(&self, region: DmaSyncRegion);
     fn sync_for_cpu(&self, region: DmaSyncRegion);
     fn phys_to_dma(&self, region: DmaSyncRegion, constraints: DmaConstraints) -> Option<usize>;
+
+    /// 建立一个可能有状态的设备地址映射。
+    ///
+    /// 直连 mapper 沿用 `phys_to_dma` 并返回 token 0；IOMMU mapper 覆盖本方法，
+    /// 分配 IOVA、更新页表并把撤销所需的 opaque token 放入结果。
+    fn map_region(
+        &self,
+        region: DmaSyncRegion,
+        constraints: DmaConstraints,
+    ) -> Option<DmaMappedRegion> {
+        Some(DmaMappedRegion {
+            dma_addr: self.phys_to_dma(region, constraints)?,
+            token: 0,
+        })
+    }
+
+    /// 在多 IOMMU path 组成一个逻辑设备域时，把同一物理区间映射到指定 IOVA。
+    ///
+    /// 默认实现只接受 mapper 自主分配后恰好一致的地址；支持多 path 的 IOMMU
+    /// domain 必须覆盖本方法并真正尊重 `dma_addr`。
+    fn map_region_at(
+        &self,
+        region: DmaSyncRegion,
+        constraints: DmaConstraints,
+        dma_addr: usize,
+    ) -> Option<DmaMappedRegion> {
+        let mapping = self.map_region(region, constraints)?;
+        if mapping.dma_addr == dma_addr {
+            return Some(mapping);
+        }
+        let _ = self.unmap_region(region, mapping);
+        None
+    }
+
+    /// 撤销先前建立的映射并完成必要的 IOTLB 失效。
+    ///
+    /// 返回 `false` 表示 mapper 无法确认撤销完成；调用方会记录错误，并且不会在
+    /// 撤销前把后端物理页交还分配器。
+    fn unmap_region(&self, _region: DmaSyncRegion, _mapping: DmaMappedRegion) -> bool {
+        true
+    }
+}
+
+/// mapper 返回的设备地址和 opaque 撤销 token。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaMappedRegion {
+    pub dma_addr: usize,
+    pub token: u64,
 }
 
 struct LegacyGlobalDmaMapper;
@@ -152,10 +204,59 @@ static LEGACY_GLOBAL_DMA_MAPPER: LegacyGlobalDmaMapper = LegacyGlobalDmaMapper;
 /// 这是 DMA 子系统的设备级边界：驱动只持有本设备的约束与 mapper，不直接读取
 /// 平台全局状态。直连、cache coherent 的平台可以使用默认 mapper；带地址窗口或
 /// 隔离域的总线应在枚举设备时构造专属 mapper 并传入 [`DmaContext::new`]。
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct DmaContext {
     constraints: DmaConstraints,
-    mapper: &'static dyn DmaMapper,
+    mapper: DmaMapperRef,
+    windows: Option<DmaWindows>,
+    iommu_consumer: Option<IommuConsumerLease>,
+    blocked: bool,
+}
+
+#[derive(Clone)]
+enum DmaMapperRef {
+    Static(&'static dyn DmaMapper),
+    Owned(Arc<dyn DmaMapper>),
+}
+
+impl DmaMapperRef {
+    fn get(&self) -> &dyn DmaMapper {
+        match self {
+            Self::Static(mapper) => *mapper,
+            Self::Owned(mapper) => mapper.as_ref(),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum DmaWindows {
+    Static(&'static [DmaWindow]),
+    Owned(Arc<[DmaWindow]>),
+}
+
+impl DmaWindows {
+    fn get(&self) -> &[DmaWindow] {
+        match self {
+            Self::Static(windows) => windows,
+            Self::Owned(windows) => windows.as_ref(),
+        }
+    }
+}
+
+impl fmt::Debug for DmaContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DmaContext")
+            .field("constraints", &self.constraints)
+            .field(
+                "window_count",
+                &self
+                    .windows
+                    .as_ref()
+                    .map_or(0, |windows| windows.get().len()),
+            )
+            .field("blocked", &self.blocked)
+            .finish_non_exhaustive()
+    }
 }
 
 #[kernel_symbols::export]
@@ -163,7 +264,36 @@ impl DmaContext {
     pub const fn new(constraints: DmaConstraints, mapper: &'static dyn DmaMapper) -> Self {
         Self {
             constraints,
-            mapper,
+            mapper: DmaMapperRef::Static(mapper),
+            windows: None,
+            iommu_consumer: None,
+            blocked: false,
+        }
+    }
+
+    /// 使用拥有型 mapper 构造可安全跨 ELM 生命周期保存的 DMA 上下文。
+    pub fn with_mapper(constraints: DmaConstraints, mapper: Arc<dyn DmaMapper>) -> Self {
+        Self {
+            constraints,
+            mapper: DmaMapperRef::Owned(mapper),
+            windows: None,
+            iommu_consumer: None,
+            blocked: false,
+        }
+    }
+
+    /// 使用带 PnP consumer lease 的拥有型 IOMMU mapper。
+    pub(crate) fn with_iommu_mapper(
+        constraints: DmaConstraints,
+        mapper: Arc<dyn DmaMapper>,
+        consumer: IommuConsumerLease,
+    ) -> Self {
+        Self {
+            constraints,
+            mapper: DmaMapperRef::Owned(mapper),
+            windows: None,
+            iommu_consumer: Some(consumer),
+            blocked: false,
         }
     }
 
@@ -173,6 +303,46 @@ impl DmaContext {
     /// 执行平台地址转换/cache 同步，地址位宽、coherent 等能力来自设备或桥。
     pub const fn with_constraints(constraints: DmaConstraints) -> Self {
         Self::new(constraints, &LEGACY_GLOBAL_DMA_MAPPER)
+    }
+
+    /// 使用一组固件已规范化的 CPU-physical -> device-DMA 窗口。
+    ///
+    /// `windows` 必须在设备上下文可能被使用期间保持有效；启动固件描述通常具有
+    /// 内核全生命周期。空 `dma-ranges` 的 identity 语义应使用
+    /// [`Self::with_constraints`]，空窗口切片在本接口中表示没有可达地址。
+    pub const fn with_windows(constraints: DmaConstraints, windows: &'static [DmaWindow]) -> Self {
+        Self {
+            constraints,
+            mapper: DmaMapperRef::Static(&LEGACY_GLOBAL_DMA_MAPPER),
+            windows: Some(DmaWindows::Static(windows)),
+            iommu_consumer: None,
+            blocked: false,
+        }
+    }
+
+    /// 使用由固件枚举对象拥有的 DMA 窗口，避免把运行期重解析结果泄漏为 `'static`。
+    pub fn with_owned_windows(constraints: DmaConstraints, windows: Arc<[DmaWindow]>) -> Self {
+        Self {
+            constraints,
+            mapper: DmaMapperRef::Static(&LEGACY_GLOBAL_DMA_MAPPER),
+            windows: Some(DmaWindows::Owned(windows)),
+            iommu_consumer: None,
+            blocked: false,
+        }
+    }
+
+    /// 构造一个保留同步能力、但拒绝生成任何设备地址的上下文。
+    ///
+    /// 固件要求 IOMMU 或声明了当前内核不能安全表达的地址转换时，总线层使用该
+    /// fail-closed 上下文，避免静默退化成 identity DMA。
+    pub const fn blocked(constraints: DmaConstraints) -> Self {
+        Self {
+            constraints,
+            mapper: DmaMapperRef::Static(&LEGACY_GLOBAL_DMA_MAPPER),
+            windows: None,
+            iommu_consumer: None,
+            blocked: true,
+        }
     }
 
     #[kernel_symbols::export(
@@ -188,8 +358,32 @@ impl DmaContext {
         )
     }
 
-    pub const fn constraints(self) -> DmaConstraints {
+    pub const fn constraints(&self) -> DmaConstraints {
         self.constraints
+    }
+
+    /// 取得一次性的 IOMMU consumer bus resource。
+    pub(crate) fn claim_iommu_pnp_resource(
+        &self,
+        label: &'static str,
+    ) -> Option<Box<dyn PnpResource>> {
+        self.iommu_consumer.as_ref()?.claim_pnp_resource(label)
+    }
+
+    pub(crate) const fn has_iommu_consumer(&self) -> bool {
+        self.iommu_consumer.is_some()
+    }
+
+    /// 当前设备地址必须由支持 `VIRTIO_F_ACCESS_PLATFORM` 等等价协议能力的
+    /// 驱动提交；否则设备会把 IOVA 当成 CPU 物理地址并绕过 IOMMU。
+    pub const fn requires_access_platform(&self) -> bool {
+        self.iommu_consumer.is_some()
+    }
+
+    pub(crate) fn iommu_consumer_released(&self) -> bool {
+        self.iommu_consumer
+            .as_ref()
+            .is_some_and(IommuConsumerLease::released)
     }
 
     /// 由具体设备驱动确认 scatter/gather descriptor 能力后设置段数上限。
@@ -231,7 +425,7 @@ impl DmaContext {
         flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
     )]
     pub fn map_borrowed(
-        self,
+        &self,
         vaddr: usize,
         len: usize,
         direction: DmaDirection,
@@ -243,26 +437,159 @@ impl DmaContext {
             len,
             direction,
         };
-        let dma_addr = self.mapper.phys_to_dma(region, self.constraints)?;
+        let mapping = self.map_region(region)?;
         Some(DmaBorrowedMapping {
-            dma_addr,
+            mapping: Some(mapping),
             sync: self.sync_handle(region),
         })
     }
 
-    pub(crate) const fn sync_handle(self, region: DmaSyncRegion) -> DmaSyncHandle {
+    pub(crate) fn sync_handle(&self, region: DmaSyncRegion) -> DmaSyncHandle {
         DmaSyncHandle {
-            mapper: self.mapper,
+            context: self.clone(),
             region,
             coherent: self.constraints.coherent,
+        }
+    }
+
+    fn map_region(&self, region: DmaSyncRegion) -> Option<DmaMappedRegion> {
+        if self.blocked {
+            return None;
+        }
+        if let Some(windows) = self.windows.as_ref() {
+            let dma_addr = windows
+                .get()
+                .iter()
+                .find_map(|window| window.translate(region.paddr, region.len))?;
+            return self
+                .constraints
+                .accepts_dma_addr(dma_addr, region.len)
+                .then_some(DmaMappedRegion { dma_addr, token: 0 });
+        }
+        self.mapper.get().map_region(region, self.constraints)
+    }
+
+    fn unmap_region(&self, region: DmaSyncRegion, mapping: DmaMappedRegion) -> bool {
+        if self.windows.is_some() {
+            return true;
+        }
+        self.mapper.get().unmap_region(region, mapping)
+    }
+
+    /// 把一段设备 MMIO doorbell 映射到相同的设备地址。
+    ///
+    /// MSI/MSI-X message address 是设备将要写入的地址，启用 IOMMU 后也必须存在
+    /// 对应页表项。这里固定 IOVA=物理地址，保持 MSI controller 生成的消息 ABI；
+    /// 普通 identity mapper 会得到无状态映射，IOMMU mapper 则通过
+    /// [`DmaMapper::map_region_at`] 建立可撤销映射。
+    pub(crate) fn map_identity_mmio(&self, paddr: usize, len: usize) -> Option<DmaAddressMapping> {
+        if self.blocked || len == 0 {
+            return None;
+        }
+        let end = paddr.checked_add(len)?;
+        let page_start = paddr & !(PAGE_SIZE - 1);
+        let page_end = end.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
+        let mapped_len = page_end.checked_sub(page_start)?;
+        let region = DmaSyncRegion {
+            paddr: page_start,
+            // MMIO doorbell 不参与 cache 同步；保留零值可阻止调用方误解为可解引用映射。
+            vaddr: 0,
+            len: mapped_len,
+            direction: DmaDirection::FromDevice,
+        };
+        let mapping = self
+            .mapper
+            .get()
+            .map_region_at(region, self.constraints, page_start)?;
+        (mapping.dma_addr == page_start).then_some(DmaAddressMapping {
+            context: self.clone(),
+            region,
+            mapping: Some(mapping),
+        })
+    }
+}
+
+/// 不拥有后端内存、只拥有设备地址映射生命周期的对象。
+pub(crate) struct DmaAddressMapping {
+    context: DmaContext,
+    region: DmaSyncRegion,
+    mapping: Option<DmaMappedRegion>,
+}
+
+impl DmaAddressMapping {
+    pub(crate) fn dma_addr(&self) -> usize {
+        self.mapping
+            .as_ref()
+            .expect("live DMA address mapping owns its mapper token")
+            .dma_addr
+    }
+
+    pub(crate) fn covers(&self, paddr: usize, len: usize) -> bool {
+        let Some(end) = paddr.checked_add(len) else {
+            return false;
+        };
+        let Some(region_end) = self.region.paddr.checked_add(self.region.len) else {
+            return false;
+        };
+        paddr >= self.region.paddr && end <= region_end
+    }
+
+    pub(crate) fn translated_addr(&self, paddr: usize, len: usize) -> Option<usize> {
+        self.covers(paddr, len)
+            .then(|| self.dma_addr().checked_add(paddr - self.region.paddr))?
+    }
+
+    /// 显式撤销固定地址映射；失败时把仍拥有 token 的对象交还调用方。
+    ///
+    /// 消费对象后只返回 `bool` 会立刻触发 Drop，令上层无法在硬件恢复后重试。
+    pub(crate) fn unmap(mut self) -> Result<(), Self> {
+        if self.unmap_inner() {
+            Ok(())
+        } else {
+            Err(self)
+        }
+    }
+
+    fn unmap_inner(&mut self) -> bool {
+        let Some(mapping) = self.mapping.take() else {
+            return true;
+        };
+        if self.context.unmap_region(self.region, mapping) {
+            true
+        } else {
+            // 保留 token，允许调用方在硬件恢复后重试；Drop 最终会再次尝试并记录。
+            self.mapping = Some(mapping);
+            false
+        }
+    }
+}
+
+// `PciMsixSet` 跨 ELM 边界按值传递，并在其自动 drop glue 中析构该私有字段。
+// 因而这里也是精确 Rust ABI 的传递依赖，必须具有稳定导入符号。
+#[kernel_symbols::export]
+impl Drop for DmaAddressMapping {
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaAddressMapping.drop",
+        contract = "kernel.general.dma-map@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
+    fn drop(&mut self) {
+        if !self.unmap_inner() {
+            log::error!(
+                "[dma] fixed address mapping unmap failed: dma={:#x} paddr={:#x} len={}",
+                self.mapping.map_or(0, |mapping| mapping.dma_addr),
+                self.region.paddr,
+                self.region.len
+            );
         }
     }
 }
 
 /// 可跨对象保存的 DMA 同步句柄，不拥有底层内存。
-#[derive(Clone, Copy)]
 pub(crate) struct DmaSyncHandle {
-    mapper: &'static dyn DmaMapper,
+    context: DmaContext,
     region: DmaSyncRegion,
     coherent: bool,
 }
@@ -271,29 +598,37 @@ impl DmaSyncHandle {
     #[inline]
     pub(crate) fn sync_for_device(&self) {
         if !self.coherent {
-            self.mapper.sync_for_device(self.region);
+            self.context.mapper.get().sync_for_device(self.region);
         }
     }
 
     #[inline]
     pub(crate) fn sync_for_cpu(&self) {
         if !self.coherent {
-            self.mapper.sync_for_cpu(self.region);
+            self.context.mapper.get().sync_for_cpu(self.region);
         }
     }
 }
 
 /// 非拥有 DMA 段的设备地址与 cache 同步句柄。
-#[derive(Clone, Copy)]
 pub struct DmaBorrowedMapping {
-    dma_addr: usize,
+    mapping: Option<DmaMappedRegion>,
     sync: DmaSyncHandle,
 }
 
 #[kernel_symbols::export]
 impl DmaBorrowedMapping {
-    pub const fn dma_addr(&self) -> usize {
-        self.dma_addr
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaBorrowedMapping.dma_addr",
+        contract = "kernel.general.dma-map@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA
+    )]
+    pub fn dma_addr(&self) -> usize {
+        self.mapping
+            .as_ref()
+            .expect("live borrowed DMA mapping always owns its token")
+            .dma_addr
     }
 
     #[kernel_symbols::export(
@@ -316,6 +651,28 @@ impl DmaBorrowedMapping {
     )]
     pub fn sync_for_cpu(&self) {
         self.sync.sync_for_cpu();
+    }
+}
+
+#[kernel_symbols::export]
+impl Drop for DmaBorrowedMapping {
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaBorrowedMapping.drop",
+        contract = "kernel.general.dma-map@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
+    fn drop(&mut self) {
+        let Some(mapping) = self.mapping.take() else {
+            return;
+        };
+        if !self.sync.context.unmap_region(self.sync.region, mapping) {
+            panic!(
+                "[dma] borrowed mapping unmap failed: dma={:#x} paddr={:#x} len={}",
+                mapping.dma_addr, self.sync.region.paddr, self.sync.region.len
+            );
+        }
     }
 }
 
@@ -442,6 +799,8 @@ fn dma_identity_addr(region: DmaSyncRegion) -> usize {
 pub struct DmaBuffer {
     allocation: PhysicalAllocation,
     context: DmaContext,
+    mapping: Option<DmaMappedRegion>,
+    mapped_region: Option<DmaSyncRegion>,
     paddr: usize,
     vaddr: usize,
     dma_addr: usize,
@@ -527,7 +886,7 @@ impl DmaBuffer {
             len: alloc_len,
             direction,
         };
-        let Some(dma_addr) = context.mapper.phys_to_dma(region, context.constraints()) else {
+        let Some(mapping) = context.map_region(region) else {
             let _ = KERNEL_ALLOCATOR.free_physical(allocation);
             return Err("DMA buffer is outside device DMA constraints");
         };
@@ -536,8 +895,10 @@ impl DmaBuffer {
             paddr: allocation.paddr,
             allocation,
             context,
+            mapping: Some(mapping),
+            mapped_region: Some(region),
             vaddr,
-            dma_addr,
+            dma_addr: mapping.dma_addr,
             len,
             direction,
         })
@@ -691,6 +1052,8 @@ impl DmaBuffer {
                 page_size: 0,
             },
             context,
+            mapping: None,
+            mapped_region: None,
             paddr,
             vaddr,
             dma_addr,
@@ -731,6 +1094,8 @@ impl DmaBuffer {
             paddr: alloc.paddr,
             allocation: alloc,
             context,
+            mapping: None,
+            mapped_region: None,
             vaddr,
             dma_addr,
             len,
@@ -739,16 +1104,60 @@ impl DmaBuffer {
     }
 
     /// 消费 DmaBuffer，返回内部 PhysicalAllocation 供手动管理。
-    pub fn take_allocation(self) -> PhysicalAllocation {
+    pub fn take_allocation(mut self) -> PhysicalAllocation {
+        assert!(
+            self.unmap(),
+            "DMA mapping must be revoked before allocation transfer"
+        );
         let alloc = self.allocation;
-        core::mem::forget(self);
+        self.allocation.size = 0;
         alloc
+    }
+
+    /// 消费一个已映射分配并把所有权缩小为其起始视图。
+    ///
+    /// legacy virtqueue 等布局使用本入口让首段对象继续拥有整段物理分配和 IOMMU
+    /// mapping；其余子段只能创建 `sub_view_in`，不得重复 unmap。
+    pub fn into_owner_view(mut self, len: usize, direction: DmaDirection) -> Self {
+        self.len = len.min(self.len);
+        self.direction = direction;
+        self
+    }
+
+    fn unmap(&mut self) -> bool {
+        let (Some(mapping), Some(region)) = (self.mapping.take(), self.mapped_region.take()) else {
+            return true;
+        };
+        if !self.context.unmap_region(region, mapping) {
+            self.mapping = Some(mapping);
+            self.mapped_region = Some(region);
+            log::error!(
+                "[dma] mapping unmap failed: dma={:#x} paddr={:#x} len={}",
+                mapping.dma_addr,
+                region.paddr,
+                region.len
+            );
+            return false;
+        }
+        true
     }
 }
 
+#[kernel_symbols::export]
 impl Drop for DmaBuffer {
-    #[inline]
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaBuffer.drop",
+        contract = "kernel.general.dma-buffer@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     fn drop(&mut self) {
+        if !self.unmap() {
+            // 设备地址仍可能访问后端页；泄漏该分配比交还 buddy 后发生 DMA UAF 安全。
+            self.allocation.size = 0;
+            return;
+        }
         if self.allocation.size == 0 {
             return;
         }
@@ -876,7 +1285,10 @@ pub fn new_netbuf_pool(
         .map_err(|_| "DMA NetBuf pool 元数据分配失败")?;
     for _ in 0..count {
         storages.push(Box::new(DmaBuffer::new_in(
-            context, size, align, direction,
+            context.clone(),
+            size,
+            align,
+            direction,
         )?));
     }
     net::buf::NetBufPool::new(storages.into_boxed_slice()).map_err(|_| "DMA NetBuf pool 构造失败")
@@ -910,7 +1322,185 @@ pub fn new_shared_netbuf_pool(
 mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{DmaConstraints, DmaContext, DmaDirection, DmaMapper, DmaSyncRegion};
+    use super::*;
+
+    static WINDOWS: [DmaWindow; 2] = [
+        DmaWindow {
+            cpu_start: 0x1000,
+            dma_start: 0x8000,
+            size: 0x100,
+        },
+        DmaWindow {
+            cpu_start: 0x3000,
+            dma_start: 0x20,
+            size: 0x80,
+        },
+    ];
+
+    fn constraints() -> DmaConstraints {
+        DmaConstraints {
+            address_mask: usize::MAX,
+            max_segment_size: usize::MAX,
+            max_segments: 1,
+            coherent: true,
+            supports_scatter_gather: false,
+            bounce: DmaBouncePolicy::Disabled,
+        }
+    }
+
+    fn region(paddr: usize, len: usize) -> DmaSyncRegion {
+        DmaSyncRegion {
+            paddr,
+            vaddr: 0,
+            len,
+            direction: DmaDirection::Bidirectional,
+        }
+    }
+
+    #[test]
+    fn windowed_and_blocked_contexts_never_fall_back_to_identity() {
+        let context = DmaContext::with_windows(constraints(), &WINDOWS);
+        assert_eq!(
+            context.map_region(region(0x1020, 0x20)),
+            Some(DmaMappedRegion {
+                dma_addr: 0x8020,
+                token: 0,
+            })
+        );
+        assert_eq!(
+            context.map_region(region(0x3070, 0x10)),
+            Some(DmaMappedRegion {
+                dma_addr: 0x90,
+                token: 0,
+            })
+        );
+        assert_eq!(context.map_region(region(0x10f0, 0x20)), None);
+        assert_eq!(context.map_region(region(0x2000, 0x10)), None);
+
+        let blocked = DmaContext::blocked(constraints());
+        assert_eq!(blocked.map_region(region(0x1000, 0x10)), None);
+    }
+
+    struct StatefulMapper {
+        maps: AtomicUsize,
+        unmaps: AtomicUsize,
+    }
+
+    impl DmaMapper for StatefulMapper {
+        fn sync_for_device(&self, _region: DmaSyncRegion) {}
+
+        fn sync_for_cpu(&self, _region: DmaSyncRegion) {}
+
+        fn phys_to_dma(
+            &self,
+            _region: DmaSyncRegion,
+            _constraints: DmaConstraints,
+        ) -> Option<usize> {
+            None
+        }
+
+        fn map_region(
+            &self,
+            region: DmaSyncRegion,
+            constraints: DmaConstraints,
+        ) -> Option<DmaMappedRegion> {
+            self.maps.fetch_add(1, Ordering::Relaxed);
+            let dma_addr = region.paddr.checked_add(0x4000)?;
+            constraints
+                .accepts_dma_addr(dma_addr, region.len)
+                .then_some(DmaMappedRegion {
+                    dma_addr,
+                    token: 0x55aa,
+                })
+        }
+
+        fn unmap_region(&self, _region: DmaSyncRegion, mapping: DmaMappedRegion) -> bool {
+            if mapping.token != 0x55aa {
+                return false;
+            }
+            self.unmaps.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+    }
+
+    #[test]
+    fn borrowed_mapping_drop_revokes_stateful_mapper_token() {
+        let mapper = Arc::new(StatefulMapper {
+            maps: AtomicUsize::new(0),
+            unmaps: AtomicUsize::new(0),
+        });
+        let context = DmaContext::with_mapper(constraints(), mapper.clone());
+        let region = region(0x2000, 0x40);
+        let mapping = context.map_region(region).unwrap();
+        let borrowed = DmaBorrowedMapping {
+            mapping: Some(mapping),
+            sync: context.sync_handle(region),
+        };
+        assert_eq!(borrowed.dma_addr(), 0x6000);
+        assert_eq!(mapper.maps.load(Ordering::Relaxed), 1);
+        drop(borrowed);
+        assert_eq!(mapper.unmaps.load(Ordering::Relaxed), 1);
+    }
+
+    struct FixedMapper {
+        maps: AtomicUsize,
+        unmaps: AtomicUsize,
+    }
+
+    impl DmaMapper for FixedMapper {
+        fn sync_for_device(&self, _region: DmaSyncRegion) {}
+
+        fn sync_for_cpu(&self, _region: DmaSyncRegion) {}
+
+        fn phys_to_dma(
+            &self,
+            _region: DmaSyncRegion,
+            _constraints: DmaConstraints,
+        ) -> Option<usize> {
+            None
+        }
+
+        fn map_region_at(
+            &self,
+            region: DmaSyncRegion,
+            constraints: DmaConstraints,
+            dma_addr: usize,
+        ) -> Option<DmaMappedRegion> {
+            assert_eq!(region.paddr, 0x2800_0000);
+            assert_eq!(region.len, PAGE_SIZE);
+            assert_eq!(region.direction, DmaDirection::FromDevice);
+            assert_eq!(dma_addr, region.paddr);
+            self.maps.fetch_add(1, Ordering::Relaxed);
+            constraints
+                .accepts_dma_addr(dma_addr, region.len)
+                .then_some(DmaMappedRegion {
+                    dma_addr,
+                    token: 0x1234,
+                })
+        }
+
+        fn unmap_region(&self, region: DmaSyncRegion, mapping: DmaMappedRegion) -> bool {
+            assert_eq!(region.paddr, 0x2800_0000);
+            assert_eq!(mapping.dma_addr, 0x2800_0000);
+            assert_eq!(mapping.token, 0x1234);
+            self.unmaps.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+    }
+
+    #[test]
+    fn fixed_mmio_mapping_keeps_message_offset_and_unmaps() {
+        let mapper = Arc::new(FixedMapper {
+            maps: AtomicUsize::new(0),
+            unmaps: AtomicUsize::new(0),
+        });
+        let context = DmaContext::with_mapper(constraints(), mapper.clone());
+        let mapping = context.map_identity_mmio(0x2800_0123, 4).unwrap();
+        assert_eq!(mapping.translated_addr(0x2800_0123, 4), Some(0x2800_0123));
+        assert_eq!(mapper.maps.load(Ordering::Relaxed), 1);
+        assert!(mapping.unmap().is_ok());
+        assert_eq!(mapper.unmaps.load(Ordering::Relaxed), 1);
+    }
 
     static SYNC_CALLS: AtomicUsize = AtomicUsize::new(0);
 

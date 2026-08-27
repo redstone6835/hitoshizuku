@@ -342,7 +342,10 @@ unsafe extern "C" fn pre_boot_init(hartid: usize, dtb_addr: usize) {
 
     unsafe { clear_bss() };
 
-    crate::riscv64::early_console::e_print(format_args!("R\n"));
+    // 串口打点 'C'：BSS 清零完成。直接写 THR（U-Boot 已初始化 UART），
+    // 避免走早期控制台初始化——其回退寄存器布局与 QEMU 8250 不符时会在
+    // LSR 轮询上死等。
+    unsafe { core::ptr::write_volatile(0x1000_0000 as *mut u8, b'C') };
 
     BOOT_HART_ID.store(hartid, Ordering::Release);
     BOOT_DTB_ADDR.store(dtb_addr, Ordering::Release);
@@ -360,4 +363,7 @@ unsafe extern "C" fn pre_boot_init(hartid: usize, dtb_addr: usize) {
         core::sync::atomic::compiler_fence(Ordering::Release);
         core::arch::asm!("mv tp, {}", in(reg) hl as usize, options(nomem, nostack));
     }
+
+    // 串口打点 'R'：per-hart 数据就绪，即将返回。
+    unsafe { core::ptr::write_volatile(0x1000_0000 as *mut u8, b'R') };
 }

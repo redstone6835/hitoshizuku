@@ -665,7 +665,6 @@ impl OwnerAllocationIndex {
                         }
                         add_node_stats(&mut expected_stats, node);
                         non_range_nodes += 1;
-                        seen_nodes += 1;
                         non_range = node.next_non_range;
                         non_range_visited += 1;
                     }

@@ -21,13 +21,12 @@ pub const VIRTIO_STATUS_FAILED: u32 = 128;
 
 /// VirtIO Feature: VERSION_1（仅 modern 模式存在）。
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+/// 设备必须通过平台 DMA/IOMMU API 访问队列和数据缓冲区。
+pub const VIRTIO_F_ACCESS_PLATFORM: u64 = 1 << 33;
 pub const VIRTIO_F_RING_EVENT_IDX: u64 = 1 << 29;
 
 // ── Modern MMIO 寄存器偏移 ──────────────────────────────────────────────────
 
-const MODERN_MAGIC: usize = 0x000;
-const MODERN_VERSION: usize = 0x004;
-const MODERN_DEVICE_ID: usize = 0x008;
 const MODERN_DEVICE_FEATURES: usize = 0x010;
 const MODERN_DEVICE_FEATURES_SEL: usize = 0x014;
 const MODERN_DRIVER_FEATURES: usize = 0x020;
@@ -49,9 +48,6 @@ const MODERN_QUEUE_USED_HIGH: usize = 0x0a4;
 
 // ── Legacy MMIO 寄存器偏移 ──────────────────────────────────────────────────
 
-const LEGACY_MAGIC: usize = 0x000;
-const LEGACY_VERSION: usize = 0x004;
-const LEGACY_DEVICE_ID: usize = 0x008;
 const LEGACY_DEVICE_FEATURES: usize = 0x010;
 const LEGACY_DEVICE_FEATURES_SEL: usize = 0x014;
 const LEGACY_DRIVER_FEATURES: usize = 0x020;

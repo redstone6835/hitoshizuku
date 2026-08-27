@@ -145,6 +145,13 @@ pub fn fill(output: &mut [u8], mode: RandomReadMode) -> Result<usize, CharIoErro
         .read(output, mode)
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.random.add_bootloader_randomness",
+    contract = "kernel.general.random-service@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn add_bootloader_randomness(input: &[u8]) {
     if input.is_empty() {
         return;

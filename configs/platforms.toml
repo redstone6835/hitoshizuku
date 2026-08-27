@@ -1,0 +1,99 @@
+schema = 1
+
+[[platforms]]
+id = "qemu-loongarch64"
+board = "qemu"
+target = "loongarch64-unknown-none"
+default_for_board = true
+config = "configs/qemu.config"
+target_dir = "target/loongarch64"
+interface_dir = "build/elm-interface/loongarch64"
+rust_cfg = []
+
+[platforms.link]
+layout = "loongarch64-dmw1"
+physical_base = "0x0000_0000_9000_0000"
+virtual_base = "0x9000_0000_9000_0000"
+alignment = "0x0000_0000_0000_1000"
+
+[platforms.image]
+output_dir = "build/loongarch64"
+default_formats = ["elf"]
+allowed_formats = ["elf"]
+
+[[platforms]]
+id = "qemu-riscv64"
+board = "qemu"
+target = "riscv64gc-unknown-none-elf"
+default_for_board = false
+config = "configs/qemu.config"
+target_dir = "target/riscv64"
+interface_dir = "build/elm-interface/riscv64"
+rust_cfg = []
+
+[platforms.link]
+layout = "riscv64-sv48"
+physical_base = "0x0000_0000_8020_0000"
+virtual_base = "0xffff_ff80_8020_0000"
+alignment = "0x0000_0000_0000_1000"
+
+[platforms.image]
+output_dir = "build/riscv64"
+default_formats = ["elf"]
+allowed_formats = ["elf"]
+
+[[platforms]]
+id = "ls2k1000"
+board = "ls2k1000"
+target = "loongarch64-unknown-none"
+default_for_board = true
+config = "configs/ls2k1000.config"
+target_dir = "target/loongarch64/ls2k1000"
+interface_dir = "build/elm-interface/loongarch64/ls2k1000"
+rust_cfg = ["mygo_la_board_ls2k1000"]
+
+[platforms.link]
+layout = "loongarch64-dmw1"
+physical_base = "0x0000_0000_0020_0000"
+virtual_base = "0x9000_0000_0020_0000"
+alignment = "0x0000_0000_0000_1000"
+
+[platforms.image]
+output_dir = "build/loongarch64/ls2k1000"
+default_formats = ["elf", "raw", "uimage"]
+allowed_formats = ["elf", "raw", "uimage"]
+
+[platforms.image.uimage]
+architecture = "loongarch"
+os = "linux"
+image_type = "kernel"
+compression = "none"
+name = "hitoshizuku-ls2k1000"
+
+[[platforms]]
+id = "visionfive2"
+board = "visionfive2"
+target = "riscv64gc-unknown-none-elf"
+default_for_board = true
+config = "configs/visionfive2.config"
+target_dir = "target/riscv64/visionfive2"
+interface_dir = "build/elm-interface/riscv64/visionfive2"
+rust_cfg = []
+
+[platforms.link]
+layout = "riscv64-sv48"
+physical_base = "0x0000_0000_8020_0000"
+virtual_base = "0xffff_ff80_8020_0000"
+alignment = "0x0000_0000_0000_1000"
+
+[platforms.image]
+output_dir = "build/riscv64/visionfive2"
+default_formats = ["elf", "raw", "uimage"]
+allowed_formats = ["elf", "raw", "uimage"]
+
+[platforms.image.uimage]
+architecture = "riscv"
+os = "linux"
+image_type = "kernel"
+compression = "none"
+name = "hitoshizuku-visionfive2"

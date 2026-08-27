@@ -739,26 +739,6 @@ fn stream_read(task: &Arc<sched::Task>, file: &File, user: u64, len: u64) -> Nat
     native_return(native_abi::status::OK, read as u64, 0)
 }
 
-pub(super) fn stream_read_memory(
-    file: &File,
-    memory: &Arc<super::memory::MemoryObject>,
-    offset: u64,
-    length: u64,
-) -> NativeCallOutcome {
-    let Ok(length) = usize::try_from(length) else {
-        return native_return(native_abi::status::CORE_OUT_OF_RANGE, 0, 0);
-    };
-    if length == 0 {
-        return native_return(native_abi::status::OK, 0, 0);
-    }
-    let mut buffer = alloc::vec::Vec::new();
-    if buffer.try_reserve_exact(length).is_err() {
-        return native_return(native_abi::status::CORE_RESOURCE_EXHAUSTED, 0, 0);
-    }
-    buffer.resize(length, 0);
-    stream_read_memory_buffered(file, memory, offset, &mut buffer)
-}
-
 pub(super) fn stream_read_memory_buffered(
     file: &File,
     memory: &Arc<super::memory::MemoryObject>,
@@ -786,26 +766,6 @@ pub(super) fn stream_read_memory_buffered(
         return native_return(error, 0, 0);
     }
     native_return(native_abi::status::OK, count as u64, 0)
-}
-
-pub(super) fn stream_write_memory(
-    file: &File,
-    memory: &Arc<super::memory::MemoryObject>,
-    offset: u64,
-    length: u64,
-) -> NativeCallOutcome {
-    let Ok(length) = usize::try_from(length) else {
-        return native_return(native_abi::status::CORE_OUT_OF_RANGE, 0, 0);
-    };
-    if length == 0 {
-        return native_return(native_abi::status::OK, 0, 0);
-    }
-    let mut buffer = alloc::vec::Vec::new();
-    if buffer.try_reserve_exact(length).is_err() {
-        return native_return(native_abi::status::CORE_RESOURCE_EXHAUSTED, 0, 0);
-    }
-    buffer.resize(length, 0);
-    stream_write_memory_buffered(file, memory, offset, &mut buffer)
 }
 
 pub(super) fn stream_write_memory_buffered(

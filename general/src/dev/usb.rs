@@ -74,6 +74,21 @@ impl PnpBusInfo for UsbDeviceInfo {
     }
 }
 
+/// 在常驻 General 侧完成 USB device bus info 的类型擦除。
+///
+/// 动态 host-controller ELM 只接收 trait object，不在模块镜像内生成
+/// [`UsbDeviceInfo`] 的 [`PnpBusInfo`] vtable。
+#[kernel_symbols::export(
+    name = "general.dev.usb.usb_device_pnp_info_boxed",
+    contract = "kernel.general.usb-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn usb_device_pnp_info_boxed(info: UsbDeviceInfo) -> Box<dyn PnpBusInfo> {
+    Box::new(info)
+}
+
 // ── UsbInterfaceInfo ─────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -194,7 +209,15 @@ impl fmt::Debug for UsbDevice {
     }
 }
 
+#[kernel_symbols::export]
 impl UsbDevice {
+    #[kernel_symbols::export(
+        name = "general.dev.usb.UsbDevice.from_pnp",
+        contract = "kernel.general.usb-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn from_pnp(pnp: &Arc<PnpDevice>) -> Option<Self> {
         let PnpId::Usb {
             interface: None, ..
@@ -233,6 +256,13 @@ impl UsbDevice {
     }
 
     /// 获取所有已注册的子 interface。
+    #[kernel_symbols::export(
+        name = "general.dev.usb.UsbDevice.interfaces",
+        contract = "kernel.general.usb-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn interfaces(&self) -> Vec<UsbInterface> {
         self.pnp
             .children()
@@ -252,6 +282,14 @@ impl UsbDevice {
     ///
     /// 调用方应在创建 interface PnpDevice 后调用
     /// `PNP_DEVICES.get_or_insert()` 和 `PNP_DRIVERS.probe_device()`。
+    #[kernel_symbols::export(
+        name = "general.dev.usb.UsbDevice.create_interface",
+        contract = "kernel.general.usb-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn create_interface(
         &self,
         num: u8,

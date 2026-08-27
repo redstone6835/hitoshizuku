@@ -5,14 +5,12 @@
 //! 只需要把字符设备 inode 委托给 TTY 适配器，不再散落这些常量。
 
 use errno::Errno;
+use sched::operation;
 use vfs::file::IoctlCmd;
 
-use crate::dev::char::{CharControlRequest, CharControlResponse, CharDevice};
-use crate::dev::control::ControlError;
-
 use super::ioctl::{
-    put_u32, read_bytes_from_user, read_i32_from_user, read_u32, write_bytes_to_user,
-    write_i32_to_user, write_u32_to_user,
+    put_u32, read_bytes_from_user, read_i32_from_user, read_pod_from_user, read_u32,
+    write_bytes_to_user, write_i32_to_user, write_u32_to_user,
 };
 
 const TCGETS: usize = 0x5401;
@@ -28,8 +26,13 @@ const TIOCSCTTY: usize = 0x540e;
 const TIOCGPGRP: usize = 0x540f;
 const TIOCSPGRP: usize = 0x5410;
 const TIOCOUTQ: usize = 0x5411;
+const TIOCSTI: usize = 0x5412;
 const TIOCGWINSZ: usize = 0x5413;
 const TIOCSWINSZ: usize = 0x5414;
+const TIOCMGET: usize = 0x5415;
+const TIOCMSET: usize = 0x5416;
+const TIOCMBIC: usize = 0x5417;
+const TIOCMBIS: usize = 0x5418;
 const FIONREAD: usize = 0x541b;
 const TIOCNOTTY: usize = 0x5422;
 const TIOCSETD: usize = 0x5423;
@@ -50,6 +53,12 @@ const TCOFLUSH: usize = 1;
 const TCIOFLUSH: usize = 2;
 const TTY_DEFAULT_BREAK_MS: u32 = 250;
 const TTY_BREAK_UNIT_MS: u32 = 100;
+
+/// TCXONC 的动作参数(与 Linux termios 一致)。
+pub const TCOOFF: u32 = 0;
+pub const TCOON: u32 = 1;
+pub const TCIOFF: u32 = 2;
+pub const TCION: u32 = 3;
 
 pub const LINUX_TERMIOS_LEN: usize = 36;
 const LINUX_TERMIOS2_LEN: usize = 44;
@@ -230,7 +239,7 @@ impl UserWinSize {
         }
     }
 
-    fn from_bytes(raw: [u8; LINUX_WINSIZE_LEN]) -> Self {
+    pub(crate) fn from_bytes(raw: [u8; LINUX_WINSIZE_LEN]) -> Self {
         Self {
             rows: u16::from_le_bytes([raw[0], raw[1]]),
             cols: u16::from_le_bytes([raw[2], raw[3]]),
@@ -239,7 +248,7 @@ impl UserWinSize {
         }
     }
 
-    fn to_bytes(self) -> [u8; LINUX_WINSIZE_LEN] {
+    pub(crate) fn to_bytes(self) -> [u8; LINUX_WINSIZE_LEN] {
         let mut out = [0u8; LINUX_WINSIZE_LEN];
         let rows = self.rows.to_le_bytes();
         let cols = self.cols.to_le_bytes();
@@ -266,12 +275,114 @@ pub trait TtyIoctlState {
     fn clear_line_state(&self);
     fn foreground_pgrp(&self) -> i32;
     fn set_foreground_pgrp(&self, pgrp: i32);
+
+    /// 执行终端后端控制请求(排空/冲刷/串口配置等)。
+    ///
+    /// 默认实现返回 `ENOTTY`;`TtyCore` 通过其 [`TerminalDriver`] 执行,
+    /// 因此控制面不再依赖底层 `CharDevice` 类型。
+    fn control(
+        &self,
+        _req: crate::dev::tty::TtyControlRequest,
+    ) -> Result<crate::dev::tty::TtyControlResponse, Errno> {
+        Err(Errno::ENOTTY)
+    }
+
+    /// 本终端的控制终端 cookie(TIOCSCTTY 用;非 tty 状态返回 None)。
+    fn ctty_cookie(&self) -> Option<u64> {
+        None
+    }
+
+    /// 本终端作为控制终端所属的会话 sid。
+    fn session_sid(&self) -> Option<i32> {
+        None
+    }
+
+    /// 设置/清除本终端的控制会话。
+    fn set_session_sid(&self, _sid: Option<i32>) {}
+
+    /// 原子声明一个当前尚未归属会话的终端。
+    fn claim_session_sid(&self, sid: i32) -> bool {
+        let _ = sid;
+        // 没有原子 claim 能力的适配器必须拒绝，不能以 check-then-set
+        // 近似实现控制终端所有权，否则并发 TIOCSCTTY 可双重认领。
+        false
+    }
+
+    /// 仅在仍由指定会话拥有时释放终端，供失败回滚和 TIOCNOTTY 使用。
+    fn release_session_sid(&self, sid: i32) {
+        let _ = sid;
+    }
+
+    /// 向前台进程组发信号(TIOCNOTTY 的 SIGHUP 等)。
+    fn signal_foreground(&self, _sig: sched::SignalNumber) {}
+
+    /// TIOCSTI:向终端行规程注入一个输入字节(如同用户键入)。
+    fn inject_input(&self, _byte: u8) -> Result<(), Errno> {
+        Err(Errno::ENOTTY)
+    }
+
+    /// TIOCMGET:读取 modem 控制线状态位图。
+    fn modem_lines(&self) -> u32 {
+        0
+    }
+
+    /// TIOCMSET/TIOCMBIS/TIOCMBIC:更新 modem 控制线状态位图。
+    fn set_modem_lines(&self, _lines: u32) -> Result<(), Errno> {
+        Err(Errno::ENOTTY)
+    }
+
+    /// TCXONC:流控动作(TCOOFF/TCOON/TCIOFF/TCION)。
+    fn transmit_control(&self, _action: u32) -> Result<(), Errno> {
+        Err(Errno::ENOTTY)
+    }
+
+    /// TIOCEXCL/TIOCNXCL:设置/清除本终端的独占打开标志。
+    fn set_exclusive(&self, _exclusive: bool) {}
 }
 
 /// TTY ioctl 外部上下文。
 pub trait TtyIoctlContext {
     fn current_or_stored_pgrp(&self) -> Result<i32, Errno>;
     fn session_id(&self) -> Result<i32, Errno>;
+
+    /// 调用者是否为会话首进程(TIOCSCTTY 前置检查)。
+    fn is_session_leader(&self) -> bool {
+        false
+    }
+
+    /// 当前会话的控制终端 cookie。
+    fn session_ctty(&self) -> Option<u64> {
+        None
+    }
+
+    /// 设置当前会话的控制终端。
+    fn set_session_ctty(&self, _cookie: Option<u64>) -> Result<(), Errno> {
+        Ok(())
+    }
+
+    /// 是否可越过控制终端归属检查执行特权 TTY 操作。
+    fn has_sys_admin(&self) -> bool {
+        false
+    }
+}
+
+fn authorize_tiocsti<S, C>(state: &S, ctx: &C) -> Result<(), Errno>
+where
+    S: TtyIoctlState,
+    C: TtyIoctlContext,
+{
+    let cookie = state.ctty_cookie().ok_or(Errno::ENOTTY)?;
+    let same_ctty = ctx.session_ctty() == Some(cookie);
+    let same_session = state
+        .session_sid()
+        .is_some_and(|sid| ctx.session_id() == Ok(sid));
+    // Linux 要求 TIOCSTI 调用者同时处于该控制终端会话，并拥有
+    // CAP_SYS_ADMIN；单纯成为会话成员不能向终端注入输入。
+    if same_ctty && same_session && ctx.has_sys_admin() {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
 }
 
 /// 判断 ioctl 是否是当前适配层认识的 TTY 命令。
@@ -291,8 +402,13 @@ pub fn is_tty_ioctl(cmd: IoctlCmd) -> bool {
             | TIOCGPGRP
             | TIOCSPGRP
             | TIOCOUTQ
+            | TIOCSTI
             | TIOCGWINSZ
             | TIOCSWINSZ
+            | TIOCMGET
+            | TIOCMSET
+            | TIOCMBIC
+            | TIOCMBIS
             | FIONREAD
             | TIOCNOTTY
             | TIOCSETD
@@ -306,18 +422,14 @@ pub fn is_tty_ioctl(cmd: IoctlCmd) -> bool {
     )
 }
 
-/// 执行 TTY ioctl，把用户 ABI 转换为 typed char control 或状态更新。
-pub fn handle_tty_ioctl<S, C>(
-    state: &S,
-    ctx: &C,
-    dev: &CharDevice,
-    cmd: IoctlCmd,
-    arg: usize,
-) -> Result<usize, Errno>
+/// 执行 TTY ioctl，把用户 ABI 转换为 typed 控制请求或状态更新。
+pub fn handle_tty_ioctl<S, C>(state: &S, ctx: &C, cmd: IoctlCmd, arg: usize) -> Result<usize, Errno>
 where
     S: TtyIoctlState,
     C: TtyIoctlContext,
 {
+    use crate::dev::tty::TtyControlRequest;
+
     match cmd.raw() {
         TCGETS => {
             let termios = state.termios();
@@ -334,11 +446,11 @@ where
             read_bytes_from_user(arg, &mut raw)?;
             state.set_termios(UserTermios { raw });
             if matches!(cmd.raw(), TCSETSW | TCSETSF) {
-                control_done_ignore_unsupported(dev, CharControlRequest::DrainTx)?;
+                control_done_ignore_unsupported(state, TtyControlRequest::DrainTx)?;
             }
             if matches!(cmd.raw(), TCSETSF) {
                 state.clear_line_state();
-                control_done_ignore_unsupported(dev, CharControlRequest::FlushRx)?;
+                control_done_ignore_unsupported(state, TtyControlRequest::FlushRx)?;
             }
             Ok(0)
         }
@@ -350,13 +462,13 @@ where
                 *dst = *src;
             }
             state.set_termios(UserTermios { raw: termios });
-            sync_termios2_hardware(dev, &raw)?;
+            sync_termios2_hardware(state, &raw)?;
             if matches!(cmd.raw(), TCSETSW2 | TCSETSF2) {
-                control_done_ignore_unsupported(dev, CharControlRequest::DrainTx)?;
+                control_done_ignore_unsupported(state, TtyControlRequest::DrainTx)?;
             }
             if matches!(cmd.raw(), TCSETSF2) {
                 state.clear_line_state();
-                control_done_ignore_unsupported(dev, CharControlRequest::FlushRx)?;
+                control_done_ignore_unsupported(state, TtyControlRequest::FlushRx)?;
             }
             Ok(0)
         }
@@ -371,12 +483,12 @@ where
             Ok(0)
         }
         FIONREAD => {
-            let queued = control_u32_or_zero(dev, CharControlRequest::GetInputQueueLen)?;
+            let queued = control_u32_or_zero(state, TtyControlRequest::GetInputQueueLen)?;
             write_u32_to_user(arg, queued)?;
             Ok(0)
         }
         TIOCOUTQ => {
-            let queued = control_u32_or_zero(dev, CharControlRequest::GetOutputQueueLen)?;
+            let queued = control_u32_or_zero(state, TtyControlRequest::GetOutputQueueLen)?;
             write_u32_to_user(arg, queued)?;
             Ok(0)
         }
@@ -388,6 +500,13 @@ where
             let pgid = read_i32_from_user(arg)?;
             if pgid <= 0 {
                 return Err(Errno::EINVAL);
+            }
+            // 目标进程组必须存在,否则 ESRCH。
+            operation::getpgid(pgid)?;
+            // 目标进程组必须属于当前会话,否则 EPERM。
+            let pgid_sid = operation::getsid(pgid)?;
+            if pgid_sid != ctx.session_id()? {
+                return Err(Errno::EPERM);
             }
             state.set_foreground_pgrp(pgid);
             Ok(0)
@@ -409,11 +528,11 @@ where
             }
         }
         TCSBRK => {
-            control_done_ignore_unsupported(dev, CharControlRequest::DrainTx)?;
+            control_done_ignore_unsupported(state, TtyControlRequest::DrainTx)?;
             if arg == 0 {
                 control_done_ignore_unsupported(
-                    dev,
-                    CharControlRequest::SendBreak {
+                    state,
+                    TtyControlRequest::SendBreak {
                         duration_ms: TTY_DEFAULT_BREAK_MS,
                     },
                 )?;
@@ -421,73 +540,262 @@ where
             Ok(0)
         }
         TCSBRKP => {
-            control_done_ignore_unsupported(dev, CharControlRequest::DrainTx)?;
+            control_done_ignore_unsupported(state, TtyControlRequest::DrainTx)?;
             let units = u32::try_from(arg).unwrap_or(u32::MAX);
             let duration_ms = if units == 0 {
                 TTY_DEFAULT_BREAK_MS
             } else {
                 units.saturating_mul(TTY_BREAK_UNIT_MS)
             };
-            control_done_ignore_unsupported(dev, CharControlRequest::SendBreak { duration_ms })?;
+            control_done_ignore_unsupported(state, TtyControlRequest::SendBreak { duration_ms })?;
             Ok(0)
         }
         TCFLSH => match arg {
             TCIFLUSH => {
                 state.clear_line_state();
-                control_done_ignore_unsupported(dev, CharControlRequest::FlushRx)?;
+                control_done_ignore_unsupported(state, TtyControlRequest::FlushRx)?;
                 Ok(0)
             }
             TCOFLUSH => {
-                control_done_ignore_unsupported(dev, CharControlRequest::FlushTx)?;
+                control_done_ignore_unsupported(state, TtyControlRequest::FlushTx)?;
                 Ok(0)
             }
             TCIOFLUSH => {
                 state.clear_line_state();
-                control_done_ignore_unsupported(dev, CharControlRequest::FlushBoth)?;
+                control_done_ignore_unsupported(state, TtyControlRequest::FlushBoth)?;
                 Ok(0)
             }
             _ => Err(Errno::EINVAL),
         },
-        TCXONC | TIOCEXCL | TIOCNXCL | TIOCSCTTY | TIOCNOTTY => Ok(0),
+        TIOCSTI => {
+            // 非特权调用者只能向自己会话的控制终端注入。先鉴权再访问用户
+            // 指针，避免未授权调用通过 EFAULT 等差异探测地址有效性。
+            authorize_tiocsti(state, ctx)?;
+            let mut byte = [0u8; 1];
+            read_bytes_from_user(arg, &mut byte)?;
+            state.inject_input(byte[0])?;
+            Ok(0)
+        }
+        TIOCMGET => {
+            write_u32_to_user(arg, state.modem_lines())?;
+            Ok(0)
+        }
+        TIOCMSET => {
+            let lines = read_pod_from_user::<u32>(arg)?;
+            state.set_modem_lines(lines)?;
+            Ok(0)
+        }
+        TIOCMBIS => {
+            let bits = read_pod_from_user::<u32>(arg)?;
+            state.set_modem_lines(state.modem_lines() | bits)?;
+            Ok(0)
+        }
+        TIOCMBIC => {
+            let bits = read_pod_from_user::<u32>(arg)?;
+            state.set_modem_lines(state.modem_lines() & !bits)?;
+            Ok(0)
+        }
+        TCXONC => {
+            let action = u32::try_from(arg).unwrap_or(u32::MAX);
+            state.transmit_control(action)?;
+            Ok(0)
+        }
+        TIOCEXCL => {
+            state.set_exclusive(true);
+            Ok(0)
+        }
+        TIOCNXCL => {
+            state.set_exclusive(false);
+            Ok(0)
+        }
+        TIOCSCTTY => {
+            // Linux 语义:仅会话首进程可设置。
+            if !ctx.is_session_leader() {
+                return Err(Errno::EPERM);
+            }
+            // 无论是否抢占,调用者都不得已拥有控制终端。
+            if ctx.session_ctty().is_some() {
+                return Err(Errno::EPERM);
+            }
+            // 抢占对象是「目标终端」而非调用者旧 ctty。
+            let Some(cookie) = state.ctty_cookie() else {
+                return Err(Errno::ENOTTY);
+            };
+            let sid = ctx.session_id()?;
+            // arg!=0 的 Linux 抢占语义必须同时清除旧 Session.ctty。当前 sched
+            // 没有按 SID 稳定解析 Session 的注册表，不能只清 TTY 一侧后伪装成功；
+            // 因而在完整的双向所有权事务落地前统一拒绝已归属终端。
+            if !state.claim_session_sid(sid) {
+                return Err(Errno::EPERM);
+            }
+            if let Err(err) = ctx.set_session_ctty(Some(cookie)) {
+                state.release_session_sid(sid);
+                return Err(err);
+            }
+            if state.foreground_pgrp() <= 0 {
+                state.set_foreground_pgrp(operation::getpgid(0).unwrap_or(0));
+            }
+            Ok(0)
+        }
+        TIOCNOTTY => {
+            // 仅当该终端是当前会话的控制终端时生效(Linux:否则 ENOTTY)。
+            if ctx.session_ctty() != state.ctty_cookie() {
+                return Err(Errno::ENOTTY);
+            }
+            let sid = ctx.session_id()?;
+            if state.session_sid() != Some(sid) {
+                return Err(Errno::ENOTTY);
+            }
+            if ctx.is_session_leader() {
+                // 会话首进程:向前台进程组发 SIGHUP + SIGCONT,然后全量脱离。
+                state.signal_foreground(sched::SignalNumber::SIGHUP);
+                state.signal_foreground(sched::SignalNumber::SIGCONT);
+                ctx.set_session_ctty(None)?;
+                state.release_session_sid(sid);
+                return Ok(0);
+            }
+            // Linux 可只清调用进程 signal_struct 的 ctty；当前模型只有 Session
+            // 级字段，返回成功却不改变状态会造成权限边界错觉，因此先拒绝。
+            Err(Errno::EPERM)
+        }
         _ => Err(Errno::ENOTTY),
     }
 }
 
-fn sync_termios2_hardware(dev: &CharDevice, raw: &[u8; LINUX_TERMIOS2_LEN]) -> Result<(), Errno> {
+fn sync_termios2_hardware<S: TtyIoctlState>(
+    state: &S,
+    raw: &[u8; LINUX_TERMIOS2_LEN],
+) -> Result<(), Errno> {
     let ospeed = read_u32(raw, 40).ok_or(Errno::EINVAL)?;
     if ospeed == 0 {
         return Ok(());
     }
     control_done_ignore_unsupported(
-        dev,
-        CharControlRequest::SetSerialConfig { baud: Some(ospeed) },
+        state,
+        crate::dev::tty::TtyControlRequest::SetSerialConfig { baud: Some(ospeed) },
     )
 }
 
-fn control_done_ignore_unsupported(dev: &CharDevice, req: CharControlRequest) -> Result<(), Errno> {
-    match dev.control(req) {
-        Ok(CharControlResponse::Done) | Err(ControlError::Unsupported) => Ok(()),
+fn control_done_ignore_unsupported<S: TtyIoctlState>(
+    state: &S,
+    req: crate::dev::tty::TtyControlRequest,
+) -> Result<(), Errno> {
+    match state.control(req) {
+        Ok(crate::dev::tty::TtyControlResponse::Done) | Err(Errno::ENOTTY) => Ok(()),
         Ok(_) => Err(Errno::EINVAL),
-        Err(err) => Err(map_control_errno(err)),
+        Err(err) => Err(err),
     }
 }
 
-fn control_u32_or_zero(dev: &CharDevice, req: CharControlRequest) -> Result<u32, Errno> {
-    match dev.control(req) {
-        Ok(CharControlResponse::U32(value)) => Ok(value),
-        Ok(CharControlResponse::Done) => Err(Errno::EINVAL),
-        Err(ControlError::Unsupported) => Ok(0),
-        Err(err) => Err(map_control_errno(err)),
+fn control_u32_or_zero<S: TtyIoctlState>(
+    state: &S,
+    req: crate::dev::tty::TtyControlRequest,
+) -> Result<u32, Errno> {
+    match state.control(req) {
+        Ok(crate::dev::tty::TtyControlResponse::U32(value)) => Ok(value),
+        Ok(crate::dev::tty::TtyControlResponse::Done) => Err(Errno::EINVAL),
+        Err(Errno::ENOTTY) => Ok(0),
+        Err(err) => Err(err),
     }
 }
 
-fn map_control_errno(e: ControlError) -> Errno {
-    match e {
-        ControlError::Unsupported => Errno::ENOTTY,
-        ControlError::Invalid => Errno::EINVAL,
-        ControlError::NoDevice => Errno::ENODEV,
-        ControlError::Busy => Errno::EBUSY,
-        ControlError::Io => Errno::EIO,
-        ControlError::Permission => Errno::EPERM,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct State {
+        cookie: Option<u64>,
+        sid: Option<i32>,
+    }
+
+    impl TtyIoctlState for State {
+        fn termios(&self) -> UserTermios {
+            UserTermios::new_default()
+        }
+
+        fn set_termios(&self, _termios: UserTermios) {}
+
+        fn winsize(&self) -> UserWinSize {
+            UserWinSize::default_console()
+        }
+
+        fn set_winsize(&self, _winsize: UserWinSize) {}
+
+        fn clear_line_state(&self) {}
+
+        fn foreground_pgrp(&self) -> i32 {
+            1
+        }
+
+        fn set_foreground_pgrp(&self, _pgrp: i32) {}
+
+        fn ctty_cookie(&self) -> Option<u64> {
+            self.cookie
+        }
+
+        fn session_sid(&self) -> Option<i32> {
+            self.sid
+        }
+    }
+
+    struct Context {
+        cookie: Option<u64>,
+        sid: i32,
+        sys_admin: bool,
+    }
+
+    impl TtyIoctlContext for Context {
+        fn current_or_stored_pgrp(&self) -> Result<i32, Errno> {
+            Ok(1)
+        }
+
+        fn session_id(&self) -> Result<i32, Errno> {
+            Ok(self.sid)
+        }
+
+        fn session_ctty(&self) -> Option<u64> {
+            self.cookie
+        }
+
+        fn has_sys_admin(&self) -> bool {
+            self.sys_admin
+        }
+    }
+
+    #[test]
+    fn tiocsti_requires_controlling_tty_session_and_capability() {
+        let state = State {
+            cookie: Some(9),
+            sid: Some(42),
+        };
+        let mut ctx = Context {
+            cookie: Some(9),
+            sid: 42,
+            sys_admin: false,
+        };
+        assert_eq!(authorize_tiocsti(&state, &ctx), Err(Errno::EPERM));
+
+        ctx.sys_admin = true;
+        assert_eq!(authorize_tiocsti(&state, &ctx), Ok(()));
+
+        ctx.cookie = None;
+        assert_eq!(authorize_tiocsti(&state, &ctx), Err(Errno::EPERM));
+        ctx.cookie = Some(9);
+        ctx.sid = 7;
+        assert_eq!(authorize_tiocsti(&state, &ctx), Err(Errno::EPERM));
+    }
+
+    #[test]
+    fn tiocsti_without_a_tty_is_rejected() {
+        let state = State {
+            cookie: None,
+            sid: None,
+        };
+        let ctx = Context {
+            cookie: Some(9),
+            sid: 42,
+            sys_admin: true,
+        };
+        assert_eq!(authorize_tiocsti(&state, &ctx), Err(Errno::ENOTTY));
     }
 }

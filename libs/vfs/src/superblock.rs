@@ -306,6 +306,15 @@ pub trait SuperblockOps {
 
     /// 以新标志重新挂载，更新超级块的只读/读写状态等属性。
     fn remount(&self, sb: &Arc<Superblock>, new_flags: MountFlags) -> VfsResult<()>;
+
+    /// 是否支持 O_DIRECT 直接 I/O（绕过页缓存语义；本内核数据路径本就直达
+    /// 底层存储，此标志用于 open(O_DIRECT) 的 Linux 兼容校验）。
+    ///
+    /// 默认 `false`：tmpfs/procfs/sysfs/devtmpfs 等内存或伪文件系统在 Linux 上
+    /// 不接受 O_DIRECT（open 返回 EINVAL）；ext4 等块设备文件系统覆盖为 `true`。
+    fn supports_direct_io(&self) -> bool {
+        false
+    }
 }
 
 // ── 文件系统驱动注册与查找 ───────────────────────────────────────────────────

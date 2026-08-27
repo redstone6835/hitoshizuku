@@ -11,15 +11,15 @@
 //! | inline_data | — | — | 是 | 最小支持:inode.i_block 直接承载 |
 //! | linear + HTree 目录 | 是 | 是 | 是 | 读路径走线性扫描(跳过索引块,正确性不受影响) |
 //! | fast / slow symlink | 是 | 是 | 是 | ≤60 字节走 i_block;其它走数据块 |
-//! | extra_isize 时间戳 | — | — | 是 | 读取并忽略纳秒 |
+//! | extra_isize 时间戳 | — | — | 是 | atime/mtime/ctime/crtime 纳秒均解析;atime/mtime/ctime 透出 stat,crtime 因 VFS `FileStat` 无 btime 字段暂未透出 |
 //! | METADATA_CSUM 校验 | — | — | 是 | 读侧验证超级块/块组描述符/inode/extent 节点/目录叶 |
 //! | JBD2 日志恢复 | — | 是 | 是 | [`journal`]:scan/revoke/replay,v1/v2/v3 校验、撕裂提交、回绕 |
 //! | fast commit 回放 | — | — | 是 | [`fc`]:HEAD/TAIL/CREAT/LINK/UNLINK/INODE/ADD_RANGE/DEL_RANGE |
 //! | 孤儿 inode 清理 | — | 是 | 是 | [`orphan`]:s_last_orphan 链表 + orphan file |
 //! | 读写(create/mkdir/unlink/rename/write/truncate/...) | 是 | 是 | 是 | 写路径不走日志(writeback 语义),崩溃依赖 s_state + fsck |
-//! | MMP | — | — | 挂载时检查 | 仅接受 CLEAN 序列;无运行时心跳 |
-//! | CASEFOLD | — | — | 挂载 | 带标志目录按 ASCII 大小写不敏感(完整 Unicode 未实现) |
-//! | ENCRYPT | — | — | 挂载 | 加密 inode 读写返回 `NotSupported`(与无密钥 Linux 一致) |
+//! | MMP | — | — | 挂载时检查 + 运行时心跳 | 挂载检查 + 活动驱动最小间隔心跳(见 [`mmp`]) |
+//! | CASEFOLD | — | — | 挂载 | 带标志目录按 Unicode 简单小写折叠(完整 casefold/NFKD 未实现,见 [`dir`]) |
+//! | ENCRYPT | — | — | 挂载 | 加密 inode 读写/truncate 返回 `Enokey`(与 Linux 无密钥一致) |
 //! | VERITY | — | — | 挂载 | verity inode 写/截断返回 `ReadOnlyFilesystem` |
 //! | BIGALLOC / READONLY / HAS_SNAPSHOT / SHARED_BLOCKS | — | — | 强制只读 | 未知 ro_compat 位同样退化为只读 |
 //!
@@ -58,17 +58,19 @@ mod journal;
 mod layout;
 mod map;
 mod map_wr;
+mod mmp;
 mod orphan;
 mod sb;
 mod state;
 mod symlink;
+mod xattr;
 
 pub use state::{BlockBackend, BlockBackendError, ExtFsDriver};
 
 /// 强制链接器保留 Ext 驱动直接符号目录。
 #[doc(hidden)]
 pub fn kernel_symbol_catalog_anchor() -> usize {
-    ExtFsDriver::bind_backend as usize
+    ExtFsDriver::bind_backend as *const () as usize
 }
 
 #[cfg(test)]

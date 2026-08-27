@@ -597,59 +597,6 @@ pub fn random_core() -> &'static RandomCore {
     &RANDOM_CORE
 }
 
-// ──────────────────────── 公开熵注入入口 ──────────────────────────────────
-
-/// 添加"硬件时间源"型熵（TSC、IRQ 时间等）。
-///
-/// `n_bits` 是调用方对本次采样的最佳熵估计，按本次 buffer 长度 clamp；
-/// 不再按 byte 向上折算，避免 1 bit jitter 被记成 8 bit。
-pub fn add_hw_randomness(data: &[u8], n_bits: u64) {
-    if data.is_empty() {
-        return;
-    }
-    random_core().add_input(data, n_bits);
-}
-
-/// 添加启动期"已知熵"——这种来源调用方声称自己已验证熵密度为 100%。
-/// 适用于 bootloader 提供的随机种子、rdrand 输出、tpm2 pcr digest 等。
-pub fn add_bootloader_randomness(data: &[u8]) {
-    if data.is_empty() {
-        return;
-    }
-    let entropy_bits = (data.len() as u64).saturating_mul(8);
-    random_core().add_input(data, entropy_bits);
-}
-
-/// 用户态 `write(/dev/{,u}random, buf)` 路径。
-pub fn add_user_input(buf: &[u8]) {
-    random_core().write_input(buf);
-}
-
-/// 取熵估计 bit 数（暴露给内核调试/procfs 等）。
-pub fn entropy_estimate_bits() -> u64 {
-    random_core().estimated_entropy_bits()
-}
-
-/// 强制 reseed CSPRNG。
-pub fn force_reseed() {
-    random_core().reseed_locked();
-}
-
-/// 内核子系统从已初始化 CSPRNG 取得随机材料。
-pub fn fill_kernel_random(out: &mut [u8]) {
-    random_core().read_nonblocking(out);
-}
-
-/// 在依赖随机 key 的 PnP 驱动注册前完成启动 seed 和首次 reseed。
-pub fn initialize_for_kernel(bootloader_seed: Option<&[u8]>) {
-    if let Some(seed) = bootloader_seed {
-        add_bootloader_randomness(seed);
-    }
-    if !random_core().first_seed_done.load(Ordering::Acquire) {
-        seed_from_startup();
-    }
-}
-
 // ──────────────────────── CharDriver 实现 ─────────────────────────────────
 struct RandomBackendImpl;
 

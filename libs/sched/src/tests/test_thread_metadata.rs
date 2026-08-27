@@ -1682,6 +1682,24 @@ fn runqueue_pick_respects_cpu_affinity_mask() {
 }
 
 #[ktest]
+fn runqueue_published_load_hint_tracks_queue_mutations() {
+    let fair = make_task();
+    let realtime = make_task();
+    realtime.sched.set_sched_attr(SchedAttr::rt_fifo(20));
+    let rq = Runqueue::new();
+
+    assert!(rq.enqueue(Arc::clone(&fair), 1));
+    assert!(rq.enqueue(Arc::clone(&realtime), 1));
+    let hint = rq.migratable_class_load_hint();
+    assert_eq!(hint.fair, 1);
+    assert_eq!(hint.realtime, 1);
+
+    assert!(rq.dequeue(&fair, 2));
+    assert!(rq.dequeue(&realtime, 2));
+    assert_eq!(rq.migratable_class_load_hint().total(), 0);
+}
+
+#[ktest]
 fn runqueue_exact_pick_selects_requested_fair_task() {
     let first = make_task();
     let target = make_task();
@@ -1919,6 +1937,18 @@ fn runqueue_accounts_current_cpu_runtime() {
     assert_eq!(current.usage_snapshot(300).user_ns, 100);
     rq.tick(400);
     assert_eq!(current.usage_snapshot(400).user_ns, 100);
+}
+
+/// 独占 CPU 的 fair current 到期后不应触发无意义的同任务切换。
+#[ktest]
+fn runqueue_fair_tick_without_peer_does_not_reschedule() {
+    let task = make_task();
+    let rq = Runqueue::new();
+    assert!(rq.enqueue(Arc::clone(&task), 0));
+    let current = rq.pick_next(0).expect("fair task should become current");
+
+    assert!(!rq.tick(crate::eevdf::DEFAULT_BASE_SLICE_NS + 1));
+    assert!(rq.dequeue(&current, crate::eevdf::DEFAULT_BASE_SLICE_NS + 2));
 }
 
 #[ktest]

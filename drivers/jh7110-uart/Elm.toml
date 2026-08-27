@@ -1,0 +1,11 @@
+[elm]
+name = "platform.jh7110-uart"
+version = "0.1.0"
+kind = "driver"
+source = "kernel-tree:drivers.jh7110-uart"
+mode = "m"
+integrated_phase = "device"
+
+[[profiles]]
+id = "hitoshizuku-default"
+priority = "100"

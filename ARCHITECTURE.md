@@ -86,6 +86,9 @@ ISA 专属汇编和 CSR/寄存器操作必须留在 `arch`。通用状态机、�
 `libs` 中的 crate 按实际子系统关系互相依赖，但不得依赖 `kernel`。其中：
 
 - `allocator`、`sched`、`vfs`、`socket`、`net` 等提供可直接由内核和 ELM 使用的 Rust API；
+- `fdt` 提供独立 `no_std` Flattened Devicetree 解析器：默认层只借用并完整校验
+  blob，`alloc` feature 额外提供稳定 `NodeId`、路径、alias、phandle、status 与普通
+  `reg/ranges` 地址翻译；
 - `kernel-symbols` 为审核后的 API 生成稳定导出描述符和 Mixin 站点；
 - `elm` 与 `elm-loader` 定义运行时模型、EBI 和装载协议；
 - `socket` 提供 AF_UNIX；`net` 提供网络设备契约、packet/flow 类型、队列和单写者执行原语；
@@ -93,6 +96,17 @@ ISA 专属汇编和 CSR/寄存器操作必须留在 `arch`。通用状态机、�
   通过直接固定端点与 kernel host 协作。
 
 跨 crate 依赖必须保持无环。全局能力需要后端时，优先使用明确的注册接口、trait 或函数指针，不允许通过依赖 `kernel` 获取实现。
+
+### 2.5.1 Device Tree 分层
+
+Device Tree 处理分为四层，禁止重复建立路径、alias、phandle 或普通总线地址索引：
+
+1. `libs/fdt` 处理 FDT 头、块布局、token、字符串表、reservation map 和通用树语义。属性值始终保留原始大端字节，调用方依据 binding 显式选择字符串、cell 或布尔解码器；`alloc` 层额外提供无损 `u128` 内存 bank、chosen usable-range 和带 path/phandle/purpose/flags 的 reserved-memory 请求。
+2. `general::firmware::dtb` 复用 `fdt::Tree`，解释 CPU、串口、IRQ、PCI host、syscon 电源等内核 binding，并在本机位宽边界落实内存布局。所有静态保留区先于动态 `size/alignment/alloc-ranges` 请求处理，内核镜像和 initramfs 同样参与选址避让；解析后的 reserved-memory 身份与 concrete 范围安装为只读运行期快照。`general::dtb` 仅保留兼容重导出，新代码不得在其中恢复解析实现。
+3. `kernel::dtb` 决定启动协议策略：固件内存图存在时忽略 `/memory`，直接启动才使用 DT memory bank；两条路径都应用 `linux,usable-memory-range` 和 DT 保留约束。`no-map` 在 buddy 初始化前从物理 allocator 排除。当前 RISC-V 静态 Sv48 直映和 LoongArch DMW 仍保留固定别名，因此都以 `ReservedOnly` 明确暴露这一限制；未来实现可拆分页表映射后再升级为 `MappedHoles`。完全不支持保留语义的架构必须 fail-closed。
+4. DTB 原始属性和节点身份保存在只读启动快照中。`/sys/firmware/fdt` 与 `/sys/firmware/devicetree/base` 尚未投影；后续实现必须复用同一快照，按 Linux 规则合成 `name`、保护 `security-*`，并在公开前移除已经消费的 `rng-seed` 与 `kaslr-seed`。
+
+架构加载器只负责验证固件指针可读、复制 blob 到内核拥有的稳定缓冲区，并把 `fdt::Fdt<'static>` 放入启动上下文；不得在架构目录重新实现完整树遍历或 binding 解析。
 
 ### 2.6 `drivers`
 
@@ -162,15 +176,22 @@ Kernel API Profile（内核 API 配置）同时包含目标专属 Rust metadata�
 - `cargo xtask defconfig`：恢复默认配置；
 - `cargo xtask modules --target <triple>`：构建用于接口导出的 kernel、导出该目标的
   Kernel API Profile，再构建当前配置选择的模块集合；
-- `cargo xtask build --target <triple>`：消费模块清单与集成归档完成最终 kernel 链接；
-  对应清单不存在时先补跑 `modules`；
+- `cargo xtask build --target <triple>`：默认重新导出 Kernel API Profile、构建当前模块集合，
+  再消费本次生成的模块清单与集成归档完成最终 kernel 链接；只有显式传入
+  `--reuse-modules` 时才复用经过完整性校验的已有模块产物；
 - `cargo xtask build --target <triple> --initramfs <cpio>`：在调用方提供镜像时启用
-  `embedded-initramfs` 并嵌入该 CPIO。
+  `embedded-initramfs` 并嵌入该 CPIO；
+- `cargo xtask image --board <board>`：按平台目录校验最终 ELF，并派生板卡需要的 raw
+  payload 或 U-Boot legacy image。
 
-`modules` 与 `build` 默认分别复用 `target/<arch>` 和 `build/<arch>/modules`。切换目标、
-配置或接口后应显式重新运行 `modules`，不要依赖旧的 `modules.manifest` 自动失效。
+`modules` 与 `build` 共享 `target/<arch>` 和 `build/<arch>/modules`，由 Cargo 和
+`cargo-elm` 复用未变化的内部构建结果。`build`/`image` 默认刷新模块产物，因此切换目标、
+配置或接口后无需额外手动运行 `modules`；`--reuse-modules` 不推断源码新鲜度，只适用于调用方
+已经确认现有 manifest 与归档匹配当前源码的场景。
 
-initramfs 生成、用户态 rootfs 和镜像装配属于独立工程，不是内核构建的隐式步骤。
+内核总是先链接为带符号 ELF；架构链接脚本只描述 section/ABI，板卡装载地址和封装配方
+来自 `configs/platforms.toml`。initramfs 内容生成、用户态 rootfs 和磁盘镜像装配仍属于
+独立工程，不是内核构建的隐式步骤。
 
 ## 6. 不安全代码与并发
 

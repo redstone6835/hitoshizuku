@@ -672,9 +672,9 @@ fn build_direct_map_pmd() -> PhysicalAllocation {
 
     let direct_map_entries = KERNEL_DIRECT_MAP_WINDOW_SIZE / HEAP_PMD_SIZE;
     let direct_map_end = KERNEL_VIRT_BASE + KERNEL_DIRECT_MAP_WINDOW_SIZE;
-    let text_start = stext as usize;
-    let text_end = etext as usize;
-    let rodata_end = erodata as usize;
+    let text_start = stext as *const () as usize;
+    let text_end = etext as *const () as usize;
+    let rodata_end = erodata as *const () as usize;
     assert!(
         KERNEL_VIRT_BASE <= text_start && text_start < text_end && text_end <= rodata_end,
         "[arch][heap_vm] invalid kernel section ordering"
@@ -849,6 +849,10 @@ pub fn activate_kernel_page_table() {
     unsafe {
         Riscv64Paging::activate_with_asid(PhysPageTableRoot::new(root_paddr), 0, false);
     }
+    // 保持架构侧用户 PGD 驻留记录与硬件根同步。HAL 调度路径也直接进入
+    // 此入口，不会经过 `UserPgdOps::activate_kernel`。必须先切换硬件根，
+    // 再清驻留槽，避免并发释放仍在使用的用户页表。
+    crate::riscv64::mm::deactivate_current_user_pgd();
 }
 
 /// 为 SBI HSM 的物理入口临时恢复内核镜像所在 1 GiB 的 identity mapping。
@@ -983,17 +987,22 @@ fn verify_kernel_segments(root_paddr: usize) {
         }
     };
 
-    let text_start = stext as usize;
+    let text_start = stext as *const () as usize;
+    let text_end = etext as *const () as usize;
+    let rodata_start = srodata as *const () as usize;
+    let rodata_end = erodata as *const () as usize;
+    let data_start = sdata as *const () as usize;
+    let kernel_end = ekernel as *const () as usize;
     let text_leaf_start = text_start & !(HEAP_PMD_SIZE - 1);
     let first_direct_map_end = KERNEL_VIRT_BASE + KERNEL_DIRECT_MAP_WINDOW_SIZE;
     let full_direct_map_end =
         KERNEL_VIRT_BASE + KERNEL_DIRECT_MAP_PUD_COUNT * KERNEL_DIRECT_MAP_WINDOW_SIZE;
     assert!(
         KERNEL_VIRT_BASE <= text_leaf_start
-            && text_start < etext as usize
-            && etext as usize == srodata as usize
-            && erodata as usize <= sdata as usize
-            && ekernel as usize <= first_direct_map_end,
+            && text_start < text_end
+            && text_end == rodata_start
+            && rodata_end <= data_start
+            && kernel_end <= first_direct_map_end,
         "[heap_vm] invalid linker section layout"
     );
 
@@ -1019,7 +1028,7 @@ fn verify_kernel_segments(root_paddr: usize) {
     check_range(
         ".text",
         text_start,
-        etext as usize,
+        text_end,
         true,
         false,
         true,
@@ -1027,8 +1036,8 @@ fn verify_kernel_segments(root_paddr: usize) {
     );
     check_range(
         ".rodata",
-        srodata as usize,
-        erodata as usize,
+        rodata_start,
+        rodata_end,
         true,
         false,
         false,
@@ -1036,8 +1045,8 @@ fn verify_kernel_segments(root_paddr: usize) {
     );
     check_range(
         ".data/.bss",
-        sdata as usize,
-        ekernel as usize,
+        data_start,
+        kernel_end,
         true,
         true,
         false,
@@ -1045,7 +1054,7 @@ fn verify_kernel_segments(root_paddr: usize) {
     );
     check_range(
         "PUD[2] direct-map tail",
-        ekernel as usize,
+        kernel_end,
         first_direct_map_end,
         true,
         true,

@@ -196,6 +196,7 @@ impl CpuSchedState {
     #[inline]
     pub(crate) fn user_return_work_authoritative(&self) -> bool {
         self.need_resched.load(Ordering::Acquire)
+            || self.need_balance.load(Ordering::Acquire)
             || self.post_syscall_handoff.load(Ordering::Acquire) != 0
     }
 
@@ -229,6 +230,9 @@ impl CpuSchedState {
 
     pub fn request_balance(&self) {
         self.need_balance.store(true, Ordering::Release);
+        // balance 请求也必须唤醒返回用户态前的慢路径；否则忙 CPU 在 timer
+        // tick 上只置 need_balance、却没有 need_resched 时永远不会消费请求。
+        self.mark_user_return_work();
     }
 
     pub fn take_balance(&self) -> bool {
@@ -595,7 +599,7 @@ impl Scheduler {
             stats[domain_id] = SchedDomainStats {
                 generation: snapshot.generation,
                 active: snapshot.active,
-                capacity: domain.effective_capacity(snapshot.active),
+                capacity: snapshot.topology().capacity_of(cpus),
                 load,
             };
         }
@@ -629,3 +633,23 @@ impl Scheduler {
 }
 
 pub static SCHEDULER: Scheduler = Scheduler::new();
+
+#[cfg(test)]
+mod tests {
+    use super::CpuSchedState;
+
+    #[test]
+    fn balance_only_return_work_can_be_fully_consumed() {
+        let cpu = CpuSchedState::new();
+        cpu.request_balance();
+        assert!(cpu.user_return_work_authoritative());
+        assert!(!cpu.needs_resched());
+
+        // 模拟 RISC-V syscall 返回慢路径：先在安全调度边界消费 balance，
+        // 随后清除并权威复查聚合 hint。不能因没有 need_resched 而跳过前者。
+        assert!(cpu.take_balance());
+        assert!(cpu.take_user_return_work());
+        assert!(!cpu.user_return_work_authoritative());
+        assert!(!cpu.user_return_work_pending_acquire());
+    }
+}

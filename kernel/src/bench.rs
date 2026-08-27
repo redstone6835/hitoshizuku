@@ -25,6 +25,10 @@ use alloc::sync::Arc;
 use alloc::vec;
 #[cfg(any(feature = "bench", feature = "block-bench"))]
 use alloc::vec::Vec;
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 use core::alloc::{GlobalAlloc, Layout};
 #[cfg(feature = "bench")]
 use core::any::Any;
@@ -33,9 +37,14 @@ use core::num::NonZeroU32;
 #[cfg(any(feature = "bench", feature = "block-bench"))]
 use core::ops::ControlFlow;
 
+use allocator::KERNEL_ALLOCATOR;
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 use allocator::{
-    AllocatorAuditScope, AllocatorReclaimRequest, KERNEL_ALLOCATOR, MAX_SMALL_SIZE, MemoryDomain,
-    MemoryPlacement, MemoryRequest, PAGE_SIZE, PhysicalAllocRequest, ReclaimPolicy, Zeroing,
+    AllocatorAuditScope, AllocatorReclaimRequest, MAX_SMALL_SIZE, MemoryDomain, MemoryPlacement,
+    MemoryRequest, PAGE_SIZE, PhysicalAllocRequest, ReclaimPolicy, Zeroing,
 };
 #[cfg(any(feature = "bench", feature = "block-bench"))]
 use vfs::cred::Credentials;
@@ -232,6 +241,10 @@ pub fn run_block_device() {
     log::info!("[bench] ================= TEST COMPLETE ====================");
 }
 
+#[cfg(all(
+    feature = "allocator-bench",
+    not(any(feature = "bench", feature = "block-bench"))
+))]
 pub fn run_allocator_only() {
     log::info!("[bench] ================= ALLOCATOR PERF TEST =================");
     run_allocator_bench();
@@ -301,9 +314,21 @@ fn release_bench_superblock_no_sync(tag: &str, sb: Option<Arc<Superblock>>) {
 // TODO(alloc-stabilization): allocator-bench 已能在 QEMU 下给出单次 ns/op、p50/p95
 // 小样本和主要计数器来源。后续应把优化前后 ns/op 对比固化到提交说明或独立报告中，
 // 并补多 CPU、cache warm/cold 等可重复采样场景，避免只凭 host check 推断内核态性能。
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 const ALLOC_BENCH_BATCH: usize = 128;
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 const ALLOC_BENCH_SAMPLES: usize = 7;
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_bench() {
     log::info!("[bench][alloc] ---------------- allocator cost model ----------------");
     let registry_paths_start = KERNEL_ALLOCATOR.registry_path_counters();
@@ -434,6 +459,10 @@ fn run_allocator_bench() {
     log_allocator_hotspot("end");
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn log_allocator_hotspot(stage: &str) {
     let hot = KERNEL_ALLOCATOR.hotspot_summary();
     log::info!(
@@ -468,6 +497,10 @@ fn log_allocator_hotspot(stage: &str) {
     );
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn bench_per_mille(part: u64, total: u64) -> u64 {
     if total == 0 {
         return 0;
@@ -475,6 +508,10 @@ fn bench_per_mille(part: u64, total: u64) -> u64 {
     ((part as u128 * 1000) / total as u128).min(u64::MAX as u128) as u64
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_audit() {
     let iters = 4096usize;
     let t0 = hal::time::monotonic_ns();
@@ -508,6 +545,10 @@ fn run_allocator_audit() {
     );
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_counter_audit() {
     let iters = 4096usize;
     let t0 = hal::time::monotonic_ns();
@@ -532,12 +573,20 @@ fn run_allocator_counter_audit() {
     );
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn allocator_request(size: usize, align: usize, zeroing: Zeroing) -> MemoryRequest {
     MemoryRequest::new(MemoryDomain::Kernel, size, align)
         .with_zeroing(zeroing)
         .with_reclaim(ReclaimPolicy::NoReclaim)
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 #[derive(Clone, Copy)]
 struct AllocFreeMeasurement {
     completed: usize,
@@ -545,6 +594,10 @@ struct AllocFreeMeasurement {
     avg_ns: u64,
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_alloc_free_case(
     tag: &str,
     size: usize,
@@ -569,6 +622,10 @@ fn run_allocator_alloc_free_case(
     measurement.avg_ns
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn measure_allocator_alloc_free_case(
     tag: &str,
     size: usize,
@@ -628,6 +685,10 @@ fn measure_allocator_alloc_free_case(
     })
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_sampled_alloc_free_case(
     tag: &str,
     size: usize,
@@ -667,6 +728,10 @@ fn run_allocator_sampled_alloc_free_case(
     );
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn percentile_index(count: usize, percentile: usize) -> usize {
     count
         .saturating_mul(percentile)
@@ -675,6 +740,10 @@ fn percentile_index(count: usize, percentile: usize) -> usize {
         .min(count.saturating_sub(1))
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_split_alloc_free_case(
     tag: &str,
     size: usize,
@@ -745,6 +814,10 @@ fn run_allocator_split_alloc_free_case(
     );
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_kheap_full_cache_reuse() {
     const COUNT: usize = 160;
     let mut records = [None; COUNT];
@@ -824,6 +897,10 @@ fn run_allocator_kheap_full_cache_reuse() {
     let _ = KERNEL_ALLOCATOR.deallocate(reused.ptr);
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_reclaim_api() {
     const KHEAP_COUNT: usize = 8;
     const SLAB_COUNT: usize = 16;
@@ -902,6 +979,10 @@ fn run_allocator_reclaim_api() {
     );
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_registry_lookup() {
     let request = allocator_request(64, 8, Zeroing::Uninitialized);
     let record = match KERNEL_ALLOCATOR.allocate(request) {
@@ -936,6 +1017,10 @@ fn run_allocator_registry_lookup() {
     );
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_sampled_registry_lookup() {
     let request = allocator_request(64, 8, Zeroing::Uninitialized);
     let record = match KERNEL_ALLOCATOR.allocate(request) {
@@ -989,6 +1074,10 @@ fn run_allocator_sampled_registry_lookup() {
     );
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_in_place_query() {
     let request = allocator_request(64, 8, Zeroing::Uninitialized);
     let record = match KERNEL_ALLOCATOR.allocate(request) {
@@ -1034,6 +1123,10 @@ fn run_allocator_in_place_query() {
     );
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_realloc_same_class() {
     let old_layout = Layout::from_size_align(64, 8).expect("valid realloc old layout");
     let new_layout = Layout::from_size_align(63, 8).expect("valid realloc new layout");
@@ -1082,6 +1175,10 @@ fn run_allocator_realloc_same_class() {
     );
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_typed_realloc_same_class() {
     let old_request = allocator_request(64, 8, Zeroing::Uninitialized);
     let new_request = allocator_request(63, 8, Zeroing::Uninitialized);
@@ -1156,6 +1253,10 @@ fn run_allocator_typed_realloc_same_class() {
     );
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_realloc_grow() {
     let old_layout = Layout::from_size_align(64, 8).expect("valid realloc old layout");
     let new_layout = Layout::from_size_align(4096, 8).expect("valid realloc new layout");
@@ -1205,6 +1306,10 @@ fn run_allocator_realloc_grow() {
     );
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_diagnostic() {
     let mut buf = [0u8; 2048];
     let iters = 512usize;
@@ -1224,6 +1329,10 @@ fn run_allocator_diagnostic() {
     );
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_counter_diagnostic() {
     let mut buf = [0u8; 2048];
     let iters = 512usize;
@@ -1244,6 +1353,10 @@ fn run_allocator_counter_diagnostic() {
     );
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_physical() {
     let mut pages = [None; ALLOC_BENCH_BATCH];
     let request = PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE);
@@ -1318,6 +1431,10 @@ fn run_allocator_physical() {
     );
 }
 
+#[cfg(any(
+    feature = "bench",
+    all(feature = "allocator-bench", not(feature = "block-bench"))
+))]
 fn run_allocator_physical_exact_reclaim() {
     const COUNT: usize = 16;
     let mut pages = [None; COUNT];
@@ -3006,12 +3123,11 @@ fn run_ext_write_breakdown(tag: &str, sb: &Arc<Superblock>) {
         let dt_4k = hal::time::monotonic_ns().saturating_sub(t0);
 
         // 细分：再做一轮 4K overwrite，分段计时
-        let mut dt_4k_warm = 0u64;
         let t0 = hal::time::monotonic_ns();
         for i in 0..1024 {
             let _ = f.write_at(&small, (i * 4096) as u64);
         }
-        dt_4k_warm = hal::time::monotonic_ns().saturating_sub(t0);
+        let dt_4k_warm = hal::time::monotonic_ns().saturating_sub(t0);
         log::info!(
             "[bench][{}][EXT-BREAKDOWN] overwrite 4K x 1024 (cold): {} ns (avg {} ns/call)",
             tag,

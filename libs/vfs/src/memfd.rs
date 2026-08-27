@@ -26,8 +26,17 @@ pub const F_SEAL_SHRINK: u32 = 0x0002;
 pub const F_SEAL_GROW: u32 = 0x0004;
 pub const F_SEAL_WRITE: u32 = 0x0008;
 pub const F_SEAL_FUTURE_WRITE: u32 = 0x0010;
+pub const F_SEAL_EXEC: u32 = 0x0020;
 pub const F_SEAL_ALL: u32 =
-    F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
+    F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE | F_SEAL_EXEC;
+
+// fallocate(2) 的 Linux FALLOC_FL_* 位。fs 层把用户态位原样传给
+// `FallocateMode::from_bits`，因此这里按 Linux ABI 值匹配。
+const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
+const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+const FALLOC_FL_INSERT_RANGE: u32 = 0x20;
+const FALLOC_FL_UNSHARE_RANGE: u32 = 0x40;
 
 const MEMFD_PAGE_SIZE: usize = 4096;
 const MEMFD_PAGE_SIZE_U64: u64 = MEMFD_PAGE_SIZE as u64;
@@ -87,6 +96,46 @@ impl MemfdFileData {
             page.data[start..end].fill(0);
             true
         });
+        Ok(())
+    }
+
+    /// `FALLOC_FL_COLLAPSE_RANGE`：删除 `[offset, offset+len)`，其后数据整体前移。
+    ///
+    /// 采用“搬移尾部 + 截断”的方式实现，O(尾部长度)；对内存后端而言等价于
+    /// Linux shmem 的整块搬移语义。
+    fn collapse_range(&mut self, offset: u64, len: u64) -> VfsResult<()> {
+        let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
+        if end > self.size {
+            return Err(VfsError::InvalidArgument);
+        }
+        let tail_len = usize::try_from(self.size - end).map_err(|_| VfsError::FileTooLarge)?;
+        let mut tail = Vec::new();
+        tail.try_reserve_exact(tail_len)
+            .map_err(|_| VfsError::OutOfMemory)?;
+        tail.resize(tail_len, 0);
+        let n = self.read_at(&mut tail, end);
+        debug_assert_eq!(n, tail_len);
+        self.truncate(offset);
+        self.write_at(&tail, offset)?;
+        Ok(())
+    }
+
+    /// `FALLOC_FL_INSERT_RANGE`：在 `offset` 处插入 `len` 字节空洞，其后数据整体后移。
+    fn insert_range(&mut self, offset: u64, len: u64) -> VfsResult<()> {
+        if offset > self.size {
+            return Err(VfsError::InvalidArgument);
+        }
+        let tail_len = usize::try_from(self.size - offset).map_err(|_| VfsError::FileTooLarge)?;
+        let mut tail = Vec::new();
+        tail.try_reserve_exact(tail_len)
+            .map_err(|_| VfsError::OutOfMemory)?;
+        tail.resize(tail_len, 0);
+        let n = self.read_at(&mut tail, offset);
+        debug_assert_eq!(n, tail_len);
+        // 插入的空洞按稀疏页补零；先零化空洞区间再写入后移的尾部。
+        self.punch_hole(offset, len)?;
+        let target = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
+        self.write_at(&tail, target)?;
         Ok(())
     }
 
@@ -186,8 +235,11 @@ struct MemfdState {
 }
 
 impl MemfdState {
-    fn new(allow_sealing: bool) -> Self {
-        let seals = if allow_sealing { 0 } else { F_SEAL_SEAL };
+    fn new(allow_sealing: bool, noexec_seal: bool) -> Self {
+        let mut seals = if allow_sealing { 0 } else { F_SEAL_SEAL };
+        if noexec_seal {
+            seals |= F_SEAL_EXEC;
+        }
         Self {
             inner: Spinlock::new(MemfdInner {
                 file: MemfdFileData::new(),
@@ -307,6 +359,10 @@ impl FileOps for MemfdFileOps {
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
         let mut inner = self.state.inner.lock();
+        // F_SEAL_WRITE 与 F_SEAL_FUTURE_WRITE 都会拒绝新的 write 系统调用。
+        // Linux 中二者的差别仅在“FUTURE_WRITE 不影响已建立的可写共享映射”——
+        // 本内核 memfd 后端不追踪可写映射（映射状态在 mm 子系统），因此此处
+        // 只能等价处理；F_GET_SEALS 仍按位精确回报。
         if (inner.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) != 0 {
             return Err(VfsError::OperationNotPermitted);
         }
@@ -364,13 +420,17 @@ impl FileOps for MemfdFileOps {
 
     fn fallocate(&self, mode: FallocateMode, offset: u64, len: u64) -> VfsResult<()> {
         let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
+        let check_writable = |inner: &MemfdInner| -> VfsResult<()> {
+            if (inner.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) != 0 {
+                return Err(VfsError::OperationNotPermitted);
+            }
+            Ok(())
+        };
         match mode.bits() {
             0 => self.state.truncate(end),
             bits if bits == FallocateMode::KEEP_SIZE.bits() => {
                 let inner = self.state.inner.lock();
-                if (inner.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) != 0 {
-                    return Err(VfsError::OperationNotPermitted);
-                }
+                check_writable(&inner)?;
                 // memfd 后端保持稀疏表示；KEEP_SIZE 不产生可见的逻辑大小变化。
                 Ok(())
             }
@@ -380,15 +440,49 @@ impl FileOps for MemfdFileOps {
                     .bits() =>
             {
                 let mut inner = self.state.inner.lock();
-                if (inner.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) != 0 {
-                    return Err(VfsError::OperationNotPermitted);
-                }
+                check_writable(&inner)?;
                 inner.file.punch_hole(offset, len)?;
                 Self::state_update_inode_size(&inner);
                 drop(inner);
                 self.state.waiters.wake_all();
                 Ok(())
             }
+            // ZERO_RANGE：零化区间；无 KEEP_SIZE 时扩展逻辑大小到区间末尾。
+            bits if bits == FALLOC_FL_ZERO_RANGE
+                || bits == (FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE) =>
+            {
+                let mut inner = self.state.inner.lock();
+                check_writable(&inner)?;
+                inner.file.punch_hole(offset, len)?;
+                if (bits & FALLOC_FL_KEEP_SIZE) == 0 {
+                    inner.file.size = inner.file.size.max(end);
+                }
+                Self::state_update_inode_size(&inner);
+                drop(inner);
+                self.state.waiters.wake_all();
+                Ok(())
+            }
+            bits if bits == FALLOC_FL_COLLAPSE_RANGE => {
+                let mut inner = self.state.inner.lock();
+                check_writable(&inner)?;
+                inner.file.collapse_range(offset, len)?;
+                Self::state_update_inode_size(&inner);
+                drop(inner);
+                self.state.waiters.wake_all();
+                Ok(())
+            }
+            bits if bits == FALLOC_FL_INSERT_RANGE => {
+                let mut inner = self.state.inner.lock();
+                check_writable(&inner)?;
+                inner.file.insert_range(offset, len)?;
+                Self::state_update_inode_size(&inner);
+                drop(inner);
+                self.state.waiters.wake_all();
+                Ok(())
+            }
+            // UNSHARE_RANGE：memfd 无 CoW/共享区，区间天然已 unshare，按 Linux
+            // shmem 语义视为 no-op 成功。
+            bits if bits == FALLOC_FL_UNSHARE_RANGE => Ok(()),
             _ => Err(VfsError::NotSupported),
         }
     }
@@ -418,7 +512,19 @@ pub fn create(
     allow_sealing: bool,
     cloexec: bool,
 ) -> Result<Fd, Errno> {
-    let state = Arc::new(MemfdState::new(allow_sealing));
+    create_ext(fdt, cred, allow_sealing, cloexec, false)
+}
+
+/// 带 `MFD_NOEXEC_SEAL` 语义的扩展入口：`noexec_seal` 为 true 时初始即带
+/// `F_SEAL_EXEC` 封条。
+pub fn create_ext(
+    fdt: &FdTable,
+    cred: Arc<Credentials>,
+    allow_sealing: bool,
+    cloexec: bool,
+    noexec_seal: bool,
+) -> Result<Fd, Errno> {
+    let state = Arc::new(MemfdState::new(allow_sealing, noexec_seal));
     let inode_ops = Arc::new(MemfdInodeOps {
         state: Arc::clone(&state),
     });

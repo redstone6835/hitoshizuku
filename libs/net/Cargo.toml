@@ -12,6 +12,7 @@ bench = false
 performance-profile = ["dep:profiling"]
 
 [dependencies]
+allocator = { path = "../allocator" }
 elm_model = { package = "elm", path = "../elm" }
 hashbrown = { version = "0.17.1", default-features = false }
 kernel-symbols = { path = "../kernel-symbols", default-features = false }

@@ -181,7 +181,11 @@ struct InterfaceView {
 }
 
 pub(crate) struct InterfaceObject {
+    /// Ownership anchor: an interface handle must keep its component loaded.
+    #[allow(dead_code)]
     component: Arc<ComponentObject>,
+    /// Validated userspace vtable address retained for future interface dispatch.
+    #[allow(dead_code)]
     vtable: usize,
 }
 
@@ -2577,14 +2581,4 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
     value
         .checked_add(alignment - 1)
         .map(|value| value & !(alignment - 1))
-}
-
-impl InterfaceObject {
-    pub(crate) fn component(&self) -> &Arc<ComponentObject> {
-        &self.component
-    }
-
-    pub(crate) const fn vtable(&self) -> usize {
-        self.vtable
-    }
 }

@@ -63,6 +63,25 @@ fn send_software_ipi(logical_id: usize) -> bool {
     ret.is_ok()
 }
 
+/// Requests every online remote hart to synchronize its external IRQ state.
+pub(super) fn request_external_irq_sync() {
+    let current = crate::riscv64::specific::current_cpu_id();
+    let online = ONLINE_HARTS.load(Ordering::Acquire);
+    for logical_id in 0..MAX_CPUS {
+        if logical_id == current || online & (1 << logical_id) == 0 {
+            continue;
+        }
+        if !send_software_ipi(logical_id) {
+            let hart_id = physical_hart_id(logical_id).unwrap_or(UNKNOWN_HART_ID);
+            log::warning!(
+                "[smp] external IRQ sync IPI failed: logical={} hart={}",
+                logical_id,
+                hart_id,
+            );
+        }
+    }
+}
+
 fn send_reschedule(logical_id: usize) {
     if !send_software_ipi(logical_id) {
         let hart_id = physical_hart_id(logical_id).unwrap_or(UNKNOWN_HART_ID);
@@ -104,6 +123,7 @@ pub(crate) static CPU_CONTROL_OPS: CpuControlOps = CpuControlOps {
 };
 
 pub(crate) fn handle_ipi() {
+    super::trap::sync_external_irq_current_cpu();
     sched::poll_urgent_work();
     // request_resched() 在发送 IPI 前已发布目标 CPU 的 need_resched；trap 返回路径
     // 会在安全边界消费该标志。RFENCE 由 OpenSBI 同步执行，不进入 S-mode handler。

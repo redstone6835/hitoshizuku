@@ -614,7 +614,7 @@ fn build_text(b: &mut [u8]) {
 }
 
 fn blob_bytes() -> &'static [u8] {
-    let start = __mygo_vdso_blob_start as usize;
+    let start = __mygo_vdso_blob_start as *const () as usize;
     let end = addr_of!(__mygo_vdso_blob_end) as usize;
     unsafe { slice::from_raw_parts(start as *const u8, end - start) }
 }
@@ -640,7 +640,7 @@ fn symbol_layouts() -> [(usize, usize); 5] {
 }
 
 fn symbol_offset(sym: *const u8) -> usize {
-    let start = __mygo_vdso_blob_start as usize;
+    let start = __mygo_vdso_blob_start as *const () as usize;
     TEXT_OFF + (sym as usize - start)
 }
 

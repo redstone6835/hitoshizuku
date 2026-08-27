@@ -13,6 +13,9 @@ use elm_model::{
 };
 use sched::sync::Spinlock;
 
+#[cfg(test)]
+pub(crate) static TEST_ELM_CONTEXT_STATE: Spinlock<()> = Spinlock::new(());
+
 pub const ELM_GUARD_PHASE_NONE: u32 = 0;
 pub const ELM_GUARD_PHASE_HOOK: u32 = 1;
 pub const ELM_GUARD_PHASE_MIGRATION: u32 = 2;
@@ -227,6 +230,19 @@ impl ElmTaskExecutionState {
         }
     }
 
+    fn suspend_context(&self) -> Option<u64> {
+        let mut stack = self.contexts.lock();
+        if stack.depth >= ELM_CONTEXT_MAX_DEPTH {
+            return None;
+        }
+        let depth = stack.depth;
+        stack.entries[depth] = None;
+        stack.depth = depth + 1;
+        self.context_cell.store(0, Ordering::Relaxed);
+        self.context_present.store(false, Ordering::Release);
+        Some((depth + 1) as u64)
+    }
+
     fn current_context(&self) -> Option<ElmCurrentContext> {
         let stack = self.contexts.lock();
         stack
@@ -400,7 +416,7 @@ impl ElmGuard {
         true
     }
 
-    pub fn enter_domain(&self, domain: ElmExecutionDomain) -> Option<ElmExecutionDomainGuard> {
+    pub fn enter_domain(&self, domain: ElmExecutionDomain) -> Option<ElmExecutionDomainGuard<'_>> {
         if self.state.guard_depth.load(Ordering::Acquire) != self.depth + 1 {
             return None;
         }
@@ -412,7 +428,7 @@ impl ElmGuard {
         }
         frame.domain.store(domain as usize, Ordering::Release);
         Some(ElmExecutionDomainGuard {
-            state: Arc::clone(&self.state),
+            state: &self.state,
             depth: self.depth,
             previous,
         })
@@ -459,13 +475,13 @@ impl Drop for ElmGuard {
     }
 }
 
-pub struct ElmExecutionDomainGuard {
-    state: Arc<ElmTaskExecutionState>,
+pub struct ElmExecutionDomainGuard<'a> {
+    state: &'a ElmTaskExecutionState,
     depth: usize,
     previous: usize,
 }
 
-impl Drop for ElmExecutionDomainGuard {
+impl Drop for ElmExecutionDomainGuard<'_> {
     fn drop(&mut self) {
         if self.state.guard_depth.load(Ordering::Acquire) == self.depth + 1 {
             self.state.frames[self.depth]
@@ -480,8 +496,10 @@ pub fn register_task_context_backend() -> bool {
     register_current_context_ops(&TASK_CONTEXT_OPS)
 }
 
-pub fn enter_current_domain(domain: ElmExecutionDomain) -> Option<ElmExecutionDomainGuard> {
-    let state = current_state_arc()?;
+pub fn enter_current_domain(
+    domain: ElmExecutionDomain,
+) -> Option<ElmExecutionDomainGuard<'static>> {
+    let state = current_state_ref()?;
     let (depth, frame) = state.current_frame()?;
     let previous = frame.domain.load(Ordering::Acquire);
     let current = ElmExecutionDomain::from_raw(previous)?;
@@ -935,13 +953,6 @@ fn ensure_current_state() -> Option<Arc<ElmTaskExecutionState>> {
     Some(state)
 }
 
-fn current_state_arc() -> Option<Arc<ElmTaskExecutionState>> {
-    sched::current_task_fast()
-        .ext_lookup(sched::TASKEXT_ELM_EXECUTION)?
-        .downcast::<ElmTaskExecutionState>()
-        .ok()
-}
-
 fn current_state_ref() -> Option<&'static ElmTaskExecutionState> {
     let raw = sched::try_current_task_ref()?.elm_execution_ptr();
     if raw == 0 {
@@ -965,9 +976,21 @@ fn task_current_context() -> Option<ElmCurrentContext> {
     current_state_ref()?.current_context()
 }
 
+fn task_context_suspend() -> Option<u64> {
+    ensure_current_state()?.suspend_context()
+}
+
+fn task_context_resume(token: u64) {
+    if let Some(state) = current_state_ref() {
+        state.pop_context(token);
+    }
+}
+
 static TASK_CONTEXT_OPS: ElmCurrentContextOps = ElmCurrentContextOps {
     enter: task_context_enter,
     leave: task_context_leave,
+    suspend: task_context_suspend,
+    resume: task_context_resume,
     current: task_current_context,
 };
 
@@ -991,7 +1014,10 @@ const fn fault_slot(cpu_id: usize, index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::ElmTaskExecutionState;
+    use alloc::sync::Arc;
+    use core::sync::atomic::Ordering;
+
+    use super::{ElmExecutionDomain, ElmGuard, ElmTaskExecutionState};
     use elm_model::{ElmCurrentContext, ElmId, ElmKind, ElmLifecyclePhase, ElmState, Generation};
 
     fn context(cell: u64) -> ElmCurrentContext {
@@ -1019,9 +1045,48 @@ mod tests {
         let inner = state.push_context(context(22)).expect("内层上下文应可入栈");
         assert_eq!(state.current_context_cell(), Some(22));
 
+        let suspended = state.suspend_context().expect("上下文应可暂停");
+        assert_eq!(state.current_context(), None);
+        assert_eq!(state.current_context_cell(), None);
+        state.pop_context(suspended);
+        assert_eq!(state.current_context_cell(), Some(22));
+
         state.pop_context(inner);
         assert_eq!(state.current_context_cell(), Some(11));
         state.pop_context(outer);
         assert_eq!(state.current_context_cell(), None);
+    }
+
+    #[test]
+    fn execution_domain_guard_borrows_existing_state() {
+        let state = Arc::new(ElmTaskExecutionState::new());
+        state.frames[0].cell.store(1, Ordering::Release);
+        state.frames[0]
+            .domain
+            .store(ElmExecutionDomain::Runtime as usize, Ordering::Release);
+        state.guard_depth.store(1, Ordering::Release);
+        let guard = ElmGuard {
+            state: Arc::clone(&state),
+            depth: 0,
+            cell: 1,
+            entry_cpu: 0,
+            deadline_armed: false,
+        };
+        let owners_before = Arc::strong_count(&state);
+
+        let domain_guard = guard
+            .enter_domain(ElmExecutionDomain::KernelCall)
+            .expect("应能进入内核调用域");
+
+        assert_eq!(Arc::strong_count(&state), owners_before);
+        assert_eq!(
+            state.frames[0].domain.load(Ordering::Acquire),
+            ElmExecutionDomain::KernelCall as usize
+        );
+        drop(domain_guard);
+        assert_eq!(
+            state.frames[0].domain.load(Ordering::Acquire),
+            ElmExecutionDomain::Runtime as usize
+        );
     }
 }

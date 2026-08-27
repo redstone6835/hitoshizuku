@@ -9,7 +9,7 @@
 mod interrupt;
 pub use interrupt::*;
 
-mod exception;
+pub mod exception;
 pub use exception::*;
 
 use core::arch::naked_asm;
@@ -133,8 +133,8 @@ pub unsafe extern "C" fn __loongarch_tlb_refill_entry() {
         "csrrd $r12, {csr_tlbrsave}",
         "ertn",
 
-        // 空目录表示该地址没有可供 TLB 重填的页表路径。安装一个无效的匹配项，
-        // 让重试转入普通 PIF/PIL/PIS 异常，而不是继续从物理地址 0 读取伪 PTE。
+        // 任一级空目录都会让后续 lddir/ldpte 从物理地址零附近读取伪 PTE。
+        // 显式安装无效匹配项，使重试转入普通缺页异常并由 VmSpace 建立映射。
         ".L_tlb_refill_invalid:",
         "csrwr $r0, {csr_tlbrelo0}",
         "csrwr $r0, {csr_tlbrelo1}",

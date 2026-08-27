@@ -76,6 +76,8 @@ pub struct NetStackBootConfig {
     generation_nonce: [u8; 8],
     /// 本代协议状态与 worker 必须共同采用的 shard 数。
     active_cpu_count: u8,
+    /// 内核 DHCP 客户端关闭开关（启动参数 net.dhcp=0）。
+    dhcp_disabled: bool,
 }
 
 #[kernel_symbols::export]
@@ -139,6 +141,16 @@ impl NetStackBootConfig {
     pub fn active_cpu_count(&self) -> u8 {
         self.active_cpu_count
     }
+
+    /// 内核 DHCP 客户端是否被启动参数关闭。
+    pub fn dhcp_disabled(&self) -> bool {
+        self.dhcp_disabled
+    }
+
+    /// 设置 DHCP 客户端关闭开关（仅能在安装前调用）。
+    pub fn set_dhcp_disabled(&mut self, disabled: bool) {
+        self.dhcp_disabled = disabled;
+    }
 }
 
 /// 常驻 host 从原始随机材料一次性拆出的三类配置。
@@ -178,6 +190,7 @@ impl NetBootConfigs {
                 hash_seed,
                 generation_nonce,
                 active_cpu_count,
+                dhcp_disabled: false,
             },
         })
     }

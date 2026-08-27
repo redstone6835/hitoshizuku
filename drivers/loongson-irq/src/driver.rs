@@ -1,4 +1,4 @@
-//! Loongson 固件中断控制器 platform ELM 驱动。
+//! Loongson 固件中断控制器平台 ELM 驱动。
 //!
 //! 本模块按固件描述的 interrupt-controller 层级注册 IRQ domain，而不是让设备
 //! 驱动猜测自己挂在哪一级控制器下：
@@ -18,17 +18,23 @@ use alloc::vec::Vec;
 
 use vfs::sync::Spinlock;
 
-use crate::dev::irq::{self, IrqDomain, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
+use crate::dev::irq::{
+    self, IrqDomain, IrqError, IrqHandle, IrqHandler, IrqLine, IrqPolarity, IrqStatus, IrqTrigger,
+};
 use crate::dev::msi::{self, MsiController, MsiError, MsiMessage, MsiVector};
 use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqResolveError};
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, DriverHandle, PnpBusInfo, PnpDependency, PnpDevice,
     PnpDriver, PnpError, PnpId, PnpResourceKind, register_driver_factory, unregister_driver,
 };
+use crate::eio_layout::EioIntcIocsrWindow;
+use crate::ls2k_icu_layout::{Ls2kIcuLayout, pending_sources, route_value};
 
 const COMPAT_LOONGSON_CPUIC: &str = "loongson,cpu-interrupt-controller";
 const COMPAT_LOONGSON_EIOINTC: &str = "loongson,ls2k2000-eiointc";
 const COMPAT_LOONGSON_EIOINTC_GENERIC: &str = "loongson,eiointc-1.0";
+const COMPAT_LOONGSON_2K1000_ICU: &str = "loongson,2k1000-icu";
+const COMPAT_LOONGSON_2K1000_IOINTC: &str = "loongson,2k1000-iointc";
 const COMPAT_LOONGSON_PCH_PIC: &str = "loongson,pch-pic-1.0";
 const COMPAT_LOONGSON_PCH_MSI: &str = "loongson,pch-msi-1.0";
 
@@ -46,14 +52,10 @@ const EIOINTC_PACKED_FIELDS_PER_REG: u32 = 4;
 const EIOINTC_PACKED_FIELD_BITS: u32 = 8;
 const EIOINTC_NODEMAP_GROUP_STRIDE_BITS: u32 = 2;
 const EIOINTC_NODEMAP_MIRROR_SHIFT: u32 = 16;
-const EIOINTC_REG_NODEMAP: usize = 0x14a0;
-const EIOINTC_REG_IPMAP: usize = 0x14c0;
-const EIOINTC_REG_ENABLE: usize = 0x1600;
-const EIOINTC_REG_BOUNCE: usize = 0x1680;
-const EIOINTC_REG_ISR: usize = 0x1800;
-const EIOINTC_REG_ROUTE: usize = 0x1c00;
 const EIOINTC_DEFAULT_ROUTE_CPU: u8 = 1;
 const EIOINTC_PROP_ROUTE_CPU: &str = "loongson,eiointc-route-cpu";
+
+const LS2K_ICU_IRQ_COUNT: u32 = 64;
 
 const PCH_PIC_IRQ_COUNT: u32 = 64;
 const PCH_PIC_IRQ_COUNT_USIZE: usize = PCH_PIC_IRQ_COUNT as usize;
@@ -66,6 +68,8 @@ const PCH_PIC_REG_AUTO_CTRL1: usize = 0xe0;
 const PCH_PIC_REG_ROUTE: usize = 0x100;
 const PCH_PIC_REG_HTVEC: usize = 0x200;
 const PCH_PIC_REG_POL: usize = 0x3e0;
+/// 覆盖最后一个 polarity 寄存器（offset 0x3e4，32-bit）的最小 MMIO 窗口。
+const PCH_PIC_REQUIRED_MMIO_SIZE: usize = PCH_PIC_REG_POL + 2 * core::mem::size_of::<u32>();
 const PCH_PIC_DEFAULT_ROUTE_TARGET: u8 = 1;
 const PCH_PIC_PROP_BASE_VECTOR: &str = "loongson,pic-base-vec";
 const PCH_PIC_PROP_ROUTE_TARGET: &str = "loongson,pic-route-target";
@@ -130,6 +134,7 @@ impl PnpDriver for LoongsonCpuIrqDriver {
             PnpResourceKind::IrqDomain,
             "cpuic phandle missing",
         ))?;
+        dev.reserve_owned_resources(1)?;
         let handle = irq::register_irq_domain(controller, Arc::new(LoongsonCpuIrqDomain))
             .map_err(map_irq_error)?;
         if let Err(err) = dev.own_resource(irq::irq_domain_pnp_resource(
@@ -186,11 +191,16 @@ impl EioIntcRouteConfig {
 struct EioIntc {
     controller: u32,
     route: EioIntcRouteConfig,
+    registers: EioIntcIocsrWindow,
 }
 
 impl EioIntc {
-    fn new(controller: u32, route: EioIntcRouteConfig) -> Self {
-        Self { controller, route }
+    fn new(controller: u32, route: EioIntcRouteConfig, registers: EioIntcIocsrWindow) -> Self {
+        Self {
+            controller,
+            route,
+            registers,
+        }
     }
 
     fn initialize(&self) -> Result<(), PnpError> {
@@ -207,19 +217,16 @@ impl EioIntc {
         for reg in
             0..EIOINTC_VECTOR_COUNT / EIOINTC_VECTOR_BITS_PER_REG / EIOINTC_PACKED_FIELDS_PER_REG
         {
-            iocsr_write32(EIOINTC_REG_IPMAP + reg as usize * 4, ipmap)?;
+            iocsr_write32(self.registers.ipmap(reg), ipmap)?;
         }
 
         for reg in 0..EIOINTC_VECTOR_COUNT / EIOINTC_VECTOR_BITS_PER_REG {
-            iocsr_write32(
-                EIOINTC_REG_NODEMAP + reg as usize * 4,
-                self.route.nodemap_value(reg),
-            )?;
+            iocsr_write32(self.registers.nodemap(reg), self.route.nodemap_value(reg))?;
         }
 
         let route = self.route.route_value();
         for reg in 0..EIOINTC_VECTOR_COUNT / EIOINTC_PACKED_FIELDS_PER_REG {
-            iocsr_write32(EIOINTC_REG_ROUTE + reg as usize * 4, route)?;
+            iocsr_write32(self.registers.route(reg), route)?;
         }
         Ok(())
     }
@@ -227,16 +234,15 @@ impl EioIntc {
     fn set_all_vectors_enabled(&self, enabled: bool) -> Result<(), PnpError> {
         let value = if enabled { u32::MAX } else { 0 };
         for reg in 0..EIOINTC_VECTOR_COUNT / EIOINTC_VECTOR_BITS_PER_REG {
-            let offset = reg as usize * 4;
-            iocsr_write32(EIOINTC_REG_ENABLE + offset, value)?;
-            iocsr_write32(EIOINTC_REG_BOUNCE + offset, 0)?;
+            iocsr_write32(self.registers.enable(reg), value)?;
+            iocsr_write32(self.registers.bounce(reg), 0)?;
         }
         Ok(())
     }
 
     fn clear_pending(&self) -> Result<(), PnpError> {
         for reg in 0..EIOINTC_VECTOR_COUNT / EIOINTC_VECTOR_BITS_PER_ISR {
-            iocsr_write64(EIOINTC_REG_ISR + reg as usize * 8, u64::MAX)?;
+            iocsr_write64(self.registers.isr64(reg), u64::MAX)?;
         }
         Ok(())
     }
@@ -247,7 +253,7 @@ impl EioIntc {
         }
         let reg = hwirq / EIOINTC_VECTOR_BITS_PER_REG;
         let bit = hwirq % EIOINTC_VECTOR_BITS_PER_REG;
-        let offset = EIOINTC_REG_ENABLE + reg as usize * 4;
+        let offset = self.registers.enable(reg);
         let Some(mut value) = irq::iocsr_read32(offset) else {
             return false;
         };
@@ -262,7 +268,7 @@ impl EioIntc {
     fn dispatch_pending(&self) -> IrqStatus {
         let mut handled = false;
         for reg in 0..EIOINTC_VECTOR_COUNT / EIOINTC_VECTOR_BITS_PER_ISR {
-            let offset = EIOINTC_REG_ISR + reg as usize * 8;
+            let offset = self.registers.isr64(reg);
             let Some(mut pending) = irq::iocsr_read64(offset) else {
                 continue;
             };
@@ -384,16 +390,32 @@ impl PnpDriver for EioIntcDriver {
         let route = EioIntcRouteConfig::from_platform(parent_hwi, info).ok_or(
             PnpError::malformed(PnpResourceKind::IrqDomain, "invalid eiointc route"),
         )?;
-        let intc = Arc::new(EioIntc::new(controller, route));
-        intc.initialize()?;
-        let domain = irq::register_irq_domain(controller, intc.clone()).map_err(map_irq_error)?;
-        if let Err(err) = dev.own_resource(irq::irq_domain_pnp_resource(
-            domain,
-            "loongson-eiointc-domain",
-        )) {
-            let _ = irq::unregister_irq_domain(domain);
-            return Err(err);
+        // 该 binding 的 `reg` 是 IOCSR 寄存器编号窗口。platform core 只负责保留
+        // DT `reg` 元组，因此这里不做 `phys_to_virt`，而是由 EIOINTC 布局解释地址。
+        let mut iocsr_resources = info.mmio_resources();
+        let (iocsr_base, iocsr_size) = iocsr_resources.next().ok_or(PnpError::missing(
+            PnpResourceKind::Mmio,
+            "eiointc IOCSR reg missing",
+        ))?;
+        if iocsr_resources.next().is_some() {
+            return Err(PnpError::malformed(
+                PnpResourceKind::Mmio,
+                "eiointc requires exactly one IOCSR reg window",
+            ));
         }
+        let registers = EioIntcIocsrWindow::new(iocsr_base, iocsr_size).map_err(|_| {
+            PnpError::malformed(PnpResourceKind::Mmio, "invalid eiointc IOCSR reg window")
+        })?;
+        if registers.uses_qemu_legacy_route_extension() {
+            log::warning!(
+                "[loongson-eiointc] DT IOCSR window {:#x}+{:#x} omits route table; using QEMU legacy adjacent route extension",
+                registers.base(),
+                registers.declared_size()
+            );
+        }
+        let intc = Arc::new(EioIntc::new(controller, route, registers));
+        intc.initialize()?;
+        dev.reserve_owned_resources(2)?;
         let handler: Arc<dyn IrqHandler> = Arc::new(EioIntcIrqHandler {
             intc: Arc::clone(&intc),
         });
@@ -410,10 +432,318 @@ impl PnpDriver for EioIntcDriver {
             let _ = irq::unregister_irq_handler(parent_irq);
             return Err(err);
         }
+        // IRQ 中断域登记会同步唤醒延迟消费者；必须等父级级联处理函数
+        // 已经可用后再发布 provider，避免 consumer 提前打开子中断却无人分发。
+        let domain = irq::register_irq_domain(controller, intc.clone()).map_err(map_irq_error)?;
+        if let Err(err) = dev.own_resource(irq::irq_domain_pnp_resource(
+            domain,
+            "loongson-eiointc-domain",
+        )) {
+            let _ = irq::unregister_irq_domain(domain);
+            return Err(err);
+        }
         Ok(())
     }
 
     fn remove(&self, _dev: &Arc<PnpDevice>) {}
+}
+
+struct Ls2kIcu {
+    controller: u32,
+    layout: Ls2kIcuLayout,
+    route: u8,
+    config_lock: Spinlock<()>,
+}
+
+impl Ls2kIcu {
+    fn new(controller: u32, layout: Ls2kIcuLayout, route: u8) -> Self {
+        Self {
+            controller,
+            layout,
+            route,
+            config_lock: Spinlock::new(()),
+        }
+    }
+
+    fn initialize(&self) {
+        self.mask_all();
+        for first_source in [0, 32] {
+            let regs = self
+                .layout
+                .source(first_source)
+                .expect("validated LS2K ICU bank must exist");
+            self.write32(regs.polarity, 0);
+            self.write32(regs.edge, 0);
+            self.write32(regs.bounce, 0);
+            self.write32(regs.auto, 0);
+        }
+        for source in 0..LS2K_ICU_IRQ_COUNT {
+            let regs = self
+                .layout
+                .source(source)
+                .expect("validated LS2K ICU source must exist");
+            self.write8(regs.route, self.route);
+        }
+    }
+
+    fn mask_all(&self) {
+        for first_source in [0, 32] {
+            let regs = self
+                .layout
+                .source(first_source)
+                .expect("validated LS2K ICU bank must exist");
+            self.write32(regs.disable, u32::MAX);
+        }
+    }
+
+    fn set_source_enabled(&self, source: u32, enabled: bool) -> bool {
+        let Some(regs) = self.layout.source(source) else {
+            return false;
+        };
+        self.write32(if enabled { regs.enable } else { regs.disable }, regs.bit);
+        true
+    }
+
+    fn configure_source(
+        &self,
+        source: u32,
+        trigger: Option<IrqTrigger>,
+        polarity: Option<IrqPolarity>,
+    ) -> bool {
+        let Some(regs) = self.layout.source(source) else {
+            return false;
+        };
+        let edge = matches!(trigger.unwrap_or(IrqTrigger::Level), IrqTrigger::Edge);
+        let active_low = matches!(polarity.unwrap_or(IrqPolarity::High), IrqPolarity::Low);
+        let _guard = self.config_lock.lock();
+        self.write_bit_state(regs.edge, regs.bit, edge);
+        self.write_bit_state(regs.polarity, regs.bit, active_low);
+        true
+    }
+
+    fn dispatch_pending(&self) -> IrqStatus {
+        let core = sched::current_cpu_id();
+        let Some(registers) = self.layout.pending(core) else {
+            return IrqStatus::Unhandled;
+        };
+        let pending = [self.read32(registers[0]), self.read32(registers[1])];
+        let mut handled = false;
+        for source in pending_sources(pending) {
+            handled |= irq::dispatch_irq_line(IrqLine::Controller {
+                controller: self.controller,
+                hwirq: source,
+            });
+        }
+        if handled {
+            IrqStatus::Handled
+        } else {
+            IrqStatus::Unhandled
+        }
+    }
+
+    fn write_bit_state(&self, address: usize, bit: u32, set: bool) {
+        let mut value = self.read32(address);
+        if set {
+            value |= bit;
+        } else {
+            value &= !bit;
+        }
+        self.write32(address, value);
+    }
+
+    fn read32(&self, address: usize) -> u32 {
+        // Safety: 地址由已校验的 LS2K ICU MMIO 布局生成，并满足 32 位对齐要求。
+        unsafe { core::ptr::read_volatile(address as *const u32) }
+    }
+
+    fn write32(&self, address: usize, value: u32) {
+        // Safety: 地址由已校验的 LS2K ICU MMIO 布局生成，并满足 32 位对齐要求。
+        unsafe { core::ptr::write_volatile(address as *mut u32, value) };
+    }
+
+    fn write8(&self, address: usize, value: u8) {
+        // Safety: 路由表位于已校验的 ICU MMIO 窗口内，硬件按字节定义每个中断源。
+        unsafe { core::ptr::write_volatile(address as *mut u8, value) };
+    }
+}
+
+impl IrqDomain for Ls2kIcu {
+    fn translate(&self, cells: &[u32]) -> Option<IrqLine> {
+        let [source] = cells else {
+            return None;
+        };
+        (*source < LS2K_ICU_IRQ_COUNT).then_some(IrqLine::Controller {
+            controller: self.controller,
+            hwirq: *source,
+        })
+    }
+
+    fn set_line_enabled(&self, hwirq: u32, enabled: bool) -> bool {
+        self.set_source_enabled(hwirq, enabled)
+    }
+
+    fn configure_line(
+        &self,
+        hwirq: u32,
+        trigger: Option<IrqTrigger>,
+        polarity: Option<IrqPolarity>,
+    ) -> bool {
+        self.configure_source(hwirq, trigger, polarity)
+    }
+}
+
+struct Ls2kIcuCascadeHandler {
+    intc: Arc<Ls2kIcu>,
+}
+
+impl IrqHandler for Ls2kIcuCascadeHandler {
+    fn handle_irq(&self, _line: IrqLine) -> IrqStatus {
+        self.intc.dispatch_pending()
+    }
+}
+
+struct Ls2kIcuBinding {
+    intc: Arc<Ls2kIcu>,
+}
+
+pub struct Ls2kIcuDriver {
+    device_mmio_to_virt: fn(usize) -> usize,
+    boot_cpu_id: usize,
+}
+
+impl Ls2kIcuDriver {
+    const fn new(device_mmio_to_virt: fn(usize) -> usize, boot_cpu_id: usize) -> Self {
+        Self {
+            device_mmio_to_virt,
+            boot_cpu_id,
+        }
+    }
+
+    fn matches_platform(info: &PlatformDeviceInfo) -> bool {
+        info.properties.interrupt_controller
+            && (info.has_id(COMPAT_LOONGSON_2K1000_ICU)
+                || info.has_id(COMPAT_LOONGSON_2K1000_IOINTC))
+    }
+}
+
+impl PnpDriver for Ls2kIcuDriver {
+    fn name(&self) -> &'static str {
+        "platform-loongson-2k1000-icu"
+    }
+
+    fn bus_type(&self) -> BusType {
+        BusType::PLATFORM
+    }
+
+    fn matches(&self, id: &PnpId, info: &dyn PnpBusInfo) -> bool {
+        if !matches!(id, PnpId::Platform { .. }) {
+            return false;
+        }
+        info.as_any()
+            .downcast_ref::<PlatformDeviceInfo>()
+            .is_some_and(Self::matches_platform)
+    }
+
+    fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
+        let info = platform_info(dev)?;
+        let controller = info.properties.fw_phandle.ok_or(PnpError::missing(
+            PnpResourceKind::IrqDomain,
+            "ls2k1000 ICU phandle missing",
+        ))?;
+        let parent_line = match info.resolve_first_irq_line() {
+            Ok(line) => line,
+            Err(PlatformIrqResolveError::Unresolved) => {
+                return Err(PnpError::dependency(first_irq_dependency(info)));
+            }
+            Err(PlatformIrqResolveError::NoResource) => {
+                return Err(PnpError::missing(
+                    PnpResourceKind::Irq,
+                    "ls2k1000 ICU cascade irq missing",
+                ));
+            }
+        };
+        let IrqLine::Hardware(parent_hwi) = parent_line else {
+            return Err(PnpError::malformed(
+                PnpResourceKind::Irq,
+                "ls2k1000 ICU parent is not a CPU hardware irq",
+            ));
+        };
+        let core_bit = u32::try_from(self.boot_cpu_id)
+            .ok()
+            .and_then(|core| 1u8.checked_shl(core))
+            .ok_or(PnpError::malformed(
+                PnpResourceKind::IrqDomain,
+                "ls2k1000 ICU boot core cannot be routed",
+            ))?;
+        let route = route_value(parent_hwi, core_bit).ok_or(PnpError::malformed(
+            PnpResourceKind::IrqDomain,
+            "ls2k1000 ICU route is outside hardware range",
+        ))?;
+        let mut resources = info.mmio_resources();
+        let (control_phys, control_size) = resources.next().ok_or(PnpError::missing(
+            PnpResourceKind::Mmio,
+            "ls2k1000 ICU control window missing",
+        ))?;
+        let (isr_phys, isr_size) = resources.next().ok_or(PnpError::missing(
+            PnpResourceKind::Mmio,
+            "ls2k1000 ICU per-core ISR window missing",
+        ))?;
+        if resources.next().is_some() {
+            return Err(PnpError::malformed(
+                PnpResourceKind::Mmio,
+                "ls2k1000 ICU requires exactly two reg windows",
+            ));
+        }
+        let layout = Ls2kIcuLayout::new(
+            (self.device_mmio_to_virt)(control_phys),
+            control_size,
+            (self.device_mmio_to_virt)(isr_phys),
+            isr_size,
+        )
+        .map_err(|_| {
+            PnpError::malformed(PnpResourceKind::Mmio, "invalid ls2k1000 ICU reg layout")
+        })?;
+        let intc = Arc::new(Ls2kIcu::new(controller, layout, route));
+        intc.initialize();
+        dev.reserve_owned_resources(2)?;
+        let parent_irq = irq::register_irq_handler(
+            parent_line,
+            Arc::new(Ls2kIcuCascadeHandler {
+                intc: Arc::clone(&intc),
+            }),
+        )
+        .map_err(map_irq_error)?;
+        if let Err(error) = dev.own_resource(irq::irq_handler_pnp_resource(
+            parent_irq,
+            "loongson-2k1000-icu-cascade",
+        )) {
+            let _ = irq::unregister_irq_handler(parent_irq);
+            return Err(error);
+        }
+        let domain = irq::register_irq_domain(controller, intc.clone()).map_err(map_irq_error)?;
+        if let Err(error) = dev.own_resource(irq::irq_domain_pnp_resource(
+            domain,
+            "loongson-2k1000-icu-domain",
+        )) {
+            let _ = irq::unregister_irq_domain(domain);
+            return Err(error);
+        }
+        dev.set_driver_data(Arc::new(Ls2kIcuBinding { intc }));
+        log::printk!(
+            "[loongson-2k1000-icu] bound {} route={:#04x}",
+            dev.name,
+            route
+        );
+        Ok(())
+    }
+
+    fn remove(&self, dev: &Arc<PnpDevice>) {
+        if let Some(data) = dev.take_driver_data()
+            && let Ok(binding) = data.downcast::<Ls2kIcuBinding>()
+        {
+            binding.intc.mask_all();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -498,7 +828,7 @@ impl PchPic {
         for reg in 0..PCH_PIC_IRQ_COUNT / 32 {
             let offset = reg as usize * 4;
             // PCH_PIC_MASK 为 1 表示屏蔽。复位阶段先屏蔽所有源，后续由
-            // set_line_enabled() 按设备实际注册状态逐条 unmask，避免未绑定设备
+            // `set_line_enabled()` 按设备实际注册状态逐条解除屏蔽，避免未绑定设备
             // 或旧 pending 在控制器初始化期间产生中断风暴。
             self.write32(PCH_PIC_REG_MASK + offset, u32::MAX);
             self.write32(PCH_PIC_REG_HTMSI_EN + offset, u32::MAX);
@@ -544,7 +874,7 @@ impl PchPic {
         drop(inner);
 
         // 只有当某个设备 IRQ specifier 真正分配到本 slot 时，才在父级
-        // domain 上安装级联 handler。这样未使用的 PCH source 不会提前打开
+        // 中断域上安装级联处理函数。这样未使用的 PCH 中断源不会提前打开
         // 上游 vector，也让热移除时可以按 slot 精确释放资源。
         let parent_irq = self.register_parent_handler(slot)?;
         let vector = self.base_vector.checked_add(slot)?;
@@ -592,7 +922,7 @@ impl PchPic {
 
     fn unregister_parent_handlers(&self) {
         // 先从 slot 表里取走所有 handler 句柄，再在锁外注销。注销过程会回调
-        // IRQ registry 和父 domain，不能持有 PCH 内部锁进入外层基础设施。
+        // IRQ 注册表和父中断域，不能持有 PCH 内部锁进入外层基础设施。
         let handles: Vec<IrqHandle> = {
             let mut inner = self.inner.lock();
             let mut handles = Vec::new();
@@ -668,7 +998,7 @@ impl PchPic {
     }
 
     fn set_source_enabled(&self, source: u32, enabled: bool) {
-        // MASK bit 的硬件语义与 enabled 相反：1 = masked，0 = unmasked。
+        // MASK 位的硬件语义与启用状态相反：1 表示屏蔽，0 表示解除屏蔽。
         self.write_bit_state(PCH_PIC_REG_MASK, source, !enabled);
     }
 
@@ -784,13 +1114,31 @@ impl PnpDriver for PchPicDriver {
                 PnpResourceKind::IrqDomain,
                 "pch-pic interrupt-parent missing",
             ))?;
-        let Some((phys, _size)) = info.first_mmio() else {
+        let Some((phys, size)) = info.first_mmio() else {
             return Err(PnpError::missing(
                 PnpResourceKind::Mmio,
                 "pch-pic reg missing",
             ));
         };
+        if !phys.is_multiple_of(core::mem::align_of::<u32>())
+            || size < PCH_PIC_REQUIRED_MMIO_SIZE
+            || phys.checked_add(size).is_none()
+        {
+            return Err(PnpError::malformed(
+                PnpResourceKind::Mmio,
+                "pch-pic reg window is truncated or misaligned",
+            ));
+        }
         let base_vector = info.u32_property(PCH_PIC_PROP_BASE_VECTOR).unwrap_or(0);
+        if base_vector
+            .checked_add(PCH_PIC_IRQ_COUNT - 1)
+            .is_none_or(|last| last > u8::MAX as u32)
+        {
+            return Err(PnpError::malformed(
+                PnpResourceKind::IrqDomain,
+                "pch-pic vector range exceeds the hardware table",
+            ));
+        }
         let route_target = PchPicRouteTarget::from_platform(info).ok_or(PnpError::malformed(
             PnpResourceKind::IrqDomain,
             "invalid pch-pic route target",
@@ -803,6 +1151,7 @@ impl PnpDriver for PchPicDriver {
             route_target,
         ));
         pic.reset();
+        dev.reserve_owned_resources(1)?;
         let domain = irq::register_irq_domain(
             controller,
             Arc::new(PchPicDomain {
@@ -826,7 +1175,7 @@ impl PnpDriver for PchPicDriver {
             && let Ok(binding) = data.downcast::<PchPicBinding>()
         {
             // 移除控制器时先把所有 source 重新屏蔽并清 pending，再拆掉父级
-            // handler/domain。这样即使设备侧仍有旧电平或残留边沿，也不会在
+            // 处理函数和中断域。这样即使设备侧仍有旧电平或残留边沿，也不会在
             // 注销过程中继续向上游控制器冒泡。
             binding.pic.reset();
             binding.pic.unregister_parent_handlers();
@@ -990,6 +1339,7 @@ impl PnpDriver for PchMsiDriver {
             vector_count,
             allocated,
         ));
+        dev.reserve_owned_resources(1)?;
         let handle = msi::register_msi_controller(controller, msi).map_err(map_msi_error)?;
         if let Err(err) = dev.own_resource(msi::controller_pnp_resource(
             handle,
@@ -1087,6 +1437,21 @@ impl DriverFactory for EioIntcFactory {
     }
 }
 
+struct Ls2kIcuFactory;
+
+impl DriverFactory for Ls2kIcuFactory {
+    fn name(&self) -> &'static str {
+        "platform-loongson-2k1000-icu"
+    }
+
+    fn create(&self, ctx: &DevInitContext) -> Result<Arc<dyn PnpDriver>, PnpError> {
+        Ok(Arc::new(Ls2kIcuDriver::new(
+            ctx.device_mmio_to_virt,
+            ctx.boot_cpu_id,
+        )))
+    }
+}
+
 struct PchPicFactory;
 
 impl DriverFactory for PchPicFactory {
@@ -1111,7 +1476,7 @@ impl DriverFactory for PchMsiFactory {
     }
 }
 
-pub fn register_builtin_driver() -> Result<[DriverHandle; 4], PnpError> {
+pub fn register_builtin_driver() -> Result<[DriverHandle; 5], PnpError> {
     let cpu_irq = register_driver_factory(Arc::new(LoongsonCpuIrqFactory))?;
     let eiointc = match register_driver_factory(Arc::new(EioIntcFactory)) {
         Ok(handle) => handle,
@@ -1120,7 +1485,7 @@ pub fn register_builtin_driver() -> Result<[DriverHandle; 4], PnpError> {
             return Err(error);
         }
     };
-    let pch_pic = match register_driver_factory(Arc::new(PchPicFactory)) {
+    let ls2k_icu = match register_driver_factory(Arc::new(Ls2kIcuFactory)) {
         Ok(handle) => handle,
         Err(error) => {
             let _ = unregister_driver(eiointc);
@@ -1128,10 +1493,20 @@ pub fn register_builtin_driver() -> Result<[DriverHandle; 4], PnpError> {
             return Err(error);
         }
     };
+    let pch_pic = match register_driver_factory(Arc::new(PchPicFactory)) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = unregister_driver(ls2k_icu);
+            let _ = unregister_driver(eiointc);
+            let _ = unregister_driver(cpu_irq);
+            return Err(error);
+        }
+    };
     match register_driver_factory(Arc::new(PchMsiFactory)) {
-        Ok(pch_msi) => Ok([cpu_irq, eiointc, pch_pic, pch_msi]),
+        Ok(pch_msi) => Ok([cpu_irq, eiointc, ls2k_icu, pch_pic, pch_msi]),
         Err(error) => {
             let _ = unregister_driver(pch_pic);
+            let _ = unregister_driver(ls2k_icu);
             let _ = unregister_driver(eiointc);
             let _ = unregister_driver(cpu_irq);
             Err(error)

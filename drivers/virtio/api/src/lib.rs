@@ -55,6 +55,13 @@ pub const VIRTIO_STATUS_FAILED: u8 = 128;
 
 /// 所有 modern VirtIO 设备都必须支持的基础 feature。
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+/// 设备必须通过平台 DMA/IOMMU API 访问队列和数据缓冲区。
+pub const VIRTIO_F_ACCESS_PLATFORM: u64 = 1 << 33;
+
+/// 校验当前 DMA 上下文是否能由设备提供的 VirtIO feature 安全表达。
+pub const fn access_platform_compatible(device_features: u64, required: bool) -> bool {
+    !required || device_features & VIRTIO_F_ACCESS_PLATFORM != 0
+}
 /// split virtqueue event suppression。
 pub const VIRTIO_F_RING_EVENT_IDX: u64 = 1 << 29;
 /// reset 后等待 status 清零的默认自旋上限。
@@ -672,12 +679,27 @@ impl SplitVirtQueue {
         let avail_len = avail_ring_bytes(qsz)?;
         let used_len = used_ring_bytes(qsz)?;
 
-        let desc = DmaBuffer::new_in(dma_context, desc_len, DESC_ALIGN, DmaDirection::ToDevice)
-            .map_err(VirtQueueError::DmaAllocationFailed)?;
-        let avail = DmaBuffer::new_in(dma_context, avail_len, AVAIL_ALIGN, DmaDirection::ToDevice)
-            .map_err(VirtQueueError::DmaAllocationFailed)?;
-        let used = DmaBuffer::new_in(dma_context, used_len, USED_ALIGN, DmaDirection::FromDevice)
-            .map_err(VirtQueueError::DmaAllocationFailed)?;
+        let desc = DmaBuffer::new_in(
+            dma_context.clone(),
+            desc_len,
+            DESC_ALIGN,
+            DmaDirection::ToDevice,
+        )
+        .map_err(VirtQueueError::DmaAllocationFailed)?;
+        let avail = DmaBuffer::new_in(
+            dma_context.clone(),
+            avail_len,
+            AVAIL_ALIGN,
+            DmaDirection::ToDevice,
+        )
+        .map_err(VirtQueueError::DmaAllocationFailed)?;
+        let used = DmaBuffer::new_in(
+            dma_context.clone(),
+            used_len,
+            USED_ALIGN,
+            DmaDirection::FromDevice,
+        )
+        .map_err(VirtQueueError::DmaAllocationFailed)?;
 
         let mut queue = Self {
             queue_size,
@@ -713,34 +735,31 @@ impl SplitVirtQueue {
         // Legacy 要求 Used Ring 页对齐：在 avail 和 used 之间可能有填充
         let used_off = (desc_len + avail_len).next_multiple_of(4096);
         let total = used_off + used_len;
-        let buf = DmaBuffer::new_in(dma_context, total, page_align, DmaDirection::Bidirectional)
-            .map_err(VirtQueueError::DmaAllocationFailed)?;
+        let buf = DmaBuffer::new_in(
+            dma_context.clone(),
+            total,
+            page_align,
+            DmaDirection::Bidirectional,
+        )
+        .map_err(VirtQueueError::DmaAllocationFailed)?;
 
         let base_dma = buf.dma_addr();
         let base_paddr = buf.paddr();
         let base_vaddr = buf.vaddr();
-        let master_alloc = buf.take_allocation();
 
-        // desc 持有主分配（drop 时释放整段）；avail/used 是零分配视图
-        let desc = DmaBuffer::from_allocation_in(
-            dma_context,
-            master_alloc,
-            base_dma,
-            base_vaddr,
-            desc_len,
-            DmaDirection::ToDevice,
-        );
+        // desc 持有主分配和整段 IOMMU mapping；avail/used 是零分配视图。
+        let desc = buf.into_owner_view(desc_len, DmaDirection::ToDevice);
         // Legacy 规范要求 Used Ring 页对齐
         let used_off = (desc_len + avail_len).next_multiple_of(4096);
         let avail = DmaBuffer::sub_view_in(
-            dma_context,
+            dma_context.clone(),
             base_dma + desc_len,
             base_vaddr + desc_len,
             base_paddr + desc_len,
             avail_len,
         );
         let used = DmaBuffer::sub_view_in(
-            dma_context,
+            dma_context.clone(),
             base_dma + used_off,
             base_vaddr + used_off,
             base_paddr + used_off,
@@ -761,8 +780,8 @@ impl SplitVirtQueue {
         Ok(queue)
     }
 
-    pub const fn dma_context(&self) -> DmaContext {
-        self.dma_context
+    pub fn dma_context(&self) -> DmaContext {
+        self.dma_context.clone()
     }
 
     pub const fn queue_size(&self) -> u16 {
@@ -1431,4 +1450,16 @@ fn descriptor_record_contains(
             .iter()
             .take(len - INLINE_DESCRIPTOR_CHAIN)
             .any(|idx| *idx == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_platform_requirement_is_fail_closed() {
+        assert!(access_platform_compatible(0, false));
+        assert!(!access_platform_compatible(0, true));
+        assert!(access_platform_compatible(VIRTIO_F_ACCESS_PLATFORM, true));
+    }
 }

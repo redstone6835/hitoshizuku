@@ -15,18 +15,18 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::num::NonZeroU32;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(feature = "block-profile")]
 use super::common::VirtioBlkProfile;
 use super::common::{
     IrqSafeMutex, MIN_QUEUE_SIZE as VIRTIO_BLK_MIN_QUEUE_SIZE, VirtioBlkAllocatedRequest,
-    VirtioBlkCapabilities, VirtioBlkConfigReader, VirtioBlkPendingRequest, VirtioBlkQueueCore,
-    VirtioBlkQueueId, VirtioBlkReqMeta, VirtioBlkRequestPlan, allocate_request, block_limits,
-    copy_completed_read_payload, free_allocated_request, negotiate_supported_features,
-    read_device_config, reclaim_request_payload_for_cpu, status_to_result,
-    validate_bio_buffer_for_plan, validate_used_write_len, write_allocated_request_descriptors,
-    write_data_payload,
+    VirtioBlkCapabilities, VirtioBlkConfigReader, VirtioBlkOperationGate, VirtioBlkPendingRequest,
+    VirtioBlkQueueCore, VirtioBlkQueueId, VirtioBlkReqMeta, VirtioBlkRequestPlan,
+    abandon_allocated_request, allocate_request, block_limits, copy_completed_read_payload,
+    free_allocated_request, negotiate_supported_features, read_device_config,
+    reclaim_request_payload_for_cpu, status_to_result, validate_bio_buffer_for_plan,
+    validate_used_write_len, write_allocated_request_descriptors, write_data_payload,
 };
 use super::{VIRTIO_BLK_SECTOR_SIZE, alloc_virtio_blk_dev_name};
 use general::dev::bio::{BIO_MAX_BORROWED_SEGMENTS, Bio, BioIoError, BioOp, SubmitError};
@@ -81,15 +81,16 @@ struct VirtioBlkInner {
     queue_id: VirtioBlkQueueId,
     /// 热路径缓存：MMIO queue notify 寄存器地址。
     notify_addr: usize,
-    /// 热路径缓存：写入 notify 寄存器的队列号。
-    notify_value: u32,
     /// 中断状态/ACK 寄存器地址。中断路径也避免 dyn transport 调用。
     interrupt_status_addr: usize,
     interrupt_ack_addr: usize,
     /// 队列
-    queue: IrqSafeMutex<VirtioBlkQueueCore>,
+    queue: IrqSafeMutex<Option<VirtioBlkQueueCore>>,
+    operations: VirtioBlkOperationGate,
     /// 中断计数（用于轮询模式）
     irq_count: AtomicUsize,
+    /// probe 完成后是否已注册 PLIC/父级 IRQ handler。
+    irq_registered: AtomicBool,
     #[cfg(feature = "block-profile")]
     profile: VirtioBlkProfile,
 }
@@ -98,9 +99,27 @@ pub struct VirtioBlk {
     inner: Arc<VirtioBlkInner>,
 }
 
+impl VirtioBlkInner {
+    fn reset_wait(&self) -> bool {
+        self.transport.write_status(0);
+        for _ in 0..VIRTIO_MMIO_RESET_SPIN_LIMIT {
+            if self.transport.read_status() == 0 {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        self.transport.read_status() == 0
+    }
+}
+
 impl Drop for VirtioBlk {
     fn drop(&mut self) {
-        self.inner.transport.write_status(0);
+        if self.shutdown().is_err() {
+            // reset 未完成时设备仍可能访问 queue/pending DMA。额外保留一份 inner
+            // 所有权，保证即使 panic 策略允许展开，也不会释放仍可被设备访问的页。
+            core::mem::forget(Arc::clone(&self.inner));
+            panic!("virtio-mmio-blk: device reset timed out during teardown")
+        }
     }
 }
 
@@ -156,6 +175,32 @@ impl VirtioBlkConfigReader for VirtioMmioRegs {
 // ───────── 驱动初始化 ─────────
 
 impl VirtioBlk {
+    /// 幂等关闭设备，并在 reset 完成后主动撤销全部队列 DMA。
+    fn shutdown(&self) -> Result<(), &'static str> {
+        if !self.inner.operations.quiesce(VIRTIO_MMIO_RESET_SPIN_LIMIT) {
+            return Err("virtio-mmio-blk: data path did not quiesce during shutdown");
+        }
+        let (queue, pending) = {
+            let mut slot = self.inner.queue.lock();
+            let Some(queue) = slot.as_mut() else {
+                return Ok(());
+            };
+            queue.mark_failed();
+            if !self.inner.reset_wait() {
+                return Err("virtio-mmio-blk: device reset timed out during shutdown");
+            }
+            let mut queue = slot.take().expect("live queue checked before reset");
+            let pending = queue.take_all_pending();
+            (queue, pending)
+        };
+
+        // reset 已确认后，先撤销 queue/pool 映射，再归还 pending BIO。后者会在
+        // 唤醒等待者前撤销 direct 映射，并在本函数返回前释放请求 DMA。
+        drop(queue);
+        Self::complete_failed_requests(pending, BioIoError::Unavailable);
+        Ok(())
+    }
+
     /// 创建并初始化 VirtIO Block 设备驱动
     ///
     /// # 参数
@@ -182,7 +227,11 @@ impl VirtioBlk {
 
         // 4. 协商特性
         let device_features = transport.read_device_features();
-        let driver_features = match negotiate_supported_features(device_features, !is_legacy) {
+        let driver_features = match negotiate_supported_features(
+            device_features,
+            !is_legacy,
+            dma_context.requires_access_platform(),
+        ) {
             Ok(features) => features,
             Err(msg) => {
                 transport.write_status(VIRTIO_STATUS_FAILED);
@@ -257,11 +306,12 @@ impl VirtioBlk {
             capabilities,
             queue_id,
             notify_addr: mmio_base + MMIO_QUEUE_NOTIFY,
-            notify_value: u32::from(queue_id.raw()),
             interrupt_status_addr: mmio_base + MMIO_INTERRUPT_STATUS,
             interrupt_ack_addr: mmio_base + MMIO_INTERRUPT_ACK,
-            queue: IrqSafeMutex::new(VirtioBlkQueueCore::new(split_queue)),
+            queue: IrqSafeMutex::new(Some(VirtioBlkQueueCore::new(split_queue))),
+            operations: VirtioBlkOperationGate::new(),
             irq_count: AtomicUsize::new(0),
+            irq_registered: AtomicBool::new(false),
             #[cfg(feature = "block-profile")]
             profile: VirtioBlkProfile::new(),
         });
@@ -270,12 +320,13 @@ impl VirtioBlk {
     }
 
     fn complete_failed_requests(pending: Vec<Option<VirtioBlkPendingRequest>>, error: BioIoError) {
-        for pending in pending.into_iter().flatten() {
+        for mut pending in pending.into_iter().flatten() {
             pending.meta_dma.sync_for_cpu();
             reclaim_request_payload_for_cpu(
                 pending.data_dma.as_ref(),
                 pending.direct_bio_mappings.as_ref(),
             );
+            drop(pending.direct_bio_mappings.take());
             pending.bio.complete(Err(error));
         }
     }
@@ -295,24 +346,25 @@ impl VirtioBlk {
         // 借用页可能仍是设备的 DMA 目标。fatal queue 路径必须观察到 device reset
         // 完成后才能把 pending BIO 归还给调用方；坏设备不响应 reset 时宁可停在此处，
         // 也不能制造 DMA-after-free。
-        self.inner.transport.write_status(0);
-        for _ in 0..VIRTIO_MMIO_RESET_SPIN_LIMIT {
-            if self.inner.transport.read_status() == 0 {
-                return queue.take_all_pending();
-            }
-            core::hint::spin_loop();
+        if self.inner.reset_wait() {
+            return queue.take_all_pending();
         }
         panic!("virtio-mmio-blk: device reset timed out after fatal queue error")
     }
 
     /// 轮询并处理已完成的请求
     pub fn poll(&self) {
-        let mut queue = self.inner.queue.lock();
-        if queue.is_failed() {
+        let Some(_operation) = self.inner.operations.enter() else {
             return;
-        }
-
+        };
         loop {
+            let mut queue_guard = self.inner.queue.lock();
+            let Some(queue) = queue_guard.as_mut() else {
+                return;
+            };
+            if queue.is_failed() {
+                return;
+            }
             #[cfg(feature = "block-profile")]
             let profile_poll_start = queue
                 .sampled_pending_published_ns()
@@ -342,8 +394,8 @@ impl VirtioBlk {
                     break;
                 }
                 Err(_) => {
-                    let failed = self.fail_queue_locked(&mut queue, "used ring corruption");
-                    drop(queue);
+                    let failed = self.fail_queue_locked(queue, "used ring corruption");
+                    drop(queue_guard);
                     Self::complete_failed_requests(failed, BioIoError::Unavailable);
                     return;
                 }
@@ -358,9 +410,8 @@ impl VirtioBlk {
                 // used ring 返回了当前队列内的 descriptor head，但驱动没有对应的
                 // BIO 记录。继续运行可能释放到其它请求的描述符链，因此直接把队列
                 // 标记为失败，让上层重新发现设备状态，而不是尝试局部恢复。
-                let failed =
-                    self.fail_queue_locked(&mut queue, "used head without pending request");
-                drop(queue);
+                let failed = self.fail_queue_locked(queue, "used head without pending request");
+                drop(queue_guard);
                 Self::complete_failed_requests(failed, BioIoError::Unavailable);
                 return;
             };
@@ -404,17 +455,17 @@ impl VirtioBlk {
                 .free_chain_from_head(desc_head)
                 .is_err()
             {
-                let failed =
-                    self.fail_queue_locked(&mut queue, "completed descriptor chain corrupt");
-                drop(queue);
+                let failed = self.fail_queue_locked(queue, "completed descriptor chain corrupt");
+                drop(queue_guard);
                 reclaim_request_payload_for_cpu(data_dma.as_ref(), direct_bio_mappings.as_ref());
+                drop(direct_bio_mappings);
                 bio.complete(Err(BioIoError::Unavailable));
                 Self::complete_failed_requests(failed, BioIoError::Unavailable);
                 return;
             }
 
             // 大块顺序读的数据同步/回拷放到队列锁外，避免长时间阻塞提交路径。
-            drop(queue);
+            drop(queue_guard);
             reclaim_request_payload_for_cpu(data_dma.as_ref(), direct_bio_mappings.as_ref());
             if result.is_ok() && bio.op == BioOp::Read {
                 if let Err(error) = copy_completed_read_payload(
@@ -426,15 +477,16 @@ impl VirtioBlk {
                 }
             }
             if let Some(dma) = data_dma.take() {
-                queue = self.inner.queue.lock();
-                queue.recycle_data_dma(dma);
-                drop(queue);
+                let mut queue_guard = self.inner.queue.lock();
+                if let Some(queue) = queue_guard.as_mut() {
+                    queue.recycle_data_dma(dma);
+                }
             }
+            drop(direct_bio_mappings);
 
             // 释放 queue 锁后再 complete bio——避免 completion 路径
             // （包括 Waker::wake 和 WaitQueue::wake_all）持队列锁重入。
             bio.complete(result);
-            queue = self.inner.queue.lock();
         }
     }
 
@@ -451,6 +503,16 @@ impl VirtioBlk {
         // 轮询完成的请求
         self.poll();
         true
+    }
+
+    pub fn set_irq_registered(&self, registered: bool) {
+        self.inner
+            .irq_registered
+            .store(registered, Ordering::Release);
+    }
+
+    fn completion_is_interrupt_driven(&self) -> bool {
+        self.inner.irq_registered.load(Ordering::Acquire)
     }
 
     /// 创建 BlockDev 包装
@@ -471,12 +533,15 @@ impl VirtioBlk {
             .ok_or("Invalid geometry")?;
 
         let queue_guard = self.inner.queue.lock();
+        let queue = queue_guard
+            .as_ref()
+            .ok_or("VirtIO block queue is already shut down")?;
         let limits = block_limits(
             block_size,
-            queue_guard.split_queue().dma_context(),
+            queue.split_queue().dma_context(),
             self.inner.capabilities,
         )?;
-        let queue_depth = u32::from(queue_guard.split_queue().queue_size());
+        let queue_depth = u32::from(queue.split_queue().queue_size());
         drop(queue_guard);
         let attributes = BlockAttributes::new(false, false, NonZeroU32::new(queue_depth), None);
         let features = self.inner.capabilities.block_features(block_size);
@@ -531,9 +596,15 @@ struct VirtioBlkIo {
 
 impl BlockDriver for VirtioBlkIo {
     fn queue_bio(&self, bio: Bio) -> Result<(), (SubmitError, Bio)> {
+        let Some(_operation) = self.driver.inner.operations.enter() else {
+            return Err((SubmitError::DeviceGone, bio));
+        };
         // 先回收设备已发布的完成项，避免并发提交在中断合并时丢失进度。
         self.driver.poll();
-        let mut queue = self.driver.inner.queue.lock();
+        let mut queue_guard = self.driver.inner.queue.lock();
+        let Some(queue) = queue_guard.as_mut() else {
+            return Err((SubmitError::DeviceGone, bio));
+        };
         if queue.is_failed() {
             return Err((SubmitError::DeviceGone, bio));
         }
@@ -552,36 +623,49 @@ impl BlockDriver for VirtioBlkIo {
         if let Err(err) = validate_bio_buffer_for_plan(plan, &bio) {
             return Err((err, bio));
         }
-        let mut request =
-            match allocate_request(&mut *queue, plan, &bio, self.driver.inner.capabilities) {
-                Ok(request) => request,
-                Err(err) => return Err((err, bio)),
-            };
+        let mut request = match allocate_request(queue, plan, &bio, self.driver.inner.capabilities)
+        {
+            Ok(request) => request,
+            Err(err) => return Err((err, bio)),
+        };
 
         if request.data_dma.is_some() {
             // 大块顺序写和 range payload 初始化放到队列锁外，避免阻塞完成路径。
-            drop(queue);
+            drop(queue_guard);
             if let Err(err) = write_data_payload(plan, &bio, &mut request.data_dma) {
-                queue = self.driver.inner.queue.lock();
-                free_allocated_request(&mut *queue, request);
-                return Err((err, bio));
+                let mut queue_guard = self.driver.inner.queue.lock();
+                if let Some(queue) = queue_guard.as_mut() {
+                    free_allocated_request(queue, request);
+                    return Err((err, bio));
+                }
+                drop(queue_guard);
+                abandon_allocated_request(request);
+                return Err((SubmitError::DeviceGone, bio));
             }
-            queue = self.driver.inner.queue.lock();
+            queue_guard = self.driver.inner.queue.lock();
+            let Some(queue) = queue_guard.as_mut() else {
+                drop(queue_guard);
+                abandon_allocated_request(request);
+                return Err((SubmitError::DeviceGone, bio));
+            };
             if queue.is_failed() {
-                free_allocated_request(&mut *queue, request);
+                free_allocated_request(queue, request);
                 return Err((SubmitError::DeviceGone, bio));
             }
         }
+        let queue = queue_guard
+            .as_mut()
+            .expect("queue presence checked after every unlocked staging window");
 
         // 描述符链形状由 virtio-blk 公共层统一维护，MMIO 传输层只负责发布 head。
-        if let Err(err) = write_allocated_request_descriptors(&mut *queue, &request, plan, &bio) {
-            free_allocated_request(&mut *queue, request);
+        if let Err(err) = write_allocated_request_descriptors(queue, &request, plan, &bio) {
+            free_allocated_request(queue, request);
             return Err((err, bio));
         }
         let expected_device_write_len = match plan.expected_device_write_len() {
             Ok(len) => len,
             Err(err) => {
-                free_allocated_request(&mut *queue, request);
+                free_allocated_request(queue, request);
                 return Err((err, bio));
             }
         };
@@ -628,8 +712,8 @@ impl BlockDriver for VirtioBlkIo {
                 None => {
                     let failed = self
                         .driver
-                        .fail_queue_locked(&mut queue, "pending lost before publish failure");
-                    drop(queue);
+                        .fail_queue_locked(queue, "pending lost before publish failure");
+                    drop(queue_guard);
                     VirtioBlk::complete_failed_requests(failed, BioIoError::Unavailable);
                     return Ok(());
                 }
@@ -665,7 +749,7 @@ impl BlockDriver for VirtioBlkIo {
         unsafe {
             write_volatile(
                 self.driver.inner.notify_addr as *mut u32,
-                self.driver.inner.notify_value,
+                u32::from(self.driver.inner.queue_id.raw()),
             );
         }
         #[cfg(feature = "block-profile")]
@@ -677,12 +761,16 @@ impl BlockDriver for VirtioBlkIo {
                 .record_publish_to_notify(notified_ns.saturating_sub(profile_published_ns));
             let _ = queue.set_pending_profile_notified_ns(head_idx, notified_ns);
         }
-        drop(queue);
+        drop(queue_guard);
         Ok(())
     }
 
     fn drain(&self) {
         self.driver.poll();
+    }
+
+    fn completion_is_interrupt_driven(&self) -> bool {
+        self.driver.completion_is_interrupt_driven()
     }
 
     #[cfg(feature = "block-profile")]
@@ -711,6 +799,10 @@ impl BlockDriver for VirtioBlkIo {
 /// 通用 function 注册到设备 core。
 pub struct VirtioMmioBlkDriver {
     device_mmio_to_virt: fn(usize) -> usize,
+}
+
+struct VirtioMmioBlkBinding {
+    driver: Arc<VirtioBlk>,
 }
 
 impl VirtioMmioBlkDriver {
@@ -831,6 +923,7 @@ impl PnpDriver for VirtioMmioBlkDriver {
             PnpError::registration_failed(PnpResourceKind::Function, "block function")
         })?;
         let irq_handle = register_virtio_mmio_blk_irq(info, Arc::clone(&driver))?;
+        let irq_registered = irq_handle.is_some();
         if let Some(handle) = irq_handle
             && let Err(err) =
                 dev.own_resource(irq::irq_handler_pnp_resource(handle, "virtio-mmio-blk-irq"))
@@ -838,9 +931,11 @@ impl PnpDriver for VirtioMmioBlkDriver {
             let _ = irq::unregister_irq_handler(handle);
             return Err(err);
         }
+        driver.set_irq_registered(irq_registered);
         dev.register_function(BlockFunction::with_projection_name_arc(
             &dev.name, &dev_name, block_dev,
         ))?;
+        dev.set_driver_data(Arc::new(VirtioMmioBlkBinding { driver }));
         log::printk!(
             "[platform-virtio-mmio-blk] bound {} phys={:#x} -> /dev/{}",
             dev.name,
@@ -851,7 +946,34 @@ impl PnpDriver for VirtioMmioBlkDriver {
     }
 
     fn remove(&self, dev: &Arc<PnpDevice>) {
+        if let Err(error) = self.try_remove(dev) {
+            log::error!(
+                "[platform-virtio-mmio-blk] remove failed for {}: {:?}",
+                dev.name,
+                error
+            );
+        }
+    }
+
+    fn try_remove(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
+        let data = dev.take_driver_data().ok_or(PnpError::InvalidState)?;
+        let binding =
+            Arc::downcast::<VirtioMmioBlkBinding>(data).map_err(|_| PnpError::InvalidState)?;
+        if let Err(error) = binding.driver.shutdown() {
+            log::error!(
+                "[platform-virtio-mmio-blk] shutdown failed for {}: {}",
+                dev.name,
+                error
+            );
+            // PnP commit 已进入不可逆阶段，binding 不能重新挂回 Removing 设备。
+            // 保留 driver 可确保仍可能被设备访问的 queue/pending DMA 不会析构。
+            core::mem::forget(binding);
+            return Err(PnpError::hardware_failure(
+                "virtio-mmio block shutdown failed",
+            ));
+        }
         log::printk!("[platform-virtio-mmio-blk] removed {}", dev.name);
+        Ok(())
     }
 }
 

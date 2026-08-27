@@ -53,6 +53,7 @@ const LOOP_SET_STATUS: usize = 0x4c02;
 const LOOP_GET_STATUS: usize = 0x4c03;
 const LOOP_SET_STATUS64: usize = 0x4c04;
 const LOOP_GET_STATUS64: usize = 0x4c05;
+const LOOP_CHANGE_FD: usize = 0x4c06;
 const LOOP_SET_CAPACITY: usize = 0x4c07;
 const LOOP_SET_DIRECT_IO: usize = 0x4c08;
 const LOOP_SET_BLOCK_SIZE: usize = 0x4c09;
@@ -378,6 +379,15 @@ fn handle_loop_block_ioctl(driver: &LoopDriver, raw: usize, arg: usize) -> Resul
             write_user_struct(arg, &info)?;
             Ok(0)
         }
+        LOOP_CHANGE_FD => {
+            // losetup 更换 backing file:保留当前 offset/sizelimit/read_only,
+            // 只替换底层文件对象。
+            let options = attach_options_from_fd(arg, LinuxLoopInfo64::zeroed())?;
+            driver
+                .change_backing(options.backing, options.file_name)
+                .map_err(map_loop_errno)?;
+            Ok(0)
+        }
         LOOP_SET_STATUS => {
             let info: LinuxLoopInfo = read_user_struct(arg)?;
             let info64 = linux_loop_info64_from_legacy(info)?;
@@ -681,6 +691,7 @@ fn is_loop_ioctl(raw: usize) -> bool {
             | LOOP_GET_STATUS
             | LOOP_SET_STATUS64
             | LOOP_GET_STATUS64
+            | LOOP_CHANGE_FD
             | LOOP_SET_CAPACITY
             | LOOP_SET_DIRECT_IO
             | LOOP_SET_BLOCK_SIZE

@@ -218,6 +218,15 @@ pub struct ThreadGroup {
     rlimits: Spinlock<Rlimits>,
     /// 已退出线程的 usage 累计，供进程记账在最后一个线程退出时汇总。
     exited_usage: Spinlock<TaskUsage>,
+    /// 线程组累计 CPU 时间（`CLOCK_PROCESS_CPUTIME_ID` 定时器与
+    /// `ITIMER_PROF` 的 CPU 时间域基准；由成员任务记账时原子累加）。
+    pub(crate) cpu_runtime_ns: AtomicU64,
+    /// 线程组累计用户态 CPU 时间（`ITIMER_VIRTUAL` 基准；tick 记账）。
+    pub(crate) user_cpu_ns: AtomicU64,
+    /// `ITIMER_VIRTUAL` 定时器状态。
+    pub(crate) itimer_virtual: Spinlock<Option<crate::cpu_itimer::CpuItimer>>,
+    /// `ITIMER_PROF` 定时器状态。
+    pub(crate) itimer_prof: Spinlock<Option<crate::cpu_itimer::CpuItimer>>,
     /// 尚未执行退出清理的成员数，保证最后一个线程汇总时其余 usage 已经入账。
     acct_live_members: AtomicUsize,
     /// 防止并发退出路径重复输出同一条 acct 记录。
@@ -325,6 +334,10 @@ impl ThreadGroup {
             shared_signal: Arc::new(SharedSignal::new()),
             rlimits: Spinlock::new(Rlimits::new_with_defaults()),
             exited_usage: Spinlock::new(TaskUsage::default()),
+            cpu_runtime_ns: AtomicU64::new(0),
+            user_cpu_ns: AtomicU64::new(0),
+            itimer_virtual: Spinlock::new(None),
+            itimer_prof: Spinlock::new(None),
             acct_live_members: AtomicUsize::new(0),
             acct_emitted: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -355,6 +368,10 @@ impl ThreadGroup {
             shared_signal: shared,
             rlimits: Spinlock::new(Rlimits::new_with_defaults()),
             exited_usage: Spinlock::new(TaskUsage::default()),
+            cpu_runtime_ns: AtomicU64::new(0),
+            user_cpu_ns: AtomicU64::new(0),
+            itimer_virtual: Spinlock::new(None),
+            itimer_prof: Spinlock::new(None),
             acct_live_members: AtomicUsize::new(0),
             acct_emitted: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -617,6 +634,16 @@ impl ThreadGroup {
         &self.rlimits
     }
 
+    /// 线程组累计 CPU 时间（ns）。
+    pub fn cpu_runtime_ns(&self) -> u64 {
+        self.cpu_runtime_ns.load(Ordering::Acquire)
+    }
+
+    /// 线程组累计用户态 CPU 时间（ns）。
+    pub fn user_cpu_ns(&self) -> u64 {
+        self.user_cpu_ns.load(Ordering::Acquire)
+    }
+
     pub fn tgid(&self) -> PidT {
         self.tgid.load(Ordering::Acquire)
     }
@@ -759,6 +786,17 @@ impl ThreadGroup {
         &self.process_exit_waiters
     }
 
+    /// 唤醒线程组全体成员的 `exit_waiters`。
+    ///
+    /// POSIX wait4/waitid 阻塞在调用线程自己的 `exit_waiters` 上，而 child 登记在
+    /// 实际 fork 它的那个线程名下。子退出时必须广播唤醒同组所有成员，任意线程
+    /// 的 wait 才能被唤醒后重新扫描线程组 children 并集。
+    pub fn wake_member_exit_waiters(&self) {
+        for member in self.snapshot() {
+            member.exit_waiters.wake_all();
+        }
+    }
+
     /// 订阅进程终止事件；订阅与终止并发时允许幂等补发，但不会漏失事件。
     pub fn try_subscribe_process_exit(
         &self,
@@ -804,6 +842,10 @@ impl Default for ThreadGroup {
             shared_signal: Arc::new(SharedSignal::new()),
             rlimits: Spinlock::new(Rlimits::new_with_defaults()),
             exited_usage: Spinlock::new(TaskUsage::default()),
+            cpu_runtime_ns: AtomicU64::new(0),
+            user_cpu_ns: AtomicU64::new(0),
+            itimer_virtual: Spinlock::new(None),
+            itimer_prof: Spinlock::new(None),
             acct_live_members: AtomicUsize::new(0),
             acct_emitted: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -901,6 +943,8 @@ pub struct Session {
     /// 会话 leader 绑定线程组身份；线程组内 exec 替换 leader 时无需搬运引用。
     leader: Spinlock<Weak<ThreadGroup>>,
     groups: Spinlock<Vec<Weak<ProcessGroup>>>,
+    /// 控制终端句柄(不透明 cookie,由 TTY 层解析;sched 不依赖 general)。
+    ctty: Spinlock<Option<u64>>,
 }
 
 impl Session {
@@ -909,6 +953,7 @@ impl Session {
             sid: AtomicI32::new(PID_INVALID),
             leader: Spinlock::new(Weak::new()),
             groups: Spinlock::new(Vec::new()),
+            ctty: Spinlock::new(None),
         })
     }
 
@@ -956,6 +1001,15 @@ impl Session {
 
     pub fn sid(&self) -> PidT {
         self.sid.load(Ordering::Acquire)
+    }
+
+    /// 控制终端 cookie(TTY 层登记的不透明句柄)。
+    pub fn ctty(&self) -> Option<u64> {
+        *self.ctty.lock()
+    }
+
+    pub fn set_ctty(&self, cookie: Option<u64>) {
+        *self.ctty.lock() = cookie;
     }
 
     pub fn set_sid(&self, pid: PidT) {

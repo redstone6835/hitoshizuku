@@ -25,8 +25,11 @@ const RO_COMPAT_BIGALLOC: u32 = 0x0200;
 const RO_COMPAT_VERITY: u32 = 0x8000;
 
 struct Mounted {
+    /// Owns the backend binding for as long as the mounted superblock is exercised.
+    #[allow(dead_code)]
     driver: ExtFsDriver,
     sb: Arc<VfsSuperblock>,
+    /// Keeps the in-memory block device alive behind the trait object held by the driver.
     #[allow(dead_code)]
     disk: Arc<MemDisk>,
 }
@@ -242,6 +245,51 @@ fn mmp_check_accepts_clean_and_rejects_busy() {
     assert!(m.is_err(), "MMP 非 CLEAN 序列必须拒绝挂载");
 }
 
+/// MMP:挂载夺占所有权(写非 CLEAN 序列),心跳推进序列号,干净卸载写回 CLEAN。
+#[ktest]
+fn mmp_claim_heartbeat_and_clean_unmount() {
+    let mut img = ExtImg::new();
+    img.add_incompat(INCOMPAT_MMP);
+    {
+        let csum_seed = img.csum_seed;
+        let sb = &mut img.data[1024..2048];
+        le64(sb, 0x168, 60); // s_mmp_block = 60
+        le16(sb, 0x166, 5); // s_mmp_update_interval = 5s
+        let sum = crate::crc::crc32c(&sb[..0x3fc]);
+        le32(sb, 0x3fc, sum);
+        let blk = img.block_mut(60);
+        le32(blk, 0, 0x004d_4d50); // MMP magic
+        le32(blk, 4, 0xff4d_4d50); // CLEAN
+        // mmp csum:crc32c(csum_seed, mmp[..1020])
+        let csum = crate::crc::update(csum_seed, &blk[..1020]);
+        le32(blk, 1020, csum);
+    }
+    img.set_block_used(60, true);
+
+    let m = mount(img);
+    let seq_at = |dump: &std::vec::Vec<u8>| rd32(dump, 60 * BS + 4);
+    // 挂载后必须夺占所有权(写回首个非 CLEAN 序列号)。
+    assert_eq!(seq_at(&m.disk.dump()), 1, "挂载必须写回首个非 CLEAN 序列号");
+
+    // 拿 FsState 引用,手动推进心跳(now=10s > interval=5s)。
+    let ops =
+        m.sb.ops
+            .as_any()
+            .downcast_ref::<crate::state::ExtFsSuperblockOps>()
+            .expect("downcast ExtFsSuperblockOps");
+    let state = &ops.state;
+    crate::mmp::heartbeat_at(state, 10_000_000_000, 10);
+    assert_eq!(seq_at(&m.disk.dump()), 2, "心跳必须推进序列号");
+
+    // 干净卸载写回 CLEAN。
+    crate::mmp::mark_clean(state);
+    assert_eq!(
+        seq_at(&m.disk.dump()),
+        0xff4d_4d50,
+        "干净卸载必须写回 CLEAN"
+    );
+}
+
 /// BIGALLOC 与未知 ro_compat 位:强制只读挂载(写操作返回 EROFS)。
 #[ktest]
 fn bigalloc_and_unknown_ro_compat_force_read_only() {
@@ -276,7 +324,7 @@ fn unknown_incompat_rejected() {
     assert!(m.is_err(), "未知 incompat 位必须拒绝挂载");
 }
 
-/// ENCRYPT:挂载成功;加密文件读写报 NotSupported,lookup 不受影响。
+/// ENCRYPT:挂载成功;加密文件读写报 Enokey(与 Linux 无密钥一致),lookup 不受影响。
 #[ktest]
 fn encrypt_inode_io_rejected_but_lookup_works() {
     let mut img = ExtImg::new();
@@ -296,9 +344,9 @@ fn encrypt_inode_io_rejected_but_lookup_works() {
         .expect("打开加密文件");
     let mut buf = vec![0u8; 4];
     let err = f.read_at(&mut buf, 0).expect_err("读加密文件必须失败");
-    assert_eq!(err, VfsError::NotSupported);
+    assert_eq!(err, VfsError::Enokey);
     let err = f.write_at(b"xxxx", 0).expect_err("写加密文件必须失败");
-    assert_eq!(err, VfsError::NotSupported);
+    assert_eq!(err, VfsError::Enokey);
 }
 
 /// VERITY:verity 文件读正常,写/截断报 ReadOnlyFilesystem。
@@ -361,6 +409,32 @@ fn casefold_dir_lookup_ascii_insensitive() {
     assert!(
         m.sb.root_inode.lookup("hellp").is_err(),
         "错误拼写必须 NotFound"
+    );
+}
+
+/// CASEFOLD 目录:非 ASCII 名按 Unicode 简单小写折叠做大小写不敏感 lookup。
+#[ktest]
+fn casefold_dir_lookup_unicode_insensitive() {
+    let mut img = ExtImg::new();
+    img.add_incompat(INCOMPAT_CASEFOLD);
+    // 文件名 "Café"(é = U+00E9,UTF-8 2 字节)。
+    add_file(&mut img, 12, "Café".as_bytes(), FILE_DATA_BLOCK, b"DATA", 0);
+    // 根目录加 CASEFOLD 标志。
+    {
+        let mut raw = [0u8; INODE_SIZE];
+        let table_off = INODE_TABLE as usize * BS + (2 - 1) * INODE_SIZE;
+        raw.copy_from_slice(&img.data[table_off..table_off + INODE_SIZE]);
+        let flags = rd32(&raw, 32) | EXT4_CASEFOLD_FL;
+        le32(&mut raw, 32, flags);
+        img.write_inode(2, &raw);
+    }
+    let m = mount(img);
+    // "CAFÉ"(É = U+00C9) 与 "café" 必须命中 "Café";去掉变音符号不得命中。
+    m.sb.root_inode.lookup("CAFÉ").expect("大写变音 lookup");
+    m.sb.root_inode.lookup("café").expect("小写 lookup");
+    assert!(
+        m.sb.root_inode.lookup("Cafe").is_err(),
+        "去掉变音符号必须 NotFound"
     );
 }
 

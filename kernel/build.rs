@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
+use xtask::{CATALOG_RELATIVE_PATH, LinkLayout, PlatformCatalog, PlatformSpec};
+
+const HITOSHIZUKU_PLATFORM_ENV: &str = "HITOSHIZUKU_PLATFORM";
 
 fn main() {
     let target = std::env::var("TARGET").expect("Cargo 未设置 TARGET 环境变量");
@@ -18,6 +21,7 @@ fn main() {
     generate_elm_build_bound(&root, &out_dir, &target);
     generate_soyo_trust_policy(&root, &out_dir);
     link_integrated_components();
+    configure_kernel_linker(&root, &target);
 
     println!("cargo:rerun-if-env-changed=INITRAMFS");
     println!("cargo:rerun-if-env-changed=ELM_TRUST_ANCHORS_FILE");
@@ -35,6 +39,119 @@ fn main() {
     }
     println!("cargo:rustc-env=ELM_TARGET_TRIPLE={target}");
     println!("cargo:rustc-env=ELM_RUSTC_VERSION={}", rustc_version_line());
+}
+
+/// 选择架构级规范链接脚本，并从平台目录注入该板卡的地址布局。
+///
+/// Cargo 产物始终是带符号 ELF；raw/uImage 由 xtask 在链接完成后派生。链接脚本不再
+/// 包含板卡地址，也不再生成 debug 或板级变体。
+fn configure_kernel_linker(root: &Path, target: &str) {
+    let expected_layout = match target {
+        "loongarch64-unknown-none" => LinkLayout::Loongarch64Dmw1,
+        "riscv64gc-unknown-none-elf" => LinkLayout::Riscv64Sv48,
+        _ => return,
+    };
+
+    println!("cargo:rerun-if-env-changed={HITOSHIZUKU_PLATFORM_ENV}");
+    let catalog_path = root.join(CATALOG_RELATIVE_PATH);
+    println!("cargo:rerun-if-changed={}", catalog_path.display());
+    let catalog = PlatformCatalog::load(&catalog_path)
+        .unwrap_or_else(|error| panic!("加载平台目录 {} 失败：{error}", catalog_path.display()));
+    let platform_id = std::env::var_os(HITOSHIZUKU_PLATFORM_ENV).map(|value| {
+        value
+            .into_string()
+            .unwrap_or_else(|_| panic!("{HITOSHIZUKU_PLATFORM_ENV} 必须是有效的 UTF-8 平台标识"))
+    });
+    let platform = catalog
+        .select_for_build(platform_id.as_deref(), target)
+        .unwrap_or_else(|error| panic!("选择内核链接平台失败：{error}"));
+    validate_link_platform(platform, target, expected_layout);
+
+    let linker_dir = root.join("kernel/linker");
+    let script = match expected_layout {
+        LinkLayout::Loongarch64Dmw1 => linker_dir.join("loongarch64.ld"),
+        LinkLayout::Riscv64Sv48 => linker_dir.join("riscv64.ld"),
+    };
+    for source in [
+        script.clone(),
+        linker_dir.join("common-rodata.ld"),
+        linker_dir.join("common-debug.ld"),
+    ] {
+        println!("cargo:rerun-if-changed={}", source.display());
+    }
+
+    println!("cargo:rustc-link-arg-bin=kernel=-L{}", linker_dir.display());
+    println!(
+        "cargo:rustc-link-arg-bin=kernel=--defsym=KERNEL_PHYS_BASE={:#x}",
+        platform.link.physical_base.get()
+    );
+    println!(
+        "cargo:rustc-link-arg-bin=kernel=--defsym=KERNEL_VIRT_BASE={:#x}",
+        platform.link.virtual_base.get()
+    );
+    println!(
+        "cargo:rustc-link-arg-bin=kernel=--defsym=HITOSHIZUKU_PLATFORM_TAG={:#x}",
+        platform.identity_tag()
+    );
+    println!("cargo:rustc-link-arg-bin=kernel=-T{}", script.display());
+}
+
+fn validate_link_platform(platform: &PlatformSpec, target: &str, expected_layout: LinkLayout) {
+    assert_eq!(
+        platform.target, target,
+        "平台 {} 的目标与 Cargo TARGET 不一致",
+        platform.id
+    );
+    assert_eq!(
+        platform.link.layout, expected_layout,
+        "平台 {} 的链接布局与目标架构不一致",
+        platform.id
+    );
+
+    let physical = platform.link.physical_base.get();
+    let virtual_address = platform.link.virtual_base.get();
+    let alignment = platform.link.alignment.get();
+    assert!(
+        alignment >= 0x1000 && alignment.is_power_of_two(),
+        "平台 {} 的链接对齐必须是至少 4 KiB 的 2 的幂",
+        platform.id
+    );
+    assert_eq!(
+        physical % alignment,
+        0,
+        "平台 {} 的物理基址未满足链接对齐",
+        platform.id
+    );
+    assert_eq!(
+        virtual_address % alignment,
+        0,
+        "平台 {} 的虚拟基址未满足链接对齐",
+        platform.id
+    );
+
+    let expected_virtual = match expected_layout {
+        LinkLayout::Loongarch64Dmw1 => {
+            assert!(
+                physical < (1 << 60),
+                "平台 {} 的物理基址超出 LoongArch DMW1",
+                platform.id
+            );
+            0x9000_0000_0000_0000 | physical
+        }
+        LinkLayout::Riscv64Sv48 => {
+            assert!(
+                physical < 0x80_0000_0000,
+                "平台 {} 的物理基址超出 RISC-V Sv48 内核窗口",
+                platform.id
+            );
+            0xffff_ff80_0000_0000 | physical
+        }
+    };
+    assert_eq!(
+        virtual_address, expected_virtual,
+        "平台 {} 的虚拟基址不是物理基址的规范内核映射",
+        platform.id
+    );
 }
 
 struct ConfiguredBuildBoundModule {

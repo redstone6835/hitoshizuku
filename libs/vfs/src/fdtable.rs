@@ -381,6 +381,22 @@ pub struct FdTable {
     inner: Spinlock<FdTableInner>,
 }
 
+/// 当前任务 VFS 状态钩子（由上层（general/kernel）注册；fanotify 读事件
+/// 时分配对象 fd 用）。libs/vfs 无法反向依赖 general，因此用函数指针注入。
+pub type CurrentVfsStateFn = fn() -> Option<(Arc<FdTable>, Arc<crate::vfs::cred::Credentials>)>;
+
+static CURRENT_VFS_STATE: Spinlock<Option<CurrentVfsStateFn>> = Spinlock::new(None);
+
+/// 注册当前任务 VFS 状态获取函数（general 初始化时调用一次）。
+pub fn set_current_vfs_state_hook(f: CurrentVfsStateFn) {
+    *CURRENT_VFS_STATE.lock() = Some(f);
+}
+
+/// 取当前任务的 (fd 表, 凭据)；未注册或不在任务上下文时返回 None。
+pub fn current_vfs_state() -> Option<(Arc<FdTable>, Arc<crate::vfs::cred::Credentials>)> {
+    CURRENT_VFS_STATE.lock().and_then(|f| f())
+}
+
 impl FdTable {
     /// 构造一个空的描述符表，从 `limits` 中读取初始软硬限制。
     pub fn new(limits: &VfsLimits) -> Self {
@@ -664,7 +680,7 @@ impl FdTable {
     /// 通过位图遍历就地提取，**不在锁内做任何堆分配**。
     /// 提取出的 `FdEntry` 在锁外统一 drop，避免 `File::drop` → `FileOps::release`
     /// 在持锁状态下执行。
-    pub fn close_on_exec(&self) {
+    pub fn close_on_exec(&self, owner_pid: i32) {
         // 栈上固定大小缓冲区，避免按硬限制做线性堆分配。
         // 无论进程硬限制多大，每轮都只在锁外批量 drop 最多 64 个条目。
         const BATCH: usize = 64;
@@ -701,6 +717,7 @@ impl FdTable {
             // 锁已释放，安全 drop
             for entry in batch_buf[..batch_count].iter_mut() {
                 if let Some(removed) = entry.take() {
+                    Self::release_record_locks_for_removed(&removed, owner_pid);
                     self.notify_fd_closed(&removed);
                     drop(removed);
                 }

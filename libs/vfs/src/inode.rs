@@ -45,7 +45,10 @@
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use alloc::vec::Vec;
+use core::sync::atomic::{
+    AtomicBool, AtomicIsize, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use crate::vfs::cred::{Credentials, Gid, Uid};
 use crate::vfs::error::{VfsError, VfsResult};
@@ -175,6 +178,23 @@ pub(crate) fn derive_stat_dev(fs_id: FsId, dev_id: Option<DevId>) -> DevId {
     dev_id.unwrap_or_else(|| DevId::new((fs_id.raw() >> 32) as u32, fs_id.raw() as u32))
 }
 
+/// 严格小于比较(`Timespec` 未派生 `Ord`,relatime 需要)。
+#[inline]
+fn timespec_lt(a: Timespec, b: Timespec) -> bool {
+    a.secs < b.secs || (a.secs == b.secs && a.nsecs < b.nsecs)
+}
+
+/// Linux 默认 relatime 判定:是否需要把 atime 更新为 `now`。
+///
+/// 仅当 `atime` 早于 `mtime` 或 `ctime`,或距上次访问已满 24 小时时返回 true。
+#[inline]
+fn atime_needs_update(atime: Timespec, mtime: Timespec, ctime: Timespec, now: Timespec) -> bool {
+    const RELATIME_UPDATE_SECS: i64 = 24 * 60 * 60;
+    timespec_lt(atime, mtime)
+        || timespec_lt(atime, ctime)
+        || now.secs.saturating_sub(atime.secs) >= RELATIME_UPDATE_SECS
+}
+
 /// 文件系统对象的核心内存表示。
 ///
 /// 每个 Inode 实例对应磁盘（或内存文件系统中）的一个唯一文件系统对象。Inode 与
@@ -253,6 +273,13 @@ pub struct Inode {
     /// 在 Superblock 被卸载后自动失效，upgrade() 会返回 None。
     pub(crate) superblock: Weak<Superblock>,
 
+    /// 该 inode 是否可能携带扩展属性（xattr 快速路径提示）。
+    ///
+    /// 为 `false` 时权限检查无需读取 xattr 块；由驱动在装载（如 extfs 的
+    /// `i_file_acl != 0`）或首次 setxattr 时置位。对象随 inode 生命周期
+    /// 失效，无陈旧风险。
+    has_xattrs: AtomicBool,
+
     /// 生命周期状态：
     /// - LIVE: 仍在命名空间中可达；
     /// - ORPHANED: 已从命名空间摘除，等待最后一个强引用释放；
@@ -311,6 +338,7 @@ impl Inode {
             cached_nlink: AtomicU32::new(meta.nlink),
             data_state: AtomicU64::new(data_state(1, 0, false)),
             exec_write_state: AtomicIsize::new(0),
+            has_xattrs: AtomicBool::new(false),
             ops,
             superblock,
             lifecycle: AtomicU8::new(STATE_LIVE),
@@ -327,6 +355,21 @@ impl Inode {
         self.kind
     }
 
+    /// 是否可能携带扩展属性（快速路径提示；`false` 保证无 xattr）。
+    pub fn has_xattrs(&self) -> bool {
+        self.has_xattrs.load(Ordering::Acquire)
+    }
+
+    /// 标记该 inode 可能携带扩展属性（驱动在装载/写入时调用）。
+    pub fn mark_has_xattrs(&self) {
+        self.has_xattrs.store(true, Ordering::Release);
+    }
+
+    /// 清除 xattr 存在标记（驱动在删除最后一个属性后调用）。
+    pub(crate) fn clear_has_xattrs(&self) {
+        self.has_xattrs.store(false, Ordering::Release);
+    }
+
     /// 返回可跨打开文件描述复用、且不会因对象地址复用而冲突的缓存身份。
     pub(crate) fn private_page_cache_key(&self) -> Option<usize> {
         (self.private_page_cache_id != 0).then_some(self.private_page_cache_id)
@@ -337,6 +380,17 @@ impl Inode {
         self.cached_size.load(Ordering::Acquire)
     }
 
+    /// 该文件是否属于内存文件系统（tmpfs / anonfs，Linux 统称 shmem）。
+    ///
+    /// `MADV_REMOVE` 只对这类文件生效；普通文件映射返回 `EINVAL`。anonfs 上的
+    /// memfd 与 tmpfs 同为 Linux shmem 语义，因此一并计入。
+    pub fn is_shmem_fs(&self) -> bool {
+        matches!(
+            self.superblock.upgrade().map(|sb| sb.fs_type),
+            Some("tmpfs" | "anonfs")
+        )
+    }
+
     /// 返回当前硬链接计数的无锁快照。
     pub fn nlink(&self) -> u32 {
         self.cached_nlink.load(Ordering::Acquire)
@@ -345,6 +399,16 @@ impl Inode {
     /// 返回当前文件内容代际的无锁快照。
     pub fn data_generation(&self) -> u64 {
         data_state_generation(self.data_state.load(Ordering::Acquire))
+    }
+
+    /// 返回可供 `MAP_SHARED` 文件页缓存使用的内容代际。
+    ///
+    /// 复用 [`Self::data_generation`]:每次内容变更(`write`/`truncate`/
+    /// `fallocate` 等,经 `begin_data_mutation` 保护)结束发布时递增,单调不降、
+    /// 不复活。与私有页缓存的 `private_page_cache_generation` 不同,这里不要求
+    /// 空闲(mutation 在途时也可返回旧代际,VM 只会在下次缺页时读取最新值)。
+    pub(crate) fn shared_page_cache_generation(&self) -> Option<u64> {
+        Some(self.data_generation())
     }
 
     /// 返回可用于私有干净页缓存的稳定代际。
@@ -640,6 +704,20 @@ impl Inode {
     /// 更新访问时间为当前时间。
     pub fn touch_atime(&self) {
         self.meta.lock().atime = Timespec::now();
+    }
+
+    /// 按 Linux 默认 relatime 语义更新访问时间。
+    ///
+    /// 仅当 `atime` 早于 `mtime` 或 `ctime`,或距上次访问已满 24 小时时才更新;
+    /// 否则跳过以降低读密集负载的元数据写回。`noatime` / `nodiratime` 挂载标志
+    /// 与伪文件豁免由调用方(通用 `File` 读路径)在持有 `Mount` 时判断,本方法
+    /// 只负责时间比较与更新。
+    pub(crate) fn touch_atime_relatime(&self) {
+        let now = Timespec::now();
+        let mut meta = self.meta.lock();
+        if atime_needs_update(meta.atime, meta.mtime, meta.ctime, now) {
+            meta.atime = now;
+        }
     }
 
     /// 更新修改时间为当前时间。
@@ -970,6 +1048,27 @@ pub trait InodeOps {
         Ok(())
     }
 
+    /// 读取扩展属性；`None` 表示属性不存在（`ENODATA`）。
+    /// 默认实现表示该文件系统不支持 xattr（`EOPNOTSUPP`）。
+    fn getxattr(&self, _name: &[u8]) -> VfsResult<Option<Vec<u8>>> {
+        Err(VfsError::NotSupported)
+    }
+
+    /// 设置扩展属性；`flags` 为 `XATTR_CREATE`/`XATTR_REPLACE`。
+    fn setxattr(&self, _name: &[u8], _value: &[u8], _flags: u32) -> VfsResult<()> {
+        Err(VfsError::NotSupported)
+    }
+
+    /// 列出全部扩展属性名。
+    fn listxattr(&self) -> VfsResult<Vec<Vec<u8>>> {
+        Err(VfsError::NotSupported)
+    }
+
+    /// 删除扩展属性；属性不存在返回 `ENODATA`。
+    fn removexattr(&self, _name: &[u8]) -> VfsResult<()> {
+        Err(VfsError::NotSupported)
+    }
+
     /// 返回 &dyn Any 引用，用于支持从 trait object 向下转型到具体的驱动类型。
     /// 实现者只需写 fn as_any(&self) -> &dyn Any { self } 即可。
     fn as_any(&self) -> &dyn core::any::Any;
@@ -1000,5 +1099,61 @@ mod data_state_tests {
         assert_eq!(data_state_generation(next), DATA_GENERATION_MAX);
         assert_eq!(data_state_active(next), 0);
         assert!(data_state_disabled(next));
+    }
+}
+
+#[cfg(test)]
+mod relatime_tests {
+    use super::{atime_needs_update, timespec_lt};
+    use crate::vfs::stat::Timespec;
+
+    fn ts(secs: i64, nsecs: u32) -> Timespec {
+        Timespec { secs, nsecs }
+    }
+
+    #[test]
+    fn timespec_lt_compares_seconds_then_nanoseconds() {
+        assert!(timespec_lt(ts(1, 0), ts(2, 0)));
+        assert!(timespec_lt(ts(1, 999), ts(2, 0)));
+        assert!(timespec_lt(ts(1, 0), ts(1, 1)));
+        assert!(!timespec_lt(ts(1, 1), ts(1, 0)));
+        assert!(!timespec_lt(ts(1, 0), ts(1, 0)));
+    }
+
+    #[test]
+    fn relatime_updates_when_atime_older_than_mtime_or_ctime() {
+        let now = ts(1_000, 0);
+        // atime 早于 mtime → 更新。
+        assert!(atime_needs_update(ts(100, 0), ts(200, 0), ts(300, 0), now));
+        // atime 早于 ctime → 更新。
+        assert!(atime_needs_update(ts(250, 0), ts(200, 0), ts(300, 0), now));
+        // atime 不早于 mtime/ctime 且未满 24h → 不更新。
+        assert!(!atime_needs_update(ts(500, 0), ts(200, 0), ts(300, 0), now));
+    }
+
+    #[test]
+    fn relatime_updates_after_24h_idle() {
+        let now = ts(100_000, 0);
+        // atime 距今恰好 86400s → 更新。
+        assert!(atime_needs_update(
+            ts(100_000 - 86_400, 0),
+            ts(1, 0),
+            ts(1, 0),
+            now
+        ));
+        // 距今 86399s → 不更新。
+        assert!(!atime_needs_update(
+            ts(100_000 - 86_399, 0),
+            ts(1, 0),
+            ts(1, 0),
+            now
+        ));
+    }
+
+    #[test]
+    fn relatime_ignores_future_atime_clock_skew() {
+        let now = ts(1_000, 0);
+        // atime 在未来(时钟回拨):不因 24h 判定误更新。
+        assert!(!atime_needs_update(ts(2_000, 0), ts(1, 0), ts(1, 0), now));
     }
 }

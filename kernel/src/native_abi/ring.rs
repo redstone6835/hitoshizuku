@@ -70,7 +70,7 @@ struct RingState {
     generation: u64,
     completed: u64,
     cancelled: u64,
-    #[cfg(feature = "kernel-tests")]
+    #[cfg(any(feature = "kernel-tests", feature = "soyo-tests"))]
     worker_paused: bool,
 }
 
@@ -367,7 +367,7 @@ pub(super) fn ring_create(
             generation: 1,
             completed: 0,
             cancelled: 0,
-            #[cfg(feature = "kernel-tests")]
+            #[cfg(any(feature = "kernel-tests", feature = "soyo-tests"))]
             worker_paused: false,
         }),
         capacity: entries,
@@ -1080,7 +1080,7 @@ fn execute_prepared_call(call: &mut PreparedCall) -> NativeCallReturn {
             let KernelNativeObject::Socket(socket) = &call.pinned.object else {
                 return unsupported();
             };
-            let Some((memory, offset, length)) = call.memory.as_ref() else {
+            let Some((memory, offset, _length)) = call.memory.as_ref() else {
                 return unsupported();
             };
             let address = call
@@ -1342,13 +1342,13 @@ unsafe extern "C" fn ring_worker(argument: usize) -> ! {
         };
         let budget = {
             let state = ring.state.lock();
-            #[cfg(feature = "kernel-tests")]
+            #[cfg(any(feature = "kernel-tests", feature = "soyo-tests"))]
             if state.worker_paused {
                 0
             } else {
                 state.pending.len()
             }
-            #[cfg(not(feature = "kernel-tests"))]
+            #[cfg(not(any(feature = "kernel-tests", feature = "soyo-tests")))]
             state.pending.len()
         };
         if budget == 0 {
@@ -1390,7 +1390,7 @@ unsafe extern "C" fn ring_worker(argument: usize) -> ! {
     sched::kthread_finish(sched::ExitCode(0));
 }
 
-#[cfg(feature = "kernel-tests")]
+#[cfg(any(feature = "kernel-tests", feature = "soyo-tests"))]
 pub(super) fn pause_worker_for_test(ring: &SubmissionRingObject) {
     ring.state.lock().worker_paused = true;
 }

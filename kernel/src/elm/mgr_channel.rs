@@ -36,6 +36,7 @@ use super::{
     executor, menu, source, with_core,
 };
 
+#[allow(dead_code)] // Kept as the in-kernel transport adapter for a future manager endpoint.
 pub(crate) fn dispatch_mgr_call(input: &[u8]) -> Vec<u8> {
     dispatch_mgr_call_as(ElmPrincipal::kernel(), input)
 }
@@ -299,6 +300,7 @@ pub(crate) fn dispatch_mgr_call_as(principal: ElmPrincipal, input: &[u8]) -> Vec
     with_core(|core| dispatch_mgr_call_on_core_as(core, principal, input))
 }
 
+#[cfg(feature = "kernel-tests")]
 pub(crate) fn dispatch_mgr_call_on_core(core: &mut ElmCore, input: &[u8]) -> Vec<u8> {
     dispatch_mgr_call_on_core_as(core, ElmPrincipal::kernel(), input)
 }

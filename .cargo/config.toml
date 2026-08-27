@@ -1,14 +1,12 @@
 [target.riscv64gc-unknown-none-elf]
 linker = "rust-lld"
 rustflags = [
-    "-Clink-arg=-Tkernel/linker/qemu-riscv64.ld",
     "-C", "link-arg=--fatal-warnings",
 ]
 
 [target.loongarch64-unknown-none]
 linker = "rust-lld"
 rustflags = [
-    "-C", "link-arg=-Tkernel/linker/qemu-loongarch64.ld",
     "-C", "link-arg=--fatal-warnings",
     "-C", "link-arg=--no-gc-sections",
     "-A", "named_asm_labels",

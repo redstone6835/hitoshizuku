@@ -1,7 +1,6 @@
 //! Native Socket：不经过 fd table 的网络 endpoint capability。
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use general::syscall::NativeCallOutcome;
@@ -433,24 +432,6 @@ pub(super) fn socket_receive_memory(
     }
 }
 
-pub(super) fn socket_send_memory_nonblocking(
-    socket: &SocketObject,
-    memory: &MemoryObject,
-    offset: u64,
-    length: u64,
-    address: Option<(&MemoryObject, u64)>,
-) -> NativeCallOutcome {
-    let Ok(length) = usize::try_from(length) else {
-        return native_return(status::CORE_OUT_OF_RANGE, 0, 0);
-    };
-    let mut buffer = Vec::new();
-    if buffer.try_reserve_exact(length).is_err() {
-        return native_return(status::CORE_RESOURCE_EXHAUSTED, 0, 0);
-    }
-    buffer.resize(length, 0);
-    socket_send_memory_buffered(socket, memory, offset, address, &mut buffer)
-}
-
 pub(super) fn socket_send_memory_buffered(
     socket: &SocketObject,
     memory: &MemoryObject,
@@ -483,24 +464,6 @@ pub(super) fn socket_send_memory_buffered(
         Ok(_) => native_return(status::SOCKET_ERROR, 0, 0),
         Err(error) => map_socket_error(error),
     }
-}
-
-pub(super) fn socket_receive_memory_nonblocking(
-    socket: &SocketObject,
-    memory: &MemoryObject,
-    offset: u64,
-    length: u64,
-    address: Option<(&MemoryObject, u64)>,
-) -> NativeCallOutcome {
-    let Ok(length) = usize::try_from(length) else {
-        return native_return(status::CORE_OUT_OF_RANGE, 0, 0);
-    };
-    let mut buffer = Vec::new();
-    if buffer.try_reserve_exact(length).is_err() {
-        return native_return(status::CORE_RESOURCE_EXHAUSTED, 0, 0);
-    }
-    buffer.resize(length, 0);
-    socket_receive_memory_buffered(socket, memory, offset, address, &mut buffer)
 }
 
 pub(super) fn socket_receive_memory_buffered(

@@ -33,6 +33,8 @@ pub enum RlimitError {
     InvalidResource,
     /// 软/硬限制超过约束。
     ExceedsHard,
+    /// 非特权进程尝试提升硬限制，需 CAP_SYS_RESOURCE。
+    PermissionDenied,
 }
 
 impl fmt::Display for RlimitError {
@@ -40,6 +42,7 @@ impl fmt::Display for RlimitError {
         match self {
             Self::InvalidResource => f.write_str("invalid rlimit resource"),
             Self::ExceedsHard => f.write_str("limit exceeds hard or existing cap"),
+            Self::PermissionDenied => f.write_str("raising hard limit requires CAP_SYS_RESOURCE"),
         }
     }
 }

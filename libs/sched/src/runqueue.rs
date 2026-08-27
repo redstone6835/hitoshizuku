@@ -7,13 +7,14 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::cpu::SCHED_CAPACITY_SCALE;
 use crate::eevdf::{SchedParams, scale_delta_by_weight};
 use crate::sched_class::{
     DEFAULT_RT_PERIOD_NS, DEFAULT_RT_RUNTIME_NS, RT_PRIO_MAX, SchedAttr, SchedClass, SchedPolicy,
 };
-use crate::sync::Spinlock;
+use crate::sync::IrqSpinlock;
 use crate::task::{Task, TaskState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -96,13 +97,14 @@ struct RqInner {
     deadline_tree: BTreeMap<DeadlineKey, Arc<Task>>,
     deadline_throttled: BTreeMap<DeadlineThrottleKey, Arc<Task>>,
     idle_tree: BTreeMap<RtKey, Arc<Task>>,
+    queued_deadline_utilization: u64,
     total_weight: u128,
     weighted_vruntime_sum: u128,
     min_vruntime: u64,
     current: Option<Arc<Task>>,
     last_update_ns: u64,
     enqueue_seq: u64,
-    preferred_fair_addr: Option<usize>,
+    preferred_fair_key: Option<FairKey>,
     rt_period_ns: u64,
     rt_runtime_ns: u64,
     rt_period_start_ns: u64,
@@ -114,7 +116,12 @@ struct RqInner {
 
 /// 单 CPU 运行队列。每个 online CPU 持有一份。
 pub(crate) struct Runqueue {
-    inner: Spinlock<RqInner>,
+    inner: IrqSpinlock<RqInner>,
+    published_deadline: AtomicUsize,
+    published_deadline_utilization: AtomicU64,
+    published_realtime: AtomicUsize,
+    published_fair: AtomicUsize,
+    published_fair_weight: AtomicU64,
 }
 
 /// 记录任务当前登记在哪个 CPU 的 rq 上，用于捕获双重入队。
@@ -218,19 +225,20 @@ impl RunqueueClassLoad {
 impl Runqueue {
     pub(crate) const fn new() -> Self {
         Self {
-            inner: Spinlock::new(RqInner {
+            inner: IrqSpinlock::new(RqInner {
                 fair_tree: BTreeMap::new(),
                 rt_tree: BTreeMap::new(),
                 deadline_tree: BTreeMap::new(),
                 deadline_throttled: BTreeMap::new(),
                 idle_tree: BTreeMap::new(),
+                queued_deadline_utilization: 0,
                 total_weight: 0,
                 weighted_vruntime_sum: 0,
                 min_vruntime: 0,
                 current: None,
                 last_update_ns: 0,
                 enqueue_seq: 0,
-                preferred_fair_addr: None,
+                preferred_fair_key: None,
                 rt_period_ns: DEFAULT_RT_PERIOD_NS,
                 rt_runtime_ns: DEFAULT_RT_RUNTIME_NS,
                 rt_period_start_ns: 0,
@@ -238,6 +246,11 @@ impl Runqueue {
                 rt_throttled: false,
                 owner_cpu: RQ_OWNER_NONE,
             }),
+            published_deadline: AtomicUsize::new(0),
+            published_deadline_utilization: AtomicU64::new(0),
+            published_realtime: AtomicUsize::new(0),
+            published_fair: AtomicUsize::new(0),
+            published_fair_weight: AtomicU64::new(0),
         }
     }
 
@@ -246,24 +259,57 @@ impl Runqueue {
         self.inner.lock().owner_cpu = cpu_id;
     }
 
+    fn publish_load_locked(&self, inner: &RqInner) {
+        // 这些字段只用于负载均衡的无锁提示；真正摘取任务时仍在目标 rq 锁内
+        // 复核状态、亲和性和 MIGRATING。分字段发布允许读者看到相邻操作的混合
+        // 快照，但不会影响正确性，只可能让一次 steal 尝试提前或延后一轮。
+        self.published_deadline
+            .store(inner.deadline_tree.len(), Ordering::Release);
+        self.published_deadline_utilization
+            .store(inner.queued_deadline_utilization, Ordering::Release);
+        self.published_realtime
+            .store(inner.rt_tree.len(), Ordering::Release);
+        self.published_fair
+            .store(inner.fair_tree.len(), Ordering::Release);
+        self.published_fair_weight.store(
+            inner.total_weight.min(u64::MAX as u128) as u64,
+            Ordering::Release,
+        );
+    }
+
+    /// 返回本 rq 的可迁移负载提示，不取得 rq 锁。
+    ///
+    /// 这是 balance_once 的快路径摘要。它故意不声称 affinity 精确，避免在每次
+    /// 周期 balance 时锁住并扫描所有队列；候选摘取入口会再次执行严格过滤。
+    pub(crate) fn migratable_class_load_hint(&self) -> RunqueueClassLoad {
+        RunqueueClassLoad {
+            deadline: self.published_deadline.load(Ordering::Acquire),
+            deadline_utilization: self.published_deadline_utilization.load(Ordering::Acquire),
+            realtime: self.published_realtime.load(Ordering::Acquire),
+            fair: self.published_fair.load(Ordering::Acquire),
+            fair_weight: self.published_fair_weight.load(Ordering::Acquire),
+        }
+    }
+
     /// 创建带有指定 RT bandwidth 的运行队列，仅供调度器初始化和测试使用。
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(crate) fn new_with_rt_bandwidth(period_ns: u64, runtime_ns: u64) -> Self {
         let period_ns = period_ns.max(1);
         Self {
-            inner: Spinlock::new(RqInner {
+            inner: IrqSpinlock::new(RqInner {
                 fair_tree: BTreeMap::new(),
                 rt_tree: BTreeMap::new(),
                 deadline_tree: BTreeMap::new(),
                 deadline_throttled: BTreeMap::new(),
                 idle_tree: BTreeMap::new(),
+                queued_deadline_utilization: 0,
                 total_weight: 0,
                 weighted_vruntime_sum: 0,
                 min_vruntime: 0,
                 current: None,
                 last_update_ns: 0,
                 enqueue_seq: 0,
-                preferred_fair_addr: None,
+                preferred_fair_key: None,
                 rt_period_ns: period_ns,
                 rt_runtime_ns: runtime_ns.min(period_ns),
                 rt_period_start_ns: 0,
@@ -271,6 +317,11 @@ impl Runqueue {
                 rt_throttled: false,
                 owner_cpu: RQ_OWNER_NONE,
             }),
+            published_deadline: AtomicUsize::new(0),
+            published_deadline_utilization: AtomicU64::new(0),
+            published_realtime: AtomicUsize::new(0),
+            published_fair: AtomicUsize::new(0),
+            published_fair_weight: AtomicU64::new(0),
         }
     }
 
@@ -301,6 +352,7 @@ impl Runqueue {
         inner.rt_period_start_ns = now_ns - now_ns % period_ns;
         inner.rt_runtime_used_ns = 0;
         inner.rt_throttled = runtime_ns == 0;
+        self.publish_load_locked(&inner);
     }
 
     /// 可跨 CPU 迁移的就绪负载。
@@ -355,6 +407,7 @@ impl Runqueue {
     }
 
     /// 按调度类统计允许迁移到指定 CPU 集的就绪负载。
+    #[cfg(test)]
     pub(crate) fn migratable_class_load_for(&self, allowed_cpu_mask: u64) -> RunqueueClassLoad {
         let inner = self.inner.lock();
         class_load_locked(&inner, Some(allowed_cpu_mask), false)
@@ -423,25 +476,36 @@ impl Runqueue {
         let _ = update_curr_locked(&mut inner, now_ns);
         task.set_state(TaskState::Runnable);
         task.sched.set_on_rq(true);
-        if preferred && task.sched.policy() == SchedPolicy::Fair {
-            // futex 唤醒是短等待热路径。只记录一次性候选，
-            // 真正 pick 时仍会复查状态、亲和性和 class，避免破坏长期公平性。
-            inner.preferred_fair_addr = Some(task_addr(&task));
-        }
+        let preferred_fair =
+            preferred && matches!(task.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch);
+        let preferred_task = preferred_fair.then(|| Arc::clone(&task));
         enqueue_queued_locked_at(&mut inner, task, now_ns, "enqueue");
+        if let Some(task) = preferred_task {
+            // futex 唤醒是短等待热路径。只记录一次性候选，真正 pick 时仍会
+            // 复查状态、亲和性和 class，避免破坏长期公平性。
+            inner.preferred_fair_key = Some(FairKey {
+                deadline: task.sched.rq_fair_deadline(),
+                addr: task_addr(&task),
+            });
+        }
+        self.publish_load_locked(&inner);
         true
     }
 
     pub(crate) fn dequeue(&self, task: &Arc<Task>, now_ns: u64) -> bool {
         let mut inner = self.inner.lock();
         let _ = update_curr_locked(&mut inner, now_ns);
-        dequeue_locked(&mut inner, task)
+        let removed = dequeue_locked(&mut inner, task);
+        self.publish_load_locked(&inner);
+        removed
     }
 
     pub(crate) fn dequeue_queued(&self, task: &Arc<Task>, now_ns: u64) -> bool {
         let mut inner = self.inner.lock();
         let _ = update_curr_locked(&mut inner, now_ns);
-        remove_queued_any_locked(&mut inner, task).is_some()
+        let removed = remove_queued_any_locked(&mut inner, task).is_some();
+        self.publish_load_locked(&inner);
+        removed
     }
 
     /// 为迁移事务从本 rq 摘除任务，并在同一临界区内发布 `MIGRATING`。
@@ -456,6 +520,7 @@ impl Runqueue {
             return false;
         };
         task.sched.set_migrating();
+        self.publish_load_locked(&inner);
         true
     }
 
@@ -504,6 +569,7 @@ impl Runqueue {
             task.sched.set_on_rq(true);
         }
         enqueue_queued_locked_at(&mut inner, task, now_ns, "enqueue_migrated");
+        self.publish_load_locked(&inner);
         true
     }
 
@@ -518,9 +584,17 @@ impl Runqueue {
     pub(crate) fn tick(&self, now_ns: u64) -> bool {
         let mut inner = self.inner.lock();
         let replenished = update_curr_locked(&mut inner, now_ns);
+        self.publish_load_locked(&inner);
         let Some(curr) = inner.current.as_ref().map(Arc::clone) else {
             return replenished;
         };
+        // 时间片到期本身不要求切换：当本 rq 没有其它可运行任务时，把 current
+        // 重新插入再从同一棵树取回只会制造锁、引用计数和上下文切换开销。真正的
+        // 竞争者到达时，入队路径会单独发布重调度请求。
+        let has_runnable_peer = !inner.deadline_tree.is_empty()
+            || !inner.rt_tree.is_empty()
+            || !inner.fair_tree.is_empty()
+            || !inner.idle_tree.is_empty();
         replenished
             || match curr.sched.policy() {
                 SchedPolicy::Deadline => {
@@ -534,8 +608,8 @@ impl Runqueue {
                             && has_rt_peer_locked(&inner, curr.sched.rt_priority()))
                 }
                 SchedPolicy::RtFifo => inner.rt_throttled && !curr.pi_is_boosted(),
-                SchedPolicy::Fair | SchedPolicy::Idle => {
-                    curr.sched.vruntime() >= curr.sched.deadline()
+                SchedPolicy::Fair | SchedPolicy::Batch | SchedPolicy::Idle => {
+                    has_runnable_peer && curr.sched.vruntime() >= curr.sched.deadline()
                 }
             }
     }
@@ -554,7 +628,8 @@ impl Runqueue {
         let _ = update_curr_locked(&mut inner, now_ns);
 
         let mut prev_addr = None;
-        let mut fair_prev_addr = None;
+        let mut fair_prev_key = None;
+        let mut fair_prev_task = None;
         let mut kernel_idle = None;
         if let Some(prev) = inner.current.take() {
             prev_addr = Some(task_addr(&prev));
@@ -569,10 +644,14 @@ impl Runqueue {
                 && (prev.state() == TaskState::Running || prev.state() == TaskState::Runnable)
             {
                 prev.set_state(TaskState::Runnable);
-                if prev.sched.policy() == SchedPolicy::Fair {
-                    fair_prev_addr = Some(task_addr(&prev));
+                if matches!(prev.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch) {
+                    fair_prev_task = Some(Arc::clone(&prev));
                 }
                 enqueue_queued_locked_at(&mut inner, prev, now_ns, "pick_next_requeue_prev");
+                fair_prev_key = fair_prev_task.map(|task| FairKey {
+                    deadline: task.sched.rq_fair_deadline(),
+                    addr: task_addr(&task),
+                });
             } else {
                 if prev.arch_context().is_none()
                     && !matches!(prev.state(), TaskState::Zombie | TaskState::Dead)
@@ -589,13 +668,13 @@ impl Runqueue {
             }
         }
 
-        let preferred_fair_addr = inner.preferred_fair_addr.take();
+        let preferred_fair_key = inner.preferred_fair_key.take();
         // 被选中的任务从索引树移入 current 槽，仍归属本 rq，因此不释放归属标记。
         let picked = pick_queued_locked(
             &mut inner,
             prev_addr,
-            fair_prev_addr,
-            preferred_fair_addr,
+            fair_prev_key,
+            preferred_fair_key,
             cpu_mask,
         )
         .or(kernel_idle);
@@ -612,6 +691,7 @@ impl Runqueue {
             prepare_running_locked(&mut inner, task, now_ns);
             inner.current = Some(Arc::clone(task));
         }
+        self.publish_load_locked(&inner);
         picked
     }
 
@@ -629,7 +709,7 @@ impl Runqueue {
         let mut inner = self.inner.lock();
         let _ = update_curr_locked(&mut inner, now_ns);
 
-        if target.sched.policy() != SchedPolicy::Fair
+        if !matches!(target.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch)
             || !task_can_run_on(target, cpu_mask)
             // 精确交接目标不可能是 current（下一项已显式排除），因此只要仍有
             // CPU 执行所有权，就尚未完成上下文保存。调用方的无锁预检与这里拿
@@ -650,7 +730,10 @@ impl Runqueue {
             return None;
         }
 
-        let key = FairKey::of(target);
+        let key = FairKey {
+            deadline: target.sched.rq_fair_deadline(),
+            addr: task_addr(target),
+        };
         if !inner
             .fair_tree
             .get(&key)
@@ -660,13 +743,16 @@ impl Runqueue {
         }
 
         requeue_current_locked(&mut inner, now_ns);
-        let task = inner.fair_tree.remove(&key)?;
-        account_fair_remove_locked(&mut inner, &task);
-        if inner.preferred_fair_addr == Some(task_addr(&task)) {
-            inner.preferred_fair_addr = None;
+        let task = remove_fair_by_key_locked(&mut inner, key)?;
+        if inner
+            .preferred_fair_key
+            .is_some_and(|key| key.addr == task_addr(&task))
+        {
+            inner.preferred_fair_key = None;
         }
         prepare_running_locked(&mut inner, &task, now_ns);
         inner.current = Some(Arc::clone(&task));
+        self.publish_load_locked(&inner);
         Some(task)
     }
 
@@ -676,12 +762,16 @@ impl Runqueue {
         let _ = update_curr_locked(&mut inner, now_ns);
 
         if let Some(task) = take_fair_migratable_locked(&mut inner, allowed_cpu_mask) {
+            self.publish_load_locked(&inner);
             return Some(task);
         }
         if let Some(task) = take_rt_migratable_locked(&mut inner, allowed_cpu_mask) {
+            self.publish_load_locked(&inner);
             return Some(task);
         }
-        take_deadline_migratable_locked(&mut inner, allowed_cpu_mask)
+        let task = take_deadline_migratable_locked(&mut inner, allowed_cpu_mask);
+        self.publish_load_locked(&inner);
+        task
     }
 
     /// 从指定调度类中取出一个允许迁移到目标 CPU 集的任务。
@@ -693,12 +783,14 @@ impl Runqueue {
     ) -> Option<Arc<Task>> {
         let mut inner = self.inner.lock();
         let _ = update_curr_locked(&mut inner, now_ns);
-        match class {
+        let task = match class {
             SchedClass::Deadline => take_deadline_migratable_locked(&mut inner, allowed_cpu_mask),
             SchedClass::Realtime => take_rt_migratable_locked(&mut inner, allowed_cpu_mask),
             SchedClass::Fair => take_fair_migratable_locked(&mut inner, allowed_cpu_mask),
             SchedClass::Idle => None,
-        }
+        };
+        self.publish_load_locked(&inner);
+        task
     }
 
     /// 排空 CPU 下线时需要迁移的队列任务。
@@ -739,6 +831,7 @@ impl Runqueue {
         for task in drained.iter() {
             task.sched.set_migrating();
         }
+        self.publish_load_locked(&inner);
         drained
     }
 
@@ -785,6 +878,7 @@ impl Runqueue {
                 apply(task);
                 let now = inner.last_update_ns;
                 prepare_running_locked(&mut inner, task, now);
+                self.publish_load_locked(&inner);
                 return true;
             }
         }
@@ -796,6 +890,7 @@ impl Runqueue {
             owned.set_state(TaskState::Runnable);
             let now = inner.last_update_ns;
             enqueue_queued_locked_at(&mut inner, owned, now, "update_sched_entity");
+            self.publish_load_locked(&inner);
             return true;
         }
 
@@ -809,6 +904,7 @@ impl Runqueue {
         apply(task);
         let now = inner.last_update_ns;
         prepare_sleeping_locked(&mut inner, task, now);
+        self.publish_load_locked(&inner);
         true
     }
 
@@ -865,8 +961,7 @@ fn deadline_utilization(task: &Arc<Task>) -> u64 {
     ((runtime as u128 * SCHED_CAPACITY_SCALE as u128) / period as u128).min(u64::MAX as u128) as u64
 }
 
-fn requeue_current_locked(inner: &mut RqInner, now_ns: u64) -> Option<usize> {
-    let mut fair_prev_addr = None;
+fn requeue_current_locked(inner: &mut RqInner, now_ns: u64) {
     if let Some(prev) = inner.current.take() {
         if prev.is_idle_task() {
             // kernel idle 由每 CPU idle 槽持有，targeted pick 时同样不能把它
@@ -877,9 +972,6 @@ fn requeue_current_locked(inner: &mut RqInner, now_ns: u64) -> Option<usize> {
             && matches!(prev.state(), TaskState::Running | TaskState::Runnable)
         {
             prev.set_state(TaskState::Runnable);
-            if prev.sched.policy() == SchedPolicy::Fair {
-                fair_prev_addr = Some(task_addr(&prev));
-            }
             enqueue_queued_locked_at(inner, prev, now_ns, "requeue_current");
         } else {
             if prev.arch_context().is_none()
@@ -896,7 +988,6 @@ fn requeue_current_locked(inner: &mut RqInner, now_ns: u64) -> Option<usize> {
             prev.sched.set_on_rq(false);
         }
     }
-    fair_prev_addr
 }
 
 /// `site` 只用于双重入队断言的诊断信息，标识调用来源。
@@ -923,9 +1014,7 @@ fn enqueue_queued_locked_at(inner: &mut RqInner, task: Arc<Task>, now_ns: u64, s
                 }
             }
             let seq = next_seq(inner);
-            inner
-                .deadline_tree
-                .insert(DeadlineKey::of(&task, seq), task);
+            insert_deadline_locked(inner, DeadlineKey::of(&task, seq), task);
         }
         SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => {
             if task.sched.policy() == SchedPolicy::RtRoundRobin && task.sched.rr_remaining_ns() == 0
@@ -935,7 +1024,7 @@ fn enqueue_queued_locked_at(inner: &mut RqInner, task: Arc<Task>, now_ns: u64, s
             let seq = next_seq(inner);
             inner.rt_tree.insert(RtKey::of(&task, seq), task);
         }
-        SchedPolicy::Fair => enqueue_fair_locked(inner, task),
+        SchedPolicy::Fair | SchedPolicy::Batch => enqueue_fair_locked(inner, task),
         SchedPolicy::Idle => {
             let seq = next_seq(inner);
             inner.idle_tree.insert(RtKey::idle(&task, seq), task);
@@ -965,33 +1054,36 @@ fn enqueue_fair_locked(inner: &mut RqInner, task: Arc<Task>) {
 
     inner.total_weight += weight;
     inner.weighted_vruntime_sum += new_vr as u128 * weight;
-    inner.fair_tree.insert(FairKey::of(&task), task);
+    let key = FairKey::of(&task);
+    task.sched.store_rq_fair_deadline(key.deadline);
+    let replaced_task = inner.fair_tree.insert(key, task);
+    debug_assert!(replaced_task.is_none(), "[sched] duplicate fair tree key");
 }
 
 fn pick_queued_locked(
     inner: &mut RqInner,
     prev_addr: Option<usize>,
-    mut fair_prev_addr: Option<usize>,
-    mut preferred_fair_addr: Option<usize>,
+    mut fair_prev_key: Option<FairKey>,
+    mut preferred_fair_key: Option<FairKey>,
     cpu_mask: u64,
 ) -> Option<Arc<Task>> {
     loop {
         let task = pick_queued_candidate_locked(
             inner,
             prev_addr,
-            fair_prev_addr,
-            preferred_fair_addr,
+            fair_prev_key,
+            preferred_fair_key,
             cpu_mask,
         )?;
         if task_can_run_on(&task, cpu_mask) {
             return Some(task);
         }
         discard_non_runnable_pick(&task);
-        if fair_prev_addr.is_some_and(|addr| addr == task_addr(&task)) {
-            fair_prev_addr = None;
+        if fair_prev_key.is_some_and(|key| key.addr == task_addr(&task)) {
+            fair_prev_key = None;
         }
-        if preferred_fair_addr.is_some_and(|addr| addr == task_addr(&task)) {
-            preferred_fair_addr = None;
+        if preferred_fair_key.is_some_and(|key| key.addr == task_addr(&task)) {
+            preferred_fair_key = None;
         }
     }
 }
@@ -999,8 +1091,8 @@ fn pick_queued_locked(
 fn pick_queued_candidate_locked(
     inner: &mut RqInner,
     prev_addr: Option<usize>,
-    fair_prev_addr: Option<usize>,
-    preferred_fair_addr: Option<usize>,
+    fair_prev_key: Option<FairKey>,
+    preferred_fair_key: Option<FairKey>,
     cpu_mask: u64,
 ) -> Option<Arc<Task>> {
     if let Some(key) = inner
@@ -1009,7 +1101,7 @@ fn pick_queued_candidate_locked(
         .find(|(_, task)| task_pickable_on(task, cpu_mask, prev_addr))
         .map(|(key, _)| *key)
     {
-        return inner.deadline_tree.remove(&key);
+        return remove_deadline_by_key_locked(inner, key);
     }
     if let Some(key) = inner
         .rt_tree
@@ -1025,8 +1117,8 @@ fn pick_queued_candidate_locked(
     if let Some(task) = pick_fair_locked(
         inner,
         prev_addr,
-        fair_prev_addr,
-        preferred_fair_addr,
+        fair_prev_key,
+        preferred_fair_key,
         cpu_mask,
     ) {
         return Some(task);
@@ -1042,48 +1134,54 @@ fn pick_queued_candidate_locked(
 fn pick_fair_locked(
     inner: &mut RqInner,
     prev_addr: Option<usize>,
-    skip_addr: Option<usize>,
-    preferred_addr: Option<usize>,
+    skip_key: Option<FairKey>,
+    preferred_key: Option<FairKey>,
     cpu_mask: u64,
 ) -> Option<Arc<Task>> {
     let avg = avg_vruntime_locked(inner);
+
+    // EEVDF 按 fair deadline 排序。唤醒密集的普通任务通常让队首任务已经
+    // eligible；先检查这个候选可以把常见的 nice=0 调度从整棵 BTreeMap
+    // 扫描降为一次首元素查询。亲和性、buddy-skip 或 preferred 候选存在时
+    // 仍走完整筛选，因而不会改变受限 CPU 集合和公平性语义。
+    if skip_key.is_none()
+        && preferred_key.is_none()
+        && let Some((&key, task)) = inner.fair_tree.iter().next()
+        && task_pickable_on(task, cpu_mask, prev_addr)
+        && task.sched.vruntime() <= avg
+    {
+        return remove_fair_by_key_locked(inner, key);
+    }
+
     let mut preferred = None;
     let mut first_allowed = None;
     let mut first_eligible = None;
     let mut min_non_skip: Option<(FairKey, u64)> = None;
 
-    // 调度器持 rq 锁选择下一个 fair 任务。原实现为了保留“优先不选刚让出
-    // CPU 的任务，再退化到最小 vruntime，最后才允许选回它”的语义会多次
-    // 扫描 BTreeMap；这里一次遍历同时收集候选，减少 lmbench syscall/context
-    // switch 热路径里的锁内扫描成本。
     for (key, task) in inner.fair_tree.iter() {
         if !task_pickable_on(task, cpu_mask, prev_addr) {
             continue;
         }
-
-        if preferred_addr.is_some_and(|addr| task_addr(task) == addr) {
+        if preferred_key == Some(*key) {
             preferred = Some(*key);
         }
         first_allowed.get_or_insert(*key);
-
-        let is_skip = skip_addr.is_some_and(|skip| task_addr(task) == skip);
-        if !is_skip {
-            let vruntime = task.sched.vruntime();
-            if vruntime <= avg {
-                first_eligible.get_or_insert(*key);
-            }
-            if min_non_skip
-                .as_ref()
-                .is_none_or(|(_, current_min)| vruntime < *current_min)
-            {
-                min_non_skip = Some((*key, vruntime));
-            }
-        } else if skip_addr.is_none() && first_eligible.is_none() && task.sched.vruntime() <= avg {
-            first_eligible = Some(*key);
+        if skip_key == Some(*key) {
+            continue;
+        }
+        let vruntime = task.sched.vruntime();
+        if vruntime <= avg {
+            first_eligible.get_or_insert(*key);
+        }
+        if min_non_skip
+            .as_ref()
+            .is_none_or(|(_, current_min)| vruntime < *current_min)
+        {
+            min_non_skip = Some((*key, vruntime));
         }
     }
 
-    let key = if skip_addr.is_some() {
+    let key = if skip_key.is_some() {
         first_eligible
             .or_else(|| min_non_skip.map(|(key, _)| key))
             .or(first_allowed)
@@ -1091,6 +1189,10 @@ fn pick_fair_locked(
         first_eligible.or(first_allowed)
     };
     let key = preferred.or(key)?;
+    remove_fair_by_key_locked(inner, key)
+}
+
+fn remove_fair_by_key_locked(inner: &mut RqInner, key: FairKey) -> Option<Arc<Task>> {
     let task = inner.fair_tree.remove(&key)?;
     account_fair_remove_locked(inner, &task);
     Some(task)
@@ -1142,7 +1244,7 @@ fn prepare_running_locked(inner: &mut RqInner, task: &Arc<Task>, now_ns: u64) {
     task.set_state(TaskState::Running);
     task.sched.set_on_rq(true);
     match task.sched.policy() {
-        SchedPolicy::Fair | SchedPolicy::Idle => {
+        SchedPolicy::Fair | SchedPolicy::Batch | SchedPolicy::Idle => {
             let new_vr = task.sched.vruntime().max(inner.min_vruntime);
             task.sched.store_vruntime(new_vr);
             task.sched.store_lag(0);
@@ -1169,7 +1271,7 @@ fn prepare_running_locked(inner: &mut RqInner, task: &Arc<Task>, now_ns: u64) {
 }
 
 fn prepare_sleeping_locked(inner: &mut RqInner, task: &Arc<Task>, _now_ns: u64) {
-    if task.sched.policy() == SchedPolicy::Fair {
+    if matches!(task.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch) {
         let new_dl = task.sched.recalc_deadline();
         task.sched.store_deadline(new_dl);
     } else if task.sched.policy() == SchedPolicy::RtRoundRobin && task.sched.rr_remaining_ns() == 0
@@ -1187,7 +1289,7 @@ fn prepare_sleeping_locked(inner: &mut RqInner, task: &Arc<Task>, _now_ns: u64) 
 fn dequeue_locked(inner: &mut RqInner, task: &Arc<Task>) -> bool {
     if let Some(curr) = inner.current.as_ref() {
         if Arc::ptr_eq(curr, task) {
-            if task.sched.policy() == SchedPolicy::Fair {
+            if matches!(task.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch) {
                 store_fair_lag_locked(inner, task);
             }
             release_rq_ownership(task);
@@ -1217,13 +1319,18 @@ fn remove_queued_any_locked(inner: &mut RqInner, task: &Arc<Task>) -> Option<Arc
 }
 
 fn remove_fair_locked(inner: &mut RqInner, task: &Arc<Task>) -> Option<Arc<Task>> {
-    let key = inner
+    let key = FairKey {
+        deadline: task.sched.rq_fair_deadline(),
+        addr: task_addr(task),
+    };
+    if !inner
         .fair_tree
-        .iter()
-        .find(|(_, value)| Arc::ptr_eq(value, task))
-        .map(|(key, _)| *key)?;
-    let task = inner.fair_tree.remove(&key)?;
-    account_fair_remove_locked(inner, &task);
+        .get(&key)
+        .is_some_and(|value| Arc::ptr_eq(value, task))
+    {
+        return None;
+    }
+    let task = remove_fair_by_key_locked(inner, key)?;
     store_fair_lag_locked(inner, &task);
     release_rq_ownership(&task);
     task.sched.set_on_rq(false);
@@ -1242,13 +1349,29 @@ fn remove_rt_locked(inner: &mut RqInner, task: &Arc<Task>) -> Option<Arc<Task>> 
     Some(task)
 }
 
+fn insert_deadline_locked(inner: &mut RqInner, key: DeadlineKey, task: Arc<Task>) {
+    inner.queued_deadline_utilization = inner
+        .queued_deadline_utilization
+        .saturating_add(deadline_utilization(&task));
+    let replaced = inner.deadline_tree.insert(key, task);
+    debug_assert!(replaced.is_none(), "[sched] duplicate deadline tree key");
+}
+
+fn remove_deadline_by_key_locked(inner: &mut RqInner, key: DeadlineKey) -> Option<Arc<Task>> {
+    let task = inner.deadline_tree.remove(&key)?;
+    inner.queued_deadline_utilization = inner
+        .queued_deadline_utilization
+        .saturating_sub(deadline_utilization(&task));
+    Some(task)
+}
+
 fn remove_deadline_locked(inner: &mut RqInner, task: &Arc<Task>) -> Option<Arc<Task>> {
     let key = inner
         .deadline_tree
         .iter()
         .find(|(_, value)| Arc::ptr_eq(value, task))
         .map(|(key, _)| *key)?;
-    let task = inner.deadline_tree.remove(&key)?;
+    let task = remove_deadline_by_key_locked(inner, key)?;
     release_rq_ownership(&task);
     task.sched.set_on_rq(false);
     Some(task)
@@ -1298,8 +1421,7 @@ fn take_fair_migratable_locked(inner: &mut RqInner, allowed_cpu_mask: u64) -> Op
             task.running_cpu().is_none() && migratable_candidate(task, allowed_cpu_mask)
         })
         .map(|(key, _)| *key)?;
-    let task = inner.fair_tree.remove(&key)?;
-    account_fair_remove_locked(inner, &task);
+    let task = remove_fair_by_key_locked(inner, key)?;
     store_fair_lag_locked(inner, &task);
     // 迁移事务开始：任务已不在本 rq 索引中，但归属权归迁移方独占。绝不能置
     // NONE，否则并发唤醒会把它重新塞回源 rq，造成双 rq 登记。
@@ -1335,7 +1457,7 @@ fn take_deadline_migratable_locked(
             task.running_cpu().is_none() && migratable_candidate(task, allowed_cpu_mask)
         })
         .map(|(key, _)| *key)?;
-    let task = inner.deadline_tree.remove(&key)?;
+    let task = remove_deadline_by_key_locked(inner, key)?;
     release_rq_ownership(&task);
     task.sched.set_migrating();
     Some(task)
@@ -1350,7 +1472,7 @@ fn update_curr_locked(inner: &mut RqInner, now_ns: u64) -> bool {
         if let Some(curr) = inner.current.as_ref().map(Arc::clone) {
             curr.account_cpu_runtime(delta, now_ns);
             match curr.sched.policy() {
-                SchedPolicy::Fair | SchedPolicy::Idle => {
+                SchedPolicy::Fair | SchedPolicy::Batch | SchedPolicy::Idle => {
                     update_fair_curr_locked(inner, &curr, delta)
                 }
                 SchedPolicy::RtRoundRobin => {
@@ -1411,9 +1533,7 @@ fn requeue_ready_deadline_locked(inner: &mut RqInner, now_ns: u64) -> bool {
         }
         task.sched.replenish_deadline(now_ns);
         let seq = next_seq(inner);
-        inner
-            .deadline_tree
-            .insert(DeadlineKey::of(&task, seq), task);
+        insert_deadline_locked(inner, DeadlineKey::of(&task, seq), task);
         moved = true;
     }
     moved
@@ -1447,7 +1567,7 @@ fn update_fair_curr_locked(inner: &mut RqInner, curr: &Arc<Task>, delta_ns: u64)
 
 fn avg_vruntime_locked(inner: &RqInner) -> u64 {
     let (w_sum, vw_sum) = match inner.current.as_ref() {
-        Some(curr) if curr.sched.policy() == SchedPolicy::Fair => {
+        Some(curr) if matches!(curr.sched.policy(), SchedPolicy::Fair | SchedPolicy::Batch) => {
             let w = curr.sched.weight() as u128;
             let vr = curr.sched.vruntime() as u128;
             (inner.total_weight + w, inner.weighted_vruntime_sum + vr * w)

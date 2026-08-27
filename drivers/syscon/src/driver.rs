@@ -7,14 +7,14 @@
 use alloc::sync::Arc;
 use core::ptr::{read_volatile, write_volatile};
 
-use crate::dev::platform::{FirmwarePropertyValue, PlatformDeviceInfo};
+use crate::dev::platform::{PlatformDeviceInfo, firmware_u32_list_get};
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, DriverHandle, PnpBusInfo, PnpDevice, PnpDriver,
     PnpError, PnpId, PnpResourceKind, register_driver_factory, unregister_driver,
 };
 use crate::dev::syscon::{self, SysconAccessWidth, SysconDevice, SysconError};
 use crate::firmware::power::{
-    PowerAccessWidth, PowerControlMethod, PowerRegister, PowerRegisterSpace,
+    self, PowerAccessWidth, PowerControlMethod, PowerError, PowerRegister, PowerRegisterSpace,
 };
 
 const COMPAT_SYSCON: &str = "syscon";
@@ -191,8 +191,11 @@ impl PnpDriver for SysconPlatformDriver {
             reg_shift,
             width,
         ));
+        dev.reserve_owned_resources(1)?;
         let handle = syscon::register(syscon).map_err(map_syscon_error)?;
-        if let Err(err) = dev.own_resource(syscon::pnp_resource(handle, "platform-syscon")) {
+        if let Err(err) =
+            dev.own_boxed_resource(syscon::pnp_resource_boxed(handle, "platform-syscon"))
+        {
             let _ = syscon::unregister(handle);
             return Err(err);
         }
@@ -299,13 +302,22 @@ impl PnpDriver for SysconPowerDriver {
             value,
         };
 
-        match action {
+        // 动态 handler 一经登记就会立即成为全局入口；先为其 PnP 所有权预留槽位，
+        // 避免登记成功后因资源 Vec 扩容失败而留下无法随 ELM 撤销的半安装状态。
+        dev.reserve_owned_resources(1)?;
+        let handle = match action {
             SysconPowerAction::Shutdown => {
-                crate::firmware::power::install_shutdown(method, self.device_mmio_to_virt)
+                power::register_shutdown(method, self.device_mmio_to_virt)
             }
-            SysconPowerAction::Reboot => {
-                crate::firmware::power::install_reboot(method, self.device_mmio_to_virt)
-            }
+            SysconPowerAction::Reboot => power::register_reboot(method, self.device_mmio_to_virt),
+        }
+        .map_err(map_power_error)?;
+        if let Err(error) = dev.own_boxed_resource(power::pnp_resource_boxed(
+            handle,
+            "platform-syscon-power-control",
+        )) {
+            let _ = power::unregister(handle);
+            return Err(error);
         }
 
         dev.set_driver_data(Arc::new(SysconPowerBinding {
@@ -364,22 +376,15 @@ fn usize_property(info: &PlatformDeviceInfo, name: &str) -> Option<usize> {
 }
 
 fn u64_property(info: &PlatformDeviceInfo, name: &str) -> Option<u64> {
-    info.fw_properties
-        .iter()
-        .find(|property| property.name.as_ref() == name)
-        .and_then(|property| match &property.value {
-            FirmwarePropertyValue::U32(value) => Some(u64::from(*value)),
-            FirmwarePropertyValue::U32List(values) if values.len() == 1 => {
-                Some(u64::from(values[0]))
-            }
-            FirmwarePropertyValue::U32List(values) if values.len() == 2 => {
-                Some((u64::from(values[0]) << 32) | u64::from(values[1]))
-            }
-            FirmwarePropertyValue::Bool
-            | FirmwarePropertyValue::U32List(_)
-            | FirmwarePropertyValue::StringList(_)
-            | FirmwarePropertyValue::Bytes(_) => None,
-        })
+    let values = info.u32_list_property(name)?;
+    match values.len() {
+        1 => Some(u64::from(firmware_u32_list_get(values, 0)?)),
+        2 => Some(
+            (u64::from(firmware_u32_list_get(values, 0)?) << 32)
+                | u64::from(firmware_u32_list_get(values, 1)?),
+        ),
+        _ => None,
+    }
 }
 
 fn map_syscon_error(err: SysconError) -> PnpError {
@@ -393,6 +398,19 @@ fn map_syscon_error(err: SysconError) -> PnpError {
         SysconError::NotFound => {
             PnpError::dependency(crate::dev::pnp::PnpDependency::Other("syscon-registry"))
         }
+    }
+}
+
+fn map_power_error(err: PowerError) -> PnpError {
+    match err {
+        PowerError::OutOfMemory => PnpError::OutOfMemory,
+        PowerError::UnsupportedAddressSpace(_) | PowerError::InvalidRegister => {
+            PnpError::malformed(
+                PnpResourceKind::Other("power-control"),
+                "invalid power method",
+            )
+        }
+        PowerError::NotInstalled | PowerError::NotFound => PnpError::ProbeFailed,
     }
 }
 

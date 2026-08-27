@@ -8,7 +8,7 @@ use crate::transport::{
     ControlErrorTarget, ControlPacketResult, LocalUdpIngressError, PreparedRawTx, PreparedTcpTx,
     PreparedUdpTx, RawBindError, RawEndpointTable, TcpBindError, TcpEndpointTable, TcpIngressError,
     TcpPacket, TcpPath, UdpBindError, UdpDatagram, UdpEndpointTable, UdpTxError,
-    build_port_unreachable, build_tcp_reset, build_udp_packet, handle_control_packet,
+    build_port_unreachable, build_tcp_reset, handle_control_packet,
 };
 use crate::{Endpoint, FlowId, InterfaceId, IpAddr, ListenGroup, ListenGroupId, ShardId};
 use crate::{OwnerRef, SocketError, SocketFacade, TcpTxLease, UdpTxLease};
@@ -390,6 +390,39 @@ impl FlowShard {
         )?;
         // 回环 SYN 可能在内核消费本轮返回的命令元数据前完成握手。必须先发布
         // 稳定的 facade 绑定，再允许握手唤醒向用户态暴露已连接状态。
+        facade.publish_binding(
+            OwnerRef::Flow {
+                shard: self.id,
+                flow: id,
+                generation: facade.generation(),
+            },
+            local,
+            Some(remote),
+            Some(path.route.interface),
+        );
+        self.reschedule_tcp(id);
+        Ok(id)
+    }
+
+    /// TCP Fast Open 主动打开（sendmsg(MSG_FASTOPEN)）。
+    pub fn connect_tcp_fastopen(
+        &mut self,
+        local: Endpoint,
+        remote: Endpoint,
+        path: TcpPath,
+        facade: Arc<SocketFacade>,
+        control_sequence: u64,
+        _local_transport: bool,
+        now_ns: u64,
+    ) -> Result<FlowId, TcpBindError> {
+        let id = self.tcp.connect_fastopen(
+            local,
+            remote,
+            path,
+            Arc::clone(&facade),
+            control_sequence,
+            now_ns,
+        )?;
         facade.publish_binding(
             OwnerRef::Flow {
                 shard: self.id,
@@ -834,13 +867,22 @@ impl FlowShard {
             };
             mac_address
         };
-        let packet = match build_udp_packet(
+        let facade = self.udp.facade(flow);
+        let packet = match crate::transport::build_udp_packet_with_options(
             payload,
             route,
             destination,
             endpoint.local.port,
             interface.mac_address,
             destination_mac,
+            facade.as_ref().map_or(64, |facade| facade.ip_hop_limit()),
+            facade
+                .as_ref()
+                .map_or(0, |facade| facade.ip_traffic_class()),
+            false,
+            facade.map_or(crate::ip_options::IpOptions::empty(), |facade| {
+                facade.ip_options()
+            }),
         ) {
             Ok(packet) => packet,
             Err((error, payload)) => {
@@ -1354,13 +1396,19 @@ impl FlowShard {
             return Err((SocketError::Closed, payload));
         };
         let destination = payload.destination;
-        let bound_source = (!endpoint.local.addr.is_unspecified()).then_some(endpoint.local.addr);
+        // sendmsg cmsg（IP_PKTINFO ipi_spec_dst / IPV6_PKTINFO）与 sockaddr scope_id
+        // 逐包覆盖 socket 级 bind/route 选择。
+        let bound_source = payload
+            .source
+            .or_else(|| (!endpoint.local.addr.is_unspecified()).then_some(endpoint.local.addr));
         let facade = payload.facade();
-        let interface_scope = if destination.addr.is_multicast() {
-            endpoint.interface.or_else(|| facade.multicast_interface())
-        } else {
-            endpoint.interface
-        };
+        let interface_scope = payload.interface.or_else(|| {
+            if destination.addr.is_multicast() {
+                endpoint.interface.or_else(|| facade.multicast_interface())
+            } else {
+                endpoint.interface
+            }
+        });
         let route_result = if destination.addr.is_multicast() {
             config.multicast_route(
                 destination.addr,
@@ -1430,6 +1478,13 @@ impl FlowShard {
                 None => ([0; 6], Some(key)),
             }
         };
+        let hop_limit = payload
+            .hop_limit
+            .unwrap_or(if destination.addr.is_multicast() {
+                facade.multicast_hops()
+            } else {
+                facade.ip_hop_limit()
+            });
         Ok(PreparedUdpTx {
             payload,
             route,
@@ -1438,12 +1493,9 @@ impl FlowShard {
             source_mac: interface.mac_address,
             destination_mac,
             unresolved_neighbor,
-            hop_limit: if destination.addr.is_multicast() {
-                facade.multicast_hops()
-            } else {
-                facade.ip_hop_limit()
-            },
+            hop_limit,
             traffic_class: facade.ip_traffic_class(),
+            ip_options: facade.ip_options(),
             mark,
             completion: {
                 let completion = CompletionToken(self.next_completion);
@@ -1465,14 +1517,23 @@ impl FlowShard {
             return Err((SocketError::Closed, payload));
         };
         let destination = payload.destination.addr;
-        let bound_source = (!endpoint.local.is_unspecified()).then_some(endpoint.local);
+        let bound_source = payload
+            .source
+            .or_else(|| (!endpoint.local.is_unspecified()).then_some(endpoint.local));
+        let interface_scope = payload.interface.or_else(|| {
+            if destination.is_multicast() {
+                endpoint
+                    .interface
+                    .or_else(|| payload.facade().multicast_interface())
+            } else {
+                endpoint.interface
+            }
+        });
         let route_result = if destination.is_multicast() {
             config.multicast_route(
                 destination,
                 bound_source,
-                endpoint
-                    .interface
-                    .or_else(|| payload.facade().multicast_interface()),
+                interface_scope,
                 endpoint.free_bind,
             )
         } else {
@@ -1480,7 +1541,7 @@ impl FlowShard {
                 destination,
                 mark,
                 bound_source,
-                endpoint.interface,
+                interface_scope,
                 endpoint.free_bind,
             )
         };
@@ -1524,6 +1585,7 @@ impl FlowShard {
             }
         };
         let facade = payload.facade();
+        let hop_limit = payload.hop_limit.unwrap_or_else(|| facade.ip_hop_limit());
         Ok(PreparedRawTx {
             payload,
             route,
@@ -1533,8 +1595,10 @@ impl FlowShard {
             unresolved_neighbor,
             protocol: endpoint.protocol,
             header_included: facade.raw_header_included(),
-            hop_limit: facade.ip_hop_limit(),
+            hop_limit,
             traffic_class: facade.ip_traffic_class(),
+            ip_options: facade.ip_options(),
+            ipv6_checksum_offset: facade.ipv6_checksum_offset(),
             completion: {
                 let completion = CompletionToken(self.next_completion);
                 self.next_completion = self.next_completion.wrapping_add(1).max(1);
