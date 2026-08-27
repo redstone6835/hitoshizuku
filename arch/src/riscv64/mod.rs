@@ -17,6 +17,7 @@ pub mod csr;
 
 pub mod boot;
 pub(crate) mod efi_stub;
+mod external_irq;
 pub mod loader; // RISC-V 不走 UEFI，仅提供 panic stub
 
 // ── 异常与中断 ────────────────────────────────────────────────────────────────

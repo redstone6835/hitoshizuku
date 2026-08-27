@@ -10,7 +10,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use vfs::cred::{Gid, Uid};
 use vfs::dentry::Dentry;
@@ -1073,6 +1073,25 @@ pub(crate) struct FsState {
     inode_writeback: Spinlock<DirtyInodeState>,
     /// 只读挂载标志(由驱动 flags 或 remount 控制)。
     pub(crate) read_only: core::sync::atomic::AtomicBool,
+    /// MMP 运行时心跳状态(未启用 MMP 的文件系统保持初始值,不参与 I/O)。
+    pub(crate) mmp: MmpRuntime,
+}
+
+/// MMP 运行时心跳的可变状态(见 [`crate::mmp`])。
+pub(crate) struct MmpRuntime {
+    /// 当前心跳序列号(挂载夺占时置 1,每次心跳 +1)。
+    pub(crate) seq: AtomicU32,
+    /// 上次心跳的实时纳秒(用于按 `s_mmp_update_interval` 节流)。
+    pub(crate) last_heartbeat_ns: AtomicU64,
+}
+
+impl MmpRuntime {
+    fn new() -> Self {
+        Self {
+            seq: AtomicU32::new(0),
+            last_heartbeat_ns: AtomicU64::new(0),
+        }
+    }
 }
 
 impl FsState {
@@ -1674,6 +1693,7 @@ impl FsState {
     }
 
     fn flush_one_evicted(&self, snapshot: &DirtyBlockSnapshot) -> Result<(), BlockBackendError> {
+        crate::mmp::heartbeat(self);
         let mut current = snapshot.clone();
         loop {
             if let Err(err) = bgd::write_blocks(
@@ -1698,6 +1718,7 @@ impl FsState {
     }
 
     fn flush_evicted(&self, list: &mut Vec<DirtyBlockSnapshot>) -> Result<(), BlockBackendError> {
+        crate::mmp::heartbeat(self);
         let mut queue = core::mem::take(list);
         let bs = self.ext_sb.block_size as usize;
         const MAX_FLUSH_RUN_BLOCKS: usize = 128;
@@ -1966,6 +1987,7 @@ impl FsState {
     }
 
     pub(crate) fn sync_all(&self) -> Result<(), BlockBackendError> {
+        crate::mmp::heartbeat(self);
         loop {
             self.flush_pending_inode_writes()?;
             let staged_seq = self.inode_writeback.lock().seq;
@@ -2074,6 +2096,8 @@ impl FsDriver for ExtFsDriver {
             .store(true, core::sync::atomic::Ordering::Release);
         let _ = state.sync_all();
         let _ = crate::alloc_mod::mark_clean_unmount(&state);
+        // 释放 MMP 所有权,允许后续节点挂载。
+        crate::mmp::mark_clean(&state);
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -2113,6 +2137,10 @@ impl SuperblockOps for ExtFsSuperblockOps {
     fn sync_fs(&self, _sb: &Arc<VfsSuperblock>) -> VfsResult<()> {
         self.state.sync_all().map_err(map_err)
     }
+    fn supports_direct_io(&self) -> bool {
+        true
+    }
+
     fn remount(&self, _sb: &Arc<VfsSuperblock>, flags: MountFlags) -> VfsResult<()> {
         use core::sync::atomic::Ordering;
         if flags.has(MountFlags::RDONLY) {
@@ -2120,6 +2148,7 @@ impl SuperblockOps for ExtFsSuperblockOps {
             self.state.sync_all().map_err(map_err)?;
             self.state.read_only.store(true, Ordering::Release);
             crate::alloc_mod::mark_clean_unmount(&self.state).map_err(map_err)?;
+            crate::mmp::mark_clean(&self.state);
         } else {
             if self.state.ext_sb.force_read_only {
                 // BIGALLOC/READONLY/SHARED_BLOCKS 等语义位不允许读写。
@@ -2127,6 +2156,8 @@ impl SuperblockOps for ExtFsSuperblockOps {
             }
             self.state.read_only.store(false, Ordering::Release);
             crate::alloc_mod::mark_mounted(&self.state, false).map_err(map_err)?;
+            // 重新夺占 MMP 所有权。
+            crate::mmp::claim(&self.state).map_err(map_err)?;
         }
         Ok(())
     }
@@ -2137,9 +2168,14 @@ impl SuperblockOps for ExtFsSuperblockOps {
 
 /// MMP(多挂载保护)挂载时检查。
 ///
-/// 与 Linux `ext4_multi_mount_protect` 的入口语义对齐,但不做运行时心跳
-/// (extfs 没有周期性写线程):仅接受 `EXT4_MMP_SEQ_CLEAN`(干净卸载)的
-/// MMP 块;`FSCK`(正被 fsck)或其它序列号一律拒绝,避免双挂载。
+/// 与 Linux `ext4_multi_mount_protect` 的入口语义对齐:
+/// - `EXT4_MMP_SEQ_CLEAN`:无其它节点挂载,允许挂载;
+/// - `EXT4_MMP_SEQ_FSCK`:正被 fsck,拒绝;
+/// - 其它非 CLEAN 序列:读取 `mmp_time`,若距上次心跳超过 `2 ×
+///   s_mmp_update_interval` 视为陈旧(上个宿主崩溃/掉线),允许接管;否则视为
+///   仍有存活节点,拒绝双挂载。
+///
+/// 运行时心跳见 [`crate::mmp`]。
 fn mmp_check(backend: &dyn BlockBackend, sb: &ExtSb) -> Result<(), BlockBackendError> {
     use crate::layout::*;
 
@@ -2168,15 +2204,46 @@ fn mmp_check(backend: &dyn BlockBackend, sb: &ExtSb) -> Result<(), BlockBackendE
     if seq == EXT4_MMP_SEQ_CLEAN {
         return Ok(());
     }
-    log::error!("[extfs] MMP: 序列号 {seq:#x} 非 CLEAN,可能正被 fsck 或其它节点挂载,拒绝挂载");
+    if seq == EXT4_MMP_SEQ_FSCK {
+        log::error!("[extfs] MMP: 文件系统正被 fsck(序列号 {seq:#x}),拒绝挂载");
+        return Err(BlockBackendError::Io);
+    }
+    // 非 CLEAN / 非 FSCK:判定心跳是否已过期。
+    let mmp_time = u64::from_le_bytes([
+        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+    ]);
+    let interval = if sb.mmp_update_interval == 0 {
+        5
+    } else {
+        sb.mmp_update_interval as u64
+    };
+    let now = vfs::stat::Timespec::now().secs.max(0) as u64;
+    if now.saturating_sub(mmp_time) >= interval.saturating_mul(2) {
+        // 陈旧心跳:上个宿主崩溃或掉线,允许接管。
+        log::warning!(
+            "[extfs] MMP: 心跳陈旧(seq={seq:#x}, 距今 {}s),接管挂载",
+            now.saturating_sub(mmp_time)
+        );
+        return Ok(());
+    }
+    log::error!("[extfs] MMP: 序列号 {seq:#x} 非 CLEAN,可能正被其它节点挂载,拒绝挂载");
     Err(BlockBackendError::Io)
 }
 
 fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
-    let ext_sb = sb::load(backend.as_ref()).map_err(map_err)?;
+    let ext_sb = sb::load(backend.as_ref()).map_err(|e| {
+        log::warning!("[extfs] mount step sb::load failed: {:?}", e);
+        map_err(e)
+    })?;
     // MMP 检查:只读操作,先于一切写路径。
-    mmp_check(backend.as_ref(), &ext_sb).map_err(map_err)?;
-    let group_desc = bgd::load_all(backend.as_ref(), &ext_sb).map_err(map_err)?;
+    mmp_check(backend.as_ref(), &ext_sb).map_err(|e| {
+        log::warning!("[extfs] mount step mmp_check failed: {:?}", e);
+        map_err(e)
+    })?;
+    let group_desc = bgd::load_all(backend.as_ref(), &ext_sb).map_err(|e| {
+        log::warning!("[extfs] mount step bgd::load_all failed: {:?}", e);
+        map_err(e)
+    })?;
     let group_counts = group_desc
         .iter()
         .map(|g| GroupCounts {
@@ -2205,7 +2272,12 @@ fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
         alloc_sb_dirty: AtomicBool::new(false),
         inode_writeback: Spinlock::new(DirtyInodeState::new()),
         read_only: core::sync::atomic::AtomicBool::new(force_ro),
+        mmp: MmpRuntime::new(),
     });
+
+    // MMP 夺占所有权:写回非 CLEAN 序列号,阻止第二个节点并发挂载。
+    // 必须在日志恢复/孤儿清理等任何写路径之前完成。
+    crate::mmp::claim(&state).map_err(map_err)?;
 
     // 日志恢复(NEEDS_RECOVERY):回放已提交事务 + fast commit 区域,
     // 复位日志头后清除主超级块的 RECOVER 位。
@@ -2231,16 +2303,28 @@ fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
 
     // 孤儿 inode 清理(s_last_orphan 链表 + orphan file)。
     if !state.is_read_only() {
-        crate::orphan::cleanup(&state).map_err(map_err)?;
+        crate::orphan::cleanup(&state).map_err(|e| {
+            log::warning!("[extfs] mount step orphan::cleanup failed: {:?}", e);
+            map_err(e)
+        })?;
     }
 
     // 挂载记账:清/置 VALID_FS、s_mnt_count+1、s_mtime。
-    crate::alloc_mod::mark_mounted(&state, state.is_read_only()).map_err(map_err)?;
+    crate::alloc_mod::mark_mounted(&state, state.is_read_only()).map_err(|e| {
+        log::warning!("[extfs] mount step mark_mounted failed: {:?}", e);
+        map_err(e)
+    })?;
     // 恢复 + 孤儿清理 + 记账的结果先落盘,再开始对外服务。
-    state.sync_all().map_err(map_err)?;
+    state.sync_all().map_err(|e| {
+        log::warning!("[extfs] mount step sync_all failed: {:?}", e);
+        map_err(e)
+    })?;
 
     // 加载根 inode(2 号)
-    let (root_meta_on_disk, root_raw) = load_inode(&state, EXT4_ROOT_INO).map_err(map_err)?;
+    let (root_meta_on_disk, root_raw) = load_inode(&state, EXT4_ROOT_INO).map_err(|e| {
+        log::warning!("[extfs] mount step load_inode(root) failed: {:?}", e);
+        map_err(e)
+    })?;
     let fs_id = FsId::new(EXTFS_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed));
 
     let kind_hint = match state.ext_sb.kind {
@@ -2679,6 +2763,7 @@ mod tests {
             alloc_sb_dirty: AtomicBool::new(false),
             inode_writeback: Spinlock::new(DirtyInodeState::new()),
             read_only: AtomicBool::new(false),
+            mmp: MmpRuntime::new(),
         }
     }
 

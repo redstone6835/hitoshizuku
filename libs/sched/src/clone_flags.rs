@@ -26,6 +26,7 @@ impl CloneFlags {
     pub const CLONE_DETACHED: u64 = 0x00400000;
     pub const CLONE_UNTRACED: u64 = 0x00800000;
     pub const CLONE_CHILD_SETTID: u64 = 0x01000000;
+    pub const CLONE_NEWTIME: u64 = 0x0000_0080;
     pub const CLONE_NEWCGROUP: u64 = 0x02000000;
     pub const CLONE_NEWUTS: u64 = 0x04000000;
     pub const CLONE_NEWIPC: u64 = 0x08000000;

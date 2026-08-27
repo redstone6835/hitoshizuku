@@ -25,6 +25,7 @@ use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use errno::Errno;
+use sched::SignalNumber;
 
 use crate::TrapFramePtr;
 
@@ -480,6 +481,203 @@ fn complete_native_external_control_at_boundary(task: &Arc<sched::Task>) -> bool
     }
 }
 
+/// `PTRACE_SYSCALL` 的 entry-stop：在 syscall 主体执行前停止被跟踪任务。
+///
+/// stop 后任务由 tracer `PTRACE_CONT` 恢复；恢复时用户态重入 syscall 指令
+/// （trap frame 的 PC 未推进），重入后不再 entry-stop，而是在 syscall 出口
+/// 产生 exit-stop。`PTRACE_O_TRACESYSGOOD` 时停止信号编码为 `0x80|SIGTRAP`。
+fn ptrace_syscall_entry(ctx: &SyscallContext<'_>) -> bool {
+    let task = ctx.task();
+    if !task.is_ptrace_traced() || !task.ptrace_syscall_stop_enabled() {
+        return false;
+    }
+    // 重入路径：上一个 entry-stop 已产生（reenable=true），PTRACE_SYSCALL
+    // 恢复后本任务重新进入 syscall 分发；此时放行执行 syscall 主体，
+    // 完成后的 exit-stop 由 ptrace_syscall_exit 产生。
+    if task.ptrace_syscall_reenable() {
+        return false;
+    }
+    task.set_ptrace_syscall_reenable(true);
+    task.record_syscall_entry(ctx.nr, ctx.args);
+    task.set_ptrace_stop_event(0);
+    task.clear_ptrace_last_siginfo();
+    let raw_sig = if task.ptrace_options() & PTRACE_O_TRACESYSGOOD != 0 {
+        SignalNumber::SIGTRAP.raw() as i32 | 0x80
+    } else {
+        SignalNumber::SIGTRAP.raw() as i32
+    };
+    sched::operation::ptrace_mark_stopped_raw(task, raw_sig);
+    true
+}
+
+/// `PTRACE_SYSCALL` 的 exit-stop：syscall 已执行完毕（返回值已算好），
+/// 停止任务；恢复后正常返回用户态。
+fn ptrace_syscall_exit(ctx: &SyscallContext<'_>, ret: isize) -> bool {
+    let task = ctx.task();
+    if !task.is_ptrace_traced() {
+        return false;
+    }
+    if task.ptrace_syscall_reenable() {
+        // 重入后的放行路径：本次执行结束，产生 exit-stop。
+        task.set_ptrace_syscall_reenable(false);
+        task.record_syscall_exit(ret);
+        task.set_ptrace_stop_event(0);
+        task.clear_ptrace_last_siginfo();
+        let raw_sig = if task.ptrace_options() & PTRACE_O_TRACESYSGOOD != 0 {
+            SignalNumber::SIGTRAP.raw() as i32 | 0x80
+        } else {
+            SignalNumber::SIGTRAP.raw() as i32
+        };
+        sched::operation::ptrace_mark_stopped_raw(task, raw_sig);
+        return true;
+    }
+    // 普通 ptrace 任务（非 SYSCALL 模式）不产生 exit-stop。
+    false
+}
+
+const PTRACE_O_TRACESYSGOOD: u64 = 0x0000_0001;
+
+/// 任务的 seccomp 状态扩展键（`Arc<seccomp::SeccompState>`）。
+pub const TASKEXT_SECCOMP: sched::TaskExtKey = 0x0004_0004;
+
+/// `PTRACE_O_TRACESECCOMP`。
+const PTRACE_O_TRACESECCOMP: u64 = 0x0000_0080;
+/// `PTRACE_EVENT_SECCOMP`。
+const PTRACE_EVENT_SECCOMP: u16 = 7;
+
+/// 在 syscall 入口执行 seccomp 过滤器。
+///
+/// 返回 `true` 表示 syscall 已被消费（KILL/TRAP/ERRNO/TRACE/NOTIF 或
+/// strict 模式拒绝），dispatch 不应继续执行。
+fn seccomp_filter_syscall(ctx: &mut SyscallContext<'_>) -> bool {
+    use crate::seccomp::*;
+
+    let task = ctx.task();
+    let Some(state) = task
+        .ext_lookup(TASKEXT_SECCOMP)
+        .and_then(|payload| payload.downcast::<SeccompState>().ok())
+    else {
+        return false;
+    };
+
+    let mode = state.mode();
+    if mode == SECCOMP_MODE_STRICT {
+        if crate::seccomp::SeccompState::strict_allows(ctx.nr) {
+            return false;
+        }
+        // strict 模式违规：发不可捕获的 SIGKILL（Linux 语义），而非可捕获的 SIGSYS。
+        let _ = sched::operation::tkill(
+            task.pid_root().unwrap_or(0),
+            Some(sched::SignalNumber::SIGKILL),
+        );
+        return true;
+    }
+    if mode != SECCOMP_MODE_FILTER {
+        return false;
+    }
+    if state.filters.lock().is_empty() {
+        return false;
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    const AUDIT_ARCH: u32 = 0x4000_0102;
+    #[cfg(target_arch = "riscv64")]
+    const AUDIT_ARCH: u32 = 0x4000_00f3;
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH: u32 = 0xc000_003e;
+
+    let data = encode_data(ctx.nr as i32, AUDIT_ARCH, 0, ctx.args.map(|arg| arg as u64));
+
+    let result = state.run(&data);
+    let action = result & SECCOMP_RET_ACTION_FULL;
+    let data_bits = result & SECCOMP_RET_DATA;
+    match action {
+        SECCOMP_RET_KILL_THREAD => {
+            // 仅终止当前线程，SIGSYS 默认动作终止（seccomp 的 KILL 语义）。
+            let _ = sched::operation::tkill(
+                task.pid_root().unwrap_or(0),
+                Some(sched::SignalNumber::SIGSYS),
+            );
+            true
+        }
+        SECCOMP_RET_KILL_PROCESS => {
+            // 终止整个线程组：向线程组 leader 发 SIGSYS。
+            let tgid = task
+                .thread_group()
+                .leader()
+                .and_then(|l| l.pid_root())
+                .unwrap_or_else(|| task.pid_root().unwrap_or(0));
+            let _ = sched::operation::kill(tgid, Some(sched::SignalNumber::SIGSYS));
+            true
+        }
+        SECCOMP_RET_TRAP => {
+            // TRAP 投递带完整 siginfo 的 SIGSYS（si_code=SYS_SECCOMP、
+            // si_syscall、si_arch），供 ptrace/user handler 读取。
+            let mut raw = [0u8; 128];
+            raw[0..4].copy_from_slice(&31i32.to_le_bytes()); // si_signo = SIGSYS
+            raw[4..8].copy_from_slice(&0i32.to_le_bytes()); // si_errno
+            raw[8..12].copy_from_slice(&1i32.to_le_bytes()); // si_code = SYS_SECCOMP
+            // raw[12..16] 为对齐填充；raw[16..24] 为 si_call_addr（填 0）。
+            raw[24..28].copy_from_slice(&(ctx.nr as i32).to_le_bytes()); // si_syscall
+            raw[28..32].copy_from_slice(&AUDIT_ARCH.to_le_bytes()); // si_arch
+            let info = sched::SigInfo {
+                sig: sched::SignalNumber::SIGSYS,
+                code: 1, // SYS_SECCOMP
+                sender_pid: task.pid_root().unwrap_or(0),
+                sender_uid: task.credentials().uid,
+                raw: Some(raw),
+            };
+            let tgid = task
+                .thread_group()
+                .leader()
+                .and_then(|l| l.pid_root())
+                .unwrap_or_else(|| task.pid_root().unwrap_or(0));
+            let _ = sched::operation::tgqueueinfo(tgid, task.pid_root().unwrap_or(0), info);
+            true
+        }
+        SECCOMP_RET_ERRNO => {
+            let errno = data_bits as i32;
+            ctx.finalize_frame();
+            let ops = crate::syscall::frame_ops().expect("frame ops 已注册");
+            (ops.set_sys_ret)(ctx.tf, -(errno as isize));
+            (ops.advance_pc)(ctx.tf);
+            true
+        }
+        SECCOMP_RET_TRACE => {
+            if task.is_ptrace_traced() && task.ptrace_options() & PTRACE_O_TRACESECCOMP != 0 {
+                task.record_syscall_seccomp(ctx.nr, ctx.args);
+                task.set_ptrace_event_msg(result as i64);
+                task.set_ptrace_stop_event(PTRACE_EVENT_SECCOMP);
+                task.clear_ptrace_last_siginfo();
+                sched::operation::ptrace_mark_stopped(task, sched::SignalNumber::SIGTRAP);
+                return true;
+            }
+            ctx.finalize_frame();
+            let ops = crate::syscall::frame_ops().expect("frame ops 已注册");
+            (ops.set_sys_ret)(ctx.tf, -38);
+            (ops.advance_pc)(ctx.tf);
+            true
+        }
+        SECCOMP_RET_USER_NOTIF => {
+            ctx.finalize_frame();
+            let ops = crate::syscall::frame_ops().expect("frame ops 已注册");
+            (ops.set_sys_ret)(ctx.tf, -38);
+            (ops.advance_pc)(ctx.tf);
+            true
+        }
+        SECCOMP_RET_LOG => {
+            log::info!(
+                "[seccomp] log pid={:?} nr={} action={:#x}",
+                task.pid_root(),
+                ctx.nr,
+                result
+            );
+            false
+        }
+        _ => false,
+    }
+}
+
 fn dispatch_tomori_for_task(
     tf: TrapFramePtr,
     ops: &'static SyscallFrameOps,
@@ -495,6 +693,13 @@ fn dispatch_tomori_for_task(
     let mut syscall_profile = profiling::syscall_scope(nr);
 
     let mut ctx = SyscallContext::new(nr, args, tf, task);
+
+    if ptrace_syscall_entry(&ctx) {
+        return;
+    }
+    if seccomp_filter_syscall(&mut ctx) {
+        return;
+    }
 
     // syscall 表只在启动期注册；热路径无锁读取函数指针，避免 lmbench
     // simple syscall 每次都争用全局自旋锁。
@@ -535,6 +740,10 @@ fn dispatch_tomori_for_task(
     drop(invoke_profile);
 
     complete_group_exit_at_boundary(&mut ctx);
+
+    if !ctx.frame_finalized() && ptrace_syscall_exit(&ctx, ret) {
+        return;
+    }
 
     let frame_finalized = ctx.frame_finalized();
     if !frame_finalized {

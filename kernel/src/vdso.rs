@@ -55,12 +55,38 @@ pub fn realtime_ns() -> u64 {
     apply_realtime_offset(monotonic_ns())
 }
 
+/// 当前 CLOCK_REALTIME 相对单调时钟的偏移（ns）。
+pub fn realtime_offset_ns() -> i64 {
+    REALTIME_OFFSET_NS.load(Ordering::Relaxed)
+}
+
 pub fn set_realtime_ns(realtime_ns: u64) {
     let now_ns = monotonic_ns();
     let offset = (realtime_ns as i128).saturating_sub(now_ns as i128);
     let offset = offset.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     REALTIME_OFFSET_NS.store(offset, Ordering::Relaxed);
     try_write_data(now_ns);
+}
+
+/// 以纳秒增量调整 CLOCK_REALTIME（adjtimex 的 ADJ_OFFSET 与频率折叠共用）。
+///
+/// 无锁 CAS 累加；随后刷新 vDSO 共享页使 wall_time 快照同步。
+pub(crate) fn adjust_realtime_offset(delta_ns: i64) {
+    let mut offset = REALTIME_OFFSET_NS.load(Ordering::Relaxed);
+    loop {
+        let next =
+            (offset as i128 + delta_ns as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+        match REALTIME_OFFSET_NS.compare_exchange_weak(
+            offset,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(v) => offset = v,
+        }
+    }
+    try_write_data(monotonic_ns());
 }
 
 pub fn install_realtime_source(source: RealtimeClockSource) -> bool {
@@ -96,6 +122,10 @@ pub fn unregister_realtime_source(source_id: usize) {
 }
 
 pub fn clock_time_ns(clock_id: usize) -> Option<u64> {
+    // 取舍：CLOCK_MONOTONIC_RAW 与 CLOCK_MONOTONIC 恒等。本内核的频率误差只
+    // 折进 REALTIME 偏移（见 `adjtimex::fold_locked`）、从不进入单调时钟域，
+    // 因此不存在“未经 NTP 校正的原始单调钟”与之区分，二者返回同一 `monotonic_ns()`
+    // 是语义可接受的简化。
     match clock_id {
         CLOCK_REALTIME | CLOCK_REALTIME_COARSE => Some(realtime_ns()),
         CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
@@ -123,6 +153,8 @@ pub fn shared_data_page_paddr() -> Result<usize, Errno> {
 
 pub fn update_on_timer_tick(now_ns: u64) {
     if sched::current_cpu_id() == 0 {
+        // 先折叠 NTP 频率误差，再刷新 vDSO 页，保证两条读时路径一致。
+        crate::adjtimex::on_timer_tick(now_ns);
         try_write_data(now_ns);
     }
 }

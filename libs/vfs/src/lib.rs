@@ -6,9 +6,12 @@
 #![no_std]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 pub use alloc::sync::Arc;
 
+pub mod acl;
 pub mod addr;
 pub mod anon;
 pub mod cred;
@@ -17,10 +20,14 @@ pub mod elm;
 pub mod epoll;
 pub mod error;
 pub mod eventfd;
+pub mod fanotify;
 pub mod fdtable;
 pub mod file;
 pub mod flock;
+pub mod fs_context;
+pub mod fsnotify;
 pub mod inode;
+pub mod inotify;
 pub mod lease;
 pub mod limits;
 pub mod memfd;
@@ -28,6 +35,7 @@ pub mod mount;
 pub mod net_socket;
 pub mod netlink_socket;
 pub mod operation;
+pub mod packet_socket;
 pub mod path;
 pub mod pipe;
 pub mod poll_source;
@@ -39,6 +47,7 @@ pub mod superblock;
 pub mod sync;
 pub mod sysctl;
 pub mod timerfd;
+pub mod xattr;
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use cred::Credentials;
@@ -136,7 +145,16 @@ pub struct VfsContext {
 
 /// exec 持有期间禁止共享 `CLONE_FS` 方修改 VFS 上下文。
 pub struct VfsExecLease<'a> {
+    context: &'a VfsContext,
     _gate: sync::SpinlockGuard<'a, ()>,
+}
+
+impl VfsExecLease<'_> {
+    /// 在已持有 exec 变更门时替换凭据，避免重复获取同一把锁。
+    pub fn set_cred(&self, new_cred: Arc<Credentials>) {
+        *self.context.cred.lock() = new_cred;
+        self.context.bump_generation();
+    }
 }
 
 #[kernel_symbols::export]
@@ -211,6 +229,7 @@ impl VfsContext {
 
     pub fn lock_for_exec(&self) -> VfsExecLease<'_> {
         VfsExecLease {
+            context: self,
             _gate: self.mutation_gate.lock(),
         }
     }
@@ -307,6 +326,34 @@ impl VfsContext {
     )]
     pub fn apply_umask(&self, requested: FileMode) -> FileMode {
         requested.without(*self.umask.lock())
+    }
+
+    /// `setns(CLONE_NEWNS)`：返回挂载命名空间为 `mount_ns` 的新 VFS 上下文，
+    /// cwd 与 root 按挂载树重映射（找不到对应挂载时退回新 ns 的根）。
+    pub fn with_mount_ns(&self, mount_ns: Arc<MountNamespace>) -> VfsResult<Arc<Self>> {
+        let cwd_st = self.cwd_state.lock();
+        let new_cwd_mount = mount_ns
+            .find_mount_for_root(&cwd_st.cwd_mount.mount_root)
+            .unwrap_or_else(|| Arc::clone(&mount_ns.root.lock()));
+        let root_dentry = self.root.root();
+        let new_root_mount = mount_ns
+            .find_mount_for_root(&self.root.mount().mount_root)
+            .unwrap_or_else(|| Arc::clone(&mount_ns.root.lock()));
+        VFS_CONTEXT_CREATED.fetch_add(1, Ordering::Relaxed);
+        VFS_CONTEXT_LIVE.fetch_add(1, Ordering::Relaxed);
+        Ok(Arc::new(Self {
+            cwd_state: sync::Spinlock::new(CwdState {
+                cwd: Arc::clone(&cwd_st.cwd),
+                cwd_mount: new_cwd_mount,
+            }),
+            root: VfsRoot::new(root_dentry, new_root_mount),
+            mount_ns,
+            cred: sync::Spinlock::new(self.cred()),
+            umask: sync::Spinlock::new(*self.umask.lock()),
+            mutation_gate: sync::Spinlock::new(()),
+            generation: AtomicU64::new(0),
+            limits: Arc::clone(&self.limits),
+        }))
     }
 
     #[kernel_symbols::export(

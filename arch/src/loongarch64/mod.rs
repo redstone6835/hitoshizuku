@@ -32,7 +32,7 @@ mod specific;
 mod syscall;
 mod task;
 mod tlb_shootdown;
-mod trap;
+pub mod trap;
 pub mod vdso;
 
 pub use boot::*;

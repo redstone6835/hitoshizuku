@@ -1,7 +1,10 @@
 pub mod blockfs;
 pub mod device_files;
+pub mod devpts;
 pub mod devtmpfs;
 pub mod mount_source;
+pub mod mqueue;
+pub mod nsfs;
 pub mod pidfd;
 pub mod procfs;
 pub mod sysfs;
@@ -15,8 +18,13 @@ pub use blockfs::{
     BlockFsDriver, BlockFsProbe, mount_block_device_auto, mount_block_source_auto,
     register_block_filesystems, register_block_fs_driver,
 };
+pub use devpts::DevPtsDriver;
 pub use devtmpfs::DevTmpfsDriver;
 pub use mount_source::{MountSource, resolve_block_mount_source};
+pub use mqueue::{
+    MqFsDriver, MqNotifyDispatcher, dispatch_mq_notification, mq_registry,
+    register_mq_notify_dispatcher,
+};
 pub use procfs::ProcFsDriver;
 pub use sysfs::SysFsDriver;
 pub use tmpfs::TmpfsDriver;
@@ -40,6 +48,7 @@ pub fn current_vfs_context() -> Option<Arc<VfsContext>> {
     if !sched::is_ready() {
         return None;
     }
+    install_fanotify_hook_once();
     let payload = sched::current_task().ext_lookup(sched::TASKEXT_VFS_CONTEXT)?;
     payload.downcast::<VfsContext>().ok()
 }
@@ -49,8 +58,32 @@ pub fn current_fdtable() -> Option<Arc<FdTable>> {
     if !sched::is_ready() {
         return None;
     }
+    install_fanotify_hook_once();
     let payload = sched::current_task().ext_lookup(sched::TASKEXT_VFS_FDTABLE)?;
     payload.downcast::<FdTable>().ok()
+}
+
+/// fanotify 读事件需要从 libs/vfs 取当前任务的 (fd 表, 凭据)；libs/vfs 无法
+/// 反向依赖本 crate，因此在首次使用 VFS 上下文时惰性注册函数指针钩子。
+static FANOTIFY_HOOK_INSTALLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+fn install_fanotify_hook_once() {
+    use core::sync::atomic::Ordering;
+    if FANOTIFY_HOOK_INSTALLED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    vfs::fdtable::set_current_vfs_state_hook(|| {
+        if !sched::is_ready() {
+            return None;
+        }
+        let task = sched::current_task();
+        let ctx_payload = task.ext_lookup(sched::TASKEXT_VFS_CONTEXT)?;
+        let ctx: Arc<VfsContext> = ctx_payload.downcast().ok()?;
+        let fdt_payload = task.ext_lookup(sched::TASKEXT_VFS_FDTABLE)?;
+        let fdt: Arc<FdTable> = fdt_payload.downcast().ok()?;
+        Some((fdt, ctx.cred()))
+    });
 }
 
 /// 返回 `dentry` 在 `ctx` 挂载命名空间中的绝对路径。

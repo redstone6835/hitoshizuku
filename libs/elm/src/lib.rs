@@ -170,7 +170,7 @@ pub use context::{
     ElmCurrentContextGuard, ElmCurrentContextOps, ElmCurrentContextSuspensionGuard,
     ElmLifecyclePhase, ElmNativeHookContextV1, ElmNativeMigrationContextV1, current_cell,
     current_context, enter_current_context, register_current_context_ops, register_current_cpu_id,
-    suspend_current_context, try_enter_current_context,
+    suspend_current_context, try_enter_current_context, try_enter_interrupt_context,
 };
 #[cfg(any(feature = "runtime-model", feature = "management"))]
 pub use ctl::{

@@ -10,9 +10,10 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
-#[cfg(target_arch = "riscv64")]
 use alloc::vec::Vec;
 use core::any::Any;
+use core::mem::size_of;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use errno::Errno;
 use general::mm::{VmSpace, copy_from_user, copy_to_user};
@@ -20,7 +21,9 @@ use general::vfs::{
     Credentials, Dentry, FdTable, FileMode, Mount, MountNamespace, VfsContext, VfsLimits, VfsRoot,
     build_boot_vfs_parts,
 };
+use hal::memory::page_size;
 use hal::user_context::UserTrapFrame;
+use mm::VmFlags;
 use sched::arch_hooks::VmSwitchOps;
 use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::process_ops::{ExecRequest, ProcessImageOps, UserContextRef};
@@ -30,13 +33,20 @@ use sched::task::{
     TaskExitAccountingHook, TaskExtCloneHook, TaskExtExitHook, TaskExtKey, TaskPreExitHook,
 };
 use sched::{
-    TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task,
+    SchedParams, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE,
+    TASKEXT_VM_SPACE, Task,
 };
 use vfs::Arc as VfsArc;
 
 /// acpi / dtb 启动路径在控制台挂载完成后，把 VFS 根部件存这里；
 /// [`boot_init`] 再取出来装到 init 任务上。
 static BOOT_VFS_PARTS: Spinlock<Option<BootVfsParts>> = Spinlock::new(None);
+static BOOT_ROOT_IS_INITRAMFS: AtomicBool = AtomicBool::new(false);
+
+static ALLOCATOR_INTERRUPT_OPS: allocator::InterruptOps = allocator::InterruptOps {
+    save_and_disable: hal::interrupt::save_and_disable_local,
+    restore: hal::interrupt::restore_local,
+};
 
 /// 控制台路径或 devtmpfs 节点名（例如 "/dev/console" 或 "uart0"）。stash 后
 /// install_stdio 用它走 openat 路径打开 fd 0/1/2。
@@ -76,6 +86,7 @@ pub fn stash_boot_vfs_parts(
     cwd_mount: VfsArc<Mount>,
     mount_ns: VfsArc<MountNamespace>,
     cred: VfsArc<Credentials>,
+    root_is_initramfs: bool,
 ) {
     let (cwd, cwd_mount, root, mount_ns, cred, umask, limits) =
         build_boot_vfs_parts(cwd, cwd_mount, mount_ns, cred);
@@ -88,6 +99,7 @@ pub fn stash_boot_vfs_parts(
         umask,
         limits,
     });
+    BOOT_ROOT_IS_INITRAMFS.store(root_is_initramfs, Ordering::Release);
 }
 
 // ── TaskExtCloneHook ─────────────────────────────────────────────────────────
@@ -144,6 +156,53 @@ impl TaskExtCloneHook for KernelExtCloneHook {
             sched::TASKEXT_ELM_EXECUTION => {
                 Arc::new(general::elm_guard::ElmTaskExecutionState::new())
             }
+            crate::syscalls::ipc::TASKEXT_SEM_UNDO => {
+                let table = Arc::clone(src)
+                    .downcast::<general::ipc::sem_undo::SemUndoTable>()
+                    .expect("[sched][ext] sem undo table type mismatch");
+                // CLONE_SYSVSEM 共享撤销表；否则子进程得到空表（Linux 语义：
+                // 撤销项不随 fork 继承）。
+                if flags.has(CloneFlags::CLONE_SYSVSEM) {
+                    table
+                } else {
+                    Arc::new(general::ipc::sem_undo::SemUndoTable::new())
+                }
+            }
+            crate::syscalls::process::TASKEXT_PRCTL_MISC => {
+                let state = Arc::clone(src)
+                    .downcast::<crate::syscalls::process::PrctlMiscState>()
+                    .expect("[sched][ext] prctl misc state type mismatch");
+                // Linux：TSC 模式与 THP 开关随 fork 继承（exec 保留）。
+                let child = crate::syscalls::process::PrctlMiscState::new();
+                child
+                    .tsc_mode
+                    .store(state.tsc_mode.load(Ordering::Acquire), Ordering::Release);
+                child
+                    .thp_disable
+                    .store(state.thp_disable.load(Ordering::Acquire), Ordering::Release);
+                Arc::new(child)
+            }
+            crate::syscalls::ipc::TASKEXT_KEYRINGS => {
+                let process = Arc::clone(src)
+                    .downcast::<general::ipc::keys::ProcessKeyrings>()
+                    .expect("[sched][ext] process keyrings type mismatch");
+                // CLONE_THREAD 共享 thread keyring；fork 时新建引用集并继承
+                // process/session keyring 引用（Linux copy_keys 语义）。
+                if flags.has(CloneFlags::CLONE_THREAD) {
+                    process
+                } else {
+                    let child = general::ipc::keys::ProcessKeyrings::new();
+                    *child.process.lock() = *process.process.lock();
+                    *child.session.lock() = *process.session.lock();
+                    Arc::new(child)
+                }
+            }
+            general::syscall::TASKEXT_SECCOMP => {
+                let state = Arc::clone(src)
+                    .downcast::<general::seccomp::SeccompState>()
+                    .expect("[sched][ext] seccomp state type mismatch");
+                state.fork_clone()
+            }
             _ => Arc::clone(src),
         }
     }
@@ -166,6 +225,14 @@ impl TaskExtExitHook for KernelExtExitHook {
         let _ = task.ext_remove(crate::native_runtime::TASKEXT_NATIVE_THREAD);
         let _ = task.ext_remove(sched::TASKEXT_ELM_EXECUTION);
         let _ = task.ext_remove(TASKEXT_EXEC_ACCESS);
+        // 退出扩展通常在任务已经切离 CPU 后清理，但测试/早期退出路径也可能
+        // 在当前任务仍驻留时到达这里。先切回内核根页表，再释放 VmSpace，避免
+        // RISC-V 的 CURRENT_USER_PGD 指向即将回收的页表。
+        if sched::try_current_task_ref()
+            .is_some_and(|current| core::ptr::eq(current, task.as_ref()))
+        {
+            hal::sched::activate_kernel_address_space();
+        }
         let _ = task.ext_remove(TASKEXT_VM_SPACE);
         let _ = task.ext_remove(TASKEXT_VFS_FDTABLE);
         let _ = task.ext_remove(TASKEXT_VFS_CONTEXT);
@@ -471,7 +538,7 @@ fn process_spawn_user_process(
     #[cfg(feature = "performance-profile")]
     install_profile_images(child, &loaded);
     if let Some(fdt) = task_fdtable(child) {
-        fdt.close_on_exec();
+        fdt.close_on_exec(child.pid_root().unwrap_or(0));
     }
     child
         .thread_group()
@@ -563,6 +630,97 @@ pub(crate) fn prepare_native_thread(
     child.into_kernel_thread(user_clone_entry, 0);
     child.ext_install(TASKEXT_USER_TRAP_FRAME, Arc::new(frame));
     Ok(())
+}
+
+/// `mq_notify(SIGEV_THREAD)`：在注册者进程上下文创建线程执行通知函数。
+///
+/// 语义对齐 POSIX/Linux：helper 是注册者的同进程新线程（共享 mm/fs/files/
+/// sighand），从 `function(value)` 开始执行；函数返回后经用户态退出桩调用
+/// `exit(0)` 结束该线程，不影响进程其它线程。
+pub(crate) fn spawn_mq_notify_thread(registrant: &Arc<Task>, function: usize, value: usize) {
+    use sched::clone_flags::{CloneArgs, CloneFlags};
+
+    if registrant.is_kernel_task() {
+        return;
+    }
+    let args = CloneArgs {
+        flags: CloneFlags(
+            CloneFlags::CLONE_VM
+                | CloneFlags::CLONE_FS
+                | CloneFlags::CLONE_FILES
+                | CloneFlags::CLONE_SIGHAND
+                | CloneFlags::CLONE_THREAD,
+        ),
+        pidfd: 0,
+        stack: 0,
+        stack_size: 0,
+        parent_tid: 0,
+        child_tid: 0,
+        tls: 0,
+        exit_signal: 0,
+        set_tid: 0,
+        set_tid_size: 0,
+        requested_pid: 0,
+        cgroup: 0,
+    };
+    let child = sched::spawn::clone_task(registrant, args, sched::SchedParams::default_fair());
+    if child.state() == sched::TaskState::Dead {
+        log::warning!(
+            "[mq][SIGEV_THREAD] clone failed for registrant pid={:?}",
+            registrant.pid_root(),
+        );
+        return;
+    }
+    let Some(vm) = registrant
+        .ext_lookup(TASKEXT_VM_SPACE)
+        .and_then(|payload| payload.downcast::<VmSpace>().ok())
+    else {
+        log::debug!("[mq][SIGEV_THREAD] registrant has no vm, drop notification");
+        return;
+    };
+    // 通知线程的用户栈 + 退出桩（一页，可执行）。
+    let Ok(stack_range) = vm.alloc_mmap_range(page_size()) else {
+        return;
+    };
+    let stack_flags = VmFlags::EMPTY
+        .with(VmFlags::READ)
+        .with(VmFlags::WRITE)
+        .with(VmFlags::EXEC)
+        .with(VmFlags::USER);
+    if vm.map_anon(stack_range.clone(), stack_flags).is_err() {
+        let _ = vm.unmap(stack_range.clone());
+        return;
+    }
+    let stub_addr = stack_range.start;
+    if vm.copy_user_bytes_out(stub_addr, exit_stub_code()).is_err() {
+        let _ = vm.unmap(stack_range);
+        return;
+    }
+
+    let kernel_stack_top = child.ensure_kernel_stack();
+    let mut frame = UserTrapFrame::init_user(function, stack_range.end, value);
+    frame.set_ra(stub_addr);
+    frame.set_kernel_stack_top(kernel_stack_top);
+    frame.set_current_address_space();
+    child.set_comm(b"mq-notify");
+    child.into_kernel_thread(user_clone_entry, 0);
+    child.ext_install(TASKEXT_USER_TRAP_FRAME, Arc::new(frame));
+    let _ = sched::spawn::activate_task(&child);
+}
+
+/// 用户态退出桩：`exit(0)` 的两条指令（架构相关机器码）。
+///
+/// loongarch64：`ori $a7, $zero, 93` + `syscall 0`（SYS_exit）。
+/// riscv64：`addi a7, zero, 93` + `ecall`（SYS_exit）。
+fn exit_stub_code() -> &'static [u8] {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        &[0x0b, 0x74, 0x81, 0x03, 0x00, 0x00, 0x2b, 0x00]
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        &[0x93, 0x08, 0xd0, 0x05, 0x73, 0x00, 0x00, 0x00]
+    }
 }
 
 fn process_clone_user_context(
@@ -818,11 +976,17 @@ fn process_setup_signal_frame(
     let mut next = saved;
     next.set_pc(handler_pc);
     next.set_sp(new_sp);
-    next.set_args(
-        info.sig.raw() as usize,
-        new_sp + SIGFRAME_SIGINFO_OFF,
-        new_sp + SIGFRAME_UCONTEXT_OFF,
-    );
+    if action.flags.has(SigActionFlags::SA_SIGINFO) {
+        next.set_args(
+            info.sig.raw() as usize,
+            new_sp + SIGFRAME_SIGINFO_OFF,
+            new_sp + SIGFRAME_UCONTEXT_OFF,
+        );
+    } else {
+        // 未设 SA_SIGINFO 时 handler 只收 1 个参数（signo）。`set_args` 固定写
+        // 3 个寄存器，后两参置 0（多余参数寄存器对 1 参 handler 无意义）。
+        next.set_args(info.sig.raw() as usize, 0, 0);
+    }
     next.set_ra(restorer);
     next.apply_to_context(user_ctx.as_usize());
     Ok(())
@@ -868,11 +1032,371 @@ static PROCESS_IMAGE_OPS: ProcessImageOps = ProcessImageOps {
     setup_signal_frame: process_setup_signal_frame,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum FirmwareSchedGroupKey {
+    Socket(u32),
+    Cluster {
+        socket_id: Option<u32>,
+        path: Vec<u32>,
+    },
+    Core {
+        socket_id: Option<u32>,
+        cluster_path: Vec<u32>,
+        core_id: u32,
+    },
+    Cpu(u32),
+}
+
+struct FirmwareSchedGroup {
+    key: FirmwareSchedGroupKey,
+    parent: Option<FirmwareSchedGroupKey>,
+    mask: sched::CpuMask,
+    depth: usize,
+}
+
+#[derive(Clone, Copy)]
+struct FirmwareSchedDomain {
+    span: sched::CpuMask,
+    parent: Option<usize>,
+    level: u8,
+    capacity: u64,
+}
+
+fn add_firmware_sched_group(
+    groups: &mut Vec<FirmwareSchedGroup>,
+    key: FirmwareSchedGroupKey,
+    parent: Option<FirmwareSchedGroupKey>,
+    cpu: sched::CpuId,
+    depth: usize,
+) -> Result<(), Errno> {
+    if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
+        if group.parent != parent || group.depth != depth {
+            return Err(Errno::EINVAL);
+        }
+        group.mask = group.mask.union(cpu.mask());
+        return Ok(());
+    }
+    groups.push(FirmwareSchedGroup {
+        key,
+        parent,
+        mask: cpu.mask(),
+        depth,
+    });
+    Ok(())
+}
+
+fn firmware_cpu_capacities(
+    cpus: &[(sched::CpuId, &general::dev::cpu::CpuTopologyEntry)],
+) -> Vec<(sched::CpuId, u64)> {
+    let complete = !cpus.is_empty()
+        && cpus
+            .iter()
+            .all(|(_, cpu)| cpu.capacity_dmips_mhz.is_some_and(|capacity| capacity != 0));
+    let maximum = complete
+        .then(|| {
+            cpus.iter()
+                .filter_map(|(_, cpu)| cpu.capacity_dmips_mhz)
+                .max()
+                .unwrap_or(1)
+        })
+        .unwrap_or(1);
+    cpus.iter()
+        .map(|(cpu_id, cpu)| {
+            let capacity = if complete {
+                u64::from(cpu.capacity_dmips_mhz.unwrap_or(maximum))
+                    .saturating_mul(sched::SCHED_CAPACITY_SCALE)
+                    / u64::from(maximum)
+            } else {
+                sched::SCHED_CAPACITY_SCALE
+            };
+            (*cpu_id, capacity.max(1))
+        })
+        .collect()
+}
+
+fn firmware_domain_capacity(
+    span: sched::CpuMask,
+    capacities: &[(sched::CpuId, u64)],
+) -> Result<u64, Errno> {
+    let mut total = 0u64;
+    for cpu in span.iter() {
+        let capacity = capacities
+            .iter()
+            .find(|(candidate, _)| *candidate == cpu)
+            .map(|(_, capacity)| *capacity)
+            .ok_or(Errno::EINVAL)?;
+        total = total.checked_add(capacity).ok_or(Errno::EOVERFLOW)?;
+    }
+    (total != 0).then_some(total).ok_or(Errno::EINVAL)
+}
+
+/// 把固件 CPU socket/cluster/core/thread 关系转换成调度器的稳定层级域。
+///
+/// cluster 编号按完整 ancestry 解释；不同父 cluster 下的同名 `coreN` 不会合并。
+/// thread 由每 CPU 叶域表达。连续单子树产生的相同 span 会折叠，因此任意深度的
+/// cluster 链不会耗尽调度器固定域表。
+fn firmware_sched_topology_from(
+    entries: &[general::dev::cpu::CpuTopologyEntry],
+) -> Result<Option<sched::SchedTopology>, Errno> {
+    let mut cpus = Vec::new();
+    let mut firmware_mask = sched::CpuMask::EMPTY;
+    for cpu in entries {
+        let logical_id = usize::try_from(cpu.logical_id).map_err(|_| Errno::EINVAL)?;
+        let Some(cpu_id) = sched::CpuId::new(logical_id) else {
+            // 架构启动路径同样只启动 MAX_CPUS 个 CPU；固件多余节点不应让已支持
+            // CPU 的拓扑整体失效。
+            continue;
+        };
+        if firmware_mask.contains(cpu_id) {
+            return Err(Errno::EINVAL);
+        }
+        firmware_mask = firmware_mask.union(cpu_id.mask());
+        cpus.push((cpu_id, cpu));
+    }
+    if cpus.is_empty() {
+        return Ok(None);
+    }
+    let has_hierarchy = cpus.iter().any(|(_, cpu)| {
+        cpu.socket_id.is_some()
+            || !cpu.cluster_path.is_empty()
+            || cpu.core_id.is_some()
+            || cpu.thread_id.is_some()
+    });
+    let has_capacity = cpus
+        .iter()
+        .all(|(_, cpu)| cpu.capacity_dmips_mhz.is_some_and(|capacity| capacity != 0));
+    if !has_hierarchy && !has_capacity {
+        return Ok(None);
+    }
+
+    let capacities = firmware_cpu_capacities(&cpus);
+    let mut groups = Vec::new();
+    for (cpu_id, cpu) in &cpus {
+        let mut parent = None;
+        let mut depth = 0usize;
+
+        if let Some(socket_id) = cpu.socket_id {
+            depth += 1;
+            let key = FirmwareSchedGroupKey::Socket(socket_id);
+            add_firmware_sched_group(&mut groups, key.clone(), parent.clone(), *cpu_id, depth)?;
+            parent = Some(key);
+        }
+
+        for cluster_depth in 1..=cpu.cluster_path.len() {
+            depth += 1;
+            let key = FirmwareSchedGroupKey::Cluster {
+                socket_id: cpu.socket_id,
+                path: cpu.cluster_path[..cluster_depth].to_vec(),
+            };
+            add_firmware_sched_group(&mut groups, key.clone(), parent.clone(), *cpu_id, depth)?;
+            parent = Some(key);
+        }
+
+        if let Some(core_id) = cpu.core_id {
+            depth += 1;
+            let key = FirmwareSchedGroupKey::Core {
+                socket_id: cpu.socket_id,
+                cluster_path: cpu.cluster_path.to_vec(),
+                core_id,
+            };
+            add_firmware_sched_group(&mut groups, key.clone(), parent.clone(), *cpu_id, depth)?;
+            parent = Some(key);
+        }
+
+        depth += 1;
+        add_firmware_sched_group(
+            &mut groups,
+            FirmwareSchedGroupKey::Cpu(cpu.logical_id),
+            parent,
+            *cpu_id,
+            depth,
+        )?;
+    }
+
+    groups.sort_by(|left, right| {
+        left.depth
+            .cmp(&right.depth)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+
+    let mut resolved: Vec<(FirmwareSchedGroupKey, Option<usize>)> = Vec::new();
+    let mut built: Vec<FirmwareSchedDomain> = Vec::new();
+    for group in groups {
+        let parent = match group.parent.as_ref() {
+            Some(parent_key) => resolved
+                .iter()
+                .find(|(key, _)| key == parent_key)
+                .map(|(_, domain)| *domain)
+                .ok_or(Errno::EINVAL)?,
+            None => None,
+        };
+        let duplicate_parent_span = parent.is_some_and(|parent| built[parent].span == group.mask);
+        let domain = if group.mask == firmware_mask || duplicate_parent_span {
+            parent
+        } else {
+            if built.len() + 1 >= sched::MAX_SCHED_DOMAINS {
+                return Err(Errno::E2BIG);
+            }
+            let level = parent
+                .map(|parent| built[parent].level)
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(Errno::E2BIG)?;
+            let domain = built.len();
+            built.push(FirmwareSchedDomain {
+                span: group.mask,
+                parent,
+                level,
+                capacity: firmware_domain_capacity(group.mask, &capacities)?,
+            });
+            Some(domain)
+        };
+        resolved.push((group.key, domain));
+    }
+
+    let mut domains = Vec::with_capacity(built.len() + 1);
+    domains.push(sched::SchedDomain::root());
+    for domain in built {
+        let id = domains.len();
+        let parent = domain.parent.map_or(0, |parent| parent + 1);
+        domains.push(sched::SchedDomain::with_capacity(
+            id,
+            domain.span,
+            domain.level,
+            Some(parent),
+            domain.capacity,
+        )?);
+    }
+    sched::SchedTopology::from_domains(&domains).map(Some)
+}
+
+fn firmware_sched_topology() -> Result<Option<sched::SchedTopology>, Errno> {
+    firmware_sched_topology_from(&general::dev::cpu::snapshot_topology())
+}
+
+#[cfg(feature = "kernel-tests")]
+mod firmware_topology_tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use general::dev::cpu::CpuTopologyEntry;
+    use ktest::ktest;
+
+    use super::firmware_sched_topology_from;
+
+    fn cpu(
+        logical_id: u32,
+        cluster_path: &[u32],
+        core_id: Option<u32>,
+        thread_id: Option<u32>,
+        capacity: Option<u32>,
+    ) -> CpuTopologyEntry {
+        CpuTopologyEntry {
+            logical_id,
+            reg: u64::from(logical_id),
+            phandle: Some(logical_id + 1),
+            interrupt_controller_phandles: Vec::new().into_boxed_slice(),
+            compatible: Vec::new(),
+            socket_id: None,
+            cluster_path: cluster_path.to_vec().into_boxed_slice(),
+            core_id,
+            thread_id,
+            capacity_dmips_mhz: capacity,
+        }
+    }
+
+    #[ktest]
+    fn nested_cluster_local_core_ids_remain_scoped() {
+        let entries = vec![
+            cpu(0, &[0], Some(0), Some(0), None),
+            cpu(1, &[0], Some(0), Some(1), None),
+            cpu(2, &[1], Some(0), Some(0), None),
+            cpu(3, &[1], Some(0), Some(1), None),
+        ];
+        let topology = firmware_sched_topology_from(&entries)
+            .expect("valid firmware topology")
+            .expect("firmware topology present");
+
+        let cpu0 = sched::CpuId::new(0).unwrap();
+        let cpu2 = sched::CpuId::new(2).unwrap();
+        let leaf0 = topology.domain_for_cpu(cpu0).unwrap();
+        let leaf2 = topology.domain_for_cpu(cpu2).unwrap();
+        let near0 = topology.domain(leaf0.parent().unwrap()).unwrap();
+        let near2 = topology.domain(leaf2.parent().unwrap()).unwrap();
+        assert_eq!(near0.span().bits(), 0b0011);
+        assert_eq!(near2.span().bits(), 0b1100);
+        assert_ne!(near0.id(), near2.id());
+    }
+
+    #[ktest]
+    fn firmware_capacity_is_normalized_and_used() {
+        let entries = vec![
+            cpu(0, &[], None, None, Some(1)),
+            cpu(1, &[], None, None, Some(2)),
+        ];
+        let topology = firmware_sched_topology_from(&entries)
+            .expect("valid capacities")
+            .expect("capacity topology present");
+
+        assert_eq!(
+            topology.cpu_capacity(sched::CpuId::new(0).unwrap()),
+            sched::SCHED_CAPACITY_SCALE / 2
+        );
+        assert_eq!(
+            topology.cpu_capacity(sched::CpuId::new(1).unwrap()),
+            sched::SCHED_CAPACITY_SCALE
+        );
+    }
+
+    #[ktest]
+    fn firmware_topology_ignores_cpu_ids_beyond_kernel_capacity() {
+        let entries = vec![
+            cpu(0, &[0], Some(0), None, None),
+            cpu(1, &[0], Some(1), None, None),
+            cpu(sched::NR_CPUS as u32, &[1], Some(0), None, None),
+        ];
+        let topology = firmware_sched_topology_from(&entries)
+            .expect("unsupported firmware CPUs must be cropped")
+            .expect("supported topology present");
+
+        assert!(
+            topology
+                .domain_for_cpu(sched::CpuId::new(0).unwrap())
+                .is_some()
+        );
+        assert!(
+            topology
+                .domain_for_cpu(sched::CpuId::new(1).unwrap())
+                .is_some()
+        );
+    }
+}
+
+/// 在架构层完成 boot CPU 优先的 logical-id 重排后安装固件调度拓扑。
+pub fn install_firmware_topology() {
+    match firmware_sched_topology() {
+        Ok(Some(topology)) => {
+            let domains = topology.len();
+            sched::scheduler_state::SCHEDULER.install_topology(topology);
+            log::info!(
+                "[sched][boot] installed firmware CPU topology: domains={}",
+                domains
+            );
+        }
+        Ok(None) => log::info!("[sched][boot] no firmware CPU topology; using Root->Cpu"),
+        Err(error) => log::warning!(
+            "[sched][boot] invalid firmware CPU topology ({:?}); using Root->Cpu",
+            error
+        ),
+    }
+}
+
 /// 启动期入口：注入 arch hook → 注册 ext clone hook → 建 init →
 /// 给 init 装 VfsContext + FdTable → 启动 CPU 0 的 idle 内核线程。
 pub fn boot_init() -> Arc<Task> {
     // 1. arch 侧装入上下文切换 / 时间 / trap-stack / mm / syscall 五套契约。
     hal::sched::register_arch_hooks();
+    assert!(allocator::register_interrupt_ops(&ALLOCATOR_INTERRUPT_OPS));
 
     // 2. 注入 ext clone hook，必须在 sched::init 之前——否则 init 任务后续
     //    任何 fork/clone 都会落到无 hook 的"全共享"分支。
@@ -925,7 +1449,10 @@ pub fn boot_init() -> Arc<Task> {
 
         init.ext_install(TASKEXT_VFS_CONTEXT, vfs_ctx);
         init.ext_install(TASKEXT_VFS_FDTABLE, fdtable);
-        log::info!("[sched][boot] init ext: vfs ctx + fdtable + stdio installed");
+        // 根命名空间（uts/ipc/time/cgroup/pid）。
+        let root_ns: Arc<dyn core::any::Any + Send + Sync> = crate::ns::NsProxy::root();
+        init.ext_install(crate::ns::TASKEXT_NS, root_ns);
+        log::info!("[sched][boot] init ext: vfs ctx + fdtable + stdio + ns installed");
     } else {
         log::info!("[sched][boot] BOOT_VFS_PARTS empty — init has no vfs ext");
     }
@@ -937,12 +1464,129 @@ pub fn boot_init() -> Arc<Task> {
     // 9. 注册全套 syscall 实现（kernel::syscalls::register_all 把 fs/process/
     //    mm/signal 四类实现写进 general::syscall 的全局表）。
     crate::syscalls::register_all();
+    // pid 命名空间：子进程的命名空间由 kernel 的 NsProxy.pending_pid 决定。
+    sched::spawn::register_child_pid_ns_hook(|parent| {
+        crate::ns::task_ns(parent).pending_pid.lock().take()
+    });
     crate::native_runtime::register();
 
     init
 }
 
-const INIT_CANDIDATES: [&str; 3] = ["/init", "/sbin/init", "/bin/init"];
+const RAMDISK_INIT: &str = "/init";
+pub(crate) const INIT_CANDIDATES: [&str; 4] = ["/sbin/init", "/etc/init", "/bin/init", "/bin/sh"];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InitCommandLine<'a> {
+    pub(crate) rdinit: Option<&'a str>,
+    pub(crate) init: Option<&'a str>,
+}
+
+pub(crate) fn parse_init_command_line(cmdline: Option<&[u8]>) -> InitCommandLine<'_> {
+    let Some(cmdline) = cmdline else {
+        return InitCommandLine::default();
+    };
+    let cmdline = general::cmdline::Cmdline::new(cmdline);
+    InitCommandLine {
+        rdinit: cmdline.find("rdinit"),
+        init: cmdline.find("init"),
+    }
+}
+
+pub(crate) fn ramdisk_init_command(cmdline: Option<&[u8]>) -> &str {
+    parse_init_command_line(cmdline)
+        .rdinit
+        .unwrap_or(RAMDISK_INIT)
+}
+
+fn load_init_process(
+    init: &Arc<Task>,
+    path: &str,
+    init_args: &[String],
+    envp: &[String],
+) -> Result<(crate::user::LoadedUserImage, Vec<String>), Errno> {
+    let mut argv = Vec::with_capacity(init_args.len() + 1);
+    argv.push(String::from(path));
+    argv.extend(init_args.iter().cloned());
+    let loaded = crate::user::load_user_image_from_path(init, path, &argv, envp)?;
+    Ok((loaded, argv))
+}
+
+fn enter_init_process(
+    init: &Arc<Task>,
+    path: &str,
+    envp: &[String],
+    loaded: crate::user::LoadedUserImage,
+    argv: &[String],
+) -> ! {
+    log::info!("[sched][init] starting user init '{}'", path);
+    enter_loaded_user_image(init, loaded, argv, envp)
+}
+
+/// 提取独立 `--` 之后交给 PID 1 的参数。Linux 的 `set_init_arg()` 会把这些
+/// token 作为 argv，而不是当作内核参数或环境变量；这里按 Linux `next_arg()`
+/// 的双引号规则分词并返回拥有的字符串，避免修改固件提供的只读快照。
+pub(crate) fn init_args_after_delimiter(cmdline: Option<&[u8]>) -> Vec<String> {
+    let Some(bytes) = cmdline else {
+        return Vec::new();
+    };
+    let end = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len());
+    let bytes = &bytes[..end];
+    let mut cursor = 0usize;
+    let mut after_delimiter = false;
+    let mut args = Vec::new();
+
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor == bytes.len() {
+            break;
+        }
+        let start = cursor;
+        let mut quote = false;
+        while cursor < bytes.len() {
+            let byte = bytes[cursor];
+            if byte == b'"' {
+                quote = !quote;
+            } else if byte.is_ascii_whitespace() && !quote {
+                break;
+            }
+            cursor += 1;
+        }
+        let token = &bytes[start..cursor];
+        if !after_delimiter {
+            if token == b"--" || token == b"\"--\"" {
+                after_delimiter = true;
+            }
+            continue;
+        }
+
+        args.push(decode_linux_init_arg(token));
+    }
+    args
+}
+
+fn decode_linux_init_arg(token: &[u8]) -> String {
+    let token = if token.first() == Some(&b'"') {
+        let token = &token[1..];
+        token.strip_suffix(b"\"").unwrap_or(token)
+    } else if let Some(equals) = token.iter().position(|&byte| byte == b'=')
+        && token.get(equals + 1) == Some(&b'"')
+        && token.last() == Some(&b'"')
+    {
+        let mut value = Vec::with_capacity(token.len().saturating_sub(2));
+        value.extend_from_slice(&token[..=equals]);
+        value.extend_from_slice(&token[equals + 2..token.len() - 1]);
+        return String::from_utf8_lossy(&value).into_owned();
+    } else {
+        token
+    };
+    String::from_utf8_lossy(token).into_owned()
+}
 
 /// Replace the boot init task with the first user-space init image that exists.
 ///
@@ -954,26 +1598,41 @@ pub fn start_init_process(init: &Arc<Task>) -> ! {
         String::from("HOME=/"),
         String::from("TERM=linux"),
     ];
-    let mut last_error = Errno::ENOENT;
+    let commands = parse_init_command_line(general::start_cmdline());
+    let init_args = init_args_after_delimiter(general::start_cmdline());
 
-    for path in INIT_CANDIDATES {
-        let argv = [String::from(path)];
-        match crate::user::load_user_image_from_path(init, path, &argv, &envp) {
-            Ok(loaded) => {
-                log::info!("[sched][init] starting user init '{}'", path);
-                enter_loaded_user_image(init, loaded, &argv, &envp)
-            }
-            Err(err) => {
-                last_error = err;
-                log::info!("[sched][init] cannot start '{}': {:?}", path, err);
-            }
+    if BOOT_ROOT_IS_INITRAMFS.load(Ordering::Acquire) {
+        let path = ramdisk_init_command(general::start_cmdline());
+        match load_init_process(init, path, &init_args, &envp) {
+            Ok((loaded, argv)) => enter_init_process(init, path, &envp, loaded, &argv),
+            Err(err) => log::error!(
+                "[sched][init] failed to execute ramdisk init '{}': {:?}",
+                path,
+                err
+            ),
         }
     }
 
-    panic!(
-        "[sched][init] failed to start init from {:?}: last error {:?}",
-        INIT_CANDIDATES, last_error
-    );
+    if let Some(path) = commands.init {
+        match load_init_process(init, path, &init_args, &envp) {
+            Ok((loaded, argv)) => enter_init_process(init, path, &envp, loaded, &argv),
+            Err(err) => panic!("[sched][init] requested init '{}' failed: {:?}", path, err),
+        }
+    }
+
+    for path in INIT_CANDIDATES {
+        match load_init_process(init, path, &init_args, &envp) {
+            Ok((loaded, argv)) => enter_init_process(init, path, &envp, loaded, &argv),
+            Err(Errno::ENOENT) => {}
+            Err(err) => log::error!(
+                "[sched][init] '{}' exists but could not be executed: {:?}",
+                path,
+                err
+            ),
+        }
+    }
+
+    panic!("[sched][init] no working init found; try passing init= to the kernel");
 }
 
 fn enter_loaded_user_image(
@@ -983,18 +1642,21 @@ fn enter_loaded_user_image(
     envp: &[String],
 ) -> ! {
     let exec_path = loaded.exec_path.clone();
-    let _ = task.ext_remove(TASKEXT_VM_SPACE);
+    // 保留旧地址空间的最后一个引用，直到新页表已经安装。否则 ext_remove
+    // 会立即 drop 旧 VmSpace，而 RISC-V 仍可能把它记在 CURRENT_USER_PGD 中。
+    let old_vm = task.ext_remove(TASKEXT_VM_SPACE);
     task.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
     install_exec_access(task, Arc::clone(&loaded.exec_access));
     install_exec_metadata(task, &exec_path, argv, envp);
     #[cfg(feature = "performance-profile")]
     install_profile_images(task, &loaded);
     if let Some(fdt) = task_fdtable(task) {
-        fdt.close_on_exec();
+        fdt.close_on_exec(task.pid_root().unwrap_or(0));
     }
 
     let kstack_top = task.ensure_kernel_stack();
     loaded.vm.activate();
+    drop(old_vm);
     hal::user_context::set_kernel_trap_stack(kstack_top);
     let mut frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
     frame.set_kernel_stack_top(kstack_top);

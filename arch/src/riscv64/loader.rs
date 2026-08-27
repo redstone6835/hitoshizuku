@@ -26,7 +26,7 @@
 
 use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::riscv64::early_console;
 use crate::riscv64::heap_vm;
@@ -48,6 +48,13 @@ const DTB_BUF_SIZE: usize = 4096 * 1024;
 
 /// DTB 快照的有效长度，0 表示使用零拷贝路径。
 static DTB_VALID_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether every enabled hart advertises the Svvptc extension.
+static HAS_SVVPTC: AtomicBool = AtomicBool::new(false);
+
+pub fn has_svvptc() -> bool {
+    HAS_SVVPTC.load(Ordering::Acquire)
+}
 
 /// DTB 快照缓冲区的 Sync 包装（UnsafeCell 本身非 Sync）。
 struct DtbBuffer(UnsafeCell<[u8; DTB_BUF_SIZE]>);
@@ -200,11 +207,13 @@ fn detect_isa_extensions(dtb: &Dtb<'_>) {
     let mut common_cboz_block_size = None;
     let mut zicbom_common = true;
     let mut zicboz_common = true;
+    let mut svvptc_common = true;
     for cpu_node in cpus.children() {
         if cpu_node.base_name_bytes() != b"cpu" || !cpu_node_enabled(cpu_node) {
             continue;
         }
         enabled_harts += 1;
+        svvptc_common &= cpu_has_extension(cpu_node, b"svvptc");
         if !first_isa_processed {
             first_isa_processed = true;
             if let Some(isa_prop) = cpu_node.find_property("riscv,isa") {
@@ -259,6 +268,7 @@ fn detect_isa_extensions(dtb: &Dtb<'_>) {
             );
         }
     }
+    HAS_SVVPTC.store(enabled_harts != 0 && svvptc_common, Ordering::Release);
 }
 
 fn cache_block_size(

@@ -35,6 +35,7 @@ pub mod msi;
 pub mod naming;
 pub mod net;
 pub mod numa;
+pub mod partition;
 pub mod pci;
 pub mod platform;
 pub mod pm_qos;
@@ -44,6 +45,7 @@ pub mod random;
 pub mod random_source;
 pub mod rtc;
 pub mod syscon;
+pub mod tty;
 pub mod usb;
 pub mod wdt;
 

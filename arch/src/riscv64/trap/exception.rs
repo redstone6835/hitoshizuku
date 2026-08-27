@@ -96,9 +96,10 @@ fn finish_fast_syscall_return_work(tf_ptr: usize, task: &alloc::sync::Arc<sched:
         if cpu_work {
             require_full_restore = true;
             sched::run_post_syscall_handoff_lazy();
-            if sched::needs_resched_current() {
-                sched::preempt_if_needed(kernel_timestamp_ns());
-            }
+            // CPU 返回工作不只包含 need_resched；周期负载均衡可以只置
+            // need_balance。这里已经处在安全调度边界，必须让调度器统一消费，
+            // 否则 refresh_user_return_work_on() 会不断重新武装 hint 而形成活锁。
+            sched::preempt_if_needed(kernel_timestamp_ns());
         }
         if task.has_deliverable_signal() {
             require_full_restore = true;
@@ -385,6 +386,8 @@ fn handle_interrupt(tf_ptr: usize, cause: usize, code: usize, from_user: bool) -
             }
         }
         vdso::run_timer_tick_hook(now_ns);
+        // tick 级 user/system 记账：按被中断上下文把本段增量计入用户时间。
+        sched::account_tick_user_system(now_ns, from_user);
         // timer 可打断持有 runqueue、topology 等普通自旋锁的内核路径。
         // top-half 只记录待处理时间；syscall 返回或下一次主动调度会在无锁
         // 边界补做调度工作，避免同一 CPU 重入锁后永久自旋。
@@ -439,6 +442,15 @@ fn handle_user_syscall(tf_ptr: usize) -> usize {
         let tf = unsafe { trap_frame_ref(tf_ptr) };
         (tf.a7, tf.satp)
     };
+    // 被 ptrace 跟踪的任务：保存用户 trap frame 快照，供 tracer 的
+    // PTRACE_GETREGSET/PEEKUSR 在 syscall-stop 期间读取。
+    if sched::current_task().is_ptrace_traced() {
+        let task = sched::current_task();
+        let erased: alloc::sync::Arc<dyn core::any::Any + Send + Sync> =
+            alloc::sync::Arc::new(*unsafe { trap_frame_ref(tf_ptr) });
+        let _ = task.ext_remove(sched::TASKEXT_PTRACE_FRAME);
+        task.ext_install(sched::TASKEXT_PTRACE_FRAME, erased);
+    }
     #[cfg(feature = "syscall-model-markers")]
     let _syscall_model = {
         let task = sched::current_task();
@@ -599,8 +611,27 @@ fn handle_user_illegal_instruction(tf_ptr: usize, code: usize) -> usize {
     }
 }
 
+static USER_BREAK_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 注册用户态断点陷阱钩子（ptrace 单步补丁法使用）。
+pub fn register_user_break_hook(hook: fn(usize) -> bool) {
+    USER_BREAK_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
+}
+
 fn handle_breakpoint(tf_ptr: usize, code: usize, from_user: bool) -> usize {
     if from_user {
+        let sepc = {
+            let tf = unsafe { trap_frame_ref(tf_ptr) };
+            tf.sepc
+        };
+        let hook = USER_BREAK_HOOK.load(core::sync::atomic::Ordering::Acquire);
+        if hook != 0 {
+            // Safety: register_user_break_hook 只写入 fn(usize) -> bool 指针。
+            let hook_fn: fn(usize) -> bool = unsafe { core::mem::transmute(hook) };
+            if hook_fn(sepc) {
+                return finish_trap_return(tf_ptr, true);
+            }
+        }
         return terminate_user_exception(code, sched::SignalNumber::SIGTRAP, tf_ptr, true);
     }
     if let Some(recovered) = try_recover_elm_kernel_fault(tf_ptr, code, "native breakpoint") {
@@ -716,6 +747,15 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
         let tf = unsafe { trap_frame_ref(tf_ptr) };
         (tf.a7, [tf.a0, tf.a1, tf.a2, tf.a3, tf.a4, tf.a5], tf.satp)
     };
+    // 被 ptrace 跟踪的任务：保存用户 trap frame 快照，供 tracer 的
+    // PTRACE_GETREGSET/PEEKUSR 在 syscall-stop 期间读取。
+    if task.as_arc().is_ptrace_traced() {
+        let erased: alloc::sync::Arc<dyn core::any::Any + Send + Sync> =
+            alloc::sync::Arc::new(*unsafe { trap_frame_ref(tf_ptr) });
+        let _ = task.as_arc().ext_remove(sched::TASKEXT_PTRACE_FRAME);
+        task.as_arc()
+            .ext_install(sched::TASKEXT_PTRACE_FRAME, erased);
+    }
     #[cfg(feature = "syscall-model-markers")]
     let _syscall_model = profiling::syscall_model_scope(
         task.as_arc().profile_session_id(),

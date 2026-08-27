@@ -95,6 +95,8 @@ mod vmem;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
+use core::mem::ManuallyDrop;
+use core::ops::{Deref, DerefMut};
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -107,7 +109,104 @@ use spin::relax::RelaxStrategy;
 /// 迭代处理一次已注册的无分配回调，使 shootdown 可以完成。
 pub struct AllocatorRelax;
 
-pub(crate) type Mutex<T> = spin::mutex::Mutex<T, AllocatorRelax>;
+type RawMutex<T> = spin::mutex::Mutex<T, AllocatorRelax>;
+
+/// allocator 自旋锁使用的本地中断控制钩子。
+///
+/// 运行期设备中断可能唤醒任务并释放最后一个引用，从而进入 allocator。普通内核路径
+/// 持有 allocator 锁时必须关闭本地中断，否则同核中断会重入同一把锁并永久自旋。
+#[derive(Clone, Copy)]
+pub struct InterruptOps {
+    pub save_and_disable: fn() -> usize,
+    pub restore: fn(usize),
+}
+
+static INTERRUPT_OPS: AtomicUsize = AtomicUsize::new(0);
+
+/// 注册 allocator 锁使用的本地中断控制钩子。
+///
+/// 钩子在注册后不得替换或释放；重复注册同一张静态表是幂等的。
+pub fn register_interrupt_ops(ops: &'static InterruptOps) -> bool {
+    let address = ops as *const InterruptOps as usize;
+    match INTERRUPT_OPS.compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => true,
+        Err(current) => current == address,
+    }
+}
+
+#[inline]
+fn interrupt_ops() -> Option<InterruptOps> {
+    let address = INTERRUPT_OPS.load(Ordering::Acquire);
+    if address == 0 {
+        return None;
+    }
+    // Safety: register_interrupt_ops 只接受静态表，注册后不再替换或释放。
+    Some(unsafe { *(address as *const InterruptOps) })
+}
+
+#[doc(hidden)]
+pub struct Mutex<T: ?Sized> {
+    inner: RawMutex<T>,
+}
+
+impl<T> Mutex<T> {
+    #[inline(always)]
+    pub const fn new(value: T) -> Self {
+        Self {
+            inner: RawMutex::new(value),
+        }
+    }
+}
+
+impl<T: ?Sized> Mutex<T> {
+    #[inline(always)]
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        self.lock_with_interrupt_ops(interrupt_ops())
+    }
+
+    #[inline(always)]
+    fn lock_with_interrupt_ops(&self, ops: Option<InterruptOps>) -> MutexGuard<'_, T> {
+        let interrupt_state = ops.map(|ops| ((ops.save_and_disable)(), ops.restore));
+        let guard = self.inner.lock();
+        MutexGuard {
+            guard: ManuallyDrop::new(guard),
+            interrupt_state,
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct MutexGuard<'a, T: ?Sized> {
+    guard: ManuallyDrop<spin::mutex::MutexGuard<'a, T>>,
+    interrupt_state: Option<(usize, fn(usize))>,
+}
+
+impl<T: ?Sized> Deref for MutexGuard<'_, T> {
+    type Target = T;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl<T: ?Sized> Drop for MutexGuard<'_, T> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // 必须先释放锁再恢复中断，否则 pending 中断可在锁仍被持有时立刻重入。
+        unsafe { ManuallyDrop::drop(&mut self.guard) };
+        if let Some((state, restore)) = self.interrupt_state.take() {
+            restore(state);
+        }
+    }
+}
 
 const ORDER0_PAGE_CACHE_CAPACITY: usize = 64;
 const ORDER0_PAGE_CACHE_REFILL: usize = 32;
@@ -249,7 +348,8 @@ use slab::SlabAllocator;
 
 pub use buddy::{
     BuddyAllocError as PhysicalAllocError, BuddyAllocator as PhysicalAllocator, BuddyAudit,
-    BuddyAuditFlags, BuddyReclaimStats, BuddySnapshot, BuddyStats, MemorySegment, PAGE_SIZE,
+    BuddyAuditFlags, BuddyNumaError, BuddyReclaimStats, BuddySnapshot, BuddyStats, MemorySegment,
+    NumaMemoryRange, PAGE_SIZE,
 };
 pub use error::{
     AddressSpaceError, AllocationError, DeallocationError, InitError, OwnedAllocationError,
@@ -296,6 +396,7 @@ pub type VirtToPhysFn = fn(vaddr: usize) -> usize;
 pub type CpuIdFn = fn() -> usize;
 pub type UrgentPollFn = fn();
 pub type KernelHeapRegionFn = fn() -> (usize, usize);
+pub type ExternalReclaimFn = fn(limit: usize) -> usize;
 pub type MapKernelHeapRangeFn =
     fn(vaddr: usize, paddr: usize, size: usize, page_policy: PagePolicy) -> bool;
 pub type UnmapKernelHeapRangeFn = fn(vaddr: usize, size: usize) -> bool;
@@ -314,6 +415,7 @@ pub struct AllocationAccountingOps {
 }
 
 static ALLOCATION_ACCOUNTING_OPS: AtomicUsize = AtomicUsize::new(0);
+static EXTERNAL_RECLAIM_FN: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATION_ACCOUNTING_SUSPEND_DEPTH: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(0) }; MAX_CPUS];
 static ALLOCATION_ACCOUNTING_OWNER: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
@@ -389,6 +491,18 @@ pub fn register_allocation_accounting_ops(ops: &'static AllocationAccountingOps)
         Ordering::AcqRel,
         Ordering::Acquire,
     ) {
+        Ok(_) => true,
+        Err(current) => current == address,
+    }
+}
+
+/// 注册 allocator 重试前调用的外部可回收缓存回调。
+///
+/// 回调运行在分配失败路径，不能分配、阻塞或再次进入 allocator；重复注册同一回调幂等，
+/// 替换已经生效的回调会失败。
+pub fn register_external_reclaim_hook(reclaim: ExternalReclaimFn) -> bool {
+    let address = reclaim as usize;
+    match EXTERNAL_RECLAIM_FN.compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => true,
         Err(current) => current == address,
     }
@@ -722,6 +836,16 @@ impl KernelMemorySubsystem {
                 })
             }
         }
+    }
+
+    /// Installs NUMA labels for physical ranges after the allocator is initialized.
+    pub fn install_numa_ranges(&self, ranges: &[NumaMemoryRange]) -> Result<(), BuddyNumaError> {
+        self.phys.lock().install_numa_ranges(ranges)
+    }
+
+    /// Returns the NUMA node associated with a managed physical address.
+    pub fn physical_numa_node(&self, paddr: usize) -> Option<u32> {
+        self.phys.lock().numa_node_for_addr(paddr)
     }
 
     pub fn init_kheap(&self) {
@@ -2541,8 +2665,21 @@ impl KernelMemorySubsystem {
         // kheap range cache、slab per-CPU cache/空 slab、buddy order-0 延迟合并页。
         // 这不是周期性整理，而是 OOM 前的最后防线，避免大规模短生命周期任务结束后
         // 大量页仍停在内部缓存里，后续请求却继续向 buddy 要新页。
-        self.reclaim(AllocatorReclaimRequest::caches())
-            .unwrap_or_default()
+        let stats = self
+            .reclaim(AllocatorReclaimRequest::caches())
+            .unwrap_or_default();
+        let _ = self.reclaim_external_caches_for_retry(4096);
+        stats
+    }
+
+    fn reclaim_external_caches_for_retry(&self, limit: usize) -> usize {
+        let address = EXTERNAL_RECLAIM_FN.load(Ordering::Acquire);
+        if address == 0 {
+            return 0;
+        }
+        // Safety: 注册接口只接受函数指针，且注册后不会替换或释放。
+        let reclaim: ExternalReclaimFn = unsafe { core::mem::transmute(address) };
+        reclaim(limit)
     }
 
     pub fn load_phys_to_virt(&self) -> Option<PhysToVirtFn> {
@@ -3202,14 +3339,27 @@ mod tests;
 
 #[cfg(test)]
 mod host_tests {
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use super::{KernelMemorySubsystem, Order0PageCacheState, PagePolicy};
+    use super::{InterruptOps, KernelMemorySubsystem, Mutex, Order0PageCacheState, PagePolicy};
 
     static TRACKED_REGION_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TRACKED_REGION_START: AtomicUsize = AtomicUsize::new(0x4000);
     static TRACKED_REGION_SIZE: AtomicUsize = AtomicUsize::new(0x2000);
     static TEST_ALLOCATOR: KernelMemorySubsystem = KernelMemorySubsystem::new();
+    static TEST_INTERRUPTS_ENABLED: AtomicBool = AtomicBool::new(true);
+    static TEST_INTERRUPT_SAVES: AtomicUsize = AtomicUsize::new(0);
+    static TEST_INTERRUPT_RESTORES: AtomicUsize = AtomicUsize::new(0);
+
+    fn save_and_disable_test_interrupts() -> usize {
+        TEST_INTERRUPT_SAVES.fetch_add(1, Ordering::Relaxed);
+        TEST_INTERRUPTS_ENABLED.swap(false, Ordering::AcqRel) as usize
+    }
+
+    fn restore_test_interrupts(state: usize) {
+        TEST_INTERRUPT_RESTORES.fetch_add(1, Ordering::Relaxed);
+        TEST_INTERRUPTS_ENABLED.store(state != 0, Ordering::Release);
+    }
 
     fn kernel_region() -> (usize, usize) {
         (0x1000, 0x1000)
@@ -3229,6 +3379,31 @@ mod host_tests {
 
     fn unmap_range(_vaddr: usize, _size: usize) -> bool {
         true
+    }
+
+    #[test]
+    fn allocator_mutex_restores_nested_interrupt_state_after_unlock() {
+        TEST_INTERRUPTS_ENABLED.store(true, Ordering::Release);
+        TEST_INTERRUPT_SAVES.store(0, Ordering::Relaxed);
+        TEST_INTERRUPT_RESTORES.store(0, Ordering::Relaxed);
+        let ops = InterruptOps {
+            save_and_disable: save_and_disable_test_interrupts,
+            restore: restore_test_interrupts,
+        };
+        let outer = Mutex::new(1usize);
+        let inner = Mutex::new(2usize);
+
+        let outer_guard = outer.lock_with_interrupt_ops(Some(ops));
+        assert!(!TEST_INTERRUPTS_ENABLED.load(Ordering::Acquire));
+        let inner_guard = inner.lock_with_interrupt_ops(Some(ops));
+        assert!(!TEST_INTERRUPTS_ENABLED.load(Ordering::Acquire));
+
+        drop(inner_guard);
+        assert!(!TEST_INTERRUPTS_ENABLED.load(Ordering::Acquire));
+        drop(outer_guard);
+        assert!(TEST_INTERRUPTS_ENABLED.load(Ordering::Acquire));
+        assert_eq!(TEST_INTERRUPT_SAVES.load(Ordering::Relaxed), 2);
+        assert_eq!(TEST_INTERRUPT_RESTORES.load(Ordering::Relaxed), 2);
     }
 
     #[test]

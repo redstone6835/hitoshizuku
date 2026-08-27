@@ -303,12 +303,19 @@ pub fn resolve_memory_layout(
             windows.push(native_range(range, Some(request.node), "alloc-ranges")?);
         }
 
-        let allocated = first_fit(&allocation_space, size, alignment, &windows).ok_or(
-            DtbMemoryLayoutError::DynamicAllocationFailed {
+        let Some(allocated) = first_fit(&allocation_space, size, alignment, &windows) else {
+            if request.reusable {
+                // DT 规范：reusable 允许 OS 复用该区域。本内核没有 CMA 式回收
+                // 协议，无法放置的动态 reusable 请求（例如 linux,cma 的窗口被
+                // 内核镜像落点切碎，见 VF2 DTB）跳过保留即可，区域留给通用分配器。
+                resolved_ranges[index] = Some(alloc::vec![]);
+                continue;
+            }
+            return Err(DtbMemoryLayoutError::DynamicAllocationFailed {
                 node: request.node,
                 size,
-            },
-        )?;
+            });
+        };
         allocation_space = subtract_segments(&allocation_space, &[allocated])?;
         usable_segments = subtract_segments(&usable_segments, &[allocated])?;
         reserved_segments.push(allocated);
@@ -325,6 +332,10 @@ pub fn resolve_memory_layout(
         .zip(resolved_ranges.into_iter())
     {
         let ranges = ranges.expect("every valid reserved-memory request is resolved");
+        if ranges.is_empty() {
+            // 无法放置的 reusable 动态请求（解析阶段已判定可省略）不进入快照。
+            continue;
+        }
         if request.no_map {
             no_map_segments.extend(ranges.iter().copied());
         }

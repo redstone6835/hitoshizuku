@@ -580,6 +580,21 @@ pub(crate) fn rearm_local_timer(deadline_ns: Option<u64>) {
     }
 }
 
+/// Writes one early boot marker to the LS2K1000 UART when explicitly enabled.
+pub(crate) fn debug_mark(byte: u8) {
+    #[cfg(mygo_board_debug_uart)]
+    {
+        const DEBUG_UART: usize = 0x8000_0000_1fe2_0000;
+        // Safety: the debug-only board profile maps UART0 through uncached DMW0.
+        while unsafe { core::ptr::read_volatile((DEBUG_UART + 5) as *const u8) } & 0x20 == 0 {}
+        unsafe { core::ptr::write_volatile(DEBUG_UART as *mut u8, byte) };
+    }
+    #[cfg(not(mygo_board_debug_uart))]
+    {
+        let _ = byte;
+    }
+}
+
 /// LoongArch64 平台内核架构加载器入口。
 ///
 /// 本函数由汇编引导代码（`_start_virtualized`）在以下前置条件均满足后调用：

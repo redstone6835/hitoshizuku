@@ -314,6 +314,7 @@ dependencies = [
  "mm",
  "native-abi",
  "net",
+ "ns",
  "profiling",
  "sched",
  "smallvec",
@@ -398,6 +399,7 @@ dependencies = [
  "mm",
  "native-abi",
  "net",
+ "ns",
  "profiling",
  "sched",
  "sha2",
@@ -534,6 +536,7 @@ dependencies = [
 name = "net"
 version = "0.1.0"
 dependencies = [
+ "allocator",
  "elm",
  "hashbrown",
  "kernel-symbols",
@@ -609,6 +612,15 @@ dependencies = [
  "spin",
  "vfs",
  "virtio-consumer",
+]
+
+[[package]]
+name = "ns"
+version = "0.1.0"
+dependencies = [
+ "errno",
+ "sched",
+ "spin",
 ]
 
 [[package]]
@@ -1619,6 +1631,7 @@ dependencies = [
  "ktest",
  "mm",
  "net",
+ "ns",
  "profiling",
  "sched",
  "socket",

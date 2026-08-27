@@ -1,8 +1,71 @@
+use alloc::vec;
+use alloc::vec::Vec;
 use hashbrown::HashTable;
+use spin::Mutex;
 
 use crate::{InterfaceId, IpAddr};
 
 const MAX_NEIGHBORS: usize = 512;
+
+/// 邻居镜像表条目（跨 shard 聚合快照，供 netlink/procfs 观测）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NeighborSnapshotEntry {
+    pub interface: InterfaceId,
+    pub address: IpAddr,
+    pub mac: [u8; 6],
+    /// NUD 状态位：REACHABLE=0x02 / STALE=0x04。
+    pub nud_state: u16,
+}
+
+/// 全局邻居镜像：observe/confirm/invalidate 时与 per-shard 表双写。
+/// 只服务于观测接口（RTM_GETNEIGH、/proc/net/arp），不做转发决策。
+static NEIGHBOR_MIRROR: Mutex<Vec<NeighborSnapshotEntry>> = Mutex::new(Vec::new());
+
+/// 返回全部 shard 的邻居镜像快照。
+pub fn neighbor_snapshot() -> Vec<NeighborSnapshotEntry> {
+    NEIGHBOR_MIRROR.lock().clone()
+}
+
+/// 清空当前网络栈代际发布的邻居镜像，并释放其后备存储。
+///
+/// 镜像条目来自动态 net.stack，但由常驻 netlink/procfs 观测接口持有。代际卸载时必须
+/// 同时丢弃旧条目和 Vec 容量，避免旧邻居泄漏到新代际，也避免 allocator 继续记账到
+/// 已卸载的 ELM owner。
+pub fn clear_neighbor_snapshot() -> usize {
+    let retired = {
+        let mut mirror = NEIGHBOR_MIRROR.lock();
+        core::mem::take(&mut *mirror)
+    };
+    let removed = retired.len();
+    drop(retired);
+    removed
+}
+
+fn mirror_observe(key: NeighborKey, mac_address: [u8; 6], now_ns: u64, reachable: bool) {
+    // 邻居镜像属于常驻内核，不能把延迟扩容记到发起观察的可卸载 ELM。
+    let _accounting = allocator::suspend_implicit_allocation_accounting();
+    let mut mirror = NEIGHBOR_MIRROR.lock();
+    let entry = NeighborSnapshotEntry {
+        interface: key.interface,
+        address: key.address,
+        mac: mac_address,
+        nud_state: if reachable { 0x02 } else { 0x04 },
+    };
+    if let Some(existing) = mirror
+        .iter_mut()
+        .find(|candidate| candidate.interface == key.interface && candidate.address == key.address)
+    {
+        *existing = entry;
+        return;
+    }
+    mirror.push(entry);
+}
+
+fn mirror_remove(interface: InterfaceId) {
+    NEIGHBOR_MIRROR
+        .lock()
+        .retain(|entry| entry.interface != interface);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NeighborKey {
@@ -54,6 +117,7 @@ impl NeighborTable {
             entry.mac_address = mac_address;
             entry.reachable_until_ns = now_ns.saturating_add(30_000_000_000);
             entry.stale_until_ns = now_ns.saturating_add(90_000_000_000);
+            mirror_observe(key, mac_address, now_ns, true);
             return Ok(entry.generation);
         }
         if self.entries.len() == MAX_NEIGHBORS {
@@ -73,6 +137,7 @@ impl NeighborTable {
             },
             |entry| entry.hash,
         );
+        mirror_observe(key, mac_address, now_ns, true);
         Ok(generation)
     }
 
@@ -100,6 +165,7 @@ impl NeighborTable {
         }
         entry.reachable_until_ns = now_ns.saturating_add(30_000_000_000);
         entry.stale_until_ns = now_ns.saturating_add(90_000_000_000);
+        mirror_observe(key, entry.mac_address, now_ns, true);
         true
     }
 
@@ -107,6 +173,7 @@ impl NeighborTable {
         let before = self.entries.len();
         self.entries
             .retain(|entry| entry.key.interface != interface);
+        mirror_remove(interface);
         before - self.entries.len()
     }
 }
@@ -130,8 +197,12 @@ mod tests {
     use super::*;
     use crate::Ipv4Addr;
 
+    static NEIGHBOR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn reachable_entry_becomes_stale_then_expires() {
+        let _guard = NEIGHBOR_TEST_LOCK.lock();
+        NEIGHBOR_MIRROR.lock().clear();
         let mut table = NeighborTable::new([4; 16]);
         let key = NeighborKey {
             interface: InterfaceId(1),
@@ -141,5 +212,22 @@ mod tests {
         assert!(!table.lookup(key, 1).unwrap().2);
         assert!(table.lookup(key, 31_000_000_000).unwrap().2);
         assert!(table.lookup(key, 91_000_000_000).is_none());
+    }
+
+    #[test]
+    fn clearing_neighbor_snapshot_removes_previous_generation_entries() {
+        let _guard = NEIGHBOR_TEST_LOCK.lock();
+        NEIGHBOR_MIRROR.lock().clear();
+        let mut table = NeighborTable::new([5; 16]);
+        let key = NeighborKey {
+            interface: InterfaceId(2),
+            address: IpAddr::V4(Ipv4Addr::new(10, 0, 2, 3)),
+        };
+
+        table.observe(key, [2, 0, 0, 0, 0, 2], 0).unwrap();
+        assert_eq!(neighbor_snapshot().len(), 1);
+        assert_eq!(clear_neighbor_snapshot(), 1);
+        assert!(neighbor_snapshot().is_empty());
+        assert_eq!(NEIGHBOR_MIRROR.lock().capacity(), 0);
     }
 }

@@ -599,12 +599,12 @@ impl Uart16550 {
         if duration_ms == 0 {
             return Ok(());
         }
-        let start = sched::now_ns_public();
+        let start = hal::time::monotonic_ns();
         if start == 0 {
             return Err(ControlError::Busy);
         }
         let deadline = start.saturating_add((duration_ms as u64).saturating_mul(NS_PER_MS));
-        while sched::now_ns_public() < deadline {
+        while hal::time::monotonic_ns() < deadline {
             if sched::is_ready() {
                 sched::schedule_once(0);
             } else {
@@ -1001,6 +1001,8 @@ impl Uart16550PlatformDriver {
     }
 
     fn matches_platform(info: &PlatformDeviceInfo) -> bool {
+        // DW_APB 串口（JH7110 等）由 platform-jh7110-uart 专属驱动接管，
+        // 避免两个内建驱动同时匹配同一节点触发 DriverAmbiguous。
         info.has_id("ns16550")
             || info.has_id("ns16550a")
             || info.has_id("PNP0500")

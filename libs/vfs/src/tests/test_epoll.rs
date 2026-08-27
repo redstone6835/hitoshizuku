@@ -229,7 +229,7 @@ fn epoll_watch_survives_forked_cloexec_close() {
     .unwrap();
 
     let child = fdt.fork();
-    child.close_on_exec();
+    child.close_on_exec(0);
 
     fdt.get_file(eventfd)
         .unwrap()

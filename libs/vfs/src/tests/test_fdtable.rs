@@ -150,7 +150,7 @@ fn descriptor_generation_tracks_bulk_exec_mutations() {
     table.close_range(0, 1, true);
     assert!(table.is_generation_current(after_cloexec.generation()));
 
-    table.close_on_exec();
+    table.close_on_exec(0);
     assert!(!table.is_generation_current(after_cloexec.generation()));
     assert!(
         table

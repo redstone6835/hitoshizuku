@@ -70,6 +70,8 @@ pub enum PagePolicy {
 pub enum MemoryPlacement {
     Any,
     LowMem,
+    /// 只从指定固件 NUMA node 分配；该节点内碎片不足时不跨节点回退。
+    NumaNode(u32),
     ExactPhys(usize),
 }
 

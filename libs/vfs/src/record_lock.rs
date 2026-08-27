@@ -1,9 +1,15 @@
-//! POSIX byte-range advisory record lock 管理器。
+//! POSIX / OFD byte-range advisory record lock 管理器。
 //!
-//! 这里实现的是 `fcntl(F_GETLK/F_SETLK/F_SETLKW)` 背后的 VFS 级记录锁。
-//! 它和 BSD `flock(2)` 是两套独立语义：`flock` 的 owner 是打开文件描述，
-//! record lock 的 owner 是进程，因此同一进程在同一 inode 上的新锁会替换或
-//! 合并旧锁，任意一个指向该 inode 的 fd 关闭时都要释放该进程的记录锁。
+//! 这里实现 `fcntl(F_GETLK/F_SETLK/F_SETLKW)` 与 `fcntl(F_OFD_GETLK/F_OFD_SETLK/
+//! F_OFD_SETLKW)` 背后的 VFS 级记录锁。它和 BSD `flock(2)` 是两套独立语义。
+//!
+//! 两类 record lock 的 owner 语义不同：
+//! - **POSIX 锁**的 owner 是进程：同一进程在同一 inode 上的新锁会替换/合并旧锁，
+//!   任意指向该 inode 的 fd 关闭时都要释放该进程的记录锁；`F_GETLK` 返回冲突
+//!   进程 pid。
+//! - **OFD 锁**的 owner 是打开文件描述（open file description）：`fork`/`dup`
+//!   共享同一 OFD 的进程可以协同解锁，只有最后一个引用该 OFD 的 fd 关闭时才
+//!   释放；`F_OFD_GETLK` 返回 `l_pid == -1`。
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
@@ -33,7 +39,7 @@ impl LockKey {
     }
 }
 
-/// POSIX record lock 类型。
+/// POSIX/OFD record lock 类型。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordLockType {
     Read,
@@ -75,9 +81,42 @@ pub struct RecordLockConflict {
     pub owner_pid: i32,
 }
 
-#[derive(Clone, Copy, Debug)]
+/// owner 种类：进程（POSIX）或打开文件描述（OFD）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum OwnerKind {
+    Process,
+    Ofd,
+}
+
+/// record lock 的 owner 身份。`id` 对 Process 是 pid，对 Ofd 是打开文件描述
+/// （`Arc<File>` 数据块地址）的唯一标识。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct RecordOwner {
-    pid: i32,
+    kind: OwnerKind,
+    id: u64,
+}
+
+impl RecordOwner {
+    fn process(pid: i32) -> Self {
+        Self {
+            kind: OwnerKind::Process,
+            id: pid as u32 as u64,
+        }
+    }
+
+    fn ofd(ptr: usize) -> Self {
+        Self {
+            kind: OwnerKind::Ofd,
+            id: ptr as u64,
+        }
+    }
+
+    fn pid_or_neg_one(self) -> i32 {
+        match self.kind {
+            OwnerKind::Process => self.id as u32 as i32,
+            OwnerKind::Ofd => -1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -100,7 +139,7 @@ impl RecordLock {
     }
 
     fn conflicts(self, owner: RecordOwner, req: &RecordLockRequest) -> bool {
-        self.owner.pid != owner.pid
+        self.owner != owner
             && self.lock_type != RecordLockType::Unlock
             && req.lock_type != RecordLockType::Unlock
             && (self.lock_type == RecordLockType::Write || req.lock_type == RecordLockType::Write)
@@ -112,7 +151,7 @@ impl RecordLock {
             lock_type: self.lock_type,
             start: self.start,
             end: self.end,
-            owner_pid: self.owner.pid,
+            owner_pid: self.owner.pid_or_neg_one(),
         }
     }
 }
@@ -128,6 +167,19 @@ impl RecordLockState {
             locks: Vec::new(),
             waiters: Arc::new(WaitQueue::new()),
         }
+    }
+
+    fn first_conflict_owner(
+        &self,
+        owner: RecordOwner,
+        req: &RecordLockRequest,
+    ) -> Option<RecordOwner> {
+        self.locks
+            .iter()
+            .copied()
+            .filter(|lock| lock.conflicts(owner, req))
+            .min_by_key(|lock| lock.start)
+            .map(|lock| lock.owner)
     }
 
     fn first_conflict(
@@ -146,12 +198,12 @@ impl RecordLockState {
     fn apply(&mut self, owner: RecordOwner, req: RecordLockRequest) {
         let mut out = Vec::with_capacity(self.locks.len().saturating_add(1));
         for lock in self.locks.drain(..) {
-            if lock.owner.pid != owner.pid || !lock.overlaps(&req) {
+            if lock.owner != owner || !lock.overlaps(&req) {
                 out.push(lock);
                 continue;
             }
 
-            // 同一进程的新锁会替换重叠区间。先把旧锁在请求区间两侧的残段保留，
+            // 同一 owner 的新锁会替换重叠区间。先把旧锁在请求区间两侧的残段保留，
             // 请求区间本身稍后按新类型插入；Unlock 则只保留残段。
             if let Some(left) = left_piece(lock, &req) {
                 out.push(left);
@@ -175,34 +227,67 @@ impl RecordLockState {
 
     fn release_owner(&mut self, owner: RecordOwner) -> bool {
         let before = self.locks.len();
-        self.locks.retain(|lock| lock.owner.pid != owner.pid);
+        self.locks.retain(|lock| lock.owner != owner);
         before != self.locks.len()
     }
 }
 
 static RECORD_LOCKS: Spinlock<BTreeMap<LockKey, RecordLockState>> = Spinlock::new(BTreeMap::new());
-static PENDING_LOCKS: Spinlock<BTreeMap<i32, PendingLock>> = Spinlock::new(BTreeMap::new());
+static PENDING_LOCKS: Spinlock<BTreeMap<RecordOwner, PendingLock>> = Spinlock::new(BTreeMap::new());
 
-/// 查询一次 `F_GETLK` 冲突。
+/// 查询一次 `F_GETLK` 冲突（POSIX owner）。
 pub fn getlk(file: &File, owner_pid: i32, req: RecordLockRequest) -> Option<RecordLockConflict> {
+    getlk_inner(file, RecordOwner::process(owner_pid), req)
+}
+
+/// 查询一次 `F_OFD_GETLK` 冲突（OFD owner；冲突 owner 以 `l_pid == -1` 返回）。
+pub fn getlk_ofd(
+    file: &File,
+    ofd_ptr: usize,
+    req: RecordLockRequest,
+) -> Option<RecordLockConflict> {
+    getlk_inner(file, RecordOwner::ofd(ofd_ptr), req)
+}
+
+fn getlk_inner(
+    file: &File,
+    owner: RecordOwner,
+    req: RecordLockRequest,
+) -> Option<RecordLockConflict> {
     if req.lock_type == RecordLockType::Unlock {
         return None;
     }
     let key = LockKey::from_file(file);
-    let owner = RecordOwner { pid: owner_pid };
     RECORD_LOCKS
         .lock()
         .get(&key)
         .and_then(|state| state.first_conflict(owner, &req))
 }
 
-/// 执行 `F_SETLK/F_SETLKW`。
-///
+/// 执行 `F_SETLK/F_SETLKW`（POSIX owner）。
+pub fn setlk(file: &File, owner_pid: i32, req: RecordLockRequest, wait: bool) -> Result<(), Errno> {
+    setlk_inner(file, RecordOwner::process(owner_pid), req, wait)
+}
+
+/// 执行 `F_OFD_SETLK/F_OFD_SETLKW`（OFD owner）。
+pub fn setlk_ofd(
+    file: &File,
+    ofd_ptr: usize,
+    req: RecordLockRequest,
+    wait: bool,
+) -> Result<(), Errno> {
+    setlk_inner(file, RecordOwner::ofd(ofd_ptr), req, wait)
+}
+
 /// `wait=false` 表示非阻塞；遇到冲突返回 `EAGAIN`。阻塞路径采用 prepare /
 /// recheck / sleep 协议，避免释放者在检查后唤醒前到达造成丢唤醒。
-pub fn setlk(file: &File, owner_pid: i32, req: RecordLockRequest, wait: bool) -> Result<(), Errno> {
+fn setlk_inner(
+    file: &File,
+    owner: RecordOwner,
+    req: RecordLockRequest,
+    wait: bool,
+) -> Result<(), Errno> {
     let key = LockKey::from_file(file);
-    let owner = RecordOwner { pid: owner_pid };
     let task = sched::current_task();
 
     loop {
@@ -221,9 +306,7 @@ pub fn setlk(file: &File, owner_pid: i32, req: RecordLockRequest, wait: bool) ->
             } else if !wait {
                 return Err(Errno::EAGAIN);
             } else {
-                PENDING_LOCKS
-                    .lock()
-                    .insert(owner.pid, PendingLock { key, req });
+                PENDING_LOCKS.lock().insert(owner, PendingLock { key, req });
                 let entry = state.waiters.prepare_to_wait(&task, TaskState::Sleeping);
                 (Some((Arc::clone(&state.waiters), entry)), None)
             }
@@ -242,41 +325,51 @@ pub fn setlk(file: &File, owner_pid: i32, req: RecordLockRequest, wait: bool) ->
                 .get(&key)
                 .map(|state| state.first_conflict(owner, &req).is_none())
                 .unwrap_or(true);
-            let deadlock = !retry && would_deadlock(&table, owner.pid, key, &req);
+            let deadlock = !retry && would_deadlock(&table, owner, key, &req);
             (retry, deadlock)
         };
         if retry_without_sleep {
             waiters.finish_wait(&entry);
-            PENDING_LOCKS.lock().remove(&owner.pid);
+            PENDING_LOCKS.lock().remove(&owner);
             continue;
         }
         if deadlock {
             waiters.finish_wait(&entry);
-            PENDING_LOCKS.lock().remove(&owner.pid);
+            PENDING_LOCKS.lock().remove(&owner);
             return Err(Errno::EDEADLK);
         }
         if sched::operation::has_interrupting_signal(&task) {
             waiters.finish_wait(&entry);
-            PENDING_LOCKS.lock().remove(&owner.pid);
+            PENDING_LOCKS.lock().remove(&owner);
             return Err(Errno::EINTR);
         }
 
         sched::schedule_once(sched::now_ns_public());
         waiters.finish_wait(&entry);
-        PENDING_LOCKS.lock().remove(&owner.pid);
+        PENDING_LOCKS.lock().remove(&owner);
     }
 }
 
-/// 关闭任意指向该 inode 的 fd 时释放当前进程在该 inode 上的记录锁。
-pub fn release_process_locks_for_file(file: &File, owner_pid: i32) {
+/// 关闭 fd 时释放记录锁：POSIX 锁按 owner_pid 释放；OFD 锁仅在最后一个指向该
+/// 打开文件描述的 fd 关闭时释放（用 `Arc` 强引用计数近似判断，见调用方注释）。
+pub fn release_process_locks_for_file(file: &Arc<File>, owner_pid: i32) {
     let key = LockKey::from_file(file);
-    let owner = RecordOwner { pid: owner_pid };
+    let process_owner = RecordOwner::process(owner_pid);
+    let ofd_owner = RecordOwner::ofd(Arc::as_ptr(file) as usize);
+    // 关闭路径持有 `&Arc<File>`（RemovedFd 内部），强计数为 1 表示已无其余 fd
+    // 引用该打开文件描述。若内核另有 Arc 引用（mmap/epoll 等）则保守地不释放
+    // OFD 锁，避免与仍活跃的共享映射语义冲突。
+    let last_reference = Arc::strong_count(file) <= 1;
     let waiters = {
         let mut table = RECORD_LOCKS.lock();
         let Some(state) = table.get_mut(&key) else {
             return;
         };
-        if !state.release_owner(owner) {
+        let mut released = state.release_owner(process_owner);
+        if last_reference {
+            released |= state.release_owner(ofd_owner);
+        }
+        if !released {
             return;
         }
         let wake = if state.waiters.len_hint() != 0 {
@@ -303,15 +396,14 @@ fn cleanup_empty_state(table: &mut BTreeMap<LockKey, RecordLockState>, key: Lock
 
 fn would_deadlock(
     table: &BTreeMap<LockKey, RecordLockState>,
-    waiter_pid: i32,
+    waiter: RecordOwner,
     key: LockKey,
     req: &RecordLockRequest,
 ) -> bool {
     let pending = PENDING_LOCKS.lock();
     let Some(first_owner) = table
         .get(&key)
-        .and_then(|state| state.first_conflict(RecordOwner { pid: waiter_pid }, req))
-        .map(|conflict| conflict.owner_pid)
+        .and_then(|state| state.first_conflict_owner(waiter, req))
     else {
         return false;
     };
@@ -319,20 +411,19 @@ fn would_deadlock(
     let mut stack = Vec::new();
     stack.push(first_owner);
     let mut seen = BTreeSet::new();
-    while let Some(pid) = stack.pop() {
-        if pid == waiter_pid {
+    while let Some(owner) = stack.pop() {
+        if owner == waiter {
             return true;
         }
-        if !seen.insert(pid) {
+        if !seen.insert(owner) {
             continue;
         }
-        let Some(waiting) = pending.get(&pid) else {
+        let Some(waiting) = pending.get(&owner) else {
             continue;
         };
         let Some(next_owner) = table
             .get(&waiting.key)
-            .and_then(|state| state.first_conflict(RecordOwner { pid }, &waiting.req))
-            .map(|conflict| conflict.owner_pid)
+            .and_then(|state| state.first_conflict_owner(owner, &waiting.req))
         else {
             continue;
         };
@@ -377,12 +468,12 @@ fn right_piece(lock: RecordLock, req: &RecordLockRequest) -> Option<RecordLock> 
 
 fn normalize(mut locks: Vec<RecordLock>) -> Vec<RecordLock> {
     locks.retain(|lock| lock.end.is_none_or(|end| lock.start < end));
-    locks.sort_by_key(|lock| (lock.owner.pid, lock.lock_type_order(), lock.start));
+    locks.sort_by_key(|lock| (lock.owner, lock.lock_type_order(), lock.start));
 
     let mut out: Vec<RecordLock> = Vec::with_capacity(locks.len());
     for lock in locks {
         if let Some(last) = out.last_mut()
-            && last.owner.pid == lock.owner.pid
+            && last.owner == lock.owner
             && last.lock_type == lock.lock_type
             && touches_or_overlaps(last.end, lock.start)
         {

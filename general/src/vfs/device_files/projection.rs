@@ -531,20 +531,64 @@ fn char_function_devnodes(func: &dyn DeviceFunction) -> Result<Option<DevNodeSet
     let Some(ch) = function_as::<CharFunction>(func) else {
         return Ok(None);
     };
-    Ok(Some(DevNodeSet::try_single(DevNodeSpec::Char {
+    let dev = ch.dev();
+    let mut nodes = Vec::new();
+    nodes.try_reserve(2).map_err(|_| VfsError::NoSpace)?;
+    nodes.push(DevNodeSpec::Char {
         name: fallible_box_str(ch.projection_name())?,
-        dev: ch.dev(),
-    })?))
+        dev: dev.clone(),
+    });
+    // Linux 兼容名别名:8250 系串口在 Linux 下命名为 ttyS0..N,本内核驱动名是
+    // uartN。按 Linux 习惯配置的用户空间(Alpine 的 `ttyS0::respawn` getty、
+    // minicom 等)直接打开 /dev/ttyS0,这里在呈现层把它与 uartN 绑到同一个
+    // CharDevice;底层设备身份与设备号仍不参与命名。
+    if let Some(alias) = serial_tty_alias_name(ch.projection_name()) {
+        nodes.push(DevNodeSpec::Char {
+            name: fallible_box_str(&alias)?,
+            dev,
+        });
+    }
+    DevNodeSet::try_new(nodes)
+}
+
+/// 串口投影名的 Linux 兼容别名:`uartN` -> `ttySN`(仅数字后缀,如 uart0 -> ttyS0)。
+fn serial_tty_alias_name(projection_name: &str) -> Option<String> {
+    let suffix = projection_name.strip_prefix("uart")?;
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let mut out = String::new();
+    out.try_reserve(projection_name.len() + 3).ok()?;
+    out.push_str("ttyS");
+    out.push_str(suffix);
+    Some(out)
 }
 
 fn block_function_devnodes(func: &dyn DeviceFunction) -> Result<Option<DevNodeSet>, VfsError> {
     let Some(block) = function_as::<BlockFunction>(func) else {
         return Ok(None);
     };
-    Ok(Some(DevNodeSet::try_single(DevNodeSpec::Block {
+    let dev = block.dev();
+    let mut nodes = Vec::new();
+    nodes.try_reserve(8).map_err(|_| VfsError::NoSpace)?;
+    nodes.push(DevNodeSpec::Block {
         name: fallible_box_str(block.projection_name())?,
-        dev: block.dev(),
-    })?))
+        dev: Arc::clone(&dev),
+    });
+    // 整盘设备扫描分区表并投影 /dev/<disk><part> 节点(如 vd0p1/sda1)。
+    // 分区扫描带缓存,仅在首次投影时读一次磁盘。
+    for part in crate::dev::partition::partitions_of(&dev) {
+        let name =
+            crate::dev::partition::partition_disk_name(block.projection_name(), part.number());
+        if name.is_empty() {
+            continue;
+        }
+        nodes.push(DevNodeSpec::Block {
+            name: fallible_box_str(&name)?,
+            dev: part.dev(),
+        });
+    }
+    DevNodeSet::try_new(nodes)
 }
 
 fn rtc_function_devnodes(func: &dyn DeviceFunction) -> Result<Option<DevNodeSet>, VfsError> {

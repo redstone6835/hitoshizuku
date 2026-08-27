@@ -6,15 +6,58 @@
 //! 固件解析结果拥有路径与属性数据；设备模型在注册时接管或复制这些值，
 //! 不通过泄漏分配伪造静态生命周期。
 
+/// 板级调试：绕过 printk 直接向 UART0 输出一个字符（arch::dbg_char 裸汇编）。
+///
+/// 用于 printk/分配器疑似死锁时的启动路径定位；非调试构建中 dbg_char 为空操作，
+/// 因此本函数可在任何构建中无条件调用。
+#[cfg(target_arch = "loongarch64")]
+fn raw_mark(byte: u8) {
+    unsafe extern "C" {
+        fn dbg_char();
+    }
+    unsafe {
+        core::arch::asm!(
+            "move $a3, {c}",
+            "bl {dbg_char}",
+            c = in(reg) byte as u64,
+            dbg_char = sym dbg_char,
+            options(nostack),
+            clobber_abi("C"),
+        );
+    }
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn raw_mark(_byte: u8) {}
+
+/// 板级调试：绕过 printk 直接向 UART0 输出一个 16 位十六进制值。
+#[cfg(target_arch = "loongarch64")]
+fn raw_hex16(value: usize) {
+    unsafe extern "C" {
+        fn dbg_hex16();
+    }
+    unsafe {
+        core::arch::asm!(
+            "move $a0, {v}",
+            "bl {dbg_hex16}",
+            v = in(reg) value as u64,
+            dbg_hex16 = sym dbg_hex16,
+            options(nostack),
+            clobber_abi("C"),
+        );
+    }
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn raw_hex16(_value: usize) {}
+
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use allocator::{KERNEL_ALLOCATOR, MemorySegment};
-use general::dev::block::BlockDevice;
 use general::dev::dma::{DmaBouncePolicy, DmaConstraints, DmaContext, DmaWindow};
-use general::dev::enumerate::DEVICES;
 use general::dev::iommu::{self, IommuAttachment, IommuRequester};
 use general::dev::platform::{
     DeviceMatchId, DeviceProperties, DeviceResource, FirmwareProperty, PlatformDeviceInfo,
@@ -23,15 +66,6 @@ use general::dev::platform::{
 use general::dev::pnp::DevInitContext;
 use general::dev::pnp::PnpDevice;
 use general::firmware::dtb as firmware_dtb;
-use general::vfs::FS_REGISTRY;
-use general::vfs::VfsContext;
-use general::vfs::cred::Credentials;
-use general::vfs::dentry::VfsRoot;
-use general::vfs::device_files::projection::active_block_devices;
-use general::vfs::limits::VfsLimits;
-use general::vfs::mount::{Mount, MountFlags, MountNamespace};
-use general::vfs::stat::FileMode;
-use general::vfs::superblock::Superblock;
 use general::{StartBootProtocol, StartContext, StartFirmware, StartNoMapSupport, StartPhysRange};
 use log::printk;
 
@@ -312,6 +346,7 @@ pub fn kernel_start_init(context: &StartContext) {
                 err
             )
         });
+        general::mm::install_allocator_reclaim_hook();
     }
 
     printk!(
@@ -319,6 +354,9 @@ pub fn kernel_start_init(context: &StartContext) {
         memory_segments.len()
     );
 
+    printk!("[dbg] T-a: collecting cpu topology");
+    raw_mark(b'U');
+    raw_mark(b'1');
     let cpu_numa_topology: Vec<general::dev::cpu::CpuNumaEntry> = cpus
         .iter()
         .filter_map(|cpu| {
@@ -333,6 +371,7 @@ pub fn kernel_start_init(context: &StartContext) {
         .iter()
         .map(|entry: &general::dev::cpu::CpuNumaEntry| entry.node_id)
         .collect();
+    raw_mark(b'2');
     let cpu_topology: Vec<_> = cpus
         .into_iter()
         .map(|cpu| general::dev::cpu::CpuTopologyEntry {
@@ -352,9 +391,19 @@ pub fn kernel_start_init(context: &StartContext) {
             capacity_dmips_mhz: cpu.capacity_dmips_mhz,
         })
         .collect();
+    raw_mark(b'3');
+    raw_mark(b'V');
     let cpu_topology_count = cpu_topology.len();
+    printk!(
+        "[dbg] T-b: installing cpu topology ({} entries)",
+        cpu_topology_count
+    );
     general::dev::cpu::install_topology(cpu_topology);
+    raw_mark(b'W');
+    printk!("[dbg] T-c: cpu topology installed");
     general::dev::cpu::install_numa_topology(cpu_numa_topology);
+    raw_mark(b'P');
+    printk!("[dbg] T-d: cpu numa topology installed");
     general::dev::numa::install_topology(
         cpu_numa_nodes,
         numa.distances
@@ -374,6 +423,8 @@ pub fn kernel_start_init(context: &StartContext) {
             })
             .collect(),
     );
+    raw_mark(b'Q');
+    printk!("[dbg] T-e: numa topology installed");
     printk!(
         "[kernel-start][dtb] installed CPU topology: {} CPU node(s)",
         cpu_topology_count
@@ -444,7 +495,11 @@ pub fn kernel_start_init(context: &StartContext) {
             let before = pending.len();
             let mut retry = Vec::new();
             for index in pending {
+                raw_mark(b'R');
+                raw_hex16(index);
+                raw_mark(b':');
                 let device = &platform_devices[index];
+                printk!("[dbg] probing device {}: {}", index, device.path);
                 let pcie_host = pcie_hosts
                     .iter()
                     .find(|host| host.path.as_ref() == device.path.as_ref());
@@ -455,7 +510,10 @@ pub fn kernel_start_init(context: &StartContext) {
                     &nodes,
                     &platform_devices,
                 );
+                raw_mark(b'I');
+                raw_mark(b'P');
                 let outcome = register_platform_device_status(info, "dtb", priority == 2);
+                raw_mark(b'p');
                 if let Some(pnp_device) = outcome.device {
                     remember_registered_platform_node(
                         &mut registered_platform_nodes,
@@ -499,57 +557,23 @@ pub fn kernel_start_init(context: &StartContext) {
     if pcie_hosts.is_empty() {
         printk!("[kernel-start][dtb] no pcie node in DTB");
     }
-    // 小步骤 5.4 再决定根文件系统的来源。优先级是外部/内建 initramfs，其次才是
-    // 已经注册好的块设备根盘。
-    let selected_initramfs = external_initramfs.or_else(crate::initramfs::embedded_image);
-    let cred = Credentials::root();
-    let (root_sb, root_source) = if let Some(image) = selected_initramfs {
-        let sb = mount_tmpfs_superblock();
-        (
-            sb,
-            match image.source {
-                crate::initramfs::InitramfsSource::Embedded => "embedded initramfs",
-                crate::initramfs::InitramfsSource::External => "external initramfs",
-            },
-        )
-    } else {
-        mount_first_block_root()
-            .unwrap_or_else(|err| panic!("[kernel-start][dtb] failed to mount block root: {}", err))
-    };
-    printk!("[kernel-start][dtb] root source selected: {}", root_source);
-
-    let root_mount = Mount::new(
-        Arc::clone(&root_sb),
-        Arc::clone(&root_sb.root_dentry),
-        Arc::clone(&root_sb.root_dentry),
-        MountFlags::default(),
-        None,
+    // Firmware discovery is complete. Root selection is shared with ACPI so
+    // initramfs layering, rdinit fallback and root= have one implementation.
+    let root = crate::boot_root::prepare(
+        "dtb",
+        context.boot.command_line,
+        crate::initramfs::embedded_image(),
+        external_initramfs,
     );
-    let mount_ns = MountNamespace::new(1, Arc::clone(&root_mount));
-    let vfs_ctx = VfsContext::new(
-        Arc::clone(&root_sb.root_dentry),
-        Arc::clone(&root_mount),
-        VfsRoot::new(Arc::clone(&root_sb.root_dentry), Arc::clone(&root_mount)),
-        Arc::clone(&mount_ns),
-        Arc::new(cred.clone()),
-        FileMode::new(0),
-        VfsLimits::default_arc(),
-    );
-
-    if let Some(image) = selected_initramfs {
-        crate::initramfs::unpack_newc(image, &vfs_ctx).unwrap_or_else(|err| {
-            panic!("[kernel-start][dtb] failed to unpack initramfs: {:?}", err)
-        });
-        printk!("[kernel-start][dtb] initramfs unpacked into root");
-    }
+    printk!("[kernel-start][dtb] root source selected: {}", root.source);
 
     // 小步骤 5.6 最后把 devtmpfs 和标准用户接口伪文件系统挂到公共路径。
-    crate::device_init::mount_devtmpfs_on_dev("dtb", &vfs_ctx, Arc::clone(&dev_sb));
-    crate::device_init::mount_standard_user_api_filesystems("dtb", &vfs_ctx);
+    crate::device_init::mount_devtmpfs_on_dev("dtb", &root.vfs_ctx, Arc::clone(&dev_sb));
+    crate::device_init::mount_standard_user_api_filesystems("dtb", &root.vfs_ctx);
 
     printk!(
         "[kernel-start][dtb] VFS ready: '{}' mounted as '/' + devtmpfs '/dev' + tmpfs '/dev/shm' + sysfs '/sys'",
-        root_source
+        root.source
     );
 
     // 步骤 6 最后确定启动期控制台，并把日志出口绑定到已经就绪的字符设备上。
@@ -559,10 +583,11 @@ pub fn kernel_start_init(context: &StartContext) {
     // 小步骤 6.1 先把根目录、挂载点和凭据等 VFS 组件交给 sched shim 保管；随后
     // sched::boot_init 会据此给 init 任务挂上 TASKEXT_VFS_CONTEXT / TASKEXT_VFS_FDTABLE。
     crate::sched::stash_boot_vfs_parts(
-        Arc::clone(&root_sb.root_dentry),
-        Arc::clone(&root_mount),
-        Arc::clone(&mount_ns),
-        Arc::new(cred.clone()),
+        Arc::clone(&root.superblock.root_dentry),
+        Arc::clone(&root.root_mount),
+        Arc::clone(&root.mount_ns),
+        Arc::clone(&root.cred),
+        root.is_initramfs,
     );
 
     // 小步骤 6.2 然后解析控制台来源。这里优先看命令行 console 参数，找不到时再
@@ -589,7 +614,7 @@ pub fn kernel_start_init(context: &StartContext) {
     if let Some(selector) = console_selector {
         let _ = crate::device_init::bind_or_defer_boot_console(
             "dtb",
-            &vfs_ctx,
+            &root.vfs_ctx,
             Arc::clone(&dev_sb),
             selector,
         );
@@ -598,43 +623,6 @@ pub fn kernel_start_init(context: &StartContext) {
     }
 
     printk!("[kernel-start][dtb] kernel initialization complete, jumping to main entry");
-}
-
-fn mount_tmpfs_superblock() -> Arc<Superblock> {
-    FS_REGISTRY
-        .find("tmpfs")
-        .expect("[kernel-start][dtb] tmpfs driver not found")
-        .mount(None, "")
-        .expect("[kernel-start][dtb] failed to mount tmpfs root")
-}
-
-fn mount_block_root(
-    dev: Arc<BlockDevice>,
-) -> Result<(Arc<Superblock>, &'static str), &'static str> {
-    general::vfs::mount_block_device_auto(dev, "")
-        .map_err(|_| "unsupported or invalid root filesystem")
-}
-
-fn mount_first_block_root() -> Result<(Arc<Superblock>, &'static str), &'static str> {
-    let devices = active_block_devices(&DEVICES.functions);
-    if devices.is_empty() {
-        return Err("no initramfs and no active block device found");
-    }
-
-    for dev in devices {
-        match mount_block_root(Arc::clone(&dev)) {
-            Ok(root) => return Ok(root),
-            Err(err) => {
-                log::debug!(
-                    "[kernel-start][dtb] block device {} is not root candidate: {}",
-                    dev.name(),
-                    err
-                );
-            }
-        }
-    }
-
-    Err("no active block device contains a supported root filesystem")
 }
 
 fn scrub_boot_node_graph(nodes: &mut [firmware_dtb::DtbNodeInfo]) {

@@ -196,10 +196,24 @@ impl extfs::BlockBackend for FsBlockAdapter {
         if buf.len() < want {
             return Err(extfs::BlockBackendError::OutOfRange);
         }
-        let range = BlockRange { lba, blocks: count };
-        self.dev
-            .submit_bio_wait_borrowed_read(range, &mut buf[..want])
-            .map_err(|_| extfs::BlockBackendError::Io)?;
+        // 大请求按 256 块拆分，兼容 max_blocks_per_io 受限的驱动。
+        const MAX_BLOCKS_PER_BIO: u32 = 256;
+        let mut offset = 0u64;
+        let mut remaining = count;
+        while remaining != 0 {
+            let chunk_blocks = remaining.min(MAX_BLOCKS_PER_BIO);
+            let chunk_bytes = chunk_blocks as usize * bps;
+            let start = offset as usize * bps;
+            let range = BlockRange {
+                lba: lba + offset,
+                blocks: chunk_blocks,
+            };
+            self.dev
+                .submit_bio_wait_borrowed_read(range, &mut buf[start..start + chunk_bytes])
+                .map_err(|_| extfs::BlockBackendError::Io)?;
+            offset += u64::from(chunk_blocks);
+            remaining -= chunk_blocks;
+        }
         Ok(())
     }
 
@@ -251,10 +265,32 @@ impl extfs::BlockBackend for FsBlockAdapter {
         if buf.len() < want {
             return Err(extfs::BlockBackendError::OutOfRange);
         }
-        let range = BlockRange { lba, blocks: count };
-        self.dev
-            .submit_bio_wait_borrowed_write(range, &buf[..want])
-            .map_err(|_| extfs::BlockBackendError::Io)?;
+        // 大请求按 256 块拆分。
+        const MAX_BLOCKS_PER_BIO: u32 = 256;
+        let mut offset = 0u64;
+        let mut remaining = count;
+        while remaining != 0 {
+            let chunk_blocks = remaining.min(MAX_BLOCKS_PER_BIO);
+            let chunk_bytes = chunk_blocks as usize * bps;
+            let start = offset as usize * bps;
+            let range = BlockRange {
+                lba: lba + offset,
+                blocks: chunk_blocks,
+            };
+            self.dev
+                .submit_bio_wait_borrowed_write(range, &buf[start..start + chunk_bytes])
+                .map_err(|error| {
+                    log::warning!(
+                        "[block_sync] write_sectors lba={} count={} failed: {:?}",
+                        lba + offset,
+                        chunk_blocks,
+                        error
+                    );
+                    extfs::BlockBackendError::Io
+                })?;
+            offset += u64::from(chunk_blocks);
+            remaining -= chunk_blocks;
+        }
         Ok(())
     }
 }

@@ -393,9 +393,9 @@ impl FileOps for ExtRegFileOps {
                 self.mapping_generation.load(Ordering::Acquire),
             )
         };
-        // fscrypt:无密钥时内容不可读(与 Linux 无密钥访问一致,报 EOPNOTSUPP)。
+        // fscrypt:无密钥时内容不可读(与 Linux 无密钥访问一致,报 ENOKEY)。
         if flags & EXT4_ENCRYPT_FL != 0 {
-            return Err(VfsError::NotSupported);
+            return Err(VfsError::Enokey);
         }
         if offset >= size || buf.is_empty() {
             return Ok(0);
@@ -610,9 +610,9 @@ impl FileOps for ExtRegFileOps {
             let mut raw_guard = lock_raw(&self.raw);
             {
                 let flags = raw_guard.flags();
-                // fscrypt:无密钥不可写;fs-verity:已启用校验的文件不可变(EROFS)。
+                // fscrypt:无密钥不可写(ENOKEY);fs-verity:已启用校验的文件不可变(EROFS)。
                 if flags & EXT4_ENCRYPT_FL != 0 {
-                    return Err(VfsError::NotSupported);
+                    return Err(VfsError::Enokey);
                 }
                 if flags & EXT4_VERITY_FL != 0 {
                     return Err(VfsError::ReadOnlyFilesystem);

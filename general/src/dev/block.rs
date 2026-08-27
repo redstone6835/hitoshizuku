@@ -36,9 +36,10 @@ static NEXT_BLOCK_DISKSEQ: AtomicU64 = AtomicU64::new(1);
 /// 同步块 I/O 等待时，在真正让出 CPU 前主动推进完成队列的次数。
 ///
 /// QEMU/virtio 的小请求通常在几十微秒内完成；立即切到 idle 会把一次上下文切换、
-/// 中断返回和再次切回的固定成本叠到每个 512B/4KiB I/O 上。这里先做一个很小的
-/// bounded poll 窗口，完成不了再睡眠，避免长 I/O 忙等。
-const SYNC_WAIT_ACTIVE_DRAIN_LIMIT: usize = 256;
+/// 中断返回和再次切回的固定成本叠到每个 512B/4KiB I/O 上。先做一个很小的
+/// bounded poll 窗口；已确认 IRQ 的设备随后睡眠等待，未确认 IRQ 的设备继续
+/// 以有界批次轮询，兼顾低延迟和早期启动时的完成兜底。
+const SYNC_WAIT_ACTIVE_DRAIN_LIMIT: usize = 8;
 
 #[cfg(feature = "performance-profile")]
 fn profile_block_args(op: BioOp, range: BlockRange) -> (u64, u64) {
@@ -556,6 +557,15 @@ pub trait BlockDriver: Send + Sync {
     /// 不持有任何外部锁时被调用。
     fn drain(&self) {}
 
+    /// 完成通知是否已经由驱动确认走 IRQ 路径。
+    ///
+    /// 只有 probe 成功注册设备 IRQ 后才能返回 `true`。同步等待可以据此在
+    /// 首轮短轮询后直接进入 Completion 等待队列；未注册 IRQ 的设备仍走主动
+    /// drain 兜底，避免早期启动或固件路由异常时丢失完成通知。
+    fn completion_is_interrupt_driven(&self) -> bool {
+        false
+    }
+
     /// 一个 VFS 块设备文件被打开时调用。
     ///
     /// 这是设备对象层的生命周期通知，不携带 fd、路径或权限位等 POSIX 信息。
@@ -719,6 +729,15 @@ impl BlockDevice {
         self.driver.drain();
     }
 
+    /// 把已通过上层校验的 Bio 原样转发给本设备底层驱动队列。
+    ///
+    /// 供分区/栈叠块设备转发 BIO 使用：转发层在把 LBA 偏移调整为父设备
+    /// 坐标后调用此方法，绕过父设备针对"父设备自身几何"的校验（这部分
+    /// 校验已由转发层按自身几何完成）。Flush 等不携带范围的命令原样透传。
+    pub fn queue_bio_forward(&self, bio: Bio) -> Result<(), (SubmitError, Bio)> {
+        self.driver.queue_bio(bio)
+    }
+
     /// 通知底层驱动该块设备节点被打开。
     ///
     /// VFS 兼容层只在成功创建文件对象前调用一次；失败时打开操作返回给上层。
@@ -854,29 +873,50 @@ impl BlockDevice {
         let mut drain_cycles = 0u64;
         #[cfg(feature = "performance-profile")]
         let mut drain_calls = 0u64;
-        while !completion.is_done() {
-            for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
-                #[cfg(feature = "performance-profile")]
-                let drain_start = profiling::read_counter();
-                self.driver.drain();
-                #[cfg(feature = "performance-profile")]
-                {
-                    drain_cycles = drain_cycles
-                        .saturating_add(profiling::read_counter().wrapping_sub(drain_start));
-                    drain_calls = drain_calls.saturating_add(1);
-                }
-                if completion.is_done() {
-                    break;
-                }
-                core::hint::spin_loop();
+        for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
+            #[cfg(feature = "performance-profile")]
+            let drain_start = profiling::read_counter();
+            self.driver.drain();
+            #[cfg(feature = "performance-profile")]
+            {
+                drain_cycles = drain_cycles
+                    .saturating_add(profiling::read_counter().wrapping_sub(drain_start));
+                drain_calls = drain_calls.saturating_add(1);
             }
-            if sched::is_ready() {
+            if completion.is_done() {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !completion.is_done()
+            && !(sched::is_ready() && self.driver.completion_is_interrupt_driven())
+        {
+            // 无 IRQ 兜底设备仍须主动推进完成；IRQ 已确认的设备交给
+            // Completion::wait，避免每个轮询窗口都支付一次调度器入口成本。
+            while !completion.is_done() {
+                for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
+                    #[cfg(feature = "performance-profile")]
+                    let drain_start = profiling::read_counter();
+                    self.driver.drain();
+                    #[cfg(feature = "performance-profile")]
+                    {
+                        drain_cycles = drain_cycles
+                            .saturating_add(profiling::read_counter().wrapping_sub(drain_start));
+                        drain_calls = drain_calls.saturating_add(1);
+                    }
+                    if completion.is_done() {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
                 if completion.is_done() {
                     break;
                 }
-                sched::schedule_once(sched::now_ns_public());
-            } else {
-                core::hint::spin_loop();
+                if sched::is_ready() {
+                    sched::schedule_once(sched::now_ns_public());
+                } else {
+                    core::hint::spin_loop();
+                }
             }
         }
         #[cfg(feature = "performance-profile")]
@@ -956,40 +996,65 @@ impl BlockDevice {
 
         #[cfg(feature = "performance-profile")]
         let mut profile_drain_cycles = 0u64;
-        while !completion.is_done() {
-            for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
-                let t0 = sched::now_ns_public();
-                #[cfg(feature = "performance-profile")]
-                let drain_start = profiling::read_counter();
-                self.driver.drain();
-                #[cfg(feature = "performance-profile")]
-                {
-                    profile_drain_cycles = profile_drain_cycles
-                        .saturating_add(profiling::read_counter().wrapping_sub(drain_start));
-                }
-                profile.drain_ns = profile
-                    .drain_ns
-                    .saturating_add(sched::now_ns_public().saturating_sub(t0));
-                profile.drain_calls = profile.drain_calls.saturating_add(1);
-                if completion.is_done() {
-                    break;
-                }
-                core::hint::spin_loop();
-                profile.spin_calls = profile.spin_calls.saturating_add(1);
+        for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
+            let t0 = sched::now_ns_public();
+            #[cfg(feature = "performance-profile")]
+            let drain_start = profiling::read_counter();
+            self.driver.drain();
+            #[cfg(feature = "performance-profile")]
+            {
+                profile_drain_cycles = profile_drain_cycles
+                    .saturating_add(profiling::read_counter().wrapping_sub(drain_start));
             }
-            if sched::is_ready() {
+            profile.drain_ns = profile
+                .drain_ns
+                .saturating_add(sched::now_ns_public().saturating_sub(t0));
+            profile.drain_calls = profile.drain_calls.saturating_add(1);
+            if completion.is_done() {
+                break;
+            }
+            core::hint::spin_loop();
+            profile.spin_calls = profile.spin_calls.saturating_add(1);
+        }
+
+        if !completion.is_done()
+            && !(sched::is_ready() && self.driver.completion_is_interrupt_driven())
+        {
+            while !completion.is_done() {
+                for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
+                    let t0 = sched::now_ns_public();
+                    #[cfg(feature = "performance-profile")]
+                    let drain_start = profiling::read_counter();
+                    self.driver.drain();
+                    #[cfg(feature = "performance-profile")]
+                    {
+                        profile_drain_cycles = profile_drain_cycles
+                            .saturating_add(profiling::read_counter().wrapping_sub(drain_start));
+                    }
+                    profile.drain_ns = profile
+                        .drain_ns
+                        .saturating_add(sched::now_ns_public().saturating_sub(t0));
+                    profile.drain_calls = profile.drain_calls.saturating_add(1);
+                    if completion.is_done() {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                    profile.spin_calls = profile.spin_calls.saturating_add(1);
+                }
                 if completion.is_done() {
                     break;
                 }
-                let t0 = sched::now_ns_public();
-                sched::schedule_once(sched::now_ns_public());
-                profile.schedule_ns = profile
-                    .schedule_ns
-                    .saturating_add(sched::now_ns_public().saturating_sub(t0));
-                profile.schedule_calls = profile.schedule_calls.saturating_add(1);
-            } else {
-                core::hint::spin_loop();
-                profile.spin_calls = profile.spin_calls.saturating_add(1);
+                if sched::is_ready() {
+                    let t0 = sched::now_ns_public();
+                    sched::schedule_once(sched::now_ns_public());
+                    profile.schedule_ns = profile
+                        .schedule_ns
+                        .saturating_add(sched::now_ns_public().saturating_sub(t0));
+                    profile.schedule_calls = profile.schedule_calls.saturating_add(1);
+                } else {
+                    core::hint::spin_loop();
+                    profile.spin_calls = profile.spin_calls.saturating_add(1);
+                }
             }
         }
 

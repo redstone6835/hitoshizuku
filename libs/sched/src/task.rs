@@ -27,7 +27,8 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::ptr::NonNull;
 use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64,
+    AtomicUsize, Ordering,
 };
 
 use crate::arch_hooks;
@@ -383,8 +384,10 @@ fn more_urgent(current: SchedAttr, donated: SchedAttr) -> SchedAttr {
                 _ => SchedAttr::rt_fifo(donated_prio),
             }
         }
-        SchedPolicy::Fair => {
-            if current.policy == SchedPolicy::Fair && donated.nice < current.nice {
+        SchedPolicy::Fair | SchedPolicy::Batch => {
+            if matches!(current.policy, SchedPolicy::Fair | SchedPolicy::Batch)
+                && donated.nice < current.nice
+            {
                 let mut boosted = current;
                 boosted.nice = donated.nice;
                 boosted
@@ -757,22 +760,22 @@ struct Relations {
     parent: Weak<Task>,
     /// 直接子任务的强引用列表。Zombie 子在被 reap 之前一直留在这里。
     children: Vec<Arc<Task>>,
-    /// 所属线程组（CLONE_THREAD 共享同一 group，新进程则各自独立）。
-    thread_group: Arc<ThreadGroup>,
     /// 所属进程组（setpgid 可改）。
     process_group: Arc<ProcessGroup>,
     /// 任务在各 namespace 中的 pid。从最外层祖先到自身所在 ns 依序排列，
     /// `pid_in_ns[0]` 是根 ns 的 pid（对应 Linux `task->pid`）。
     /// 无 pid 注册时可保持空 —— 调度核心完全不依赖该字段。
     pid_in_ns: Vec<(Arc<PidNamespace>, PidT)>,
+    /// 任务所在的 pid 命名空间。
+    pid_ns: Arc<PidNamespace>,
 }
 
 /// 内核任务。
 ///
 /// 整个结构使用内部可变性：稳定字段（`sched`、`exit_waiters`、`signal`、
-/// `vfork_done`）放在外层；状态字段用原子；亲缘字段集中在 [`Relations`] 内，
-/// 由一把 [`Spinlock`] 保护；其它跨子系统状态（凭据、共享信号表、内核栈、
-/// arch ctx、ext 侧表）各自独立小锁。
+/// `vfork_done`、`thread_group`）放在外层；状态字段用原子；亲缘字段集中在
+/// [`Relations`] 内，由一把 [`Spinlock`] 保护；其它跨子系统状态（凭据、共享
+/// 信号表、内核栈、arch ctx、ext 侧表）各自独立小锁。
 pub struct Task {
     pub sched: SchedEntity,
     /// 用户任务和内核任务的生命周期域不同。该字段用于把内核线程从 POSIX
@@ -802,7 +805,56 @@ pub struct Task {
     /// ptrace 的最小状态位。当前只区分任务是否处于 traced 模式，用于把
     /// 信号投递转换成父进程可 wait 的 signal-delivery-stop。
     ptrace_traced: AtomicU8,
+    /// 当前 ptracer（谁在追踪本任务）。用 `Weak` 避免追踪者先退出时形成环；
+    /// 与 `parent` 相同，任务内允许 `Weak<Task>` 自引用。`None` 表示无追踪者。
+    ptracer: Spinlock<Option<Weak<Task>>>,
+    /// `PTRACE_SETOPTIONS` 的 `PTRACE_O_*` 选项位。
+    ptrace_options: AtomicU64,
+    /// 最近一次 `PTRACE_EVENT_*` 的 event 消息（子 pid / 退出码）。
+    ptrace_event_msg: AtomicI64,
+    /// 最近一次 stop 是否带 `PTRACE_EVENT_*` 编码（0 = 普通 signal-delivery-stop）。
+    ptrace_stop_event: AtomicU16,
+    /// 是否由 `PTRACE_SEIZE` 附着（影响初始 stop 与 `PTRACE_INTERRUPT` 语义）。
+    ptrace_seized: AtomicU8,
+    /// `PTRACE_SYSCALL` 之后每个 syscall 边界是否需要 stop。
+    ptrace_syscall_stop: AtomicU8,
+    /// entry-stop 后经用户态重入恢复执行（CONT 后重入时不再次 entry-stop）。
+    ptrace_syscall_reenable: AtomicU8,
+    /// 最近一次 signal-delivery-stop 的 siginfo（`PTRACE_GETSIGINFO`）。
+    ptrace_last_siginfo: Spinlock<Option<crate::signal::SigInfo>>,
+    /// `PTRACE_GET_SYSCALL_INFO` 的三态记录（0=none 1=entry 2=exit 3=seccomp）。
+    ptrace_syscall_state: AtomicU8,
+    /// entry 时的 syscall 号与参数。
+    ptrace_syscall_nr: AtomicI64,
+    ptrace_syscall_args: Spinlock<[u64; 6]>,
+    /// exit 时的返回值。
+    ptrace_syscall_ret: AtomicI64,
+    /// `PR_SET_DUMPABLE` 状态（0/1/2）；ptrace 访问权限使用。
+    dumpable: AtomicU8,
+    /// `PR_SET_PDEATHSIG`：父进程退出时投递的信号（0 = 不投递）。
+    pdeathsig: AtomicI32,
+    /// `PR_SET_CHILD_SUBREAPER`：是否收养孤儿。
+    subreaper: AtomicU8,
+    /// `PR_SET_NO_NEW_PRIVS`：禁止 exec 提升权限。
+    no_new_privs: AtomicU8,
+    /// `PR_SET_KEEPCAPS`：setuid 后保留能力位。
+    keepcaps: AtomicU8,
+    /// `personality(2)` 的进程 persona 值（`PER_*` 位掩码，默认 `PER_LINUX = 0`）。
+    /// `ADDR_NO_RANDOMIZE` 等位随 fork 继承、exec 保留（Linux 语义）。
+    personality: AtomicU64,
+    /// `PR_SET_PTRACER` 的 yama 追踪者作用域（0 = `PR_SET_PTRACER_ANY`）。
+    /// 非 0 表示仅允许指定 pid 或其后代追踪本进程。
+    ptracer_scope: AtomicI32,
+    /// `PR_SET_SPECULATION_CTRL` 持久化的投机执行控制位图（`PR_SPEC_*`）。
+    speculation_ctrl: AtomicU64,
+    /// `PTRACE_SINGLESTEP` 补丁法单步：已把断点指令写入目标地址。
+    ptrace_singlestep: AtomicU8,
+    /// 被替换指令的地址与原指令（32 位）。
+    ptrace_singlestep_addr: AtomicUsize,
+    ptrace_singlestep_insn: Spinlock<Option<u32>>,
     pub exit_waiters: WaitQueue,
+    /// 任务创建后所属线程组不变，直接保存稳定引用，供 timer IRQ 记账无锁读取。
+    thread_group: Arc<ThreadGroup>,
     rel: Spinlock<Relations>,
     /// Native child 的线程组 owner；与 POSIX `parent` 解耦，避免调用线程退出
     /// 时触发错误的 task-level reparent。
@@ -983,13 +1035,41 @@ impl Task {
             root_pid_cache: AtomicI32::new(crate::pid::PID_INVALID),
             tgid_cache: AtomicI32::new(crate::pid::PID_INVALID),
             ptrace_traced: AtomicU8::new(0),
+            ptracer: Spinlock::new(None),
+            ptrace_options: AtomicU64::new(0),
+            ptrace_event_msg: AtomicI64::new(0),
+            ptrace_stop_event: AtomicU16::new(0),
+            ptrace_seized: AtomicU8::new(0),
+            ptrace_syscall_stop: AtomicU8::new(0),
+            ptrace_syscall_reenable: AtomicU8::new(0),
+            ptrace_last_siginfo: Spinlock::new(None),
+            ptrace_syscall_state: AtomicU8::new(0),
+            ptrace_syscall_nr: AtomicI64::new(0),
+            ptrace_syscall_args: Spinlock::new([0; 6]),
+            ptrace_syscall_ret: AtomicI64::new(0),
+            dumpable: AtomicU8::new(1),
+            pdeathsig: AtomicI32::new(0),
+            subreaper: AtomicU8::new(0),
+            no_new_privs: AtomicU8::new(0),
+            keepcaps: AtomicU8::new(0),
+            personality: AtomicU64::new(0),
+            ptracer_scope: AtomicI32::new(0),
+            speculation_ctrl: AtomicU64::new(0),
+            ptrace_singlestep: AtomicU8::new(0),
+            ptrace_singlestep_addr: AtomicUsize::new(0),
+            ptrace_singlestep_insn: Spinlock::new(None),
             exit_waiters: WaitQueue::new_with_reason(WaitReason::ProcessExit),
+            thread_group,
             rel: Spinlock::new(Relations {
                 parent,
                 children: Vec::new(),
-                thread_group,
                 process_group,
                 pid_in_ns: Vec::new(),
+                // 占位 ns：sched::init() 完成前 ROOT_PID_NS 未发布，不能在此
+                // 调用 root_pid_ns()；所有创建路径随后 set_pid_ns 覆盖
+                // （init 任务在 sched::init 内绑定根 ns，spawn_child 等用
+                // child_pid_ns(parent)）。
+                pid_ns: crate::boot_pid_ns(),
             }),
             native_owner: Spinlock::new(None),
             kstack: Spinlock::new(None),
@@ -1327,6 +1407,229 @@ impl Task {
         self.ptrace_traced.load(Ordering::Acquire) != 0
     }
 
+    /// 记录当前追踪者。`tracer` 传 `None` 等价于清除追踪关系。
+    /// `ptrace_traceme` 用父任务，`ptrace_attach` / `ptrace_seize` 用调用者。
+    pub fn set_ptracer(&self, tracer: Option<Weak<Task>>) {
+        *self.ptracer.lock() = tracer;
+    }
+
+    /// 清除追踪者记录。
+    pub fn clear_ptracer(&self) {
+        *self.ptracer.lock() = None;
+    }
+
+    /// 判断 `tracer` 是否为当前记录的追踪者（弱引用升级后按指针比较）。
+    pub fn ptracer_is(&self, tracer: &Arc<Task>) -> bool {
+        self.ptracer
+            .lock()
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+            .is_some_and(|recorded| Arc::ptr_eq(&recorded, tracer))
+    }
+
+    /// 当前记录的追踪者（追踪者已退出时升级失败，返回 `None`）。
+    pub fn ptracer(&self) -> Option<Arc<Task>> {
+        self.ptracer.lock().as_ref().and_then(|weak| weak.upgrade())
+    }
+
+    pub fn set_ptrace_options(&self, options: u64) {
+        self.ptrace_options.store(options, Ordering::Release);
+    }
+
+    pub fn ptrace_options(&self) -> u64 {
+        self.ptrace_options.load(Ordering::Acquire)
+    }
+
+    pub fn set_ptrace_event_msg(&self, message: i64) {
+        self.ptrace_event_msg.store(message, Ordering::Release);
+    }
+
+    pub fn ptrace_event_msg(&self) -> i64 {
+        self.ptrace_event_msg.load(Ordering::Acquire)
+    }
+
+    /// 记录本次 stop 的 `PTRACE_EVENT_*`（0 表示普通 signal-delivery-stop）。
+    pub fn set_ptrace_stop_event(&self, event: u16) {
+        self.ptrace_stop_event.store(event, Ordering::Release);
+    }
+
+    pub fn ptrace_stop_event(&self) -> u16 {
+        self.ptrace_stop_event.load(Ordering::Acquire)
+    }
+
+    pub fn set_ptrace_seized(&self, seized: bool) {
+        self.ptrace_seized.store(seized as u8, Ordering::Release);
+    }
+
+    pub fn is_ptrace_seized(&self) -> bool {
+        self.ptrace_seized.load(Ordering::Acquire) != 0
+    }
+
+    pub fn set_ptrace_syscall_stop(&self, enabled: bool) {
+        self.ptrace_syscall_stop
+            .store(enabled as u8, Ordering::Release);
+    }
+
+    pub fn ptrace_syscall_stop_enabled(&self) -> bool {
+        self.ptrace_syscall_stop.load(Ordering::Acquire) != 0
+    }
+
+    /// entry-stop 消费后标记：下一次 syscall 重入直接放行并在出口停止。
+    pub fn set_ptrace_syscall_reenable(&self, enabled: bool) {
+        self.ptrace_syscall_reenable
+            .store(enabled as u8, Ordering::Release);
+    }
+
+    pub fn ptrace_syscall_reenable(&self) -> bool {
+        self.ptrace_syscall_reenable.load(Ordering::Acquire) != 0
+    }
+
+    pub fn set_ptrace_last_siginfo(&self, info: crate::signal::SigInfo) {
+        *self.ptrace_last_siginfo.lock() = Some(info);
+    }
+
+    pub fn take_ptrace_last_siginfo(&self) -> Option<crate::signal::SigInfo> {
+        self.ptrace_last_siginfo.lock().take()
+    }
+
+    pub fn clear_ptrace_last_siginfo(&self) {
+        *self.ptrace_last_siginfo.lock() = None;
+    }
+
+    /// `PTRACE_GET_SYSCALL_INFO` 的 entry 记录。
+    pub fn record_syscall_entry(&self, nr: usize, args: [usize; 6]) {
+        self.ptrace_syscall_state.store(1, Ordering::Release);
+        self.ptrace_syscall_nr.store(nr as i64, Ordering::Release);
+        *self.ptrace_syscall_args.lock() = [
+            args[0] as u64,
+            args[1] as u64,
+            args[2] as u64,
+            args[3] as u64,
+            args[4] as u64,
+            args[5] as u64,
+        ];
+    }
+
+    /// `PTRACE_GET_SYSCALL_INFO` 的 exit 记录。
+    pub fn record_syscall_exit(&self, ret: isize) {
+        self.ptrace_syscall_state.store(2, Ordering::Release);
+        self.ptrace_syscall_ret.store(ret as i64, Ordering::Release);
+    }
+
+    pub fn record_syscall_seccomp(&self, nr: usize, args: [usize; 6]) {
+        self.ptrace_syscall_state.store(3, Ordering::Release);
+        self.ptrace_syscall_nr.store(nr as i64, Ordering::Release);
+        *self.ptrace_syscall_args.lock() = [
+            args[0] as u64,
+            args[1] as u64,
+            args[2] as u64,
+            args[3] as u64,
+            args[4] as u64,
+            args[5] as u64,
+        ];
+    }
+
+    pub fn ptrace_syscall_info(&self) -> (u8, i64, [u64; 6], i64) {
+        (
+            self.ptrace_syscall_state.load(Ordering::Acquire),
+            self.ptrace_syscall_nr.load(Ordering::Acquire),
+            *self.ptrace_syscall_args.lock(),
+            self.ptrace_syscall_ret.load(Ordering::Acquire),
+        )
+    }
+
+    pub fn set_pdeathsig(&self, sig: i32) {
+        self.pdeathsig.store(sig, Ordering::Release);
+    }
+
+    pub fn pdeathsig(&self) -> i32 {
+        self.pdeathsig.load(Ordering::Acquire)
+    }
+
+    pub fn set_subreaper(&self, enabled: bool) {
+        self.subreaper.store(enabled as u8, Ordering::Release);
+    }
+
+    pub fn is_subreaper(&self) -> bool {
+        self.subreaper.load(Ordering::Acquire) != 0
+    }
+
+    pub fn set_no_new_privs(&self, enabled: bool) {
+        self.no_new_privs.store(enabled as u8, Ordering::Release);
+    }
+
+    pub fn no_new_privs(&self) -> bool {
+        self.no_new_privs.load(Ordering::Acquire) != 0
+    }
+
+    pub fn set_keepcaps(&self, enabled: bool) {
+        self.keepcaps.store(enabled as u8, Ordering::Release);
+    }
+
+    pub fn keepcaps(&self) -> bool {
+        self.keepcaps.load(Ordering::Acquire) != 0
+    }
+
+    /// `personality(2)`：写回进程 persona。上层 syscall 负责 Linux 的
+    /// “`0xffffffff` 只读”语义与返回值（旧值）处理。
+    pub fn set_personality(&self, persona: u64) {
+        self.personality.store(persona, Ordering::Release);
+    }
+
+    pub fn personality(&self) -> u64 {
+        self.personality.load(Ordering::Acquire)
+    }
+
+    /// `PR_SET_PTRACER` 的 yama 追踪者作用域；0 表示任意追踪者。
+    pub fn set_ptracer_scope(&self, scope: i32) {
+        self.ptracer_scope.store(scope, Ordering::Release);
+    }
+
+    pub fn ptracer_scope(&self) -> i32 {
+        self.ptracer_scope.load(Ordering::Acquire)
+    }
+
+    /// `PR_SET_SPECULATION_CTRL` 持久化位图。
+    pub fn set_speculation_ctrl(&self, value: u64) {
+        self.speculation_ctrl.store(value, Ordering::Release);
+    }
+
+    pub fn speculation_ctrl(&self) -> u64 {
+        self.speculation_ctrl.load(Ordering::Acquire)
+    }
+
+    pub fn set_dumpable(&self, value: u8) {
+        self.dumpable.store(value, Ordering::Release);
+    }
+
+    pub fn dumpable(&self) -> u8 {
+        self.dumpable.load(Ordering::Acquire)
+    }
+
+    /// 进入 `PTRACE_SINGLESTEP`：记录被替换指令的位置与原文。
+    pub fn arm_singlestep(&self, addr: usize, insn: u32) {
+        self.ptrace_singlestep.store(1, Ordering::Release);
+        self.ptrace_singlestep_addr.store(addr, Ordering::Release);
+        *self.ptrace_singlestep_insn.lock() = Some(insn);
+    }
+
+    pub fn singlestep_armed(&self) -> bool {
+        self.ptrace_singlestep.load(Ordering::Acquire) != 0
+    }
+
+    pub fn singlestep_addr(&self) -> usize {
+        self.ptrace_singlestep_addr.load(Ordering::Acquire)
+    }
+
+    pub fn take_singlestep_insn(&self) -> Option<u32> {
+        self.ptrace_singlestep_insn.lock().take()
+    }
+
+    pub fn clear_singlestep(&self) {
+        self.ptrace_singlestep.store(0, Ordering::Release);
+        *self.ptrace_singlestep_insn.lock() = None;
+    }
+
     pub fn parent(&self) -> Option<Arc<Task>> {
         let identity = crate::pid::lock_process_identity();
         self.parent_in(&identity)
@@ -1457,7 +1760,7 @@ impl Task {
     }
 
     pub fn thread_group(&self) -> Arc<ThreadGroup> {
-        Arc::clone(&self.rel.lock().thread_group)
+        Arc::clone(&self.thread_group)
     }
 
     /// 记录该任务由哪个线程组持有 Native child 所有权。
@@ -1717,6 +2020,12 @@ impl Task {
 
     /// 标记任务因 stop 信号进入停止态，并记录一次可被 `wait(WUNTRACED)` 观察的事件。
     pub(crate) fn mark_stopped(&self, sig: SignalNumber) -> bool {
+        self.mark_stopped_with_raw_sig(sig.raw() as i32)
+    }
+
+    /// 同 [`Self::mark_stopped`]，但允许记录 `PTRACE_O_TRACESYSGOOD` 的
+    /// `0x80|SIGTRAP` 原始编码（低 7 位之外的位会原样进入 wait status）。
+    pub(crate) fn mark_stopped_with_raw_sig(&self, raw_sig: i32) -> bool {
         loop {
             let state = self.state();
             match state {
@@ -1732,8 +2041,7 @@ impl Task {
 
         self.signal.mark_user_return_work();
 
-        self.wait_stop_sig
-            .store(sig.raw() as i32, Ordering::Release);
+        self.wait_stop_sig.store(raw_sig, Ordering::Release);
         self.wait_continue_pending.store(0, Ordering::Release);
         self.wait_stop_pending.store(1, Ordering::Release);
         if let Some(parent) = self.parent() {
@@ -1784,9 +2092,18 @@ impl Task {
         if pending == 0 {
             return None;
         }
-        let sig = SignalNumber::from_raw(self.wait_stop_sig.load(Ordering::Acquire))
-            .unwrap_or(SignalNumber::SIGSTOP);
-        Some(WaitStatus::from_stop(sig))
+        let raw_sig = self.wait_stop_sig.load(Ordering::Acquire);
+        let event = self.ptrace_stop_event();
+        if event != 0 {
+            let sig = SignalNumber::from_raw(raw_sig).unwrap_or(SignalNumber::SIGTRAP);
+            Some(WaitStatus::from_stop_event(sig, event))
+        } else if raw_sig & 0x80 != 0 {
+            // TRACESYSGOOD：把 0x80|SIGTRAP 原样编码进 status。
+            Some(WaitStatus::from_stop_raw(raw_sig))
+        } else {
+            let sig = SignalNumber::from_raw(raw_sig).unwrap_or(SignalNumber::SIGSTOP);
+            Some(WaitStatus::from_stop(sig))
+        }
     }
 
     /// 返回并按需消费一次 continued wait 事件。
@@ -1975,6 +2292,15 @@ impl Task {
     ///
     /// 多 ns 共享同一任务时多次调用：祖先 ns 在前、自身 ns 在后。重复登记
     /// 同一 namespace 视作配置错误（debug_assert）。
+    /// 任务所在的 pid 命名空间（spawn 前由调用方设置）。
+    pub fn set_pid_ns(&self, ns: Arc<PidNamespace>) {
+        self.rel.lock().pid_ns = ns;
+    }
+
+    pub fn pid_ns(&self) -> Arc<PidNamespace> {
+        Arc::clone(&self.rel.lock().pid_ns)
+    }
+
     pub fn register_pid(&self, ns: Arc<PidNamespace>, pid: PidT) {
         let mut rel = self.rel.lock();
         debug_assert!(
@@ -2339,6 +2665,10 @@ impl Task {
             now_ns.saturating_sub(encoded - 1)
         };
         self.cpu_runtime_ns.fetch_add(charged, Ordering::AcqRel);
+        // 同步累计到线程组（CLOCK_PROCESS_CPUTIME_ID 基准）。
+        self.thread_group()
+            .cpu_runtime_ns
+            .fetch_add(charged, Ordering::Relaxed);
         if encoded != 0 {
             self.running_since_ns
                 .store(now_ns.saturating_add(1), Ordering::Release);
@@ -2661,6 +2991,11 @@ impl Task {
     }
 
     pub fn usage_snapshot(&self, now_ns: u64) -> TaskUsage {
+        // `user_ns` 实为总 CPU 时间（`elapsed_usage_ns`），`system_ns` 恒 0：
+        // 内核没有 per-task 的用户/系统态拆分（用户态 tick 记账只存在于线程组
+        // 级 `ThreadGroup::user_cpu_ns`）。组级拆分由 kernel 侧
+        // `aggregate_thread_group_usage` 用「组总 CPU - 组用户时间」完成；此处
+        // 保持 per-task 语义不变，避免逐任务求和时 system_ns 被重复累加。
         TaskUsage {
             user_ns: self.elapsed_usage_ns(now_ns),
             system_ns: 0,
@@ -3066,6 +3401,9 @@ pub const TASKEXT_VFS_FDTABLE: TaskExtKey = 0x0001_0001;
 pub const TASKEXT_VM_SPACE: TaskExtKey = 0x0001_0002;
 /// 已保存的用户 trap frame（kernel/hal 通过此键挂在 Task 的 ext 表上）。
 pub const TASKEXT_USER_TRAP_FRAME: TaskExtKey = 0x0001_0003;
+/// syscall 入口的用户 trap frame 快照（arch 在 syscall 分发前保存，
+/// ptrace 的 GETREGSET/PEEKUSR 在 syscall-stop 期间读取）。
+pub const TASKEXT_PTRACE_FRAME: TaskExtKey = 0x0001_0006;
 /// RISC-V64 用户态 Vector 上下文（arch 专用，按线程独立保存）。
 pub const TASKEXT_RISCV_VECTOR_STATE: TaskExtKey = 0x0001_0004;
 /// RISC-V64 信号投递期间暂存的 Vector 上下文栈。

@@ -201,6 +201,28 @@ impl LoopDriver {
         Ok(())
     }
 
+    /// 更换 backing file(LOOP_CHANGE_FD):保留 offset/size_limit/read_only/flags,
+    /// 只替换底层文件对象与文件名,并按新文件重算容量。
+    pub fn change_backing(
+        &self,
+        backing: Arc<dyn LoopBacking>,
+        file_name: Box<str>,
+    ) -> Result<(), LoopError> {
+        let mut state = self.state.lock();
+        if state.active_ios != 0 {
+            return Err(LoopError::Busy);
+        }
+        let Some(current) = state.backing.as_mut() else {
+            return Err(LoopError::NotAttached);
+        };
+        let capacity_bytes =
+            compute_capacity_for(backing.as_ref(), current.offset, current.size_limit)?;
+        current.backing = backing;
+        current.file_name = file_name;
+        current.capacity_bytes = capacity_bytes;
+        Ok(())
+    }
+
     pub fn detach(&self) -> Result<(), LoopError> {
         let mut state = self.state.lock();
         if state.backing.is_none() {

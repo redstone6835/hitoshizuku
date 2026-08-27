@@ -7,6 +7,7 @@
 pub mod base;
 pub mod cpu_dma_latency;
 pub mod loop_device;
+pub mod mem;
 pub mod projection;
 pub mod rtc;
 pub mod spec;

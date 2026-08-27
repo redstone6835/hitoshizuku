@@ -8,7 +8,7 @@ use core::mem::size_of;
 use errno::Errno;
 use general::TaskOps;
 use general::mm::{VmSpace, copy_cstr_bytes_from_user, copy_cstr_from_user, copy_from_user};
-use general::vfs::{FdTable, VfsContext};
+use general::vfs::{FdTable, VfsContext, VfsExecLease};
 use hal::user_context::UserTrapFrame;
 use native_abi::ExecPhase;
 use native_abi::UserAbiKind;
@@ -30,6 +30,8 @@ const EXEC_MAX_ARG_BYTES: usize = 128 * 1024;
 pub(crate) struct PreparedImage {
     vm: Arc<VmSpace>,
     exec_access: Arc<ExecutableAccessSet>,
+    /// exec 后的新凭据（setuid/setgid 位、能力转换；`None` = 不变）。
+    exec_credentials: Option<Arc<sched::ids::Credentials>>,
     sync_icache: bool,
     #[cfg(feature = "performance-profile")]
     main_profile: (u64, usize, usize),
@@ -66,6 +68,7 @@ pub(crate) struct PreparedInitialThread {
 struct PreparedLoad {
     vm: Arc<VmSpace>,
     exec_access: Arc<ExecutableAccessSet>,
+    exec_credentials: Option<Arc<sched::ids::Credentials>>,
     sync_icache: bool,
     personality: ProcessPersonalityState,
     fdtable: Option<Arc<FdTable>>,
@@ -114,6 +117,7 @@ enum InstallStep {
     FileDescriptors,
     AddressSpace,
     ExecutableAccess,
+    Credentials,
     ExecPath,
     Arguments,
     Environment,
@@ -122,10 +126,11 @@ enum InstallStep {
     UserContext,
 }
 
-const INSTALL_STEPS: [InstallStep; 9] = [
+const INSTALL_STEPS: [InstallStep; 10] = [
     InstallStep::FileDescriptors,
     InstallStep::AddressSpace,
     InstallStep::ExecutableAccess,
+    InstallStep::Credentials,
     InstallStep::ExecPath,
     InstallStep::Arguments,
     InstallStep::Environment,
@@ -283,6 +288,73 @@ fn task_vm_space(task: &Arc<Task>) -> Option<Arc<VmSpace>> {
         .ok()
 }
 
+/// 从新映像的用户栈上读出 exec 布好的 auxv（argc/argv/envp 之后），持久化到
+/// 任务扩展供 `PR_GET_AUXV` 读取。best-effort：读栈失败时挂空 auxv，绝不
+/// 让 PONR 后的安装序列因此失败。
+fn capture_exec_auxv(task: &Arc<Task>, frame: &UserTrapFrame, vm: &Arc<VmSpace>) {
+    let mut auxv = Vec::new();
+    let mut raw = [0u8; 8];
+    let mut cur = frame.sp();
+    if !read_stack_word(vm, cur, &mut raw) {
+        install_exec_auxv(task, auxv);
+        return;
+    }
+    let argc = u64::from_ne_bytes(raw) as usize;
+    // argv（argc 项）+ 空指针。
+    let Some(after_argv) = cur
+        .checked_add(8)
+        .and_then(|a| a.checked_add(argc.checked_mul(8)?))
+    else {
+        install_exec_auxv(task, auxv);
+        return;
+    };
+    // 跳过 argv 尾部的空指针。
+    let mut envp = after_argv.saturating_add(8);
+    // envp 直到空指针。
+    loop {
+        if !read_stack_word(vm, envp, &mut raw) {
+            install_exec_auxv(task, auxv);
+            return;
+        }
+        if u64::from_ne_bytes(raw) == 0 {
+            break;
+        }
+        envp = envp.saturating_add(8);
+    }
+    // 跳过 envp 尾部的空指针，进入 auxv。
+    cur = envp.saturating_add(8);
+    loop {
+        let key_addr = cur;
+        let val_addr = cur.saturating_add(8);
+        if !read_stack_word(vm, key_addr, &mut raw) {
+            break;
+        }
+        let key = u64::from_ne_bytes(raw);
+        if key == 0 {
+            // AT_NULL 终止。
+            break;
+        }
+        if !read_stack_word(vm, val_addr, &mut raw) {
+            break;
+        }
+        let value = u64::from_ne_bytes(raw);
+        auxv.push(key);
+        auxv.push(value);
+        cur = val_addr.saturating_add(8);
+    }
+    install_exec_auxv(task, auxv);
+}
+
+fn read_stack_word(vm: &Arc<VmSpace>, addr: usize, raw: &mut [u8; 8]) -> bool {
+    vm.copy_user_bytes_in(addr, raw).is_ok()
+}
+
+fn install_exec_auxv(task: &Arc<Task>, auxv: Vec<u64>) {
+    let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(sched::sync::Spinlock::new(auxv));
+    let _ = task.ext_remove(crate::syscalls::process::TASKEXT_EXEC_AUXV);
+    task.ext_install(crate::syscalls::process::TASKEXT_EXEC_AUXV, erased);
+}
+
 fn task_fdtable(task: &Arc<Task>) -> Option<Arc<FdTable>> {
     task.ext_lookup(TASKEXT_VFS_FDTABLE)?
         .downcast::<FdTable>()
@@ -326,16 +398,16 @@ fn collect_user_byte_string_array(
         }
         let remaining = EXEC_MAX_ARG_BYTES
             .checked_sub(*used_bytes)
-            .ok_or(Errno::EINVAL)?;
+            .ok_or(Errno::E2BIG)?;
         if remaining == 0 {
-            return Err(Errno::EINVAL);
+            return Err(Errno::E2BIG);
         }
         let value = copy_user_cstring_bytes(string_user, remaining)?;
         *used_bytes = used_bytes
             .checked_add(value.len() + 1)
             .ok_or(Errno::EINVAL)?;
         if *used_bytes > EXEC_MAX_ARG_BYTES {
-            return Err(Errno::EINVAL);
+            return Err(Errno::E2BIG);
         }
         strings.push(value);
     }
@@ -540,7 +612,12 @@ pub(crate) fn prepare_exec(task: &Arc<Task>, request: ExecRequest) -> Result<Pre
 
     let kernel_stack_top = task.ensure_kernel_stack();
     let loaded = match loaded {
-        LoadedExecutionImage::Tomori { image, argv, envp } => {
+        LoadedExecutionImage::Tomori {
+            image,
+            argv,
+            envp,
+            file_owner,
+        } => {
             let prepared_fdtable = observed
                 .fdtable
                 .as_ref()
@@ -570,9 +647,11 @@ pub(crate) fn prepare_exec(task: &Arc<Task>, request: ExecRequest) -> Result<Pre
                 .as_ref()
                 .map(|(path, range)| (crate::sched::profile_image_id(path), range.start, range.end))
                 .unwrap_or((0, 0, 0));
+            let exec_credentials = compute_exec_credentials(task, file_owner);
             PreparedLoad {
                 vm,
                 exec_access,
+                exec_credentials,
                 sync_icache: false,
                 personality: ProcessPersonalityState::TomoriLinux,
                 fdtable: prepared_fdtable,
@@ -636,6 +715,7 @@ pub(crate) fn prepare_exec(task: &Arc<Task>, request: ExecRequest) -> Result<Pre
             PreparedLoad {
                 vm: image.vm,
                 exec_access,
+                exec_credentials: None,
                 sync_icache: true,
                 personality: ProcessPersonalityState::MygoNative(personality),
                 fdtable: None,
@@ -658,6 +738,7 @@ pub(crate) fn prepare_exec(task: &Arc<Task>, request: ExecRequest) -> Result<Pre
         image: PreparedImage {
             vm: loaded.vm,
             exec_access: loaded.exec_access,
+            exec_credentials: loaded.exec_credentials,
             sync_icache: loaded.sync_icache,
             #[cfg(feature = "performance-profile")]
             main_profile: loaded.main_profile,
@@ -696,6 +777,21 @@ fn replace_required_extension<T: core::any::Any + Send + Sync>(
     task.ext_replace(key, erased)
         .map(|_| ())
         .map_err(|_| Errno::EIO)
+}
+
+/// 替换当前任务的地址空间时，先保留旧 `VmSpace`，安装并激活新页表后再释放。
+///
+/// RISC-V 维护每 CPU 的当前 PGD 槽位；若在激活新页表前释放旧对象，槽位会
+/// 短暂指向已回收的页表并在下一次切换时形成 use-after-free。其它扩展可以直接
+/// 使用 [`replace_required_extension`]，地址空间必须经过这个有序路径。
+fn replace_vm_space_extension(task: &Arc<Task>, vm: &Arc<VmSpace>) -> Result<(), Errno> {
+    let erased: Arc<dyn core::any::Any + Send + Sync> = vm.clone();
+    let old = task
+        .ext_replace(TASKEXT_VM_SPACE, erased)
+        .map_err(|_| Errno::EIO)?;
+    vm.activate();
+    drop(old);
+    Ok(())
 }
 
 fn reset_signal_state_for_exec(task: &Arc<Task>, target_abi: UserAbiKind) {
@@ -896,17 +992,23 @@ pub(crate) fn commit_exec(
                 drop(fdtable_lease.take());
             }
             InstallStep::AddressSpace => {
-                replace_required_extension(task, TASKEXT_VM_SPACE, &prepared.image.vm)?;
-                prepared.image.vm.activate();
-                // frame 在 pure prepare 中构造，此时旧地址空间仍保持激活；提交新 VM
-                // 后必须刷新架构地址空间令牌，避免返回路径重新装回旧页表。
+                replace_vm_space_extension(task, &prepared.image.vm)?;
+                // frame 在 pure prepare 中构造；提交新 VM 后必须刷新架构地址空间
+                // 令牌，避免返回路径重新装回旧页表。
                 prepared.initial_thread.frame.set_current_address_space();
                 if prepared.image.sync_icache {
                     arch::CurrentTaskOps::sync_icache();
                 }
+                // 新 VM 激活后即可读回 exec 布好的 auxv，供 PR_GET_AUXV 使用。
+                capture_exec_auxv(task, &prepared.initial_thread.frame, &prepared.image.vm);
             }
             InstallStep::ExecutableAccess => {
                 replace_required_extension(task, TASKEXT_EXEC_ACCESS, &prepared.image.exec_access)?;
+            }
+            InstallStep::Credentials => {
+                if let Some(credentials) = prepared.image.exec_credentials.as_ref() {
+                    install_exec_credentials(task, Arc::clone(credentials), vfs_lease.as_ref())?;
+                }
             }
             InstallStep::ExecPath => {
                 replace_required_extension(task, TASKEXT_EXEC_PATH, &prepared.startup.exec_path)?;
@@ -975,6 +1077,117 @@ pub(crate) fn commit_exec(
         if let Some((source, _)) = fdtable_source.as_ref() {
             source.suppress_drop_notifications_for_exec();
         }
+    }
+    ptrace_notify_exec(task);
+    Ok(())
+}
+
+/// `PTRACE_O_TRACEEXEC`：exec 完成事件（消息为 0）。
+fn ptrace_notify_exec(task: &Arc<Task>) {
+    const PTRACE_O_TRACEEXEC: u64 = 0x0000_0010;
+    const PTRACE_EVENT_EXEC: u16 = 4;
+    if !task.is_ptrace_traced() || task.ptrace_options() & PTRACE_O_TRACEEXEC == 0 {
+        return;
+    }
+    task.set_ptrace_event_msg(0);
+    task.set_ptrace_stop_event(PTRACE_EVENT_EXEC);
+    task.clear_ptrace_last_siginfo();
+    sched::operation::ptrace_mark_stopped(task, sched::SignalNumber::SIGTRAP);
+}
+
+/// Linux `commit_creds` 的 exec 凭据语义（无文件能力时）。
+///
+/// - `PR_SET_NO_NEW_PRIVS`：完全跳过权限提升；
+/// - `SECBIT_NO_SETUID_FIXUP`：跳过 setuid/setgid 位；
+/// - `S_ISUID`/`S_ISGID`：euid/egid 切换为文件属主；euid 变化时 suid 同步、
+///   `dumpable = 0`；
+/// - 能力转换（`prepare_kernel_cred`/`bprm` 公式，`fP=fI=fE=0`）：
+///   `pP' = bset & (pI | pP)`，`pE' = pE & pP'`；setuid 生效（secureexec）
+///   且未设 `SECBIT_KEEP_CAPS` 时 `pP' = bset & pI`（丢弃原有 permitted）；
+/// - `PR_SET_KEEPCAPS` 与 `SECBIT_KEEP_CAPS` 等价。
+fn compute_exec_credentials(
+    task: &Arc<Task>,
+    file_owner: Option<(u32, u32, u16)>,
+) -> Option<Arc<sched::ids::Credentials>> {
+    use sched::ids::{CapSet, Gid, Uid};
+
+    const SECBIT_KEEP_CAPS: u32 = 1 << 0;
+    const SECBIT_NO_SETUID_FIXUP: u32 = 1 << 2;
+    const S_ISUID: u16 = 0o4000;
+    const S_ISGID: u16 = 0o2000;
+
+    let old = task.credentials();
+    if task.no_new_privs() {
+        return None;
+    }
+    let securebits = old.securebits;
+    let mut new = (*old).clone();
+
+    let mut secureexec = false;
+    if securebits & SECBIT_NO_SETUID_FIXUP == 0 {
+        if let Some((file_uid, file_gid, mode)) = file_owner {
+            if mode & S_ISUID != 0 {
+                new.euid = Uid(file_uid);
+                secureexec = true;
+            }
+            if mode & S_ISGID != 0 {
+                new.egid = Gid(file_gid);
+                secureexec = true;
+            }
+        }
+    }
+    if new.euid != old.euid {
+        new.suid = new.euid;
+        task.set_dumpable(0);
+        secureexec = true;
+    }
+    if new.egid != old.egid {
+        new.fsgid = new.egid;
+        secureexec = true;
+    }
+    if !secureexec
+        && new.uid == old.uid
+        && new.euid == old.euid
+        && new.suid == old.suid
+        && new.fsuid == old.fsuid
+        && new.gid == old.gid
+        && new.egid == old.egid
+        && new.sgid == old.sgid
+        && new.fsgid == old.fsgid
+        && new.caps.raw() == old.caps.raw()
+    {
+        return None;
+    }
+
+    // 能力转换。
+    let bset = old.cap_bset;
+    let inherited = old.cap_inheritable;
+    let old_permitted = old.cap_permitted;
+    let effective = old.caps;
+    let keep_caps = task.keepcaps() || securebits & SECBIT_KEEP_CAPS != 0;
+    let inherited_or_permitted = CapSet::from_raw(inherited.raw() | old_permitted.raw());
+    let new_permitted = if secureexec && !keep_caps {
+        bset.mask(inherited)
+    } else {
+        bset.mask(inherited_or_permitted)
+    };
+    let new_effective = effective.mask(new_permitted);
+    new.cap_permitted = new_permitted;
+    new.caps = new_effective;
+    // 无 ambient 能力；inheritable 保持不变（Linux pI' = pI）。
+
+    Some(Arc::new(new))
+}
+
+/// 安装 exec 凭据：sched 凭据 + VFS 上下文凭据原子替换。
+fn install_exec_credentials(
+    task: &Arc<Task>,
+    credentials: Arc<sched::ids::Credentials>,
+    vfs_lease: Option<&VfsExecLease<'_>>,
+) -> Result<(), Errno> {
+    task.set_credentials(Arc::clone(&credentials));
+    if let Some(vfs_lease) = vfs_lease {
+        vfs_lease.set_cred(Arc::new(crate::syscalls::vfs_cred_from_sched(&credentials)));
     }
     Ok(())
 }

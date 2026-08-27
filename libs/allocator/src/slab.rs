@@ -2353,10 +2353,11 @@ impl SlabAllocator {
         {
             return false;
         }
-        let Ok(layout) = Layout::from_size_align(record.size, record.align) else {
+        if Layout::from_size_align(record.size, record.align).is_err() {
             return false;
-        };
-        let Some(zone_idx) = Self::class_index_for(layout) else {
+        }
+        // 原地缩容只更新逻辑大小，实际对象仍属于原先的 slab class。
+        let Some(zone_idx) = class_index_for_size(record.usable_size) else {
             return false;
         };
         let zone = &self.zones[zone_idx];
@@ -2667,10 +2668,11 @@ mod slab_state_tests {
         CACHE_CAPACITY, CacheDrainBuffer, CacheEntry, FLUSH_BATCH, INVALID_SLAB_NODE,
         PerCpuCacheState, SLAB_DIRECTORY_BITS, SLAB_DIRECTORY_MASK, Slab, SlabAllocator,
         SlabAuditFlags, SlabDirectoryPage, SlabNode, SlabObjectState, SlabPageDirectory, ZoneState,
-        directory_page, slab_lookup_bucket,
+        directory_page, pages_per_slab, slab_lookup_bucket,
     };
     use crate::boot::BootAllocator;
     use crate::buddy::{BuddyAllocator, MemorySegment, PAGE_SIZE};
+    use crate::request::{AllocationArena, AllocationKind, AllocationRecord, MemoryDomain};
     use crate::space::{ArenaKind, BackedRange};
 
     fn test_slab_node(base: usize) -> Box<SlabNode> {
@@ -3076,6 +3078,53 @@ mod slab_state_tests {
             .expect("创建大栈测试线程")
             .join()
             .expect("size-class owner 测试线程失败");
+    }
+
+    #[test]
+    fn free_record_uses_backing_class_after_cross_class_shrink() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                const BASE: usize = 0x1_1000_0000;
+                const BACKING_SIZE: usize = 192;
+                let allocator = Box::new(SlabAllocator::new(ArenaKind::Tracked));
+                assert!(allocator.directory.init((BASE, 4 * 1024 * 1024)));
+                allocator.initialized.store(true, Ordering::Release);
+
+                let page_count = pages_per_slab(BACKING_SIZE);
+                let mut node = Box::new(SlabNode::empty());
+                node.prepare(
+                    BackedRange {
+                        arena: ArenaKind::Tracked,
+                        vaddr: BASE,
+                        paddr: BASE,
+                        size: page_count * PAGE_SIZE,
+                        order: page_count.trailing_zeros() as usize,
+                    },
+                    page_count,
+                    BACKING_SIZE,
+                );
+                let node_addr = (&mut *node as *mut SlabNode) as usize;
+                prepare_test_directory_page(&allocator.directory, 0);
+                assert!(
+                    allocator
+                        .directory
+                        .publish_range(BASE, page_count * PAGE_SIZE, node_addr,)
+                );
+                assert!(node.activate());
+
+                let ptr = node.slab.allocate(BACKING_SIZE).expect("分配 192 字节对象");
+                let record =
+                    AllocationRecord::new(AllocationKind::Small, MemoryDomain::Kernel, ptr)
+                        .with_arena(AllocationArena::Tracked)
+                        .with_sizes(40, BACKING_SIZE, 8)
+                        .with_backend_cookie(node.backend_cookie());
+
+                assert!(allocator.free_record(record, 0));
+            })
+            .expect("创建大栈测试线程")
+            .join()
+            .expect("跨尺寸类缩容释放测试线程失败");
     }
 
     #[test]

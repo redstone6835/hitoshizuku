@@ -1,5 +1,6 @@
 use crate::vfs::*;
 
+use alloc::vec::Vec;
 use error::VfsError;
 use fdtable::{Fd, FdFlags, FdTable};
 use file::{File, OpenOptions};
@@ -38,10 +39,14 @@ fn check_parent_perm(
 ) -> VfsResult<()> {
     let pmeta = parent_inode.meta_snapshot();
     let cred = ctx.cred();
-    if !cred.can_write(pmeta.uid, pmeta.gid, pmeta.mode) {
+    if !crate::acl::check_access(cred.as_ref(), parent_inode, crate::acl::AclCheckKind::Write) {
         return Err(VfsError::PermissionDenied);
     }
-    if !cred.can_exec(pmeta.uid, pmeta.gid, pmeta.mode, true) {
+    if !crate::acl::check_access(
+        cred.as_ref(),
+        parent_inode,
+        crate::acl::AclCheckKind::Exec { is_dir: true },
+    ) {
         return Err(VfsError::PermissionDenied);
     }
     if let Some(child_uid) = sticky_child_uid {
@@ -102,6 +107,37 @@ fn create_attributes(
     )
 }
 
+/// 按父目录 default ACL 派生新 inode 的 ACL 并调整 mode（Linux
+/// `posix_acl_create` 语义）；父目录无 default ACL 时返回 `None`。
+fn default_acl_for_create(
+    parent_inode: &Arc<Inode>,
+    mode: &mut FileMode,
+) -> VfsResult<Option<Vec<u8>>> {
+    if !parent_inode.has_xattrs() {
+        return Ok(None);
+    }
+    let Some(bytes) = parent_inode.ops.getxattr(crate::acl::ACL_DEFAULT_XATTR)? else {
+        return Ok(None);
+    };
+    let default_acl = crate::acl::parse(&bytes)?;
+    let (child_acl, adjusted) = crate::acl::create(&default_acl, *mode)?;
+    *mode = adjusted;
+    Ok(Some(crate::acl::encode(&child_acl)))
+}
+
+/// 把派生出的 ACL 安装到新 inode（失败不阻断创建，与 Linux 尽力而为一致）。
+fn install_child_acl(new_inode: &Arc<Inode>, acl_bytes: Option<Vec<u8>>) {
+    if let Some(bytes) = acl_bytes {
+        if new_inode
+            .ops
+            .setxattr(crate::acl::ACL_ACCESS_XATTR, &bytes, 0)
+            .is_ok()
+        {
+            new_inode.mark_has_xattrs();
+        }
+    }
+}
+
 fn unregister_socket_inode(inode: &Inode) {
     if inode.kind == stat::FileType::Socket {
         crate::socket::unregister_path_socket(inode.fs_id().raw(), inode.ino());
@@ -159,6 +195,23 @@ pub fn openat(
 ///
 /// 普通 `openat` 只由 `OpenOptions` 派生 lookup 行为；`openat2` 的
 /// `RESOLVE_NO_SYMLINKS` 这类约束属于路径解析策略，不应塞进通用打开标志。
+/// O_DIRECT 打开校验：文件系统不支持直接 I/O 时拒绝（Linux tmpfs 等
+/// 对 `open(O_DIRECT)` 返回 EINVAL）。
+pub fn check_direct_io_supported(inode: &Inode, direct: bool) -> VfsResult<()> {
+    if !direct {
+        return Ok(());
+    }
+    let supports = inode
+        .superblock()
+        .map(|sb| sb.ops.supports_direct_io())
+        .unwrap_or(false);
+    if supports {
+        Ok(())
+    } else {
+        Err(VfsError::InvalidArgument)
+    }
+}
+
 #[kernel_symbols::export(
     name = "vfs.operation.openat_with_lookup_flags",
     contract = "kernel.vfs.operation@1",
@@ -217,13 +270,40 @@ pub fn openat_with_lookup_flags(
             check_parent_perm(ctx, &parent_inode, None)?;
 
             // 驱动的 create 负责原子地检查 O_EXCL（若文件已并发创建，返回 AlreadyExists）
-            let (effective_mode, cred) =
+            let (mut effective_mode, cred) =
                 create_attributes(ctx, &parent_inode, mode, stat::FileType::Regular);
+            let child_acl = default_acl_for_create(&parent_inode, &mut effective_mode)?;
             let new_inode = parent_inode
                 .ops
                 .create(&parent_inode, name, effective_mode, &cred)?;
+            install_child_acl(&new_inode, child_acl);
+            // fsnotify 权限事件：FAN_OPEN_PERM（拒绝 → EACCES，中断 → EINTR）。
+            crate::fsnotify::emit_perm_at(
+                &new_inode,
+                Some(&parent_mount),
+                crate::fsnotify::FAN_OPEN_PERM,
+            )
+            .map_deny()?;
 
             let canonical = cache_new_inode(&parent_dentry, name, new_inode);
+            let canonical_inode = canonical.inode().ok_or(VfsError::NotFound)?;
+            // fsnotify：父目录 IN_CREATE（带名字）+ 新文件 IN_OPEN
+            // （缓存放好后事件对象 dentry 可用，父链匹配目录监视）。
+            crate::fsnotify::emit_named_at(
+                &parent_inode,
+                Some(&parent_mount),
+                &canonical_inode,
+                crate::fsnotify::IN_CREATE,
+                name.as_bytes(),
+                0,
+            );
+            crate::fsnotify::emit_at_with_parents(
+                &canonical_inode,
+                Some(&canonical),
+                Some(&parent_mount),
+                crate::fsnotify::IN_OPEN,
+                0,
+            );
 
             (canonical, parent_mount)
         }
@@ -231,6 +311,19 @@ pub fn openat_with_lookup_flags(
     };
 
     let inode = dentry.inode().ok_or(VfsError::NotFound)?;
+    crate::fsnotify::emit_at_with_parents(
+        &inode,
+        Some(&dentry),
+        Some(&mount),
+        crate::fsnotify::IN_OPEN,
+        0,
+    );
+    // fanotify 权限事件：FAN_OPEN_PERM（拒绝 → EACCES，中断 → EINTR）。
+    match crate::fsnotify::emit_perm_at(&inode, Some(&mount), crate::fsnotify::FAN_OPEN_PERM) {
+        crate::fsnotify::PermOutcome::Deny => return Err(VfsError::PermissionDenied),
+        crate::fsnotify::PermOutcome::Interrupted => return Err(VfsError::Interrupted),
+        _ => {}
+    }
 
     // ── 类型检查 ──
     if flags.directory && inode.kind != stat::FileType::Directory {
@@ -247,6 +340,9 @@ pub fn openat_with_lookup_flags(
         return Err(VfsError::OperationNotPermitted);
     }
 
+    // ── O_DIRECT 支持校验：内存/伪文件系统拒绝（Linux 语义）──
+    check_direct_io_supported(&inode, flags.direct)?;
+
     // ── 只读挂载检查 ──
     if flags.writable() {
         mount.check_writable()?;
@@ -254,12 +350,23 @@ pub fn openat_with_lookup_flags(
 
     // ── DAC 权限检查 ──
     {
-        let meta = inode.meta_snapshot();
         let cred = ctx.cred();
-        if flags.readable() && !cred.can_read(meta.uid, meta.gid, meta.mode) {
+        if flags.readable()
+            && !crate::acl::check_access(
+                cred.as_ref(),
+                inode.as_ref(),
+                crate::acl::AclCheckKind::Read,
+            )
+        {
             return Err(VfsError::PermissionDenied);
         }
-        if flags.writable() && !cred.can_write(meta.uid, meta.gid, meta.mode) {
+        if flags.writable()
+            && !crate::acl::check_access(
+                cred.as_ref(),
+                inode.as_ref(),
+                crate::acl::AclCheckKind::Write,
+            )
+        {
             return Err(VfsError::PermissionDenied);
         }
     }
@@ -377,11 +484,21 @@ pub fn mkdirat(ctx: &VfsContext, dirfd: &Dirfd, path: &str, mode: FileMode) -> V
 
     check_parent_perm(ctx, &parent_inode, None)?;
 
-    let (effective_mode, cred) =
+    let (mut effective_mode, cred) =
         create_attributes(ctx, &parent_inode, mode, stat::FileType::Directory);
+    let child_acl = default_acl_for_create(&parent_inode, &mut effective_mode)?;
     let new_inode = parent_inode
         .ops
         .mkdir(&parent_inode, name, effective_mode, &cred)?;
+    install_child_acl(&new_inode, child_acl);
+    crate::fsnotify::emit_named_at(
+        &parent_inode,
+        Some(&parent_mount),
+        &new_inode,
+        crate::fsnotify::IN_CREATE,
+        name.as_bytes(),
+        0,
+    );
 
     cache_new_inode(&parent_dentry, name, new_inode);
     Ok(())
@@ -423,6 +540,15 @@ pub fn rmdir(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     check_parent_perm(ctx, &parent_inode, Some(child_uid))?;
 
     parent_inode.ops.rmdir(&parent_inode, name, &child_inode)?;
+    // fsnotify：父目录 IN_DELETE（目录），被删目录自身 IN_DELETE_SELF。
+    crate::fsnotify::emit_named_at(
+        &parent_inode,
+        Some(&parent_mount),
+        &child_inode,
+        crate::fsnotify::IN_DELETE,
+        name.as_bytes(),
+        0,
+    );
     // 常见空目录只逐出根键；若失败 lookup 留下负向子项，则一并清掉这些不可达引用，
     // 否则它们会长期保活 nlink=0 的 inode，导致磁盘位图和目录计数无法回收。
     DCACHE.invalidate_removed_directory(&target.dentry);
@@ -464,6 +590,15 @@ pub fn unlink(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     check_parent_perm(ctx, &parent_inode, Some(child_uid))?;
 
     parent_inode.ops.unlink(&parent_inode, name, &child_inode)?;
+    // fsnotify：父目录 IN_DELETE（带名字），被删文件自身 IN_DELETE_SELF。
+    crate::fsnotify::emit_named_at(
+        &parent_inode,
+        Some(&target.mount),
+        &child_inode,
+        crate::fsnotify::IN_DELETE,
+        name.as_bytes(),
+        0,
+    );
     unregister_socket_inode(&child_inode);
     DCACHE.invalidate_dentry(&target.dentry);
     target.dentry.invalidate();
@@ -502,6 +637,13 @@ pub fn renameat(
     }
     let old_inode = old_result.dentry.inode().ok_or(VfsError::NotFound)?;
 
+    // 目录不能改名为其自身或自身的子目录，否则会破坏目录树（Linux rename(2) 返回 EINVAL）。
+    if old_inode.kind == stat::FileType::Directory
+        && new_parent_dentry.is_descendant_of(&old_result.dentry)
+    {
+        return Err(VfsError::InvalidArgument);
+    }
+
     if Arc::ptr_eq(&old_parent_dentry, &new_parent_dentry) && old_name == new_name {
         return Ok(());
     }
@@ -537,7 +679,11 @@ pub fn renameat(
     {
         let m = old_parent_inode.meta_snapshot();
         let cred = ctx.cred();
-        if !cred.can_write(m.uid, m.gid, m.mode) {
+        if !crate::acl::check_access(
+            cred.as_ref(),
+            old_parent_inode.as_ref(),
+            crate::acl::AclCheckKind::Write,
+        ) {
             return Err(VfsError::PermissionDenied);
         }
         check_sticky(ctx, &m, old_inode_uid)?;
@@ -545,7 +691,11 @@ pub fn renameat(
     {
         let m = new_parent_inode.meta_snapshot();
         let cred = ctx.cred();
-        if !cred.can_write(m.uid, m.gid, m.mode) {
+        if !crate::acl::check_access(
+            cred.as_ref(),
+            new_parent_inode.as_ref(),
+            crate::acl::AclCheckKind::Write,
+        ) {
             return Err(VfsError::PermissionDenied);
         }
         if let Some(existing_uid) = new_existing_uid {
@@ -580,6 +730,25 @@ pub fn renameat(
         }
         retire_inode(replaced_inode);
     }
+    // fsnotify：MOVED_FROM/MOVED_TO 配对同一 cookie（+ MOVE_SELF）。
+    let cookie = crate::fsnotify::next_cookie();
+    crate::fsnotify::emit_named_at(
+        &old_parent_inode,
+        Some(&old_result.mount),
+        &old_inode,
+        crate::fsnotify::IN_MOVED_FROM,
+        old_name.as_bytes(),
+        cookie,
+    );
+    // TO 侧不再投递 MOVE_SELF（避免重复；Linux 每个 rename 只发一次）。
+    crate::fsnotify::emit_named_no_self_at(
+        &new_parent_inode,
+        Some(&new_mount),
+        &old_inode,
+        crate::fsnotify::IN_MOVED_TO,
+        new_name.as_bytes(),
+        cookie,
+    );
     Ok(())
 }
 
@@ -634,8 +803,11 @@ pub fn chdir(ctx: &mut VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     let result = path::lookup(ctx, dirfd, path, LookupFlags::DIRECTORY)?;
     let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
     // 需要对目标目录有执行（搜索）权限
-    let meta = inode.meta_snapshot();
-    if !ctx.cred().can_exec(meta.uid, meta.gid, meta.mode, true) {
+    if !crate::acl::check_access(
+        ctx.cred().as_ref(),
+        inode.as_ref(),
+        crate::acl::AclCheckKind::Exec { is_dir: true },
+    ) {
         return Err(VfsError::PermissionDenied);
     }
     ctx.set_cwd(result.dentry, result.mount)
@@ -659,7 +831,7 @@ pub fn fchmodat(
     let result = path::lookup(ctx, dirfd, path, flags)?;
     result.mount.check_writable()?;
     let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
-    chmod_inode(ctx, &inode, mode)
+    chmod_inode(ctx, &result.mount, &inode, mode)
 }
 
 /// `fchmod(2)` — 通过已打开 fd 修改文件权限位。
@@ -669,22 +841,56 @@ pub fn fchmod(ctx: &VfsContext, fdt: &FdTable, fd: Fd, mode: FileMode) -> VfsRes
         return Err(VfsError::BadFileDescriptor);
     }
     file.mount().check_writable()?;
-    chmod_inode(ctx, file.inode(), mode)
+    chmod_inode(ctx, file.mount(), file.inode(), mode)
 }
 
-fn chmod_inode(ctx: &VfsContext, inode: &Arc<Inode>, mut mode: FileMode) -> VfsResult<()> {
+fn chmod_inode(
+    ctx: &VfsContext,
+    mount: &Arc<mount::Mount>,
+    inode: &Arc<Inode>,
+    mut mode: FileMode,
+) -> VfsResult<()> {
     let inode_uid = inode.meta_snapshot().uid;
+    let inode_gid = inode.meta_snapshot().gid;
     let cred = ctx.cred();
     if !cred.is_owner(inode_uid) {
         return Err(VfsError::OperationNotPermitted);
     }
 
-    // POSIX：非特权进程 chmod 时必须清除 setuid/setgid 位，防止权限提升
-    if !cred.has_cap(cred::Capability::FSetId) {
-        mode = mode.without(FileMode::SUID_SGID);
+    // POSIX：chmod 不清除 SUID；SGID 仅在进程无 CAP_FSETID 且不是文件组成员时
+    // 清除，防止非成员借组权限提升。
+    if !cred.has_cap(cred::Capability::FSetId)
+        && cred.egid != inode_gid
+        && !cred.groups.contains(&inode_gid)
+    {
+        mode = mode.without(FileMode::ISGID);
     }
 
-    inode.ops.chmod(inode, mode)
+    inode.ops.chmod(inode, mode)?;
+    crate::fsnotify::emit_at(inode, Some(mount), crate::fsnotify::IN_ATTRIB, 0);
+    // POSIX ACL 同步：chmod 的组权限位写入 ACL mask（Linux 语义）。
+    if inode.has_xattrs() {
+        if let Ok(Some(bytes)) = inode.ops.getxattr(crate::acl::ACL_ACCESS_XATTR) {
+            if let Ok(mut acl) = crate::acl::parse(&bytes) {
+                let group_perm = ((mode.0 >> 3) & 7) as u16;
+                let mut changed = false;
+                for e in acl.entries.iter_mut() {
+                    if e.tag == crate::acl::ACL_MASK && e.perm != group_perm {
+                        e.perm = group_perm;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    let _ = inode.ops.setxattr(
+                        crate::acl::ACL_ACCESS_XATTR,
+                        &crate::acl::encode(&acl),
+                        0,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── chown ─────────────────────────────────────────────────────────────────────
@@ -710,7 +916,7 @@ pub fn fchownat(
     let result = path::lookup(ctx, dirfd, path, flags)?;
     result.mount.check_writable()?;
     let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
-    chown_inode(ctx, &inode, uid, gid)
+    chown_inode(ctx, &result.mount, &inode, uid, gid)
 }
 
 /// `fchown(2)` — 通过已打开 fd 修改文件所有者或所属组。
@@ -730,11 +936,12 @@ pub fn fchown(
         return Err(VfsError::BadFileDescriptor);
     }
     file.mount().check_writable()?;
-    chown_inode(ctx, file.inode(), uid, gid)
+    chown_inode(ctx, file.mount(), file.inode(), uid, gid)
 }
 
 fn chown_inode(
     ctx: &VfsContext,
+    mount: &Arc<mount::Mount>,
     inode: &Arc<Inode>,
     uid: Option<cred::Uid>,
     gid: Option<cred::Gid>,
@@ -756,7 +963,7 @@ fn chown_inode(
         && new_gid != inode_gid
     {
         let cred = ctx.cred();
-        let is_owner = cred.euid == inode_uid;
+        let is_owner = cred.fsuid == inode_uid;
         let gid_ok = cred.egid == new_gid || cred.groups.contains(&new_gid);
         if !(cred.has_cap(cred::Capability::Chown) || is_owner && gid_ok) {
             return Err(VfsError::OperationNotPermitted);
@@ -779,6 +986,7 @@ fn chown_inode(
             inode.ops.chmod(inode, new_mode)?;
         }
     }
+    crate::fsnotify::emit_at(inode, Some(mount), crate::fsnotify::IN_ATTRIB, 0);
 
     Ok(())
 }
@@ -908,8 +1116,11 @@ pub fn umount(ctx: &VfsContext, dirfd: &Dirfd, path: &str, force: bool) -> VfsRe
 pub fn chroot(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     let result = path::lookup(ctx, dirfd, path, LookupFlags::DIRECTORY)?;
     let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
-    let meta = inode.meta_snapshot();
-    if !ctx.cred().can_exec(meta.uid, meta.gid, meta.mode, true) {
+    if !crate::acl::check_access(
+        ctx.cred().as_ref(),
+        inode.as_ref(),
+        crate::acl::AclCheckKind::Exec { is_dir: true },
+    ) {
         return Err(VfsError::PermissionDenied);
     }
     if !ctx.cred().has_cap(cred::Capability::SysAdmin) {
@@ -976,9 +1187,18 @@ pub fn symlinkat(ctx: &VfsContext, target: &str, dirfd: &Dirfd, link_path: &str)
         FileMode::new(0o777),
         stat::FileType::Symlink,
     );
+    // 符号链接不继承 ACL（Linux 语义：POSIX ACL 只作用于常规文件/目录）。
     let new_inode = parent_inode
         .ops
         .symlink(&parent_inode, name, target, &cred)?;
+    crate::fsnotify::emit_named_at(
+        &parent_inode,
+        Some(&parent_mount),
+        &new_inode,
+        crate::fsnotify::IN_CREATE,
+        name.as_bytes(),
+        0,
+    );
     cache_new_inode(&parent_dentry, name, new_inode);
     Ok(())
 }
@@ -1004,11 +1224,12 @@ pub fn truncate(ctx: &VfsContext, dirfd: &Dirfd, path: &str, size: u64) -> VfsRe
     if inode.kind == stat::FileType::Directory {
         return Err(VfsError::IsADirectory);
     }
-    {
-        let meta = inode.meta_snapshot();
-        if !ctx.cred().can_write(meta.uid, meta.gid, meta.mode) {
-            return Err(VfsError::PermissionDenied);
-        }
+    if !crate::acl::check_access(
+        ctx.cred().as_ref(),
+        inode.as_ref(),
+        crate::acl::AclCheckKind::Write,
+    ) {
+        return Err(VfsError::PermissionDenied);
     }
     let _write_access = if inode.kind == stat::FileType::Regular {
         Some(inode.acquire_write_access()?)
@@ -1017,6 +1238,13 @@ pub fn truncate(ctx: &VfsContext, dirfd: &Dirfd, path: &str, size: u64) -> VfsRe
     };
     let _data_mutation = inode.begin_data_mutation();
     inode.ops.truncate(&inode, size)?;
+    crate::fsnotify::emit_at_with_parents(
+        &inode,
+        Some(&result.dentry),
+        Some(&result.mount),
+        crate::fsnotify::IN_MODIFY,
+        0,
+    );
     Ok(())
 }
 
@@ -1069,10 +1297,196 @@ fn utimens_inode(
         return Ok(());
     }
     let cred = ctx.cred();
-    if !cred.is_owner(meta.uid) && !cred.can_write(meta.uid, meta.gid, meta.mode) {
+    if !cred.is_owner(meta.uid)
+        && !crate::acl::check_access(
+            cred.as_ref(),
+            inode.as_ref(),
+            crate::acl::AclCheckKind::Write,
+        )
+    {
         return Err(VfsError::PermissionDenied);
     }
-    inode.ops.utimes(inode, atime, mtime)
+    inode.ops.utimes(inode, atime, mtime)?;
+    crate::fsnotify::emit_at(inode, Some(mount), crate::fsnotify::IN_ATTRIB, 0);
+    Ok(())
+}
+
+// ── fanotify 辅助 ──────────────────────────────────────────────────────────────
+
+/// `fanotify_mark` 的路径解析：返回 (inode, mount, sb_id)。
+pub fn lookup_for_fanotify(
+    ctx: &VfsContext,
+    dirfd: &Dirfd,
+    path: &str,
+    no_follow: bool,
+    onlydir: bool,
+) -> VfsResult<(Arc<Inode>, Arc<crate::vfs::mount::Mount>, u64)> {
+    let mut flags = LookupFlags::default();
+    if no_follow {
+        flags = flags.with(LookupFlags::NO_FOLLOW);
+    }
+    if onlydir {
+        flags = flags.with(LookupFlags::DIRECTORY);
+    }
+    let result = path::lookup(ctx, dirfd, path, flags)?;
+    let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
+    let sb_id = inode
+        .superblock
+        .upgrade()
+        .map(|sb| sb.fs_id.raw())
+        .unwrap_or(0);
+    Ok((inode, result.mount, sb_id))
+}
+
+// ── inotify 辅助 ───────────────────────────────────────────────────────────────
+
+/// `inotify_add_watch` 的路径解析（`IN_DONT_FOLLOW`/`IN_ONLYDIR`）。
+pub fn lookup_watch_inode(
+    ctx: &VfsContext,
+    dirfd: &Dirfd,
+    path: &str,
+    no_follow: bool,
+    onlydir: bool,
+) -> VfsResult<Arc<Inode>> {
+    let mut flags = LookupFlags::default();
+    if no_follow {
+        flags = flags.with(LookupFlags::NO_FOLLOW);
+    }
+    if onlydir {
+        flags = flags.with(LookupFlags::DIRECTORY);
+    }
+    let result = path::lookup(ctx, dirfd, path, flags)?;
+    result.dentry.inode().ok_or(VfsError::NotFound)
+}
+
+// ── xattr ─────────────────────────────────────────────────────────────────────
+
+/// 解析 xattr 目标 inode（`no_follow` 对应 `lsetxattr` 等变体）。
+fn xattr_target(
+    ctx: &VfsContext,
+    dirfd: &Dirfd,
+    path: &str,
+    no_follow: bool,
+) -> VfsResult<Arc<Inode>> {
+    let flags = if no_follow {
+        LookupFlags::NO_FOLLOW
+    } else {
+        LookupFlags::default()
+    };
+    let result = path::lookup(ctx, dirfd, path, flags)?;
+    result.dentry.inode().ok_or(VfsError::NotFound)
+}
+
+/// `getxattr`：读取属性；`None` = 属性不存在（`ENODATA`）。
+pub fn getxattr(
+    ctx: &VfsContext,
+    dirfd: &Dirfd,
+    path: &str,
+    name: &[u8],
+    no_follow: bool,
+) -> VfsResult<Option<Vec<u8>>> {
+    let inode = xattr_target(ctx, dirfd, path, no_follow)?;
+    crate::xattr::getxattr(inode.as_ref(), name, ctx.cred().as_ref())
+}
+
+/// `setxattr`：设置属性。
+pub fn setxattr(
+    ctx: &VfsContext,
+    dirfd: &Dirfd,
+    path: &str,
+    name: &[u8],
+    value: &[u8],
+    flags: u32,
+    no_follow: bool,
+) -> VfsResult<()> {
+    let result = path::lookup(
+        ctx,
+        dirfd,
+        path,
+        if no_follow {
+            LookupFlags::NO_FOLLOW
+        } else {
+            LookupFlags::default()
+        },
+    )?;
+    result.mount.check_writable()?;
+    let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
+    crate::xattr::setxattr(inode.as_ref(), name, value, flags, ctx.cred().as_ref())
+}
+
+/// `listxattr`：列出属性名。
+pub fn listxattr(
+    ctx: &VfsContext,
+    dirfd: &Dirfd,
+    path: &str,
+    no_follow: bool,
+) -> VfsResult<Vec<Vec<u8>>> {
+    let inode = xattr_target(ctx, dirfd, path, no_follow)?;
+    crate::xattr::listxattr(inode.as_ref())
+}
+
+/// `removexattr`：删除属性。
+pub fn removexattr(
+    ctx: &VfsContext,
+    dirfd: &Dirfd,
+    path: &str,
+    name: &[u8],
+    no_follow: bool,
+) -> VfsResult<()> {
+    let result = path::lookup(
+        ctx,
+        dirfd,
+        path,
+        if no_follow {
+            LookupFlags::NO_FOLLOW
+        } else {
+            LookupFlags::default()
+        },
+    )?;
+    result.mount.check_writable()?;
+    let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
+    crate::xattr::removexattr(inode.as_ref(), name, ctx.cred().as_ref())
+}
+
+/// `fgetxattr`：按 fd 读取属性。
+pub fn fgetxattr(
+    ctx: &VfsContext,
+    fdt: &FdTable,
+    fd: Fd,
+    name: &[u8],
+) -> VfsResult<Option<Vec<u8>>> {
+    let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
+    let cred = ctx.cred();
+    crate::xattr::getxattr(file.inode().as_ref(), name, cred.as_ref())
+}
+
+/// `fsetxattr`：按 fd 设置属性。
+pub fn fsetxattr(
+    ctx: &VfsContext,
+    fdt: &FdTable,
+    fd: Fd,
+    name: &[u8],
+    value: &[u8],
+    flags: u32,
+) -> VfsResult<()> {
+    let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
+    file.mount().check_writable()?;
+    let cred = ctx.cred();
+    crate::xattr::setxattr(file.inode().as_ref(), name, value, flags, cred.as_ref())
+}
+
+/// `flistxattr`：按 fd 列出属性名。
+pub fn flistxattr(_ctx: &VfsContext, fdt: &FdTable, fd: Fd) -> VfsResult<Vec<Vec<u8>>> {
+    let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
+    crate::xattr::listxattr(file.inode().as_ref())
+}
+
+/// `fremovexattr`：按 fd 删除属性。
+pub fn fremovexattr(ctx: &VfsContext, fdt: &FdTable, fd: Fd, name: &[u8]) -> VfsResult<()> {
+    let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
+    file.mount().check_writable()?;
+    let cred = ctx.cred();
+    crate::xattr::removexattr(file.inode().as_ref(), name, cred.as_ref())
 }
 
 // ── link ──────────────────────────────────────────────────────────────────────
@@ -1147,6 +1561,24 @@ pub fn linkat(
     new_parent_inode
         .ops
         .link(&new_parent_inode, &old_inode, new_name)?;
+    // fsnotify：新父目录 IN_CREATE（带名字）；目标 inode IN_ATTRIB
+    // （nlink 变化）；EXCL_UNLINK 失效监视恢复。
+    crate::fsnotify::emit_named_at(
+        &new_parent_inode,
+        Some(&new_parent_mount),
+        &old_inode,
+        crate::fsnotify::IN_CREATE,
+        new_name.as_bytes(),
+        0,
+    );
+    crate::fsnotify::emit_at_with_parents(
+        &old_inode,
+        Some(&old_result.dentry),
+        Some(&new_parent_mount),
+        crate::fsnotify::IN_ATTRIB,
+        0,
+    );
+    crate::fsnotify::rearm(&old_inode);
 
     let new_dentry = dentry::Dentry::new_positive(
         new_name,
@@ -1199,11 +1631,21 @@ pub fn mknodat(
 
     check_parent_perm(ctx, &parent_inode, None)?;
 
-    let (effective_mode, cred) = create_attributes(ctx, &parent_inode, mode, kind);
+    let (mut effective_mode, cred) = create_attributes(ctx, &parent_inode, mode, kind);
+    let child_acl = default_acl_for_create(&parent_inode, &mut effective_mode)?;
     let new_inode =
         parent_inode
             .ops
             .mknod(&parent_inode, name, kind, effective_mode, dev, &cred)?;
+    install_child_acl(&new_inode, child_acl);
+    crate::fsnotify::emit_named_at(
+        &parent_inode,
+        Some(&parent_mount),
+        &new_inode,
+        crate::fsnotify::IN_CREATE,
+        name.as_bytes(),
+        0,
+    );
 
     cache_new_inode(&parent_dentry, name, new_inode);
     Ok(())

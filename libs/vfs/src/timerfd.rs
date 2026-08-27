@@ -2,9 +2,10 @@
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::any::Any;
 use core::ops::ControlFlow;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use errno::Errno;
 use sched::{DeadlineObserver, Task, WaitQueue};
@@ -23,6 +24,18 @@ pub struct TimerSpec {
     pub value_ns: u64,
 }
 
+/// `timerfd_settime` 标志（Linux UAPI 值）。
+pub const TFD_TIMER_ABSTIME: usize = 1;
+pub const TFD_TIMER_CANCEL_ON_SET: usize = 2;
+
+/// CLOCK_REALTIME 的 clockid 值。
+const CLOCK_REALTIME_ID: usize = 0;
+
+/// 登记了 `TFD_TIMER_CANCEL_ON_SET` 的 timerfd（Linux `cancel_list` 语义）。
+///
+/// 弱引用持有：fd 关闭后条目在下次遍历时自然清理。
+static CANCEL_REGISTRY: Spinlock<Vec<Weak<TimerfdShared>>> = Spinlock::new(Vec::new());
+
 struct TimerfdState {
     next_expiry_ns: Option<u64>,
     interval_ns: u64,
@@ -40,6 +53,10 @@ struct TimerfdShared {
     poll_source: PollSource,
     registration: AtomicU64,
     self_weak: Weak<TimerfdShared>,
+    /// 已登记 CANCEL_ON_SET（在 CANCEL_REGISTRY 中）。
+    might_cancel: AtomicBool,
+    /// 实时钟被设置后置位；下一次 read/settime 消费并返回 ECANCELED。
+    cancelled: AtomicBool,
 }
 
 impl TimerfdFileOps {
@@ -54,6 +71,8 @@ impl TimerfdFileOps {
             poll_source: PollSource::new(PollEvents::default()),
             registration: AtomicU64::new(0),
             self_weak: self_weak.clone(),
+            might_cancel: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         });
         Self { shared, clock_id }
     }
@@ -82,7 +101,7 @@ impl TimerfdFileOps {
         state.expirations = state.expirations.saturating_add(count);
     }
 
-    pub fn set_time(&self, now_ns: u64, new_value: TimerSpec) -> TimerSpec {
+    pub fn set_time(&self, now_ns: u64, new_value: TimerSpec) -> VfsResult<TimerSpec> {
         let mut state = self.shared.state.lock();
         Self::refresh_locked(&mut state, now_ns);
         let old = Self::remaining_locked(&state, now_ns);
@@ -96,7 +115,12 @@ impl TimerfdFileOps {
         drop(state);
         self.shared.refresh_and_arm(now_ns);
         self.shared.waiters.wake_all();
-        old
+        // Linux：定时器照常 arm，但若此前已被时钟设置取消，本次调用返回
+        // ECANCELED（一次性，随后取消状态复位）。
+        if self.shared.take_cancelled() {
+            return Err(VfsError::Canceled);
+        }
+        Ok(old)
     }
 
     pub fn set_deadline(
@@ -104,7 +128,7 @@ impl TimerfdFileOps {
         now_ns: u64,
         deadline_ns: Option<u64>,
         interval_ns: u64,
-    ) -> TimerSpec {
+    ) -> VfsResult<TimerSpec> {
         let mut state = self.shared.state.lock();
         Self::refresh_locked(&mut state, now_ns);
         let old = Self::remaining_locked(&state, now_ns);
@@ -114,7 +138,28 @@ impl TimerfdFileOps {
         drop(state);
         self.shared.refresh_and_arm(now_ns);
         self.shared.waiters.wake_all();
-        old
+        if self.shared.take_cancelled() {
+            return Err(VfsError::Canceled);
+        }
+        Ok(old)
+    }
+
+    /// 按 Linux 语义登记/注销 CANCEL_ON_SET：仅当 clockid 为 CLOCK_REALTIME
+    /// 且本次 settime 同时带 `TFD_TIMER_ABSTIME` 与 `TFD_TIMER_CANCEL_ON_SET`。
+    pub fn update_cancel_registration(&self, flags: usize) {
+        let want = self.clock_id == CLOCK_REALTIME_ID
+            && (flags & TFD_TIMER_ABSTIME) != 0
+            && (flags & TFD_TIMER_CANCEL_ON_SET) != 0;
+        self.shared.might_cancel.store(want, Ordering::Release);
+        let mut registry = CANCEL_REGISTRY.lock();
+        registry.retain(|weak| {
+            weak.upgrade()
+                .map(|shared| !Arc::ptr_eq(&shared, &self.shared))
+                .unwrap_or(false)
+        });
+        if want {
+            registry.push(Arc::downgrade(&self.shared));
+        }
     }
 
     pub fn get_time(&self, now_ns: u64) -> TimerSpec {
@@ -136,6 +181,11 @@ impl TimerfdFileOps {
 }
 
 impl TimerfdShared {
+    /// 消费取消标记（一次性；Linux `timerfd_canceled` 复位 moffs 的等价物）。
+    fn take_cancelled(&self) -> bool {
+        self.cancelled.swap(false, Ordering::AcqRel)
+    }
+
     fn publish_readiness(&self, now_ns: u64) -> Option<u64> {
         let (ready, next, version) = {
             let mut state = self.state.lock();
@@ -194,6 +244,39 @@ impl TimerfdShared {
     }
 }
 
+/// 实时钟被设置后调用：取消所有登记的 `TFD_TIMER_CANCEL_ON_SET` timerfd，
+/// 并唤醒阻塞的读者（Linux `timerfd_clock_was_set`：ticks++ + wake，读者
+/// 醒来后发现取消标记而返回 ECANCELED）。
+pub fn cancel_timers_on_clock_set() {
+    let now_ns = sched::now_ns_public();
+    let mut affected = Vec::new();
+    {
+        let mut registry = CANCEL_REGISTRY.lock();
+        let mut i = 0;
+        while i < registry.len() {
+            match registry[i].upgrade() {
+                None => {
+                    registry.swap_remove(i);
+                }
+                Some(shared) => {
+                    if shared.might_cancel.load(Ordering::Acquire) {
+                        shared.cancelled.store(true, Ordering::Release);
+                        let mut state = shared.state.lock();
+                        state.expirations = state.expirations.saturating_add(1);
+                        drop(state);
+                        affected.push(shared);
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+    for shared in affected {
+        shared.publish_readiness(now_ns);
+        shared.waiters.wake_all();
+    }
+}
+
 impl DeadlineObserver for TimerfdShared {
     fn deadline_expired(&self, registration: u64, now_ns: u64) -> Option<u64> {
         if registration != 0 && self.registration.load(Ordering::Acquire) != registration {
@@ -229,6 +312,11 @@ impl FileOps for TimerfdFileOps {
     fn read_at(&self, buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
         if buf.len() < 8 {
             return Err(VfsError::InvalidArgument);
+        }
+        // 实时钟被设置后取消：清空累计到期数并返回 ECANCELED（Linux 语义）。
+        if self.shared.take_cancelled() {
+            self.shared.state.lock().expirations = 0;
+            return Err(VfsError::Canceled);
         }
         let value = {
             let mut state = self.shared.state.lock();
@@ -333,11 +421,47 @@ pub fn create(
 mod tests {
     use super::*;
 
+    /// 实时钟设置后：登记了 (REALTIME+ABSTIME+CANCEL_ON_SET) 的 timerfd
+    /// 被取消，read 返回 ECANCELED（一次性）；未登记的不受影响。
+    #[test]
+    fn clock_set_cancels_registered_timer() {
+        let timer = TimerfdFileOps::new(0); // CLOCK_REALTIME
+        timer.update_cancel_registration(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET);
+        let now = sched::now_ns_public();
+        let _ = timer.set_deadline(now, Some(now.saturating_add(1_000_000_000)), 0);
+        cancel_timers_on_clock_set();
+        let mut value = [0u8; 8];
+        assert_eq!(timer.read_at(&mut value, 0), Err(VfsError::Canceled));
+
+        // 未带 ABSTIME 的 settime 不登记 → 时钟设置不影响它。
+        let other = TimerfdFileOps::new(0);
+        other.update_cancel_registration(TFD_TIMER_CANCEL_ON_SET);
+        let _ = other.set_deadline(now, Some(now.saturating_add(1_000_000_000)), 0);
+        cancel_timers_on_clock_set();
+        assert!(!other.shared.cancelled.load(Ordering::Acquire));
+
+        // 已取消的 fd 上再次 settime：定时器照常 arm，但返回 ECANCELED 一次。
+        let revived = TimerfdFileOps::new(0);
+        revived.update_cancel_registration(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET);
+        let _ = revived.set_deadline(now, Some(now.saturating_add(1_000_000_000)), 0);
+        cancel_timers_on_clock_set();
+        assert_eq!(
+            revived.set_deadline(now, Some(now.saturating_add(1_000_000_000)), 0),
+            Err(VfsError::Canceled)
+        );
+        // 取消状态一次性：下一次 settime 正常。
+        assert!(
+            revived
+                .set_deadline(now, Some(now.saturating_add(1_000_000_000)), 0)
+                .is_ok()
+        );
+    }
+
     #[test]
     fn expiry_publishes_readiness_without_epoll_scanning() {
         let timer = TimerfdFileOps::new(1);
         let now = sched::now_ns_public();
-        timer.set_deadline(now, Some(now.saturating_add(10)), 0);
+        let _ = timer.set_deadline(now, Some(now.saturating_add(10)), 0);
         assert!(timer.shared.poll_source.snapshot().0.is_empty());
         let registration = timer.shared.registration.load(Ordering::Acquire);
         let _ = timer

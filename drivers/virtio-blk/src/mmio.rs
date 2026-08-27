@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::num::NonZeroU32;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(feature = "block-profile")]
 use super::common::VirtioBlkProfile;
@@ -91,6 +91,8 @@ struct VirtioBlkInner {
     operations: VirtioBlkOperationGate,
     /// 中断计数（用于轮询模式）
     irq_count: AtomicUsize,
+    /// probe 完成后是否已注册 PLIC/父级 IRQ handler。
+    irq_registered: AtomicBool,
     #[cfg(feature = "block-profile")]
     profile: VirtioBlkProfile,
 }
@@ -312,6 +314,7 @@ impl VirtioBlk {
             queue: IrqSafeMutex::new(Some(VirtioBlkQueueCore::new(split_queue))),
             operations: VirtioBlkOperationGate::new(),
             irq_count: AtomicUsize::new(0),
+            irq_registered: AtomicBool::new(false),
             #[cfg(feature = "block-profile")]
             profile: VirtioBlkProfile::new(),
         });
@@ -503,6 +506,16 @@ impl VirtioBlk {
         // 轮询完成的请求
         self.poll();
         true
+    }
+
+    pub fn set_irq_registered(&self, registered: bool) {
+        self.inner
+            .irq_registered
+            .store(registered, Ordering::Release);
+    }
+
+    fn completion_is_interrupt_driven(&self) -> bool {
+        self.inner.irq_registered.load(Ordering::Acquire)
     }
 
     /// 创建 BlockDev 包装
@@ -759,6 +772,10 @@ impl BlockDriver for VirtioBlkIo {
         self.driver.poll();
     }
 
+    fn completion_is_interrupt_driven(&self) -> bool {
+        self.driver.completion_is_interrupt_driven()
+    }
+
     #[cfg(feature = "block-profile")]
     fn control(
         &self,
@@ -909,6 +926,7 @@ impl PnpDriver for VirtioMmioBlkDriver {
             PnpError::registration_failed(PnpResourceKind::Function, "block function")
         })?;
         let irq_handle = register_virtio_mmio_blk_irq(info, Arc::clone(&driver))?;
+        let irq_registered = irq_handle.is_some();
         if let Some(handle) = irq_handle
             && let Err(err) =
                 dev.own_resource(irq::irq_handler_pnp_resource(handle, "virtio-mmio-blk-irq"))
@@ -916,6 +934,7 @@ impl PnpDriver for VirtioMmioBlkDriver {
             let _ = irq::unregister_irq_handler(handle);
             return Err(err);
         }
+        driver.set_irq_registered(irq_registered);
         dev.register_function(BlockFunction::with_projection_name_arc(
             &dev.name, &dev_name, block_dev,
         ))?;

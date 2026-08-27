@@ -926,6 +926,13 @@ pub(crate) fn enter_elm_snapshot(
     elm_model::try_enter_current_context(&elm_context_from_snapshot(context))
 }
 
+/// 从硬中断现场进入已捕获的 ELM 身份，且不访问当前任务的扩展状态。
+pub(crate) fn enter_elm_interrupt_snapshot(
+    context: elm_model::ElmCurrentContext,
+) -> Option<elm_model::ElmCurrentContextGuard> {
+    elm_model::try_enter_interrupt_context(&elm_context_from_snapshot(context))
+}
+
 /// 常驻 PnP core 持有的动态 ELM function 代理。
 ///
 /// `DeviceFunction` 的 trait vtable 与析构入口可能位于可卸载镜像中。代理在登记时
@@ -3474,7 +3481,17 @@ impl PnpDriverRegistry {
                 Some((best_key, _)) if key > *best_key => {
                     best = Some((key, candidate));
                 }
-                Some((best_key, _)) if key == *best_key => return Err(PnpError::DriverAmbiguous),
+                Some((best_key, _)) if key == *best_key => {
+                    log::warning!(
+                        "[pnp] DriverAmbiguous for {}: '{}' vs '{}' (bus_rank={}, priority={:?})",
+                        dev.id,
+                        best.as_ref().unwrap().1.driver.name(),
+                        candidate.driver.name(),
+                        bus_rank,
+                        driver.priority(),
+                    );
+                    return Err(PnpError::DriverAmbiguous);
+                }
                 _ => {}
             }
         }

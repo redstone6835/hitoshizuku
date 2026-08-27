@@ -2,16 +2,20 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
+use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use errno::Errno;
 use general::firmware::power;
 use general::mm::{VmFutexKey, VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
+use general::vfs::nsfs::ProcNsKind;
 use general::vfs::pidfd;
 use general::vfs::{self, fdtable::Fd};
+use ns::UtsNamespace;
 use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::ids::{CapSet, Capability, Credentials, Gid, Uid};
+use sched::pid::PidT;
 use sched::process_ops::{ExecRequest, UserContextRef};
 use sched::sync::Spinlock;
 use sched::task::{RseqRegistration, Task, TaskState};
@@ -45,6 +49,9 @@ const UTS_FIELD_LEN: usize = 65;
 const UTS_NAME_MAX: usize = UTS_FIELD_LEN - 1;
 const EXEC_PATH_MAX: usize = 4096;
 
+#[cfg(target_arch = "riscv64")]
+const SYS_RISCV_FLUSH_ICACHE_LOCAL: usize = 1;
+
 const PTRACE_TRACEME: usize = 0;
 const PTRACE_PEEKTEXT: usize = 1;
 const PTRACE_PEEKDATA: usize = 2;
@@ -55,6 +62,10 @@ const PTRACE_POKEUSR: usize = 6;
 const PTRACE_CONT: usize = 7;
 const PTRACE_KILL: usize = 8;
 const PTRACE_SINGLESTEP: usize = 9;
+const PTRACE_GETREGS: usize = 12;
+const PTRACE_SETREGS: usize = 13;
+const PTRACE_GETFPREGS: usize = 14;
+const PTRACE_SETFPREGS: usize = 15;
 const PTRACE_ATTACH: usize = 16;
 const PTRACE_DETACH: usize = 17;
 const PTRACE_OLDSETOPTIONS: usize = 21;
@@ -83,8 +94,45 @@ const PTRACE_SET_SYSCALL_INFO: usize = 0x4212;
 static UTS_HOSTNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_FIELD_LEN]);
 static UTS_DOMAINNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_FIELD_LEN]);
 
+#[cfg(target_arch = "riscv64")]
+fn validate_riscv_flush_icache_flags(flags: usize) -> Result<(), Errno> {
+    if flags & !SYS_RISCV_FLUSH_ICACHE_LOCAL != 0 {
+        Err(Errno::EINVAL)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(super) fn sys_riscv_flush_icache(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    validate_riscv_flush_icache_flags(ctx.args[2])?;
+
+    // Linux 当前保留并忽略 start/end，因为 RISC-V 不支持按范围失效 I-cache。
+    let _start = ctx.args[0];
+    let _end = ctx.args[1];
+
+    // TODO(riscv64): 为 LOCAL=1 增加仅本地执行 fence.i 的路径。当前全局同步
+    // 在语义上正确，但会产生不必要的远端 hart RFENCE 开销。
+    <arch::CurrentTaskOps as general::TaskOps>::sync_icache();
+    Ok(0)
+}
+
 pub(super) fn sys_getpid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let task = ctx.task();
+    // Linux：getpid 返回调用者 pid 命名空间中的 pid。任务的权威 ns 是
+    // sched 侧 `task.pid_ns()`（spawn 时由 register_pid_chain 按
+    // pending/父 ns 设置）；NsProxy.pid 只反映 fork 时的快照，unshare
+    // (CLONE_NEWPID) 后子进程会得到新 ns，必须用任务自身 ns 查询。
+    let ns = task.pid_ns();
+    // getpid 返回线程组 leader 的 pid（TGID），而非调用线程自身的 pid：
+    // CLONE_THREAD 的非 leader 线程在 ns 中的 pid 是 tid，不能直接返回。
+    if let Some(pid) = task
+        .thread_group()
+        .leader()
+        .and_then(|leader| leader.pid_in(&ns))
+    {
+        return Ok(pid as usize);
+    }
     Ok(task
         .tgid_cached()
         .or_else(|| task.pid_root_cached())
@@ -283,6 +331,8 @@ pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if let Some(installed) = installed_pidfd {
         installed.commit();
     }
+    ptrace_notify_fork(ctx.task(), flags, outcome.pid);
+    clone_install_namespaces(ctx.task(), &outcome.child, flags)?;
     Ok(outcome.pid as usize)
 }
 
@@ -345,6 +395,8 @@ pub(super) fn sys_clone3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if let Some(installed) = installed_pidfd {
         installed.commit();
     }
+    ptrace_notify_fork(ctx.task(), args.flags, outcome.pid);
+    clone_install_namespaces(ctx.task(), &outcome.child, args.flags)?;
     Ok(outcome.pid as usize)
 }
 
@@ -472,7 +524,11 @@ pub(super) fn sys_reboot(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             power::shutdown().map_err(map_power_error)?;
             halt_after_power_request()
         }
-        LINUX_REBOOT_CMD_SW_SUSPEND | LINUX_REBOOT_CMD_KEXEC => Err(Errno::EOPNOTSUPP),
+        // SW_SUSPEND：无休眠（hibernation）支持，Linux 同样返回 EOPNOTSUPP。
+        LINUX_REBOOT_CMD_SW_SUSPEND => Err(Errno::EOPNOTSUPP),
+        // KEXEC：无 kexec 内核重载机制，与 sys_kexec_load/file_load 一致返回
+        // ENOSYS（Linux 未启用 CONFIG_KEXEC 时的等价行为）。
+        LINUX_REBOOT_CMD_KEXEC => Err(Errno::ENOSYS),
         _ => Err(Errno::EINVAL),
     }
 }
@@ -515,7 +571,7 @@ pub(super) fn sys_wait4(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         copy_to_user(status_user, &result.status.raw().to_le_bytes()).map_err(|e| e.as_errno())?;
     }
     if rusage_user != 0 {
-        write_rusage(rusage_user, result.usage)?;
+        write_rusage(rusage_user, result.usage, 0)?;
     }
     Ok(result.pid as usize)
 }
@@ -553,7 +609,7 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             let fdt = vfs::current_fdtable().ok_or(Errno::ENOSYS)?;
             let file = fdt.get_file(Fd::from_raw(id as u32)).ok_or(Errno::EBADF)?;
             let nonblock_pidfd = file.flags().nonblock;
-            let group = pidfd::group_from_file(&file).ok_or(Errno::EINVAL)?;
+            let group = pidfd::group_from_file(&file).ok_or(Errno::EBADF)?;
             if nonblock_pidfd && !options.has(WaitOptions::WNOHANG) {
                 let probe_options = WaitOptions::from_raw(options.raw() | WaitOptions::WNOHANG);
                 let probe =
@@ -567,12 +623,12 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                     write_i32(&mut raw, 4, 0);
                     write_i32(&mut raw, 8, waitid_code(probe.status));
                     write_i32(&mut raw, 16, probe.pid);
-                    write_u32(&mut raw, 20, ctx.task().credentials().uid.0);
+                    write_u32(&mut raw, 20, probe.child_uid.0);
                     write_i32(&mut raw, 24, waitid_status(probe.status));
                     copy_to_user(infop, &raw).map_err(|e| e.as_errno())?;
                 }
                 if rusage != 0 {
-                    write_rusage(rusage, probe.usage)?;
+                    write_rusage(rusage, probe.usage, 0)?;
                 }
                 return Ok(0);
             }
@@ -588,13 +644,13 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             write_i32(&mut raw, 4, 0);
             write_i32(&mut raw, 8, waitid_code(result.status));
             write_i32(&mut raw, 16, result.pid);
-            write_u32(&mut raw, 20, ctx.task().credentials().uid.0);
+            write_u32(&mut raw, 20, result.child_uid.0);
             write_i32(&mut raw, 24, waitid_status(result.status));
         }
         copy_to_user(infop, &raw).map_err(|e| e.as_errno())?;
     }
     if rusage != 0 {
-        write_rusage(rusage, result.usage)?;
+        write_rusage(rusage, result.usage, 0)?;
     }
     Ok(0)
 }
@@ -801,11 +857,24 @@ pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     const MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED: usize = 1 << 2;
     const MEMBARRIER_CMD_PRIVATE_EXPEDITED: usize = 1 << 3;
     const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: usize = 1 << 4;
+    const MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE: usize = 1 << 5;
+    const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: usize = 1 << 6;
+    const MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ: usize = 1 << 7;
+    const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ: usize = 1 << 8;
+    const MEMBARRIER_CMD_GET_REGISTRATIONS: usize = 1 << 9;
+    // 取舍：SYNC_CORE / RSEQ 变体在目标 CPU 上还须执行序列化指令 / 打断 rseq
+    // 临界区；本内核 rendezvous 只做全内存屏障，二者按 PRIVATE_EXPEDITED 等价
+    // 处理并如实声明支持位。
     let supported = MEMBARRIER_CMD_GLOBAL
         | MEMBARRIER_CMD_GLOBAL_EXPEDITED
         | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
         | MEMBARRIER_CMD_PRIVATE_EXPEDITED
-        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED;
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ
+        | MEMBARRIER_CMD_GET_REGISTRATIONS;
 
     let cmd = ctx.args[0];
     let flags = ctx.args[1];
@@ -814,7 +883,10 @@ pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     }
     match cmd {
         MEMBARRIER_CMD_QUERY => Ok(supported),
-        MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED => {
+        MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ => {
             let vm = task_vm_space(ctx.task()).ok_or(Errno::EINVAL)?;
             vm.register_membarrier(cmd);
             Ok(0)
@@ -823,10 +895,19 @@ pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
             sched::synchronize_cpus()?;
             Ok(0)
         }
-        MEMBARRIER_CMD_GLOBAL_EXPEDITED | MEMBARRIER_CMD_PRIVATE_EXPEDITED => {
+        MEMBARRIER_CMD_GLOBAL_EXPEDITED
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ => {
             let required_registration = match cmd {
                 MEMBARRIER_CMD_GLOBAL_EXPEDITED => MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED,
                 MEMBARRIER_CMD_PRIVATE_EXPEDITED => MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED,
+                MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE => {
+                    MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+                }
+                MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ => {
+                    MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ
+                }
                 _ => unreachable!(),
             };
             let vm = task_vm_space(ctx.task()).ok_or(Errno::EINVAL)?;
@@ -834,6 +915,17 @@ pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
                 return Err(Errno::EPERM);
             }
             sched::synchronize_cpus()?;
+            Ok(0)
+        }
+        MEMBARRIER_CMD_GET_REGISTRATIONS => {
+            let vm = task_vm_space(ctx.task()).ok_or(Errno::EINVAL)?;
+            let mask = vm.membarrier_registration();
+            // Linux 返回注册位图（低 32 位），高位须为 0。
+            let out = ctx.args[2];
+            if out != 0 {
+                copy_to_user(out, &((mask & 0xffff_ffff) as u32).to_le_bytes())
+                    .map_err(|e| e.as_errno())?;
+            }
             Ok(0)
         }
         _ => Err(Errno::EINVAL),
@@ -877,6 +969,12 @@ pub(super) fn sys_prlimit64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         None
     };
 
+    // F3：写 rlimit 表之前先校验 NOFILE 的 u32 范围，避免部分更新。
+    if resource == sched::Resource::Nofile
+        && let Some(new) = new_pair
+    {
+        validate_nofile_rlimit(new)?;
+    }
     let old = sched::operation::prlimit64(pid, resource, new_pair)?;
     if resource == sched::Resource::Nofile
         && let Some(new) = new_pair
@@ -938,6 +1036,10 @@ pub(super) fn sys_setrlimit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let cur = u64::from_le_bytes(raw[0..8].try_into().unwrap());
     let max = u64::from_le_bytes(raw[8..16].try_into().unwrap());
     let new = sched::RlimitPair::new(sched::Rlim::from_raw(cur), sched::Rlim::from_raw(max));
+    // F3：写 rlimit 表之前先校验 NOFILE 的 u32 范围，避免部分更新。
+    if resource == sched::Resource::Nofile {
+        validate_nofile_rlimit(new)?;
+    }
     let _old = sched::operation::set_rlimit(resource, new)?;
     if resource == sched::Resource::Nofile {
         sync_thread_group_fdtable_nofile_limit(ctx.task(), new)?;
@@ -986,6 +1088,7 @@ pub(super) fn sys_getrandom(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
                     general::dev::char::CharIoError::Unavailable => Errno::ENODEV,
                     general::dev::char::CharIoError::Interrupted => Errno::EINTR,
                     general::dev::char::CharIoError::Timeout => Errno::EAGAIN,
+                    general::dev::char::CharIoError::NoSpace => Errno::ENOSPC,
                     general::dev::char::CharIoError::HardwareError => Errno::EIO,
                 });
             }
@@ -1011,6 +1114,9 @@ pub(super) fn sys_clock_gettime(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     let clock_id = ctx.args[0];
     let tp = ctx.args[1];
     let ns = clock_time_ns_for_task(ctx.task(), clock_id).ok_or(Errno::EINVAL)?;
+    // 叠加时间命名空间偏移（CLONE_NEWTIME）：有符号饱和，结果 clamp 到非负。
+    let offset = crate::ns::task_ns(ctx.task()).time.offset(clock_id as i32);
+    let ns = (ns as i128 + offset as i128).max(0) as u64;
     let sec = (ns / 1_000_000_000) as i64;
     let nsec = (ns % 1_000_000_000) as i64;
     let mut out = [0u8; 16];
@@ -1022,6 +1128,8 @@ pub(super) fn sys_clock_gettime(ctx: &mut SyscallContext<'_>) -> Result<usize, E
 
 const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
 const CLOCK_THREAD_CPUTIME_ID: usize = 3;
+/// Linux `CLOCK_TAI`：国际原子时，= `CLOCK_REALTIME` + TAI 偏移。
+const CLOCK_TAI: usize = 11;
 
 fn clock_time_ns_for_task(task: &Arc<Task>, clock_id: usize) -> Option<u64> {
     match clock_id {
@@ -1040,20 +1148,41 @@ fn clock_time_ns_for_task(task: &Arc<Task>, clock_id: usize) -> Option<u64> {
             let usage = task.usage_snapshot(sched::now_ns_direct());
             Some(usage.user_ns.saturating_add(usage.system_ns))
         }
+        CLOCK_TAI => {
+            let realtime = crate::vdso::realtime_ns();
+            Some((realtime as i64).saturating_add(crate::adjtimex::tai_offset_ns()) as u64)
+        }
         _ => crate::vdso::clock_time_ns(clock_id),
     }
 }
 
 pub(super) fn sys_uname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let uts = Arc::clone(&crate::ns::task_ns(ctx.task()).uts);
     let mut out = [0u8; 65 * 6];
     write_uts_field(&mut out, 0, b"Hitoshizuku");
-    write_uts_dynamic_field(&mut out, 1, &UTS_HOSTNAME, b"hitoshizuku");
-    write_uts_field(&mut out, 2, b"10.1.0");
-    write_uts_field(&mut out, 3, b"Hitoshizuku kernel");
+    let hostname = uts.hostname();
+    write_uts_ns_field(&mut out, 1, &hostname, b"hitoshizuku");
+    // release 是用户态兼容版本，不能使用低于 glibc 下限的 Cargo 包版本。
+    write_uts_field(&mut out, 2, b"6.6.0-hitoshizuku");
+    write_uts_field(
+        &mut out,
+        3,
+        concat!("Hitoshizuku kernel ", env!("CARGO_PKG_VERSION")).as_bytes(),
+    );
     write_uts_field(&mut out, 4, hal::platform::arch_name().as_bytes());
-    write_uts_dynamic_field(&mut out, 5, &UTS_DOMAINNAME, b"localdomain");
+    let domainname = uts.domainname();
+    write_uts_ns_field(&mut out, 5, &domainname, b"localdomain");
     copy_to_user(ctx.args[0], &out).map_err(|e| e.as_errno())?;
     Ok(0)
+}
+
+/// 写 `utsname` 字段：命名空间值非空时优先。
+fn write_uts_ns_field(out: &mut [u8], index: usize, value: &[u8], default: &[u8]) {
+    if value.iter().all(|byte| *byte == 0) {
+        write_uts_field(out, index, default);
+    } else {
+        write_uts_field(out, index, value);
+    }
 }
 
 pub(super) fn sys_getcpu(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1105,10 +1234,30 @@ pub(super) fn sys_getitimer(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     if curr_value == 0 {
         return Err(Errno::EFAULT);
     }
-    if which != ITIMER_REAL {
-        return Err(Errno::EINVAL);
-    }
-    let spec = sched::get_realtime_itimer(ctx.task());
+    let spec = match which {
+        ITIMER_REAL => sched::get_realtime_itimer(ctx.task()),
+        ITIMER_VIRTUAL => {
+            let s = sched::cpu_itimer::get_cpu_itimer(
+                &ctx.task(),
+                sched::cpu_itimer::CpuItimerKind::Virtual,
+            );
+            sched::RealtimeItimerSpec {
+                value_ns: s.value_ns,
+                interval_ns: s.interval_ns,
+            }
+        }
+        ITIMER_PROF => {
+            let s = sched::cpu_itimer::get_cpu_itimer(
+                &ctx.task(),
+                sched::cpu_itimer::CpuItimerKind::Prof,
+            );
+            sched::RealtimeItimerSpec {
+                value_ns: s.value_ns,
+                interval_ns: s.interval_ns,
+            }
+        }
+        _ => return Err(Errno::EINVAL),
+    };
     write_itimerval(curr_value, spec)?;
     Ok(0)
 }
@@ -1117,16 +1266,42 @@ pub(super) fn sys_setitimer(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let which = ctx.args[0];
     let new_value = ctx.args[1];
     let old_value = ctx.args[2];
-    if which != ITIMER_REAL {
-        return Err(Errno::EINVAL);
-    }
 
     let new_spec = if new_value == 0 {
         sched::RealtimeItimerSpec::default()
     } else {
         read_itimerval(new_value)?
     };
-    let old_spec = sched::set_realtime_itimer(ctx.task(), new_spec.value_ns, new_spec.interval_ns);
+    let old_spec = match which {
+        ITIMER_REAL => {
+            sched::set_realtime_itimer(ctx.task(), new_spec.value_ns, new_spec.interval_ns)
+        }
+        ITIMER_VIRTUAL => {
+            let old = sched::cpu_itimer::set_cpu_itimer(
+                &ctx.task(),
+                sched::cpu_itimer::CpuItimerKind::Virtual,
+                new_spec.value_ns,
+                new_spec.interval_ns,
+            );
+            sched::RealtimeItimerSpec {
+                value_ns: old.value_ns,
+                interval_ns: old.interval_ns,
+            }
+        }
+        ITIMER_PROF => {
+            let old = sched::cpu_itimer::set_cpu_itimer(
+                &ctx.task(),
+                sched::cpu_itimer::CpuItimerKind::Prof,
+                new_spec.value_ns,
+                new_spec.interval_ns,
+            );
+            sched::RealtimeItimerSpec {
+                value_ns: old.value_ns,
+                interval_ns: old.interval_ns,
+            }
+        }
+        _ => return Err(Errno::EINVAL),
+    };
     if old_value != 0 {
         write_itimerval(old_value, old_spec)?;
     }
@@ -1143,15 +1318,18 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
     if flags & !TIMER_ABSTIME != 0 {
         return Err(Errno::EINVAL);
     }
-    if clock_id == CLOCK_THREAD_CPUTIME_ID as i32 {
-        return Err(Errno::EOPNOTSUPP);
-    }
-    if clock_id != crate::vdso::CLOCK_REALTIME as i32
-        && clock_id != crate::vdso::CLOCK_MONOTONIC as i32
-        && clock_id != crate::vdso::CLOCK_MONOTONIC_RAW as i32
+    // Linux 语义：clock_nanosleep 接受 CLOCK_REALTIME、CLOCK_MONOTONIC、
+    // CLOCK_PROCESS_CPUTIME_ID；其余 clockid（含 CLOCK_MONOTONIC_RAW、
+    // CLOCK_THREAD_CPUTIME_ID）一律返回 EINVAL。
+    let is_cpu_clock = if clock_id == crate::vdso::CLOCK_REALTIME as i32
+        || clock_id == crate::vdso::CLOCK_MONOTONIC as i32
     {
+        false
+    } else if clock_id == CLOCK_PROCESS_CPUTIME_ID as i32 {
+        true
+    } else {
         return Err(Errno::EINVAL);
-    }
+    };
     if req_user == 0 {
         // 空指针是用户内存访问失败；只有读取到的 timespec 内容非法才返回 EINVAL。
         return Err(Errno::EFAULT);
@@ -1166,6 +1344,13 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
     let absolute = (flags & TIMER_ABSTIME) != 0;
     let deadline = if absolute {
         sec.saturating_mul(1_000_000_000i64).saturating_add(nsec) as u64
+    } else if is_cpu_clock {
+        // CPU 时间域：相对模式以“进程累计 CPU 时间”作为现在，deadline 落在
+        // 进程 CPU 时间轴上（而非单调时钟）。
+        let now_cpu =
+            clock_time_ns_for_task(ctx.task(), CLOCK_PROCESS_CPUTIME_ID).ok_or(Errno::EINVAL)?;
+        let ns_total = sec.saturating_mul(1_000_000_000i64).saturating_add(nsec);
+        now_cpu.saturating_add(ns_total as u64)
     } else {
         let ns_total = sec.saturating_mul(1_000_000_000i64).saturating_add(nsec);
         sched::now_ns_direct().saturating_add(ns_total as u64)
@@ -1173,8 +1358,13 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
     if !absolute && sec == 0 && nsec == 0 {
         return Ok(0);
     }
-    let now_fn = || {
-        if absolute {
+    let task = Arc::clone(ctx.task());
+    let now_fn = move || {
+        if is_cpu_clock {
+            // 睡眠判定同样使用进程 CPU 时间，否则相对/绝对 deadline 的语义域
+            // 不一致。
+            clock_time_ns_for_task(&task, CLOCK_PROCESS_CPUTIME_ID).ok_or(Errno::EINVAL)
+        } else if absolute {
             crate::vdso::clock_time_ns(clock_id as usize).ok_or(Errno::EINVAL)
         } else {
             Ok(sched::now_ns_direct())
@@ -1184,10 +1374,14 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
         Ok(()) => Ok(0),
         Err(Errno::EINTR) => {
             if !absolute {
-                write_remaining_timespec(
-                    rem_user,
-                    deadline.saturating_sub(sched::now_ns_direct()),
-                )?;
+                let remaining = if is_cpu_clock {
+                    let now_cpu = clock_time_ns_for_task(ctx.task(), CLOCK_PROCESS_CPUTIME_ID)
+                        .unwrap_or(deadline);
+                    deadline.saturating_sub(now_cpu)
+                } else {
+                    deadline.saturating_sub(sched::now_ns_direct())
+                };
+                write_remaining_timespec(rem_user, remaining)?;
             }
             Err(Errno::EINTR)
         }
@@ -1267,6 +1461,9 @@ pub(super) fn sys_clock_getres(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     let tp = ctx.args[1];
     let res_ns = match clock_id {
         CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => 1,
+        CLOCK_TAI => {
+            crate::vdso::clock_getres_ns(crate::vdso::CLOCK_REALTIME).ok_or(Errno::EINVAL)?
+        }
         _ => crate::vdso::clock_getres_ns(clock_id).ok_or(Errno::EINVAL)?,
     } as i64;
     if tp != 0 {
@@ -1304,13 +1501,63 @@ pub(super) fn sys_getrusage(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     if usage == 0 {
         return Err(Errno::EFAULT);
     }
-    let snapshot = match who {
-        RUSAGE_SELF | RUSAGE_THREAD => ctx.task().usage_snapshot(sched::now_ns_direct()),
-        RUSAGE_CHILDREN => ctx.task().child_usage_snapshot(),
+    let task = ctx.task();
+    let (snapshot, maxrss_kb) = match who {
+        // RUSAGE_THREAD 只统计调用线程；RUSAGE_SELF 统计整个线程组
+        // （Linux 语义：线程组累计）。RUSAGE_CHILDREN 是已 reap 子进程累计，
+        // 子进程峰值驻留未记账，maxrss 记 0。
+        RUSAGE_THREAD => (
+            task.usage_snapshot(sched::now_ns_direct()),
+            task_rss_kb(task),
+        ),
+        RUSAGE_SELF => (
+            aggregate_thread_group_usage(task, sched::now_ns_direct()),
+            task_rss_kb(task),
+        ),
+        RUSAGE_CHILDREN => (task.child_usage_snapshot(), 0),
         _ => return Err(Errno::EINVAL),
     };
-    write_rusage(usage, snapshot)?;
+    write_rusage(usage, snapshot, maxrss_kb)?;
     Ok(0)
+}
+
+/// 把当前驻留页数折算为 KB（`ru_maxrss` best-effort）。
+///
+/// 本内核无峰值记账，报告的是当前（而非峰值）驻留集，与 Linux `ru_maxrss`
+/// 的峰值驻留集语义存在偏差，属已注明的 best-effort 取舍。
+fn task_rss_kb(task: &Arc<Task>) -> u64 {
+    task_vm_space(task)
+        .map(|vm| (vm.mapped_pages() as u64).saturating_mul(hal::memory::page_size() as u64) / 1024)
+        .unwrap_or(0)
+}
+
+/// 累加整个线程组的 usage（`RUSAGE_SELF`）。
+///
+/// `Task::usage_snapshot` 逐任务只记账总 CPU 时间（无 per-task 用户/系统态
+/// 拆分），因此其 `user_ns` 字段实际是逐任务总 CPU 求和。这里利用线程组已有
+/// 的 tick 级用户态记账 `ThreadGroup::user_cpu_ns` 把组总 CPU 拆成两部分：
+///
+///   ru_utime = 组用户态时间（`user_cpu_ns`，100Hz tick 粒度）
+///   ru_stime = 组总 CPU - 组用户态时间
+///
+/// 系统态时间无法逐任务拆分（内核无 per-task 用户态记账），只在线程组级
+/// 合理近似；`RUSAGE_THREAD`/`sys_times` 等逐任务路径仍报告 system = 0。
+fn aggregate_thread_group_usage(task: &Arc<Task>, now_ns: u64) -> sched::TaskUsage {
+    let mut total = sched::TaskUsage {
+        user_ns: 0,
+        system_ns: 0,
+        minflt: 0,
+        majflt: 0,
+        voluntary_ctxt_switches: 0,
+        involuntary_ctxt_switches: 0,
+    };
+    for member in task.thread_group().snapshot() {
+        total.add_assign(member.usage_snapshot(now_ns));
+    }
+    let user_ns = task.thread_group().user_cpu_ns();
+    total.system_ns = total.user_ns.saturating_sub(user_ns);
+    total.user_ns = user_ns;
+    total
 }
 
 const USER_HZ: u64 = 100;
@@ -1319,15 +1566,21 @@ fn ns_to_clock_ticks(ns: u64) -> i64 {
     (ns / (1_000_000_000 / USER_HZ)).min(i64::MAX as u64) as i64
 }
 
-fn write_rusage(user: usize, usage: sched::TaskUsage) -> Result<(), Errno> {
+fn write_rusage(user: usize, usage: sched::TaskUsage, maxrss_kb: u64) -> Result<(), Errno> {
     if user == 0 {
         return Err(Errno::EFAULT);
     }
     let mut raw = [0u8; 144];
     write_timeval_pair(&mut raw, 0, usage.user_ns);
     write_timeval_pair(&mut raw, 16, usage.system_ns);
+    // ru_maxrss：Linux 报告峰值驻留集（KB）。本内核无峰值记账，只能取当前
+    // 驻留页数折算为 KB（best-effort）。getrusage(SELF/THREAD) 由调用方透传
+    // `task_rss_kb`；wait4/waitid 的子进程已退出、VmSpace 已在 exit 路径回收
+    // 且无峰值记录，故调用方传 0。
+    put_i64(&mut raw, 32, maxrss_kb.min(i64::MAX as u64) as i64);
     put_i64(&mut raw, 64, usage.minflt.min(i64::MAX as u64) as i64);
     put_i64(&mut raw, 72, usage.majflt.min(i64::MAX as u64) as i64);
+    // 块 I/O（inblock/oublock）与 IPC/信号计数当前无记账，保持 0。
     put_i64(
         &mut raw,
         128,
@@ -1348,25 +1601,58 @@ fn write_timeval_pair(out: &mut [u8], off: usize, ns: u64) {
     put_i64(out, off + 8, usec);
 }
 
+fn encode_sysinfo(uptime: i64, totalram: u64, freeram: u64) -> [u8; 112] {
+    let mut out = [0u8; 112];
+    put_i64(&mut out, 0, uptime);
+    put_u64(&mut out, 32, totalram);
+    put_u64(&mut out, 40, freeram);
+    // 暂无可靠统计来源的共享内存、缓存、swap 和 highmem 字段保持为零。
+    put_u16(&mut out, 80, 0);
+    put_u64(&mut out, 88, 0);
+    put_u64(&mut out, 96, 0);
+    // RISC-V 与 LoongArch64 的用户态 ABI 使用 64 位 struct sysinfo。
+    put_u32(&mut out, 104, 1);
+    out
+}
+
 pub(super) fn sys_sysinfo(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let info = ctx.args[0];
     if info != 0 {
-        let mut out = [0u8; 112];
-        put_i64(&mut out, 0, sched::now_ns_direct() as i64 / 1_000_000_000);
-        put_u64(&mut out, 8, 0);
-        put_u64(&mut out, 16, 0);
-        put_u64(&mut out, 24, 0);
-        put_u64(&mut out, 32, 256 * 1024 * 1024);
-        put_u64(&mut out, 40, 128 * 1024 * 1024);
-        put_u64(&mut out, 48, 256 * 1024 * 1024);
-        put_u16(&mut out, 56, 0);
-        put_u16(&mut out, 58, 0);
-        put_u16(&mut out, 60, 0);
-        put_u16(&mut out, 62, 0);
-        put_u32(&mut out, 64, 1);
-        put_u32(&mut out, 68, 65536);
-        put_u32(&mut out, 72, 65536);
-        put_u32(&mut out, 76, 0);
+        // Linux struct sysinfo（64 位布局，sizeof == 112）：
+        // uptime(0) loads[3](8,16,24) totalram(32) freeram(40) sharedram(48)
+        // bufferram(56) totalswap(64) freeswap(72) procs(u16,80) pad(82)
+        // totalhigh(88) freehigh(96) mem_unit(u32,104) _f(108..112)。
+        let overview = allocator::KERNEL_ALLOCATOR.detailed_stats();
+        let page_size = hal::memory::page_size() as u64;
+        let totalram = overview.total_physical as u64;
+        let freeram = overview.free_physical as u64;
+        let sharedram = general::mm::memstat::SHARED_ANON_PAGES
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .saturating_mul(page_size)
+            .saturating_add(super::ipc::sysv_shm_total_bytes());
+        let (total_swap_pages, free_swap_pages) = general::mm::swap::swap_totals();
+        let mut procs = 0u16;
+        if sched::is_ready() {
+            for (_, weak) in sched::root_pid_ns().registry().snapshot() {
+                if weak.upgrade().is_some() {
+                    procs = procs.saturating_add(1);
+                }
+            }
+        }
+        let mut out = encode_sysinfo(
+            (sched::now_ns_direct() / 1_000_000_000) as i64,
+            totalram,
+            freeram,
+        );
+        let loads = sched::avenrun::loads_scaled();
+        put_u64(&mut out, 8, loads[0]);
+        put_u64(&mut out, 16, loads[1]);
+        put_u64(&mut out, 24, loads[2]);
+        put_u64(&mut out, 48, sharedram);
+        put_u64(&mut out, 56, 0); // 无块设备 buffer 记账。
+        put_u64(&mut out, 64, total_swap_pages.saturating_mul(page_size));
+        put_u64(&mut out, 72, free_swap_pages.saturating_mul(page_size));
+        put_u16(&mut out, 80, procs);
         copy_to_user(info, &out).map_err(|e| e.as_errno())?;
     }
     Ok(0)
@@ -1377,6 +1663,9 @@ pub(super) fn sys_gettimeofday(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     let _tz = ctx.args[1];
     if tv != 0 {
         let ns = crate::vdso::realtime_ns();
+        // 叠加时间命名空间的 realtime 偏移（有符号饱和、非负 clamp）。
+        let offset = crate::ns::task_ns(ctx.task()).time.offset(0);
+        let ns = (ns as i128 + offset as i128).max(0) as u64;
         let mut out = [0u8; 16];
         out[0..8].copy_from_slice(&((ns / 1_000_000_000) as i64).to_le_bytes());
         out[8..16].copy_from_slice(&((ns % 1_000_000_000 / 1000) as i64).to_le_bytes());
@@ -1478,7 +1767,8 @@ fn tasks_by_real_uid(uid: Uid) -> Vec<Arc<Task>> {
 /// 校验 setpriority 的目标权限与优先级提升权限。
 ///
 /// 普通调用者只能修改同属主任务；降低 nice（提高优先级）时，还必须满足
-/// `CAP_SYS_NICE` 或当前线程组的 `RLIMIT_NICE` 下限。
+/// `CAP_SYS_NICE` 或目标任务的 `RLIMIT_NICE` 下限。Linux `can_nice(p, nice)`
+/// 用目标进程 `p` 的 `task_rlimit(p, RLIMIT_NICE)` 判定，故此处取 `target`。
 fn check_setpriority_permission(
     caller: &Arc<Task>,
     target: &Arc<Task>,
@@ -1491,7 +1781,7 @@ fn check_setpriority_permission(
     check_sched_target_owner(&caller_creds, target)?;
 
     let current = target.pi_base_attr().nice as i32;
-    if requested_nice < current && requested_nice < nice_floor_from_rlimit(caller) {
+    if requested_nice < current && requested_nice < nice_floor_from_rlimit(target) {
         return Err(Errno::EACCES);
     }
     Ok(())
@@ -1537,7 +1827,7 @@ pub(super) fn sys_sched_setparam(ctx: &mut SyscallContext<'_>) -> Result<usize, 
     let old = task.pi_base_attr();
     let mut attr = old;
     match attr.policy {
-        SchedPolicy::Fair | SchedPolicy::Idle => {
+        SchedPolicy::Fair | SchedPolicy::Batch | SchedPolicy::Idle => {
             if priority != 0 {
                 return Err(Errno::EINVAL);
             }
@@ -1575,7 +1865,11 @@ pub(super) fn sys_sched_setscheduler(ctx: &mut SyscallContext<'_>) -> Result<usi
     let mut raw = [0u8; 4];
     copy_from_user(param_user, &mut raw).map_err(|e| e.as_errno())?;
     let priority = i32::from_le_bytes(raw);
-    if matches!(policy, SchedPolicy::Fair | SchedPolicy::Idle) && priority != 0 {
+    if matches!(
+        policy,
+        SchedPolicy::Fair | SchedPolicy::Batch | SchedPolicy::Idle
+    ) && priority != 0
+    {
         return Err(Errno::EINVAL);
     }
     let rt_priority = if matches!(policy, SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin) {
@@ -1841,7 +2135,7 @@ fn check_sched_attr_permission(
 
     let requested = requested.validate()?;
     match requested.policy {
-        SchedPolicy::Fair => {
+        SchedPolicy::Fair | SchedPolicy::Batch => {
             if requested.nice < old.nice && (requested.nice as i32) < nice_floor_from_rlimit(caller)
             {
                 return Err(Errno::EACCES);
@@ -1946,6 +2240,7 @@ fn decode_linux_sched_policy(raw: usize) -> Result<SchedPolicy, Errno> {
         0 => Ok(SchedPolicy::Fair),
         1 => Ok(SchedPolicy::RtFifo),
         2 => Ok(SchedPolicy::RtRoundRobin),
+        3 => Ok(SchedPolicy::Batch),
         5 => Ok(SchedPolicy::Idle),
         6 => Ok(SchedPolicy::Deadline),
         _ => Err(Errno::EINVAL),
@@ -1957,6 +2252,7 @@ fn encode_linux_sched_policy(policy: SchedPolicy) -> usize {
         SchedPolicy::Fair => 0,
         SchedPolicy::RtFifo => 1,
         SchedPolicy::RtRoundRobin => 2,
+        SchedPolicy::Batch => 3,
         SchedPolicy::Idle => 5,
         SchedPolicy::Deadline => 6,
     }
@@ -2065,18 +2361,116 @@ fn write_linux_sched_attr(
 }
 
 pub(super) fn sys_personality(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let _persona = ctx.args[0];
-    Ok(0)
+    // Linux `personality(2)`：
+    // - `persona == 0xffffffff`：只读当前 persona，不修改；
+    // - 否则写入新 persona 并返回旧值。
+    // `PER_*` 位（`ADDR_NO_RANDOMIZE` 等）随 fork 继承、exec 保留。
+    // 取舍：本内核尚未实现用户态 ASLR（mmap 基址由确定布局决定），因此
+    // `ADDR_NO_RANDOMIZE`/`ADDR_COMPAT_LAYOUT` 等位只做持久化与回读，
+    // 不会改变地址空间布局（见 general::mm 的 user_mmap_base 固定布局）。
+    let persona = ctx.args[0] as u64;
+    let task = ctx.task();
+    let old = task.personality();
+    if persona != 0xffff_ffff {
+        task.set_personality(persona);
+    }
+    Ok(old as usize)
 }
 
 pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    const PR_SET_PDEATHSIG: usize = 1;
+    const PR_GET_PDEATHSIG: usize = 2;
+    const PR_GET_DUMPABLE: usize = 3;
+    const PR_SET_DUMPABLE: usize = 4;
+    const PR_GET_KEEPCAPS: usize = 7;
+    const PR_SET_KEEPCAPS: usize = 8;
     const PR_SET_NAME: usize = 15;
     const PR_GET_NAME: usize = 16;
+    const PR_GET_SECCOMP: usize = 21;
+    const PR_SET_SECCOMP: usize = 22;
     const PR_CAPBSET_READ: usize = 23;
     const PR_CAPBSET_DROP: usize = 24;
+    const PR_GET_TSC: usize = 25;
+    const PR_SET_TSC: usize = 26;
+    const PR_GET_SECUREBITS: usize = 27;
+    const PR_SET_SECUREBITS: usize = 28;
     const PR_SET_TIMERSLACK: usize = 29;
     const PR_GET_TIMERSLACK: usize = 30;
+    const PR_SET_MM: usize = 35;
+    const PR_SET_CHILD_SUBREAPER: usize = 36;
+    const PR_GET_CHILD_SUBREAPER: usize = 37;
+    const PR_SET_NO_NEW_PRIVS: usize = 38;
+    const PR_GET_NO_NEW_PRIVS: usize = 39;
+    const PR_SET_THP_DISABLE: usize = 41;
+    const PR_GET_THP_DISABLE: usize = 42;
+    const PR_GET_TID_ADDRESS: usize = 40;
+    const PR_CAP_AMBIENT: usize = 47;
+    const PR_GET_SPECULATION_CTRL: usize = 52;
+    const PR_SET_SPECULATION_CTRL: usize = 53;
+    const PR_SET_PTRACER: usize = 0x5961_6d61;
+    const PR_GET_PTRACER: usize = 0x5961_6d62;
+    const PR_SET_VMA: usize = 0x5356_4d41;
+    const PR_GET_AUXV: usize = 0x4155_5856;
+
+    const SECBIT_KEEP_CAPS: u32 = 1 << 0;
+    const SECBIT_KEEP_CAPS_LOCKED: u32 = 1 << 1;
+    const SECBIT_NO_SETUID_FIXUP: u32 = 1 << 2;
+    const SECBIT_NO_SETUID_FIXUP_LOCKED: u32 = 1 << 3;
+    const SECBIT_NOROOT: u32 = 1 << 4;
+    const SECBIT_NOROOT_LOCKED: u32 = 1 << 5;
+    const SECBIT_NO_CAP_AMBIENT_RAISE: u32 = 1 << 6;
+    const SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED: u32 = 1 << 7;
+    const SECBIT_LOCKED: u32 = SECBIT_KEEP_CAPS_LOCKED
+        | SECBIT_NO_SETUID_FIXUP_LOCKED
+        | SECBIT_NOROOT_LOCKED
+        | SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+    const SECBIT_ALL: u32 = SECBIT_KEEP_CAPS
+        | SECBIT_KEEP_CAPS_LOCKED
+        | SECBIT_NO_SETUID_FIXUP
+        | SECBIT_NO_SETUID_FIXUP_LOCKED
+        | SECBIT_NOROOT
+        | SECBIT_NOROOT_LOCKED
+        | SECBIT_NO_CAP_AMBIENT_RAISE
+        | SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+
+    let task = ctx.task();
     match ctx.args[0] {
+        PR_SET_PDEATHSIG => {
+            let raw = ctx.args[1] as i32;
+            if raw >= 0 && raw > 64 {
+                return Err(Errno::EINVAL);
+            }
+            task.set_pdeathsig(raw);
+            Ok(0)
+        }
+        PR_GET_PDEATHSIG => {
+            let addr = ctx.args[1];
+            if addr == 0 {
+                return Err(Errno::EFAULT);
+            }
+            copy_to_user(addr, &(task.pdeathsig() as u32).to_le_bytes())
+                .map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        PR_GET_DUMPABLE => Ok(task.dumpable() as usize),
+        PR_SET_DUMPABLE => {
+            let value = ctx.args[1];
+            if value > 2 {
+                return Err(Errno::EINVAL);
+            }
+            task.set_dumpable(value as u8);
+            Ok(0)
+        }
+        PR_GET_KEEPCAPS => Ok(task.keepcaps() as usize),
+        PR_SET_KEEPCAPS => {
+            let enabled = ctx.args[1] != 0;
+            let creds = task.credentials();
+            if enabled && creds.euid != Uid::ROOT {
+                return Err(Errno::EPERM);
+            }
+            task.set_keepcaps(enabled);
+            Ok(0)
+        }
         PR_SET_NAME => {
             let name_user = ctx.args[1];
             if name_user == 0 {
@@ -2084,13 +2478,13 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             }
             let mut raw = [0u8; sched::TASK_COMM_LEN];
             copy_from_user(name_user, &mut raw).map_err(|e| e.as_errno())?;
-            ctx.task().set_comm(&raw);
+            task.set_comm(&raw);
             Ok(0)
         }
         PR_GET_NAME => {
             let buf = ctx.args[1];
             if buf != 0 {
-                copy_to_user(buf, &ctx.task().comm()).map_err(|e| e.as_errno())?;
+                copy_to_user(buf, &task.comm()).map_err(|e| e.as_errno())?;
             }
             Ok(0)
         }
@@ -2099,7 +2493,7 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             if !linux_cap_valid(cap) {
                 return Err(Errno::EINVAL);
             }
-            let creds = ctx.task().credentials();
+            let creds = task.credentials();
             Ok(((creds.cap_bset.raw() >> cap) & 1) as usize)
         }
         PR_CAPBSET_DROP => {
@@ -2107,21 +2501,493 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             if !linux_cap_valid(cap) {
                 return Err(Errno::EINVAL);
             }
-            let current = ctx.task().credentials();
+            let current = task.credentials();
             if !current.has_cap(Capability::Setpcap) {
                 return Err(Errno::EPERM);
             }
             let mut new = (*current).clone();
             new.cap_bset = CapSet::from_raw(new.cap_bset.raw() & !(1u64 << cap));
-            install_credentials(ctx.task(), new);
+            install_credentials(task, new);
+            Ok(0)
+        }
+        PR_GET_TSC => Ok(prctl_misc(ctx.task()).tsc_mode.load(Ordering::Acquire) as usize),
+        PR_SET_TSC => {
+            let flag = ctx.args[1];
+            // PR_TSC_ENABLE=1 / PR_TSC_SIGSEGV=2。
+            if flag != 1 && flag != 2 {
+                return Err(Errno::EINVAL);
+            }
+            prctl_misc(ctx.task())
+                .tsc_mode
+                .store(flag as u8, Ordering::Release);
+            Ok(0)
+        }
+        PR_GET_SECUREBITS => Ok(task.credentials().securebits as usize),
+        PR_SET_SECUREBITS => {
+            let bits = ctx.args[1] as u32;
+            if bits & !SECBIT_ALL != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let current = task.credentials();
+            if current.securebits & SECBIT_LOCKED != 0 {
+                // 已锁定位不可再改。
+                if current.securebits & SECBIT_LOCKED != bits & SECBIT_LOCKED {
+                    return Err(Errno::EPERM);
+                }
+            }
+            if bits & SECBIT_LOCKED != 0 && !current.has_cap(Capability::Setpcap) {
+                return Err(Errno::EPERM);
+            }
+            let mut new = (*current).clone();
+            new.securebits = bits;
+            install_credentials(task, new);
             Ok(0)
         }
         PR_SET_TIMERSLACK => {
-            ctx.task().set_timer_slack_ns(ctx.args[1] as u64);
+            task.set_timer_slack_ns(ctx.args[1] as u64);
             Ok(0)
         }
-        PR_GET_TIMERSLACK => Ok(ctx.task().timer_slack_ns().min(usize::MAX as u64) as usize),
-        _ => Ok(0),
+        PR_GET_TIMERSLACK => Ok(task.timer_slack_ns().min(usize::MAX as u64) as usize),
+        PR_SET_MM => prctl_set_mm(ctx.task(), ctx.args[1], ctx.args[2]),
+        PR_SET_CHILD_SUBREAPER => {
+            task.set_subreaper(ctx.args[1] != 0);
+            Ok(0)
+        }
+        PR_GET_CHILD_SUBREAPER => {
+            let addr = ctx.args[1];
+            if addr == 0 {
+                return Err(Errno::EFAULT);
+            }
+            copy_to_user(addr, &(task.is_subreaper() as u32).to_le_bytes())
+                .map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        PR_SET_NO_NEW_PRIVS => {
+            if ctx.args[1] != 0 && ctx.args[1] != 1 {
+                return Err(Errno::EINVAL);
+            }
+            if ctx.args[1] == 1 {
+                task.set_no_new_privs(true);
+            }
+            Ok(0)
+        }
+        PR_GET_NO_NEW_PRIVS => Ok(task.no_new_privs() as usize),
+        PR_SET_THP_DISABLE => {
+            let value = ctx.args[1];
+            if value > 1 {
+                return Err(Errno::EINVAL);
+            }
+            prctl_misc(ctx.task())
+                .thp_disable
+                .store(value as u8, Ordering::Release);
+            Ok(0)
+        }
+        PR_GET_THP_DISABLE => {
+            Ok(prctl_misc(ctx.task()).thp_disable.load(Ordering::Acquire) as usize)
+        }
+        PR_GET_SECCOMP => Ok(seccomp_state(task).mode() as usize),
+        PR_SET_SECCOMP => {
+            // 老式 PR_SET_SECCOMP：arg2 是 SECCOMP_MODE_*（STRICT=1 / FILTER=2），
+            // 与 seccomp(2) 的 SECCOMP_SET_MODE_*（STRICT=0 / FILTER=1）不同，
+            // 先换算成 SET 语义再走公共安装路径。
+            use general::seccomp::{SECCOMP_MODE_FILTER, SECCOMP_MODE_STRICT};
+            let mode = match ctx.args[1] as i32 {
+                SECCOMP_MODE_STRICT => general::seccomp::SECCOMP_SET_MODE_STRICT as usize,
+                SECCOMP_MODE_FILTER => general::seccomp::SECCOMP_SET_MODE_FILTER as usize,
+                _ => return Err(Errno::EINVAL),
+            };
+            crate::syscalls::process::seccomp_filter_setup(ctx.task(), mode, ctx.args[2])?;
+            Ok(0)
+        }
+        PR_GET_TID_ADDRESS => {
+            let addr = ctx.args[1];
+            if addr == 0 {
+                return Err(Errno::EFAULT);
+            }
+            copy_to_user(addr, &(task.clear_child_tid() as u64).to_le_bytes())
+                .map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        PR_SET_PTRACER => {
+            // yama LSM 的追踪者作用域：0 = PR_SET_PTRACER_ANY，其余为指定 pid。
+            // 取舍：持久化作用域值；ptrace_may_access 目前只做 uid/dumpable 检查，
+            // 未按作用域过滤（见 sched::operation::ptrace_may_access）。
+            task.set_ptracer_scope(ctx.args[1] as i32);
+            Ok(0)
+        }
+        PR_GET_PTRACER => {
+            let addr = ctx.args[1];
+            if addr == 0 {
+                return Err(Errno::EFAULT);
+            }
+            copy_to_user(addr, &(task.ptracer_scope() as u32).to_le_bytes())
+                .map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        PR_CAP_AMBIENT => prctl_cap_ambient(task, ctx.args[1], ctx.args[2]),
+        PR_SET_VMA => prctl_set_vma(task, ctx.args[1], ctx.args[2], ctx.args[3]),
+        PR_GET_AUXV => prctl_get_auxv(task, ctx.args[1], ctx.args[2]),
+        PR_GET_SPECULATION_CTRL => prctl_get_speculation_ctrl(task, ctx.args[1], ctx.args[2]),
+        PR_SET_SPECULATION_CTRL => prctl_set_speculation_ctrl(task, ctx.args[1], ctx.args[2]),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// 每个任务/进程的 `prctl` 杂项状态（TSC 模式、THP 开关）。
+pub(crate) const TASKEXT_PRCTL_MISC: sched::TaskExtKey = 0x0004_0005;
+
+/// `prctl` 持久化的进程级杂项状态（Linux `PR_SET_TSC`/`PR_SET_THP_DISABLE`）。
+pub(crate) struct PrctlMiscState {
+    /// `PR_TSC_ENABLE=1` / `PR_TSC_SIGSEGV=2`。
+    pub(crate) tsc_mode: AtomicU8,
+    /// `PR_SET_THP_DISABLE` 的 0/1。
+    pub(crate) thp_disable: AtomicU8,
+}
+
+impl PrctlMiscState {
+    pub(crate) fn new() -> Self {
+        Self {
+            tsc_mode: AtomicU8::new(1), // 默认 PR_TSC_ENABLE
+            thp_disable: AtomicU8::new(0),
+        }
+    }
+}
+
+/// 取任务的 prctl 杂项状态（惰性创建并挂载）。
+fn prctl_misc(task: &Arc<Task>) -> Arc<PrctlMiscState> {
+    if let Some(state) = task
+        .ext_lookup(TASKEXT_PRCTL_MISC)
+        .and_then(|payload| payload.downcast::<PrctlMiscState>().ok())
+    {
+        return state;
+    }
+    let state = Arc::new(PrctlMiscState::new());
+    let erased: Arc<dyn core::any::Any + Send + Sync> = state.clone();
+    task.ext_install(TASKEXT_PRCTL_MISC, erased);
+    state
+}
+
+/// exec 时捕获的 auxv（`PR_GET_AUXV` 读取）。由 `crate::exec` 安装，
+/// 与 `TASKEXT_EXEC_PATH/ARGS/ENVP` 同代。
+pub(crate) const TASKEXT_EXEC_AUXV: sched::TaskExtKey = 0x0002_0004;
+/// `PR_SET_MM` 持久化的 mm 边界字段（CRIU 恢复用）。
+pub(crate) const TASKEXT_PRCTL_MM: sched::TaskExtKey = 0x0004_0006;
+
+/// `PR_SET_MM` 的 mm 边界字段。Linux 把这些值存在 `mm_struct` 上；
+/// 本内核无独立 `mm_struct`，用任务扩展保存。fork 时扩展被共享（同 Arc），
+/// 但 CRIU 恢复在 exec 后、fork 前完成，实际路径不受影响。
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PrctlMmFields {
+    pub start_code: u64,
+    pub end_code: u64,
+    pub start_data: u64,
+    pub end_data: u64,
+    pub start_stack: u64,
+    pub start_brk: u64,
+    pub brk: u64,
+    pub arg_start: u64,
+    pub arg_end: u64,
+    pub env_start: u64,
+    pub env_end: u64,
+}
+
+fn prctl_mm_state(task: &Arc<Task>) -> Arc<Spinlock<PrctlMmFields>> {
+    if let Some(state) = task
+        .ext_lookup(TASKEXT_PRCTL_MM)
+        .and_then(|payload| payload.downcast::<Spinlock<PrctlMmFields>>().ok())
+    {
+        return state;
+    }
+    let state = Arc::new(Spinlock::new(PrctlMmFields::default()));
+    let erased: Arc<dyn core::any::Any + Send + Sync> = state.clone();
+    task.ext_install(TASKEXT_PRCTL_MM, erased);
+    state
+}
+
+/// `PR_SET_MM`：CRIU 依赖的 mm 边界字段恢复。
+///
+/// Linux 要求 `CAP_SYS_RESOURCE`。实现 `PR_SET_MM_MAP`（CRIU 主路径）与
+/// `PR_SET_MM_{START,END}_{CODE,DATA,STACK,BRK}`、`PR_SET_MM_ARG_*`、
+/// `PR_SET_MM_ENV_*` 标量项，并把 `PR_SET_MM_MAP_SIZE` 报告为 `sizeof(prctl_mm_map)`。
+/// 取舍：`PR_SET_MM_AUXV`/`PR_SET_MM_EXE_FILE` 只做基本校验不落地（auxv 由
+/// exec 捕获、exe 由 `TASKEXT_EXEC_PATH` 维护），且这些字段不参与实际 mm 布局，
+/// 仅持久化供 CRIU 回读。
+fn prctl_set_mm(task: &Arc<Task>, option: usize, value: usize) -> Result<usize, Errno> {
+    const PR_SET_MM_START_CODE: usize = 1;
+    const PR_SET_MM_END_CODE: usize = 2;
+    const PR_SET_MM_START_DATA: usize = 3;
+    const PR_SET_MM_END_DATA: usize = 4;
+    const PR_SET_MM_START_STACK: usize = 5;
+    const PR_SET_MM_START_BRK: usize = 6;
+    const PR_SET_MM_BRK: usize = 7;
+    const PR_SET_MM_ARG_START: usize = 8;
+    const PR_SET_MM_ARG_END: usize = 9;
+    const PR_SET_MM_ENV_START: usize = 10;
+    const PR_SET_MM_ENV_END: usize = 11;
+    const PR_SET_MM_AUXV: usize = 12;
+    const PR_SET_MM_EXE_FILE: usize = 13;
+    const PR_SET_MM_MAP: usize = 14;
+    const PR_SET_MM_MAP_SIZE: usize = 15;
+
+    if !task.credentials().has_cap(Capability::SysResource) {
+        return Err(Errno::EPERM);
+    }
+    let state = prctl_mm_state(task);
+    let mut fields = state.lock();
+    match option {
+        PR_SET_MM_START_CODE => fields.start_code = value as u64,
+        PR_SET_MM_END_CODE => fields.end_code = value as u64,
+        PR_SET_MM_START_DATA => fields.start_data = value as u64,
+        PR_SET_MM_END_DATA => fields.end_data = value as u64,
+        PR_SET_MM_START_STACK => fields.start_stack = value as u64,
+        PR_SET_MM_START_BRK => fields.start_brk = value as u64,
+        PR_SET_MM_BRK => fields.brk = value as u64,
+        PR_SET_MM_ARG_START => fields.arg_start = value as u64,
+        PR_SET_MM_ARG_END => fields.arg_end = value as u64,
+        PR_SET_MM_ENV_START => fields.env_start = value as u64,
+        PR_SET_MM_ENV_END => fields.env_end = value as u64,
+        PR_SET_MM_AUXV => {
+            // CRIU 用它传自定义 auxv；本内核 auxv 由 exec 捕获，只校验地址
+            // 非空，不回写 mm 布局。
+            if value == 0 {
+                return Err(Errno::EINVAL);
+            }
+        }
+        PR_SET_MM_EXE_FILE => {
+            // 校验 fd 有效即可；不替换 TASKEXT_EXEC_PATH（见取舍注释）。
+            if value != usize::MAX && task_fdtable(task).is_none() {
+                return Err(Errno::EBADF);
+            }
+        }
+        PR_SET_MM_MAP => {
+            if value == 0 {
+                return Err(Errno::EFAULT);
+            }
+            let mut raw = [0u8; 88];
+            copy_from_user(value, &mut raw).map_err(|e| e.as_errno())?;
+            let read = |off: usize| u64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
+            let start_code = read(0);
+            let end_code = read(8);
+            let start_data = read(16);
+            let end_data = read(24);
+            let start_brk = read(32);
+            let brk = read(40);
+            let start_stack = read(48);
+            let arg_start = read(56);
+            let arg_end = read(64);
+            let env_start = read(72);
+            let env_end = read(80);
+            // Linux 校验各区间单调不重叠（`validate_prctl_map_addr`）。
+            if start_code > end_code
+                || end_code > start_data
+                || start_data > end_data
+                || end_data > start_brk
+                || start_brk > brk
+                || brk > start_stack
+                || start_stack > arg_start
+                || arg_start > arg_end
+                || arg_end > env_start
+                || env_start > env_end
+            {
+                return Err(Errno::EINVAL);
+            }
+            fields.start_code = start_code;
+            fields.end_code = end_code;
+            fields.start_data = start_data;
+            fields.end_data = end_data;
+            fields.start_brk = start_brk;
+            fields.brk = brk;
+            fields.start_stack = start_stack;
+            fields.arg_start = arg_start;
+            fields.arg_end = arg_end;
+            fields.env_start = env_start;
+            fields.env_end = env_end;
+        }
+        PR_SET_MM_MAP_SIZE => {
+            return Ok(core::mem::size_of::<[u64; 11]>() + 8); // 11 * u64 + auxv_size/exe_fd
+        }
+        _ => return Err(Errno::EINVAL),
+    }
+    Ok(0)
+}
+
+/// `PR_CAP_AMBIENT`：ambient capability 集管理。
+fn prctl_cap_ambient(task: &Arc<Task>, sub: usize, cap_raw: usize) -> Result<usize, Errno> {
+    const PR_CAP_AMBIENT_IS_SET: usize = 1;
+    const PR_CAP_AMBIENT_RAISE: usize = 2;
+    const PR_CAP_AMBIENT_LOWER: usize = 3;
+    const PR_CAP_AMBIENT_CLEAR_ALL: usize = 4;
+
+    let cap = cap_raw as u32;
+    let current = task.credentials();
+    let mut new = (*current).clone();
+    match sub {
+        PR_CAP_AMBIENT_IS_SET => {
+            if !linux_cap_valid(cap) {
+                return Err(Errno::EINVAL);
+            }
+            Ok((new.cap_ambient.raw() >> cap & 1) as usize)
+        }
+        PR_CAP_AMBIENT_RAISE => {
+            if !linux_cap_valid(cap) {
+                return Err(Errno::EINVAL);
+            }
+            // Linux：能力必须已在 inheritable 与 permitted 中；无 CAP_SETPCAP
+            // 时只能提升已经同时存在于两者中的能力。
+            let bit = 1u64 << cap;
+            if new.cap_inheritable.raw() & bit == 0 || new.cap_permitted.raw() & bit == 0 {
+                return Err(Errno::EPERM);
+            }
+            if !new.has_cap(Capability::Setpcap) {
+                return Err(Errno::EPERM);
+            }
+            new.cap_ambient = CapSet::from_raw(new.cap_ambient.raw() | bit);
+            install_credentials(task, new);
+            Ok(0)
+        }
+        PR_CAP_AMBIENT_LOWER => {
+            if !linux_cap_valid(cap) {
+                return Err(Errno::EINVAL);
+            }
+            new.cap_ambient = CapSet::from_raw(new.cap_ambient.raw() & !(1u64 << cap));
+            install_credentials(task, new);
+            Ok(0)
+        }
+        PR_CAP_AMBIENT_CLEAR_ALL => {
+            new.cap_ambient = CapSet::EMPTY;
+            install_credentials(task, new);
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// `PR_SET_VMA`：给匿名 VMA 区间命名（`PR_SET_VMA_ANON_NAME`）。
+///
+/// 取舍：本内核 VMA 无 anon_name 存储（`general::mm::VmSpace` 只读边界），
+/// 因此只校验区间与名称，不落地；返回 0 以兼容依赖该 prctl 的运行时。
+fn prctl_set_vma(
+    _task: &Arc<Task>,
+    addr: usize,
+    size: usize,
+    name_user: usize,
+) -> Result<usize, Errno> {
+    if size == 0 || addr > usize::MAX - size {
+        return Err(Errno::EINVAL);
+    }
+    let _name = if name_user == 0 {
+        return Err(Errno::EFAULT);
+    } else {
+        copy_cstr_from_user(name_user, 256).map_err(|e| e.as_errno())?
+    };
+    Ok(0)
+}
+
+/// `PR_GET_AUXV`：把 exec 捕获的 auxv 拷回用户态。
+fn prctl_get_auxv(task: &Arc<Task>, user: usize, size: usize) -> Result<usize, Errno> {
+    if user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let auxv = task
+        .ext_lookup(TASKEXT_EXEC_AUXV)
+        .and_then(|payload| payload.downcast::<Spinlock<Vec<u64>>>().ok());
+    let Some(auxv) = auxv else {
+        // 尚未 exec（或非 Tomori 进程）：无 auxv，按空返回。
+        return Ok(0);
+    };
+    let bytes = auxv.lock();
+    let total = bytes.len() * 8;
+    let n = size.min(total);
+    if n > 0 {
+        let mut out = alloc::vec![0u8; n];
+        for (index, chunk) in out.chunks_mut(8).enumerate() {
+            chunk.copy_from_slice(&bytes[index].to_le_bytes());
+        }
+        copy_to_user(user, &out).map_err(|e| e.as_errno())?;
+    }
+    Ok(0)
+}
+
+/// `PR_GET_SPECULATION_CTRL`：读回投机执行控制位（按 feature 3 位打包）。
+fn prctl_get_speculation_ctrl(
+    task: &Arc<Task>,
+    feature: usize,
+    out_user: usize,
+) -> Result<usize, Errno> {
+    const PR_SPEC_STORE_BYPASS: usize = 0;
+    const PR_SPEC_INDIRECT_BRANCH: usize = 1;
+    const PR_SPEC_L1D_FLUSH: usize = 2;
+    if feature > PR_SPEC_L1D_FLUSH || out_user == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let value = (task.speculation_ctrl() >> (feature * 3)) & 0b111;
+    copy_to_user(out_user, &(value as u32).to_le_bytes()).map_err(|e| e.as_errno())?;
+    Ok(0)
+}
+
+/// `PR_SET_SPECULATION_CTRL`：记录投机执行控制位（不施加实际硬件缓解）。
+fn prctl_set_speculation_ctrl(
+    task: &Arc<Task>,
+    feature: usize,
+    value: usize,
+) -> Result<usize, Errno> {
+    const PR_SPEC_STORE_BYPASS: usize = 0;
+    const PR_SPEC_INDIRECT_BRANCH: usize = 1;
+    const PR_SPEC_L1D_FLUSH: usize = 2;
+    const PR_SPEC_ENABLE: usize = 0;
+    const PR_SPEC_DISABLE: usize = 1;
+    const PR_SPEC_FORCE_DISABLE: usize = 2;
+    const PR_SPEC_DISABLE_NOEXEC: usize = 4;
+    if feature > PR_SPEC_L1D_FLUSH {
+        return Err(Errno::EINVAL);
+    }
+    if value & !0b111 != 0
+        || !matches!(
+            value & 0b111,
+            PR_SPEC_ENABLE | PR_SPEC_DISABLE | PR_SPEC_FORCE_DISABLE | PR_SPEC_DISABLE_NOEXEC
+        )
+    {
+        return Err(Errno::EINVAL);
+    }
+    // 取舍：内核未实现投机执行缓解，仅持久化位图供回读（见 process.rs 顶部说明）。
+    let shift = feature * 3;
+    let mask = 0b111u64 << shift;
+    let current = task.speculation_ctrl();
+    task.set_speculation_ctrl((current & !mask) | ((value as u64 & 0b111) << shift));
+    Ok(0)
+}
+
+/// `PR_SET_SECCOMP`：老式 seccomp 入口，等价 `seccomp(2)`。
+pub(super) fn seccomp_filter_setup(
+    task: &Arc<Task>,
+    mode: usize,
+    filter_user: usize,
+) -> Result<(), Errno> {
+    use general::seccomp::*;
+    match mode as u32 {
+        SECCOMP_SET_MODE_STRICT => {
+            seccomp_state(task).set_strict();
+            Ok(())
+        }
+        SECCOMP_SET_MODE_FILTER => {
+            let cred = vfs_cred_from_sched(&task.credentials());
+            if !filter_install_allowed(task.no_new_privs(), &cred) {
+                return Err(Errno::EACCES);
+            }
+            let mut fprog = [0u8; 16];
+            copy_from_user(filter_user, &mut fprog).map_err(|e| e.as_errno())?;
+            let len = u16::from_le_bytes(fprog[0..2].try_into().unwrap()) as usize;
+            let ptr = u64::from_le_bytes(fprog[8..16].try_into().unwrap()) as usize;
+            let mut bytes = vec![0u8; len * 8];
+            if len > 0 {
+                copy_from_user(ptr, &mut bytes).map_err(|e| e.as_errno())?;
+            }
+            let insns = parse_program(&bytes)?;
+            let filter = SeccompFilter::new(insns, 0)?;
+            seccomp_state(task).push_filter(filter);
+            Ok(())
+        }
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -2302,7 +3168,11 @@ const LINUX_FS_CAP_MASK: u64 = (1u64 << Capability::Chown as u32)
     | (1u64 << 27) // CAP_MKNOD
     | (1u64 << 32); // CAP_MAC_OVERRIDE
 
-fn drop_caps_after_uid_gid_change(old: &Credentials, new: &mut Credentials) {
+/// `SECBIT_KEEP_CAPS`:setuid 从 root 降权时保留 permitted 能力集。
+const SECBIT_KEEP_CAPS: u32 = 1 << 0;
+
+fn drop_caps_after_uid_gid_change(task: &Arc<Task>, old: &Credentials, new: &mut Credentials) {
+    let keepcaps = task.keepcaps() || (old.securebits & SECBIT_KEEP_CAPS) != 0;
     let lost_root_uid = (old.uid == Uid::ROOT || old.euid == Uid::ROOT || old.suid == Uid::ROOT)
         && new.uid != Uid::ROOT
         && new.euid != Uid::ROOT
@@ -2310,9 +3180,15 @@ fn drop_caps_after_uid_gid_change(old: &Credentials, new: &mut Credentials) {
     let lost_effective_root = old.euid == Uid::ROOT && new.euid != Uid::ROOT;
     let gained_effective_root = old.euid != Uid::ROOT && new.euid == Uid::ROOT;
     if lost_root_uid {
-        new.caps = CapSet::EMPTY;
-        new.cap_permitted = CapSet::EMPTY;
-        new.cap_inheritable = CapSet::EMPTY;
+        if !keepcaps {
+            new.caps = CapSet::EMPTY;
+            new.cap_permitted = CapSet::EMPTY;
+            new.cap_inheritable = CapSet::EMPTY;
+        } else {
+            // keepcaps:保留 permitted/inheritable,仅清 effective(仍需后续
+            // lost_effective_root 语义清空 effective)。
+            new.caps = CapSet::EMPTY;
+        }
     } else if lost_effective_root {
         new.caps = CapSet::EMPTY;
     } else if gained_effective_root {
@@ -2345,7 +3221,7 @@ pub(super) fn sys_setuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     } else {
         return Err(Errno::EPERM);
     }
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -2368,7 +3244,7 @@ pub(super) fn sys_setgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     } else {
         return Err(Errno::EPERM);
     }
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -2396,7 +3272,7 @@ pub(super) fn sys_setreuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     if ruid != u32::MAX || (euid != u32::MAX && euid != creds.uid.0) {
         new.suid = new.euid;
     }
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -2424,7 +3300,7 @@ pub(super) fn sys_setregid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     if rgid != u32::MAX || (egid != u32::MAX && egid != creds.gid.0) {
         new.sgid = new.egid;
     }
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -2456,7 +3332,7 @@ pub(super) fn sys_setresuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         new.suid = Uid(suid);
     }
     new.fsuid = new.euid;
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -2488,7 +3364,7 @@ pub(super) fn sys_setresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         new.sgid = Gid(sgid);
     }
     new.fsgid = new.egid;
-    drop_caps_after_uid_gid_change(&creds, &mut new);
+    drop_caps_after_uid_gid_change(ctx.task(), &creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
 }
@@ -2506,7 +3382,7 @@ pub(super) fn sys_setfsuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     {
         let mut new = (*creds).clone();
         new.fsuid = uid;
-        drop_caps_after_uid_gid_change(&creds, &mut new);
+        // setfsuid/setfsgid 不改变 capabilities,与 Linux 主路径一致。
         install_credentials(ctx.task(), new);
     }
     Ok(old.0 as usize)
@@ -2551,7 +3427,7 @@ pub(super) fn sys_setgroups(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let size = ctx.args[0];
     let list = ctx.args[1];
     let creds = ctx.task().credentials();
-    if creds.euid != Uid::ROOT {
+    if !creds.has_cap(Capability::Setgid) {
         return Err(Errno::EPERM);
     }
     const NGROUPS_MAX: usize = 65536;
@@ -2562,7 +3438,11 @@ pub(super) fn sys_setgroups(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     for i in 0..size {
         let mut raw = [0u8; 4];
         copy_from_user(list + i * 4, &mut raw).map_err(|e| e.as_errno())?;
-        groups.push(Gid(u32::from_le_bytes(raw)));
+        let gid = u32::from_le_bytes(raw);
+        if gid == u32::MAX {
+            return Err(Errno::EINVAL);
+        }
+        groups.push(Gid(gid));
     }
     let mut new = (*creds).clone();
     new.groups = groups;
@@ -2771,7 +3651,7 @@ fn pi_urgency(attr: SchedAttr) -> u16 {
     match attr.policy {
         SchedPolicy::Deadline => 400,
         SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => 200 + attr.priority as u16,
-        SchedPolicy::Fair => 100 + (19i16 - attr.nice as i16).max(0) as u16,
+        SchedPolicy::Fair | SchedPolicy::Batch => 100 + (19i16 - attr.nice as i16).max(0) as u16,
         SchedPolicy::Idle => 0,
     }
 }
@@ -4519,11 +5399,14 @@ pub(super) fn sys_futex_requeue(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     )
 }
 
-pub(super) fn sys_unshare(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_unshare(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    crate::ns::unshare(ctx.task(), ctx.args[0] as u64)?;
+    Ok(0)
 }
 
 pub(super) fn sys_kexec_load(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // kexec 内核重载机制整体未实现。Linux 在未启用 CONFIG_KEXEC 时同样返回
+    // ENOSYS，此处语义对齐，属正确桩而非缺口。
     Err(Errno::ENOSYS)
 }
 
@@ -4535,24 +5418,233 @@ pub(super) fn sys_delete_module(_ctx: &mut SyscallContext<'_>) -> Result<usize, 
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_timer_create(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_timer_create(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    timer_create_common(ctx, false)
 }
 
-pub(super) fn sys_timer_gettime(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_timer_gettime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    timer_gettime_common(ctx)
 }
 
-pub(super) fn sys_timer_getoverrun(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_timer_getoverrun(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    timer_getoverrun_common(ctx)
 }
 
-pub(super) fn sys_timer_settime(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_timer_settime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    timer_settime_common(ctx)
 }
 
-pub(super) fn sys_timer_delete(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_timer_delete(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    timer_delete_common(ctx)
+}
+
+/// Linux `sigevent`（64 位）前 20 字节：`sigev_value`(8) + `sigev_signo`(4)
+/// + `sigev_notify`(4) + `sigev_notify_thread_id`(4)。
+const SIGEV_HEADER_SIZE: usize = 20;
+const SIGEV_VALUE_OFF: usize = 0;
+const SIGEV_SIGNO_OFF: usize = 8;
+const SIGEV_NOTIFY_OFF: usize = 12;
+const SIGEV_TID_OFF: usize = 16;
+
+const SIGEV_SIGNAL: i32 = 0;
+const SIGEV_NONE: i32 = 1;
+// SIGEV_THREAD(2) 由 glibc 用 SIGEV_THREAD_ID + 自建线程翻译，内核不接受。
+const SIGEV_THREAD_ID: i32 = 4;
+
+const TIMER_ABSTIME: i32 = 1;
+
+/// Linux `struct itimerspec`（64 位，32 字节）。
+const ITIMERSPEC_SIZE: usize = 32;
+const ITIMERSPEC_INTERVAL_OFF: usize = 0;
+const ITIMERSPEC_VALUE_OFF: usize = 16;
+
+fn timer_create_common(ctx: &mut SyscallContext<'_>, _time64: bool) -> Result<usize, Errno> {
+    let clockid = ctx.args[0] as i32;
+    let sevp = ctx.args[1];
+    let timeridp = ctx.args[2];
+    let clock = sched::posix_timer::TimerClock::from_clockid(clockid).ok_or(Errno::EINVAL)?;
+
+    // sigevent 默认：SIGEV_SIGNAL + SIGALRM（sevp == NULL）。
+    let mut sigev_value = 0u64;
+    let mut signo = SignalNumber::SIGALRM;
+    let mut notify = SIGEV_SIGNAL;
+    let mut thread_id = 0i32;
+    if sevp != 0 {
+        let mut buf = [0u8; SIGEV_HEADER_SIZE];
+        copy_from_user(sevp, &mut buf).map_err(|e| e.as_errno())?;
+        sigev_value = u64::from_le_bytes(
+            buf[SIGEV_VALUE_OFF..SIGEV_VALUE_OFF + 8]
+                .try_into()
+                .unwrap(),
+        );
+        notify = i32::from_le_bytes(
+            buf[SIGEV_NOTIFY_OFF..SIGEV_NOTIFY_OFF + 4]
+                .try_into()
+                .unwrap(),
+        );
+        thread_id = i32::from_le_bytes(buf[SIGEV_TID_OFF..SIGEV_TID_OFF + 4].try_into().unwrap());
+        // 仅信号类 notify 需要校验 signo；SIGEV_NONE 忽略 signo 与 sigev_value。
+        if notify == SIGEV_SIGNAL || notify == SIGEV_THREAD_ID {
+            signo = SignalNumber::from_raw(i32::from_le_bytes(
+                buf[SIGEV_SIGNO_OFF..SIGEV_SIGNO_OFF + 4]
+                    .try_into()
+                    .unwrap(),
+            ))
+            .ok_or(Errno::EINVAL)?;
+            // SIGKILL/SIGSTOP 不可作为定时器投递信号。
+            if signo == SignalNumber::SIGKILL || signo == SignalNumber::SIGSTOP {
+                return Err(Errno::EINVAL);
+            }
+        }
+    }
+
+    let caller = ctx.task();
+    let caller_tgid = caller.thread_group().tgid();
+    let target_tid = match notify {
+        SIGEV_NONE => {
+            let _ = sigev_value;
+            let _ = signo;
+            None
+        }
+        SIGEV_SIGNAL => {
+            let _ = sigev_value;
+            let _ = signo;
+            None
+        }
+        SIGEV_THREAD_ID => {
+            if thread_id <= 0 {
+                return Err(Errno::EINVAL);
+            }
+            // 目标线程必须属于调用者线程组（Linux 语义）。
+            let tid = thread_id as PidT;
+            let target = sched::posix_timer::lookup_task(tid).ok_or(Errno::EINVAL)?;
+            if target.is_kernel_task() || target.thread_group().tgid() != caller_tgid {
+                return Err(Errno::EINVAL);
+            }
+            Some(tid)
+        }
+        _ => return Err(Errno::EINVAL),
+    };
+    let sigev = match notify {
+        SIGEV_NONE => sched::posix_timer::SigevNotify::None,
+        _ => sched::posix_timer::SigevNotify::Signal {
+            signo,
+            value: sigev_value,
+        },
+    };
+    let timer_t = sched::posix_timer::create(clock, &caller, sigev, target_tid)?;
+    if let Err(e) = copy_to_user(timeridp, &timer_t.to_le_bytes()) {
+        // 拷贝失败（如 EFAULT）回滚已创建的定时器，避免在全局表中泄漏。
+        let _ = sched::posix_timer::delete(timer_t);
+        return Err(e.as_errno());
+    }
+    Ok(0)
+}
+
+fn timer_settime_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let timer_t = ctx.args[0] as u32;
+    let flags = ctx.args[1] as i32;
+    let new_value = ctx.args[2];
+    let old_value = ctx.args[3];
+    if flags & !TIMER_ABSTIME != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let mut buf = [0u8; ITIMERSPEC_SIZE];
+    copy_from_user(new_value, &mut buf).map_err(|e| e.as_errno())?;
+    let read_timespec = |off: usize| -> Result<(i64, i64), Errno> {
+        let sec = i64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(buf[off + 8..off + 16].try_into().unwrap());
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            return Err(Errno::EINVAL);
+        }
+        Ok((sec, nsec))
+    };
+    let (interval_sec, interval_nsec) = read_timespec(ITIMERSPEC_INTERVAL_OFF)?;
+    let (value_sec, value_nsec) = read_timespec(ITIMERSPEC_VALUE_OFF)?;
+    let interval_ns = (interval_sec as u64) * 1_000_000_000 + interval_nsec as u64;
+    let value_ns = (value_sec as u64) * 1_000_000_000 + value_nsec as u64;
+
+    // 旧值快照（timer_settime 的 old_value 输出上一次挂载的剩余时间）。
+    if old_value != 0 {
+        let (remaining_ns, old_interval_ns) =
+            sched::posix_timer::gettime(timer_t).ok_or(Errno::EINVAL)?;
+        let mut old = [0u8; ITIMERSPEC_SIZE];
+        write_timespec_pair(&mut old, ITIMERSPEC_INTERVAL_OFF, old_interval_ns);
+        write_timespec_pair(&mut old, ITIMERSPEC_VALUE_OFF, remaining_ns);
+        copy_to_user(old_value, &old).map_err(|e| e.as_errno())?;
+    }
+
+    if value_ns == 0 {
+        // 解除定时器。
+        if !sched::posix_timer::arm(
+            timer_t,
+            sched::posix_timer::TimerSpec {
+                deadline_ns: 0,
+                interval_ns: 0,
+            },
+        ) {
+            return Err(Errno::EINVAL);
+        }
+        return Ok(0);
+    }
+
+    let clock = sched::posix_timer::clock_of(timer_t).ok_or(Errno::EINVAL)?;
+    let absolute = flags & TIMER_ABSTIME != 0;
+    if absolute && clock.is_cpu_clock() {
+        // Linux：CPU 时钟定时器不支持 TIMER_ABSTIME。
+        return Err(Errno::EINVAL);
+    }
+    let now = sched::posix_timer::now_in_domain(clock, &ctx.task());
+    let deadline = match (clock, absolute) {
+        (sched::posix_timer::TimerClock::Realtime, true) => {
+            // 绝对 REALTIME：换算到单调域。
+            let offset = crate::vdso::realtime_ns().saturating_sub(crate::vdso::monotonic_ns());
+            value_ns.saturating_sub(offset)
+        }
+        (_, true) => value_ns,
+        (_, false) => now.saturating_add(value_ns),
+    };
+    if !sched::posix_timer::arm(
+        timer_t,
+        sched::posix_timer::TimerSpec {
+            deadline_ns: deadline,
+            interval_ns: interval_ns,
+        },
+    ) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(0)
+}
+
+fn timer_gettime_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let timer_t = ctx.args[0] as u32;
+    let curr = ctx.args[1];
+    let (remaining_ns, interval_ns) = sched::posix_timer::gettime(timer_t).ok_or(Errno::EINVAL)?;
+    let mut out = [0u8; ITIMERSPEC_SIZE];
+    write_timespec_pair(&mut out, ITIMERSPEC_INTERVAL_OFF, interval_ns);
+    write_timespec_pair(&mut out, ITIMERSPEC_VALUE_OFF, remaining_ns);
+    copy_to_user(curr, &mut out).map_err(|e| e.as_errno())?;
+    Ok(0)
+}
+
+fn timer_getoverrun_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let timer_t = ctx.args[0] as u32;
+    let overrun = sched::posix_timer::getoverrun(timer_t).ok_or(Errno::EINVAL)?;
+    Ok(overrun as usize)
+}
+
+fn timer_delete_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let timer_t = ctx.args[0] as u32;
+    if !sched::posix_timer::delete(timer_t) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(0)
+}
+
+/// 把 ns 写成一对 `struct timespec`（sec i64 @off，nsec i64 @off+8）。
+fn write_timespec_pair(out: &mut [u8], off: usize, ns: u64) {
+    put_i64(out, off, (ns / 1_000_000_000) as i64);
+    put_i64(out, off + 8, (ns % 1_000_000_000) as i64);
 }
 
 pub(super) fn sys_clock_settime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -4562,6 +5654,7 @@ pub(super) fn sys_clock_settime(ctx: &mut SyscallContext<'_>) -> Result<usize, E
 pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let request = ctx.args[0];
     let pid = ctx.args[1] as i32;
+    let addr = ctx.args[2];
     let data = ctx.args[3];
 
     match request {
@@ -4573,8 +5666,23 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             sched::operation::ptrace_attach(pid)?;
             Ok(0)
         }
-        PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP => {
+        PTRACE_SEIZE => {
+            sched::operation::ptrace_seize(pid)?;
+            Ok(0)
+        }
+        PTRACE_CONT => {
             sched::operation::ptrace_cont(pid, ptrace_signal_arg(data)?)?;
+            Ok(0)
+        }
+        PTRACE_SYSCALL => {
+            sched::operation::ptrace_syscall(pid, ptrace_signal_arg(data)?)?;
+            Ok(0)
+        }
+        PTRACE_SINGLESTEP => {
+            let target = ptrace_target_task(pid)?;
+            // 指令补丁法单步：把目标 PC 处的指令替换为断点指令。
+            arm_singlestep(&target)?;
+            sched::operation::ptrace_singlestep(pid, ptrace_signal_arg(data)?)?;
             Ok(0)
         }
         PTRACE_KILL => {
@@ -4585,9 +5693,8 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             sched::operation::ptrace_detach(pid, ptrace_signal_arg(data)?)?;
             Ok(0)
         }
-        PTRACE_SETOPTIONS | PTRACE_OLDSETOPTIONS => Ok(0),
-        PTRACE_SEIZE => {
-            sched::operation::ptrace_seize(pid)?;
+        PTRACE_SETOPTIONS | PTRACE_OLDSETOPTIONS => {
+            ptrace_set_options(pid, data as u64)?;
             Ok(0)
         }
         PTRACE_INTERRUPT => {
@@ -4595,33 +5702,717 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(0)
         }
         PTRACE_LISTEN => {
-            sched::operation::ptrace_cont(pid, None)?;
+            // LISTEN 语义：在 PTRACE_INTERRUPT 之后让 tracee 恢复到先前的停止态，
+            // 但保持停止、不恢复执行。最小正确实现：仅校验目标可达性后返回 0，
+            // 不调用 ptrace_cont（不 resume）。
+            let _target = ptrace_target_task(pid)?;
             Ok(0)
         }
-        PTRACE_PEEKTEXT
-        | PTRACE_PEEKDATA
-        | PTRACE_PEEKUSR
-        | PTRACE_POKETEXT
-        | PTRACE_POKEDATA
-        | PTRACE_POKEUSR
-        | PTRACE_GETFDPIC
-        | PTRACE_GETEVENTMSG
-        | PTRACE_GETSIGINFO
-        | PTRACE_SETSIGINFO
-        | PTRACE_GETREGSET
-        | PTRACE_SETREGSET
-        | PTRACE_PEEKSIGINFO
-        | PTRACE_GETSIGMASK
-        | PTRACE_SETSIGMASK
-        | PTRACE_SECCOMP_GET_FILTER
-        | PTRACE_SECCOMP_GET_METADATA
-        | PTRACE_GET_SYSCALL_INFO
-        | PTRACE_GET_RSEQ_CONFIGURATION
-        | PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG
+        PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
+            // Linux：PEEKDATA/POKEDATA 的第四个参数直接携带数据（word），
+            // 不做指针解引用——PEEK 以系统调用返回值回传。
+            let target = ptrace_target_task(pid)?;
+            let vm = ptrace_target_vm(&target)?;
+            let mut raw = [0u8; 8];
+            vm.copy_user_bytes_in(addr, &mut raw)?;
+            Ok(usize::from_ne_bytes(raw))
+        }
+        PTRACE_POKETEXT | PTRACE_POKEDATA => {
+            let target = ptrace_target_task(pid)?;
+            let vm = ptrace_target_vm(&target)?;
+            let raw = (data as u64).to_ne_bytes();
+            vm.copy_user_bytes_out(addr, &raw)?;
+            if request == PTRACE_POKETEXT {
+                <arch::CurrentTaskOps as general::TaskOps>::sync_icache();
+            }
+            Ok(0)
+        }
+        PTRACE_PEEKUSR => {
+            let target = ptrace_target_task(pid)?;
+            let value = ptrace_peek_usr(&target, addr)?;
+            Ok(value)
+        }
+        PTRACE_POKEUSR => {
+            let target = ptrace_target_task(pid)?;
+            ptrace_poke_usr(&target, addr, data)?;
+            Ok(0)
+        }
+        PTRACE_GETREGSET | PTRACE_SETREGSET => {
+            let target = ptrace_target_task(pid)?;
+            let note_type = addr;
+            let iov_user = data;
+            ptrace_regset(&target, note_type, request == PTRACE_SETREGSET, iov_user)?;
+            Ok(0)
+        }
+        PTRACE_GETREGS | PTRACE_SETREGS => {
+            // GETREGS/SETREGS 的第 4 个参数 data 直接指向原始寄存器组缓冲区
+            // （riscv64 `user_regs_struct` / loongarch64 `user_pt_regs`），
+            // 不带 iovec 包装、不带 elf_prstatus 头。
+            let target = ptrace_target_task(pid)?;
+            let size = linux_user_regs_size();
+            let mut buf = [0u8; 360]; // 覆盖 riscv 256 / loongarch 360
+            if request == PTRACE_SETREGS {
+                copy_from_user(data, &mut buf[..size]).map_err(|e| e.as_errno())?;
+                let mut frame = ptrace_target_frame(&target)?;
+                if !frame.apply_linux_user_regs(&buf[..size]) {
+                    return Err(Errno::EIO);
+                }
+                ptrace_store_frame(&target, frame);
+            } else {
+                let frame = ptrace_target_frame(&target)?;
+                if !frame.write_linux_user_regs(&mut buf[..size]) {
+                    return Err(Errno::EIO);
+                }
+                copy_to_user(data, &buf[..size]).map_err(|e| e.as_errno())?;
+            }
+            Ok(0)
+        }
+        PTRACE_GETFPREGS | PTRACE_SETFPREGS => {
+            // GETFPREGS/SETFPREGS 的第 4 个参数 data 直接指向浮点寄存器组缓冲区
+            // （`struct user_fpregs_struct` / loongarch `user_fp_state`）。
+            let target = ptrace_target_task(pid)?;
+            let size = linux_fpregset_size();
+            if request == PTRACE_SETFPREGS {
+                let mut buf = [0u8; 272]; // 覆盖 riscv 264 / loongarch 272
+                copy_from_user(data, &mut buf[..size]).map_err(|e| e.as_errno())?;
+                ptrace_write_arch_fpregs(&target, &buf[..size])?;
+            } else {
+                let out = ptrace_read_arch_fpregs(&target)?;
+                copy_to_user(data, &out).map_err(|e| e.as_errno())?;
+            }
+            Ok(0)
+        }
+        PTRACE_GETSIGINFO => {
+            let info = sched::operation::ptrace_getsiginfo(pid)?;
+            super::signal::write_siginfo(data, &info)?;
+            Ok(0)
+        }
+        PTRACE_SETSIGINFO => {
+            let info = super::signal::read_queued_siginfo_raw(data)?;
+            sched::operation::ptrace_setsiginfo(pid, info)?;
+            Ok(0)
+        }
+        PTRACE_GETEVENTMSG => {
+            let message = sched::operation::ptrace_geteventmsg(pid)?;
+            copy_to_user(data, &(message as u64).to_ne_bytes()).map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        PTRACE_GETSIGMASK => {
+            let mask = sched::operation::ptrace_get_sigmask(pid)?;
+            copy_to_user(data, &mask.raw().to_ne_bytes()).map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        PTRACE_SETSIGMASK => {
+            let mut raw = [0u8; 8];
+            copy_from_user(data, &mut raw).map_err(|e| e.as_errno())?;
+            let mask = sched::SigSet::from_raw(u64::from_ne_bytes(raw));
+            sched::operation::ptrace_set_sigmask(pid, mask)?;
+            Ok(0)
+        }
+        PTRACE_PEEKSIGINFO => {
+            // 返回目标排队中的 pending siginfo（非破坏性快照）。
+            // struct ptrace_peeksiginfo_args { u64 off; u32 flags; s32 nr; }。
+            let target = ptrace_target_task(pid)?;
+            let mut args = [0u8; 16];
+            copy_from_user(addr, &mut args).map_err(|e| e.as_errno())?;
+            let off = u64::from_le_bytes(args[0..8].try_into().unwrap()) as usize;
+            let flags = u32::from_le_bytes(args[8..12].try_into().unwrap());
+            let nr = i32::from_le_bytes(args[12..16].try_into().unwrap());
+            const PTRACE_PEEKSIGINFO_SHARED: u32 = 1;
+            // 取舍：负 nr 的倒序读取（Linux 反向遍历）未实现，按 EINVAL 拒绝。
+            if flags & !PTRACE_PEEKSIGINFO_SHARED != 0 || nr < 0 {
+                return Err(Errno::EINVAL);
+            }
+            let infos = if flags & PTRACE_PEEKSIGINFO_SHARED != 0 {
+                target.shared_signal().shared_pending_infos_snapshot()
+            } else {
+                target.signal.pending_infos_snapshot()
+            };
+            let mut copied = 0usize;
+            for (index, info) in infos.iter().skip(off).enumerate() {
+                if copied >= nr as usize {
+                    break;
+                }
+                let slot = data.checked_add(index * 128).ok_or(Errno::EFAULT)?;
+                super::signal::write_siginfo(slot, info)?;
+                copied += 1;
+            }
+            Ok(copied)
+        }
+        PTRACE_GET_SYSCALL_INFO => {
+            let target = ptrace_target_task(pid)?;
+            write_ptrace_syscall_info(&target, data)?;
+            Ok(0)
+        }
+        PTRACE_GET_RSEQ_CONFIGURATION => {
+            let target = ptrace_target_task(pid)?;
+            write_ptrace_rseq_configuration(&target, data)?;
+            Ok(0)
+        }
+        // PTRACE_GETFDPIC 只在无 MMU 的 FDPIC ABI 上有意义，LA/RV 均为
+        // ELF + MMU，Linux 同架构同样返回 EINVAL。
+        PTRACE_GETFDPIC => Err(Errno::EINVAL),
+        // 取舍：SECCOMP_GET_FILTER/GET_METADATA 需反射 seccomp 过滤器 BPF
+        // 程序（general::seccomp 属只读边界，未暴露过滤器镜像接口），暂保持
+        // EINVAL；SYSCALL_USER_DISPATCH / SET_SYSCALL_INFO 依赖 seccomp 调度
+        // 路径，未实现。
+        PTRACE_SECCOMP_GET_FILTER | PTRACE_SECCOMP_GET_METADATA => Err(Errno::EINVAL),
+        PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG
         | PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG
-        | PTRACE_SET_SYSCALL_INFO => Err(Errno::EIO),
+        | PTRACE_SET_SYSCALL_INFO => Err(Errno::EINVAL),
         _ => Err(Errno::EIO),
     }
+}
+
+/// 校验 `PTRACE_SETOPTIONS` 的选项位并安装到目标。
+fn ptrace_set_options(pid: i32, options: u64) -> Result<(), Errno> {
+    const PTRACE_O_TRACESYSGOOD: u64 = 0x0000_0001;
+    const PTRACE_O_TRACEFORK: u64 = 0x0000_0002;
+    const PTRACE_O_TRACEVFORK: u64 = 0x0000_0004;
+    const PTRACE_O_TRACECLONE: u64 = 0x0000_0008;
+    const PTRACE_O_TRACEEXEC: u64 = 0x0000_0010;
+    const PTRACE_O_TRACEEXIT: u64 = 0x0000_0040;
+    const PTRACE_O_TRACESECCOMP: u64 = 0x0000_0080;
+    const PTRACE_O_EXITKILL: u64 = 0x0010_0000;
+    const PTRACE_O_SUSPEND_SECCOMP: u64 = 0x0020_0000;
+    const KNOWN: u64 = PTRACE_O_TRACESYSGOOD
+        | PTRACE_O_TRACEFORK
+        | PTRACE_O_TRACEVFORK
+        | PTRACE_O_TRACECLONE
+        | PTRACE_O_TRACEEXEC
+        | PTRACE_O_TRACEEXIT
+        | PTRACE_O_TRACESECCOMP
+        | PTRACE_O_EXITKILL
+        | PTRACE_O_SUSPEND_SECCOMP;
+    if options & !KNOWN != 0 {
+        return Err(Errno::EINVAL);
+    }
+    sched::operation::ptrace_set_options(pid, options)?;
+    Ok(())
+}
+
+/// 取 ptrace 目标（已跟踪 + 权限）。
+fn ptrace_target_task(pid: i32) -> Result<Arc<Task>, Errno> {
+    let target = sched::operation::lookup_pid(pid)?;
+    if target.is_kernel_task() || !target.is_ptrace_traced() {
+        return Err(Errno::ESRCH);
+    }
+    let me = sched::current_task_direct();
+    if !sched::operation::ptrace_may_access(&me, &target) {
+        return Err(Errno::EPERM);
+    }
+    // 仅允许记录中的 tracer 操作（与 sched::operation::ptrace_target 的
+    // PEEK/POKE/GETREGS/GETSIGINFO 等入口保持一致）。
+    if !target.ptracer_is(&me) {
+        return Err(Errno::EPERM);
+    }
+    Ok(target)
+}
+
+fn ptrace_target_vm(target: &Arc<Task>) -> Result<Arc<VmSpace>, Errno> {
+    task_vm_space(target).ok_or(Errno::EIO)
+}
+
+/// 取目标停止时保存的用户 trap frame。
+fn ptrace_target_frame(target: &Arc<Task>) -> Result<hal::user_context::UserTrapFrame, Errno> {
+    // 优先取 syscall 入口的 arch 快照（arch 在 syscall 分发前保存）；
+    // 回退到恢复/写回路径保存的 UserTrapFrame（POKEUSR 写回后、以及
+    // 信号/单步场景）。
+    #[cfg(target_arch = "loongarch64")]
+    let arch_frame = target
+        .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
+        .and_then(|payload| payload.downcast::<arch::loongarch64::TrapFrame>().ok());
+    #[cfg(target_arch = "riscv64")]
+    let arch_frame = target
+        .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
+        .and_then(|payload| payload.downcast::<arch::riscv64::TrapFrame>().ok());
+    if let Some(frame) = arch_frame {
+        let raw = Arc::as_ptr(&frame) as usize;
+        return Ok(hal::user_context::UserTrapFrame::from_context(raw));
+    }
+    let frame = target
+        .ext_lookup(sched::TASKEXT_USER_TRAP_FRAME)
+        .and_then(|payload| payload.downcast::<hal::user_context::UserTrapFrame>().ok())
+        .ok_or(Errno::EIO)?;
+    Ok(*frame)
+}
+
+/// 写回目标 trap frame（POKEUSR 使用）。
+fn ptrace_store_frame(target: &Arc<Task>, frame: hal::user_context::UserTrapFrame) {
+    let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(frame);
+    target.ext_install(sched::TASKEXT_USER_TRAP_FRAME, erased);
+}
+
+/// `PTRACE_PEEKUSR`：按 ptrace 原始寄存器组布局读一个寄存器字。
+///
+/// - riscv64：offset 0 = pc，8..256 依次为 31 个通用寄存器（user_regs_struct）；
+/// - loongarch64：offset 0..256 = regs[0..32]、256 = orig_a0、264 = csr_era、
+///   272 = csr_badv（user_pt_regs）。
+fn ptrace_peek_usr(target: &Arc<Task>, offset: usize) -> Result<usize, Errno> {
+    let frame = ptrace_target_frame(target)?;
+    let size = linux_user_regs_size();
+    let mut regs = [0u8; 360]; // 覆盖 riscv 256 / loongarch 360
+    if !frame.write_linux_user_regs(&mut regs[..size]) {
+        return Err(Errno::EIO);
+    }
+    if offset % 8 == 0 && offset + 8 <= size {
+        let start = offset;
+        return Ok(u64::from_le_bytes(regs[start..start + 8].try_into().unwrap()) as usize);
+    }
+    Err(Errno::EIO)
+}
+
+/// `PTRACE_POKEUSR`：按 ptrace 原始寄存器组布局写一个寄存器字（`peek_usr` 的反向）。
+fn ptrace_poke_usr(target: &Arc<Task>, offset: usize, value: usize) -> Result<(), Errno> {
+    let mut frame = ptrace_target_frame(target)?;
+    let size = linux_user_regs_size();
+    let mut regs = [0u8; 360];
+    if !frame.write_linux_user_regs(&mut regs[..size]) {
+        return Err(Errno::EIO);
+    }
+    if offset % 8 == 0 && offset + 8 <= size {
+        let start = offset;
+        regs[start..start + 8].copy_from_slice(&(value as u64).to_le_bytes());
+    } else {
+        return Err(Errno::EIO);
+    }
+    if !frame.apply_linux_user_regs(&regs[..size]) {
+        return Err(Errno::EIO);
+    }
+    ptrace_store_frame(target, frame);
+    Ok(())
+}
+
+/// `PTRACE_GETREGSET`/`SETREGSET`：`struct iovec { base, len }` 指向的数据区。
+fn ptrace_regset(
+    target: &Arc<Task>,
+    note_type: usize,
+    set: bool,
+    iov_user: usize,
+) -> Result<(), Errno> {
+    let mut iov = [0u8; 16];
+    copy_from_user(iov_user, &mut iov).map_err(|e| e.as_errno())?;
+    let base = u64::from_le_bytes(iov[0..8].try_into().unwrap()) as usize;
+    let mut len = u64::from_le_bytes(iov[8..16].try_into().unwrap()) as usize;
+
+    const NT_PRSTATUS: usize = 1;
+    const NT_FPREGSET: usize = 2;
+
+    match note_type {
+        NT_PRSTATUS => {
+            // NT_PRSTATUS 在 ptrace 路径返回的是原始寄存器组
+            // （riscv64 `user_regs_struct` 256B / loongarch64 `user_pt_regs`
+            // 360B），不带 `struct elf_prstatus` 头。
+            //
+            // 说明：`struct elf_prstatus`（其 pr_reg 字段才嵌入寄存器组；
+            // loongarch64 上 offsetof(pr_reg)=112、sizeof=480，riscv64 上
+            // offsetof(pr_reg)=112、sizeof=376）只出现在 ELF core dump 的
+            // NT_PRSTATUS note 里。内核 `ptrace(PTRACE_GETREGSET, NT_PRSTATUS)`
+            // 直接向用户拷贝 regset->n * regset->size 字节的原始寄存器组（见
+            // kernel/ptrace.c 的 ptrace_regset），gdb/strace 也按原始寄存器组
+            // 解释该缓冲区。因此这里不追加 elf_prstatus 头，以免与 gdb/strace
+            // 的预期不符。
+            let size = linux_user_regs_size();
+            if set {
+                if len < size {
+                    return Err(Errno::EIO);
+                }
+                let mut input = [0u8; 360];
+                copy_from_user(base, &mut input[..size]).map_err(|e| e.as_errno())?;
+                let mut frame = ptrace_target_frame(target)?;
+                if !frame.apply_linux_user_regs(&input[..size]) {
+                    return Err(Errno::EIO);
+                }
+                ptrace_store_frame(target, frame);
+            } else {
+                if len < size {
+                    len = size;
+                    write_iov_len(iov_user, len)?;
+                    return Ok(());
+                }
+                let frame = ptrace_target_frame(target)?;
+                let mut out = [0u8; 360];
+                if !frame.write_linux_user_regs(&mut out[..size]) {
+                    return Err(Errno::EIO);
+                }
+                copy_to_user(base, &out[..size]).map_err(|e| e.as_errno())?;
+            }
+            Ok(())
+        }
+        NT_FPREGSET => {
+            // 架构 trap frame 在 syscall 入口保存了浮点寄存器
+            // （LA：f0-f31+fcsr+fcc；RV：f0-f31+fcsr），这里按 Linux
+            // `struct user_fpregs_struct` 布局读写，供 gdb/CRIU 使用。
+            let size = linux_fpregset_size();
+            if set {
+                if len < size {
+                    return Err(Errno::EIO);
+                }
+                let mut input = [0u8; 272];
+                copy_from_user(base, &mut input[..size]).map_err(|e| e.as_errno())?;
+                ptrace_write_arch_fpregs(target, &input[..size])?;
+            } else {
+                if len < size {
+                    len = size;
+                    write_iov_len(iov_user, len)?;
+                    return Ok(());
+                }
+                let out = ptrace_read_arch_fpregs(target)?;
+                copy_to_user(base, &out).map_err(|e| e.as_errno())?;
+            }
+            Ok(())
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn write_iov_len(iov_user: usize, len: usize) -> Result<(), Errno> {
+    copy_to_user(iov_user + 8, &(len as u64).to_ne_bytes()).map_err(|e| e.as_errno())
+}
+
+/// ptrace 原始寄存器组的大小（字节）。
+///
+/// 与 hal::user_context 中的编解码保持单一事实源，这里只做转发：
+/// - riscv64：`struct user_regs_struct`（pc + 31 个通用寄存器）= 256；
+/// - loongarch64：`struct user_pt_regs`（regs[32] + orig_a0 + csr_era
+///   + csr_badv + reserved[10]）= 360。
+///
+/// 注意：这不是信号帧 mcontext/sigcontext 的大小——loongarch 的 sigcontext 是
+/// 268 字节（pc@0 + regs@8 + flags@264），信号路径的尺寸由
+/// hal::user_context 内部维护，不经过本函数。
+fn linux_user_regs_size() -> usize {
+    hal::user_context::UserTrapFrame::linux_user_regs_size()
+}
+
+/// Linux `struct user_fpregs_struct` 的大小。
+///
+/// - loongarch64：`{ u64 fpr[32]; u64 fcc; u32 fcsr; }`，8 字节对齐后 272；
+/// - riscv64：`{ u64 f[32]; u64 fcsr; }`，264。
+fn linux_fpregset_size() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        32 * 8 + 8 + 4 + 4
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        32 * 8 + 8
+    }
+}
+
+/// 从架构 trap frame 读出浮点寄存器，按 `struct user_fpregs_struct` 布局编码。
+fn ptrace_read_arch_fpregs(target: &Arc<Task>) -> Result<Vec<u8>, Errno> {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let frame = target
+            .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
+            .and_then(|payload| payload.downcast::<arch::loongarch64::TrapFrame>().ok())
+            .ok_or(Errno::EIO)?;
+        let mut out = vec![0u8; linux_fpregset_size()];
+        for (index, reg) in frame.f.iter().enumerate() {
+            out[index * 8..index * 8 + 8].copy_from_slice(&reg.to_le_bytes());
+        }
+        out[256..264].copy_from_slice(&frame.fcc.to_le_bytes());
+        out[264..268].copy_from_slice(&(frame.fcsr as u32).to_le_bytes());
+        Ok(out)
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let frame = target
+            .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
+            .and_then(|payload| payload.downcast::<arch::riscv64::TrapFrame>().ok())
+            .ok_or(Errno::EIO)?;
+        let mut out = vec![0u8; linux_fpregset_size()];
+        for (index, reg) in frame.f.iter().enumerate() {
+            out[index * 8..index * 8 + 8].copy_from_slice(&reg.to_le_bytes());
+        }
+        out[256..264].copy_from_slice(&(frame.fcsr as u64).to_le_bytes());
+        Ok(out)
+    }
+}
+
+/// 把 `struct user_fpregs_struct` 布局的字节写回架构 trap frame。
+fn ptrace_write_arch_fpregs(target: &Arc<Task>, bytes: &[u8]) -> Result<(), Errno> {
+    let size = linux_fpregset_size();
+    if bytes.len() < size {
+        return Err(Errno::EIO);
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let frame = target
+            .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
+            .and_then(|payload| payload.downcast::<arch::loongarch64::TrapFrame>().ok())
+            .ok_or(Errno::EIO)?;
+        let mut new = *frame;
+        for (index, reg) in new.f.iter_mut().enumerate() {
+            *reg = u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap());
+        }
+        new.fcc = u64::from_le_bytes(bytes[256..264].try_into().unwrap());
+        new.fcsr = u32::from_le_bytes(bytes[264..268].try_into().unwrap()) as u64;
+        let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(new);
+        target
+            .ext_replace(sched::TASKEXT_PTRACE_FRAME, erased)
+            .map_err(|_| Errno::EIO)?;
+        Ok(())
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let frame = target
+            .ext_lookup(sched::TASKEXT_PTRACE_FRAME)
+            .and_then(|payload| payload.downcast::<arch::riscv64::TrapFrame>().ok())
+            .ok_or(Errno::EIO)?;
+        let mut new = *frame;
+        for (index, reg) in new.f.iter_mut().enumerate() {
+            *reg = u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap());
+        }
+        // user_fpregs_struct.fcsr 是 u64（8 字节），与读路径对称地从 8 字节
+        // 读回后截断为 TrapFrame.fcsr（u32）。
+        new.fcsr = u64::from_le_bytes(bytes[256..264].try_into().unwrap()) as u32;
+        let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(new);
+        target
+            .ext_replace(sched::TASKEXT_PTRACE_FRAME, erased)
+            .map_err(|_| Errno::EIO)?;
+        Ok(())
+    }
+}
+
+/// 单步断点：把目标 PC 处的指令替换为断点指令。
+fn arm_singlestep(target: &Arc<Task>) -> Result<(), Errno> {
+    if target.singlestep_armed() {
+        return Ok(());
+    }
+    let frame = ptrace_target_frame(target)?;
+    let pc = frame.pc();
+    let vm = ptrace_target_vm(target)?;
+    let mut insn = [0u8; 4];
+    vm.copy_user_bytes_in(pc, &mut insn)?;
+    let original = u32::from_ne_bytes(insn);
+    let breakpoint = breakpoint_insn();
+    vm.copy_user_bytes_out(pc, &breakpoint.to_ne_bytes())?;
+    <arch::CurrentTaskOps as general::TaskOps>::sync_icache();
+    target.arm_singlestep(pc, original);
+    Ok(())
+}
+
+/// 架构断点指令（loongarch64 `break 0` / riscv64 `ebreak`）。
+fn breakpoint_insn() -> u32 {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        0x2a000000 // break 0
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        0x00100073 // ebreak
+    }
+}
+
+/// 单步断点陷阱钩子（arch 的 break trap 在用户态调用）：命中则恢复原指令
+/// 并把目标置为 `SIGTRAP` stop。
+pub(crate) fn ptrace_singlestep_trap_hook(pc: usize) -> bool {
+    let me = sched::current_task_direct();
+    if !me.singlestep_armed() {
+        return false;
+    }
+    if me.singlestep_addr() != pc {
+        me.clear_singlestep();
+        return false;
+    }
+    let insn = me.take_singlestep_insn();
+    me.clear_singlestep();
+    if let Some(insn) = insn {
+        if let Some(vm) = task_vm_space(&me) {
+            let _ = vm.copy_user_bytes_out(pc, &insn.to_ne_bytes());
+        }
+        <arch::CurrentTaskOps as general::TaskOps>::sync_icache();
+    }
+    me.set_ptrace_stop_event(0);
+    me.clear_ptrace_last_siginfo();
+    sched::operation::ptrace_mark_stopped(&me, sched::SignalNumber::SIGTRAP);
+    true
+}
+
+/// clone 后安装命名空间：`CLONE_NEWUTS/NEWIPC/NEWTIME/NEWCGROUP` 换子进程
+/// 的引用集，`CLONE_NEWNS` 换子进程的 VFS 上下文，`CLONE_NEWPID` 已在
+/// clone 前经 pending 命名空间生效。
+fn clone_install_namespaces(
+    parent: &Arc<Task>,
+    child: &Arc<Task>,
+    flags: CloneFlags,
+) -> Result<(), Errno> {
+    use sched::clone_flags::CloneFlags as F;
+
+    let ns_flags = flags.raw()
+        & (F::CLONE_NEWNS
+            | F::CLONE_NEWCGROUP
+            | F::CLONE_NEWUTS
+            | F::CLONE_NEWIPC
+            | F::CLONE_NEWPID);
+    if ns_flags == 0 {
+        return Ok(());
+    }
+    if !parent
+        .credentials()
+        .has_cap(sched::ids::Capability::SysAdmin)
+    {
+        return Err(Errno::EPERM);
+    }
+    let parent_ns = crate::ns::task_ns(parent);
+    if flags.has(F::CLONE_NEWPID) {
+        // 子进程进新 pid 命名空间（sched 的 child_pid_ns hook 已消费）。
+        // 无需额外动作；验证子进程确实注册进了新 ns。
+    }
+    if flags.has(F::CLONE_NEWNS)
+        || flags.has(F::CLONE_NEWCGROUP)
+        || flags.has(F::CLONE_NEWUTS)
+        || flags.has(F::CLONE_NEWIPC)
+    {
+        let mut proxy = crate::ns::NsProxy {
+            uts: Arc::clone(&parent_ns.uts),
+            ipc: Arc::clone(&parent_ns.ipc),
+            time: Arc::clone(&parent_ns.time),
+            cgroup: Arc::clone(&parent_ns.cgroup),
+            pid: crate::ns::child_pid_namespace(parent),
+            pending_pid: sched::sync::Spinlock::new(None),
+        };
+        if flags.has(F::CLONE_NEWUTS) {
+            proxy.uts =
+                ns::UtsNamespace::new(&parent_ns.uts.hostname(), &parent_ns.uts.domainname());
+        }
+        if flags.has(F::CLONE_NEWIPC) {
+            proxy.ipc = crate::ns::IpcNamespace::new();
+        }
+        if flags.has(F::CLONE_NEWCGROUP) {
+            proxy.cgroup = ns::CgroupNamespace::new();
+        }
+        let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(proxy);
+        child.ext_install(crate::ns::TASKEXT_NS, erased);
+        if flags.has(F::CLONE_NEWNS) {
+            if let Some(vfs_ctx) = child
+                .ext_lookup(sched::TASKEXT_VFS_CONTEXT)
+                .and_then(|payload| payload.downcast::<general::vfs::VfsContext>().ok())
+            {
+                if let Ok(forked) = vfs_ctx.clone_with_new_ns() {
+                    let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(forked);
+                    child.ext_install(sched::TASKEXT_VFS_CONTEXT, erased);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 命名空间 provider（procfs `/proc/<pid>/ns/*` 使用）。
+pub(crate) fn ns_provider(pid: i32, kind: ProcNsKind) -> Option<Arc<dyn ns::Namespace>> {
+    let task = sched::operation::lookup_pid(pid).ok()?;
+    let proxy = crate::ns::task_ns(&task);
+    match kind {
+        ProcNsKind::Uts => Some(proxy.uts.clone() as Arc<dyn ns::Namespace>),
+        ProcNsKind::Ipc => Some(proxy.ipc.clone() as Arc<dyn ns::Namespace>),
+        ProcNsKind::Time => Some(proxy.time.clone() as Arc<dyn ns::Namespace>),
+        ProcNsKind::Cgroup => Some(proxy.cgroup.clone() as Arc<dyn ns::Namespace>),
+        ProcNsKind::Pid => Some(proxy.pid.clone() as Arc<dyn ns::Namespace>),
+        ProcNsKind::Mount => task
+            .ext_lookup(sched::TASKEXT_VFS_CONTEXT)
+            .and_then(|payload| payload.downcast::<general::vfs::VfsContext>().ok())
+            .map(|ctx| Arc::clone(&ctx.mount_ns) as Arc<dyn ns::Namespace>),
+        ProcNsKind::User | ProcNsKind::Net => None,
+    }
+}
+
+/// `PTRACE_O_TRACEFORK/VFORK/CLONE`：克隆事件通知（父进程停止）。
+fn ptrace_notify_fork(parent: &Arc<Task>, flags: CloneFlags, child_pid: i32) {
+    const PTRACE_O_TRACEFORK: u64 = 0x0000_0002;
+    const PTRACE_O_TRACEVFORK: u64 = 0x0000_0004;
+    const PTRACE_O_TRACECLONE: u64 = 0x0000_0008;
+    const PTRACE_EVENT_FORK: u16 = 1;
+    const PTRACE_EVENT_VFORK: u16 = 2;
+    const PTRACE_EVENT_CLONE: u16 = 3;
+
+    if !parent.is_ptrace_traced() {
+        return;
+    }
+    let options = parent.ptrace_options();
+    let (event, mask) = if flags.has(CloneFlags::CLONE_VFORK) {
+        (PTRACE_EVENT_VFORK, PTRACE_O_TRACEVFORK)
+    } else if flags.has(CloneFlags::CLONE_THREAD) {
+        (PTRACE_EVENT_CLONE, PTRACE_O_TRACECLONE)
+    } else {
+        (PTRACE_EVENT_FORK, PTRACE_O_TRACEFORK)
+    };
+    if options & mask == 0 {
+        return;
+    }
+    parent.set_ptrace_event_msg(child_pid as i64);
+    parent.set_ptrace_stop_event(event);
+    parent.clear_ptrace_last_siginfo();
+    sched::operation::ptrace_mark_stopped(parent, sched::SignalNumber::SIGTRAP);
+}
+
+/// `PTRACE_GET_SYSCALL_INFO`：`struct ptrace_syscall_info`（88 字节）。
+fn write_ptrace_syscall_info(target: &Arc<Task>, user: usize) -> Result<(), Errno> {
+    const PTRACE_SYSCALL_INFO_NONE: u8 = 0;
+    const PTRACE_SYSCALL_INFO_ENTRY: u8 = 1;
+    const PTRACE_SYSCALL_INFO_EXIT: u8 = 2;
+    const PTRACE_SYSCALL_INFO_SECCOMP: u8 = 3;
+    #[cfg(target_arch = "loongarch64")]
+    const AUDIT_ARCH: u32 = 0x4000_0102; // AUDIT_ARCH_LOONGARCH64
+    #[cfg(target_arch = "riscv64")]
+    const AUDIT_ARCH: u32 = 0x4000_00f3; // AUDIT_ARCH_RISCV64
+
+    let (state, nr, args, ret) = target.ptrace_syscall_info();
+    let frame = ptrace_target_frame(target)?;
+    let ip = frame.pc() as u64;
+    let sp = frame.sp() as u64;
+    let mut raw = [0u8; 88];
+    match state {
+        PTRACE_SYSCALL_INFO_ENTRY => {
+            raw[0] = PTRACE_SYSCALL_INFO_ENTRY;
+            raw[4..8].copy_from_slice(&AUDIT_ARCH.to_le_bytes());
+            raw[8..16].copy_from_slice(&ip.to_le_bytes());
+            raw[16..24].copy_from_slice(&sp.to_le_bytes());
+            raw[24..32].copy_from_slice(&(nr as u64).to_le_bytes());
+            for (index, arg) in args.iter().enumerate() {
+                raw[32 + index * 8..40 + index * 8].copy_from_slice(&arg.to_le_bytes());
+            }
+        }
+        PTRACE_SYSCALL_INFO_EXIT => {
+            raw[0] = PTRACE_SYSCALL_INFO_EXIT;
+            raw[4..8].copy_from_slice(&AUDIT_ARCH.to_le_bytes());
+            raw[8..16].copy_from_slice(&ip.to_le_bytes());
+            raw[16..24].copy_from_slice(&sp.to_le_bytes());
+            raw[24..32].copy_from_slice(&(ret as u64).to_le_bytes());
+            raw[32] = (ret < 0 && ret > -4096) as u8; // is_error
+        }
+        PTRACE_SYSCALL_INFO_SECCOMP => {
+            raw[0] = PTRACE_SYSCALL_INFO_SECCOMP;
+            raw[4..8].copy_from_slice(&AUDIT_ARCH.to_le_bytes());
+            raw[8..16].copy_from_slice(&ip.to_le_bytes());
+            raw[16..24].copy_from_slice(&sp.to_le_bytes());
+            raw[24..32].copy_from_slice(&(nr as u64).to_le_bytes());
+            for (index, arg) in args.iter().enumerate() {
+                raw[32 + index * 8..40 + index * 8].copy_from_slice(&arg.to_le_bytes());
+            }
+            // ret_data = seccomp 动作的 SECCOMP_RET_DATA（低 16 位）。
+            let ret_data = (target.ptrace_event_msg() as u64 & 0xffff) as u32;
+            raw[80..84].copy_from_slice(&ret_data.to_le_bytes());
+        }
+        _ => raw[0] = PTRACE_SYSCALL_INFO_NONE,
+    }
+    copy_to_user(user, &raw).map_err(|e| e.as_errno())?;
+    Ok(())
+}
+
+/// `PTRACE_GET_RSEQ_CONFIGURATION`：`struct ptrace_rseq_configuration`（24 字节）。
+fn write_ptrace_rseq_configuration(target: &Arc<Task>, user: usize) -> Result<(), Errno> {
+    let mut raw = [0u8; 24];
+    let (abi_pointer, abi_size, signature) = target
+        .rseq_registration_if_registered()
+        .map(|registration| (registration.ptr, registration.len, registration.signature))
+        .unwrap_or((0, 0, 0));
+    raw[0..8].copy_from_slice(&(abi_pointer as u64).to_le_bytes());
+    raw[8..12].copy_from_slice(&abi_size.to_le_bytes());
+    raw[12..16].copy_from_slice(&signature.to_le_bytes());
+    copy_to_user(user, &raw).map_err(|e| e.as_errno())?;
+    Ok(())
 }
 
 pub(super) fn sys_getresuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -4641,11 +6432,37 @@ pub(super) fn sys_getresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 }
 
 pub(super) fn sys_sethostname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    set_uts_field(ctx, &UTS_HOSTNAME)
+    require_cap(ctx.task(), Capability::SysAdmin)?;
+    let user = ctx.args[0];
+    let len = ctx.args[1];
+    if len > UTS_NAME_MAX {
+        return Err(Errno::EINVAL);
+    }
+    let mut value = [0u8; UTS_FIELD_LEN];
+    if len != 0 {
+        copy_from_user(user, &mut value[..len]).map_err(|e| e.as_errno())?;
+    }
+    crate::ns::task_ns(ctx.task())
+        .uts
+        .set_hostname(&value[..len])
+        .map(|_| 0)
 }
 
 pub(super) fn sys_setdomainname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    set_uts_field(ctx, &UTS_DOMAINNAME)
+    require_cap(ctx.task(), Capability::SysAdmin)?;
+    let user = ctx.args[0];
+    let len = ctx.args[1];
+    if len > UTS_NAME_MAX {
+        return Err(Errno::EINVAL);
+    }
+    let mut value = [0u8; UTS_FIELD_LEN];
+    if len != 0 {
+        copy_from_user(user, &mut value[..len]).map_err(|e| e.as_errno())?;
+    }
+    crate::ns::task_ns(ctx.task())
+        .uts
+        .set_domainname(&value[..len])
+        .map(|_| 0)
 }
 
 pub(super) fn sys_umask(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -4656,30 +6473,155 @@ pub(super) fn sys_umask(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 
 pub(super) fn sys_settimeofday(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let tv = ctx.args[0];
+    // Linux 语义：无论 tv/tz 是否为 NULL，settimeofday 都要求 CAP_SYS_TIME，
+    // 故权限检查必须早于 `tv == 0` 的空指针早退。
+    require_cap(ctx.task(), Capability::SysTime)?;
     if tv == 0 {
         return Ok(0);
     }
-    require_cap(ctx.task(), Capability::SysTime)?;
     let mut raw = [0u8; TIMEVAL_SIZE];
     copy_from_user(tv, &mut raw).map_err(|e| e.as_errno())?;
-    crate::vdso::set_realtime_ns(timeval_to_ns(&raw)?);
+    let new_ns = timeval_to_ns(&raw)?;
+    let old_offset = crate::vdso::realtime_offset_ns();
+    crate::vdso::set_realtime_ns(new_ns);
+    // 实时钟被设置：取消登记了 TFD_TIMER_CANCEL_ON_SET 的 timerfd。
+    if crate::vdso::realtime_offset_ns() != old_offset {
+        vfs::timerfd::cancel_timers_on_clock_set();
+    }
     Ok(0)
 }
 
-pub(super) fn sys_adjtimex(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_adjtimex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    adjtimex_common(ctx, 0)
+}
+
+/// Linux `struct timex`（musl 64 位布局，208 字节）。
+const TIMEX_SIZE: usize = 208;
+const TIMEX_MODES_OFF: usize = 0;
+const TIMEX_OFFSET_OFF: usize = 8;
+const TIMEX_FREQ_OFF: usize = 16;
+const TIMEX_MAXERROR_OFF: usize = 24;
+const TIMEX_ESTERROR_OFF: usize = 32;
+const TIMEX_STATUS_OFF: usize = 40;
+const TIMEX_CONSTANT_OFF: usize = 48;
+const TIMEX_PRECISION_OFF: usize = 56;
+const TIMEX_TOLERANCE_OFF: usize = 64;
+const TIMEX_TIME_OFF: usize = 72;
+const TIMEX_TICK_OFF: usize = 88;
+
+/// `adjtimex`（arg0 = timex*）与 `clock_adjtime`（arg1 = timex*）共用实现。
+fn adjtimex_common(ctx: &mut SyscallContext<'_>, timex_arg: usize) -> Result<usize, Errno> {
+    let ptr = ctx.args[timex_arg];
+    if ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut buf = [0u8; TIMEX_SIZE];
+    copy_from_user(ptr, &mut buf).map_err(|e| e.as_errno())?;
+
+    let read_i64 = |off: usize| i64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+    let read_i32 = |off: usize| i32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+    let modes = u32::from_le_bytes(
+        buf[TIMEX_MODES_OFF..TIMEX_MODES_OFF + 4]
+            .try_into()
+            .unwrap(),
+    );
+    if modes & 0x8000 != 0
+        && modes != crate::adjtimex::ADJ_OFFSET_SINGLESHOT
+        && modes != crate::adjtimex::ADJ_OFFSET_SS_READ
+    {
+        return Err(Errno::EINVAL);
+    }
+    if modes != 0 && modes != crate::adjtimex::ADJ_OFFSET_SS_READ {
+        require_cap(ctx.task(), Capability::SysTime)?;
+    }
+    let setoffset = modes & crate::adjtimex::ADJ_SETOFFSET != 0;
+    let old_realtime_offset = setoffset.then(crate::vdso::realtime_offset_ns);
+    let fields = crate::adjtimex::TimexFields {
+        modes,
+        offset: read_i64(TIMEX_OFFSET_OFF),
+        freq: read_i64(TIMEX_FREQ_OFF),
+        maxerror: read_i64(TIMEX_MAXERROR_OFF),
+        esterror: read_i64(TIMEX_ESTERROR_OFF),
+        status: read_i32(TIMEX_STATUS_OFF),
+        constant: read_i64(TIMEX_CONSTANT_OFF),
+        tick: read_i64(TIMEX_TICK_OFF),
+        time_sec: read_i64(TIMEX_TIME_OFF),
+        time_subsec: read_i64(TIMEX_TIME_OFF + 8),
+        precision: 0,
+        tolerance: 0,
+    };
+
+    if fields.modes != 0 && fields.modes != crate::adjtimex::ADJ_OFFSET_SS_READ {
+        require_cap(ctx.task(), Capability::SysTime)?;
+    }
+
+    let out = crate::adjtimex::do_adjtimex(fields)?;
+    if let Some(old_offset) = old_realtime_offset {
+        if crate::vdso::realtime_offset_ns() != old_offset {
+            vfs::timerfd::cancel_timers_on_clock_set();
+        }
+    }
+
+    let write_i64 = |buf: &mut [u8; TIMEX_SIZE], off: usize, v: i64| {
+        buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    };
+    buf[TIMEX_MODES_OFF..TIMEX_MODES_OFF + 4].copy_from_slice(&out.modes.to_le_bytes());
+    write_i64(&mut buf, TIMEX_OFFSET_OFF, out.offset);
+    write_i64(&mut buf, TIMEX_FREQ_OFF, out.freq);
+    write_i64(&mut buf, TIMEX_MAXERROR_OFF, out.maxerror);
+    write_i64(&mut buf, TIMEX_ESTERROR_OFF, out.esterror);
+    buf[TIMEX_STATUS_OFF..TIMEX_STATUS_OFF + 4].copy_from_slice(&out.status.to_le_bytes());
+    write_i64(&mut buf, TIMEX_CONSTANT_OFF, out.constant);
+    write_i64(&mut buf, TIMEX_PRECISION_OFF, out.precision);
+    write_i64(&mut buf, TIMEX_TOLERANCE_OFF, out.tolerance);
+    write_i64(&mut buf, TIMEX_TICK_OFF, out.tick);
+    // time 字段：当前 CLOCK_REALTIME；STA_NANO 决定亚秒字段单位。
+    let realtime_ns = crate::vdso::realtime_ns();
+    write_i64(
+        &mut buf,
+        TIMEX_TIME_OFF,
+        (realtime_ns / 1_000_000_000) as i64,
+    );
+    let realtime_subsec = if out.status & crate::adjtimex::STA_NANO != 0 {
+        realtime_ns % 1_000_000_000
+    } else {
+        (realtime_ns % 1_000_000_000) / 1_000
+    };
+    write_i64(&mut buf, TIMEX_TIME_OFF + 8, realtime_subsec as i64);
+    copy_to_user(ptr, &buf).map_err(|e| e.as_errno())?;
+
+    // 返回值 = 时钟状态（TIME_OK/TIME_INS/TIME_DEL/TIME_ERROR）。
+    Ok(crate::adjtimex::clock_state(out.status) as usize)
 }
 
 pub(super) fn sys_perf_event_open(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_clock_adjtime(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_clock_adjtime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let clockid = ctx.args[0] as i32;
+    // Linux 的 clock_adjtime 支持 CLOCK_REALTIME 与 CLOCK_TAI。
+    if clockid != crate::vdso::CLOCK_REALTIME as i32 && clockid != CLOCK_TAI as i32 {
+        return Err(Errno::EINVAL);
+    }
+    adjtimex_common(ctx, 1)
 }
 
-pub(super) fn sys_setns(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_setns(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd_raw = ctx.args[0] as isize;
+    let nstype = ctx.args[1] as u64;
+    if fd_raw < 0 {
+        return Err(Errno::EBADF);
+    }
+    let fdt = general::vfs::current_fdtable().ok_or(Errno::EBADF)?;
+    let file = fdt
+        .get_file(vfs::fdtable::Fd::from_raw(fd_raw as u32))
+        .ok_or(Errno::EBADF)?;
+    let ns_file = file
+        .downcast_ops::<general::vfs::nsfs::NsfsFileOps>()
+        .ok_or(Errno::EBADF)?;
+    crate::ns::setns(ctx.task(), Arc::clone(ns_file.namespace()), nstype)?;
+    Ok(0)
 }
 
 pub(super) fn sys_kcmp(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -4688,6 +6630,9 @@ pub(super) fn sys_kcmp(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     const KCMP_FILES: usize = 2;
     const KCMP_FS: usize = 3;
     const KCMP_SIGHAND: usize = 4;
+    const KCMP_IO: usize = 5;
+    const KCMP_SYSVSEM: usize = 6;
+    const KCMP_EPOLL_TFD: usize = 7;
 
     let pid1 = ctx.args[0] as i32;
     let pid2 = ctx.args[1] as i32;
@@ -4729,6 +6674,15 @@ pub(super) fn sys_kcmp(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             let sig2 = task2.shared_signal();
             Ok(kcmp_arc(&sig1, &sig2))
         }
+        KCMP_IO => {
+            // 本内核无独立 io_context；同线程组（同进程）视为共享同一 I/O 上下文，
+            // 与 Linux 对同进程线程的 KCMP_IO 返回 0 一致。
+            Ok(kcmp_arc(&task1.thread_group(), &task2.thread_group()))
+        }
+        // 取舍：KCMP_SYSVSEM 需比对 SysV 信号量 undo 表（TASKEXT_SEM_UNDO 由
+        // ipc.rs 维护，属只读边界），KCMP_EPOLL_TFD 需读取 epoll 目标文件
+        // （libs/vfs epoll 只读边界）；二者保持 EOPNOTSUPP 并在注释说明。
+        KCMP_SYSVSEM | KCMP_EPOLL_TFD => Err(Errno::EOPNOTSUPP),
         _ => Err(Errno::EOPNOTSUPP),
     }
 }
@@ -4737,8 +6691,103 @@ pub(super) fn sys_finit_module(_ctx: &mut SyscallContext<'_>) -> Result<usize, E
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_seccomp(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_seccomp(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    use general::seccomp::*;
+
+    const KNOWN_FLAGS: u32 = SECCOMP_FILTER_FLAG_TSYNC
+        | SECCOMP_FILTER_FLAG_LOG
+        | SECCOMP_FILTER_FLAG_SPEC_ALLOW
+        | SECCOMP_FILTER_FLAG_NEW_LISTENER
+        | SECCOMP_FILTER_FLAG_TSYNC_ESRCH;
+    const KNOWN_ACTIONS: [u32; 8] = [
+        SECCOMP_RET_KILL_PROCESS,
+        SECCOMP_RET_KILL_THREAD,
+        SECCOMP_RET_TRAP,
+        SECCOMP_RET_ERRNO,
+        SECCOMP_RET_USER_NOTIF,
+        SECCOMP_RET_TRACE,
+        SECCOMP_RET_LOG,
+        SECCOMP_RET_ALLOW,
+    ];
+
+    let op = ctx.args[0] as u32;
+    let flags = ctx.args[1] as u32;
+    let filter_user = ctx.args[2];
+    let task = ctx.task();
+
+    match op {
+        SECCOMP_SET_MODE_STRICT => {
+            if flags != 0 || filter_user != 0 {
+                return Err(Errno::EINVAL);
+            }
+            seccomp_state(task).set_strict();
+            Ok(0)
+        }
+        SECCOMP_SET_MODE_FILTER => {
+            if filter_user == 0 {
+                return Err(Errno::EFAULT);
+            }
+            if flags & !KNOWN_FLAGS != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let cred = vfs_cred_from_sched(&task.credentials());
+            if !filter_install_allowed(task.no_new_privs(), &cred) {
+                return Err(Errno::EACCES);
+            }
+            // struct sock_fprog { u16 len; u16 pad; ... ptr }
+            let mut fprog = [0u8; 16];
+            copy_from_user(filter_user, &mut fprog).map_err(|e| e.as_errno())?;
+            let len = u16::from_le_bytes(fprog[0..2].try_into().unwrap()) as usize;
+            let ptr = u64::from_le_bytes(fprog[8..16].try_into().unwrap()) as usize;
+            if ptr == 0 {
+                return Err(Errno::EFAULT);
+            }
+            let mut bytes = vec![0u8; len * 8];
+            if len > 0 {
+                copy_from_user(ptr, &mut bytes).map_err(|e| e.as_errno())?;
+            }
+            let insns = parse_program(&bytes)?;
+            let filter = SeccompFilter::new(insns, flags)?;
+            seccomp_state(task).push_filter(filter);
+            Ok(0)
+        }
+        SECCOMP_GET_ACTION_AVAIL => {
+            let action = ctx.args[1] as u32;
+            if action & !SECCOMP_RET_ACTION_FULL != 0
+                || !KNOWN_ACTIONS.contains(&(action & SECCOMP_RET_ACTION_FULL))
+            {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            Ok(0)
+        }
+        SECCOMP_GET_NOTIF_SIZES => {
+            // struct seccomp_notif_sizes { u16 seccomp_notif; u16 seccomp_notif_resp; u16 seccomp_data; }
+            if filter_user == 0 {
+                return Err(Errno::EFAULT);
+            }
+            let mut sizes = [0u8; 8];
+            sizes[0..2].copy_from_slice(&80u16.to_le_bytes()); // struct seccomp_notif
+            sizes[2..4].copy_from_slice(&24u16.to_le_bytes()); // struct seccomp_notif_resp
+            sizes[4..6].copy_from_slice(&64u16.to_le_bytes()); // struct seccomp_data
+            copy_to_user(filter_user, &sizes[..6]).map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// 取任务的 seccomp 状态（惰性创建并挂载）。
+fn seccomp_state(task: &Arc<Task>) -> Arc<general::seccomp::SeccompState> {
+    if let Some(state) = task
+        .ext_lookup(general::syscall::TASKEXT_SECCOMP)
+        .and_then(|payload| payload.downcast::<general::seccomp::SeccompState>().ok())
+    {
+        return state;
+    }
+    let state = general::seccomp::SeccompState::new();
+    let erased: Arc<dyn core::any::Any + Send + Sync> = state.clone();
+    task.ext_install(general::syscall::TASKEXT_SECCOMP, erased);
+    state
 }
 
 pub(super) fn sys_bpf(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -4818,6 +6867,7 @@ pub(super) fn sys_execveat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
 }
 
 pub(super) fn sys_kexec_file_load(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // kexec 内核文件加载未实现；Linux 无 CONFIG_KEXEC 时同样 ENOSYS。
     Err(Errno::ENOSYS)
 }
 
@@ -4829,8 +6879,8 @@ pub(super) fn sys_clock_settime64(ctx: &mut SyscallContext<'_>) -> Result<usize,
     clock_settime_common(ctx)
 }
 
-pub(super) fn sys_clock_adjtime64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_clock_adjtime64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    sys_clock_adjtime(ctx)
 }
 
 pub(super) fn sys_clock_getres_time64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -4841,12 +6891,12 @@ pub(super) fn sys_clock_nanosleep_time64(ctx: &mut SyscallContext<'_>) -> Result
     sys_clock_nanosleep(ctx)
 }
 
-pub(super) fn sys_timer_gettime64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_timer_gettime64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    timer_gettime_common(ctx)
 }
 
-pub(super) fn sys_timer_settime64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_timer_settime64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    timer_settime_common(ctx)
 }
 
 pub(super) fn sys_pidfd_open(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -4871,31 +6921,86 @@ pub(super) fn sys_pidfd_open(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
 }
 
 pub(super) fn sys_landlock_create_ruleset(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // Landlock LSM 整体未实现；Linux 未启用 CONFIG_SECURITY_LANDLOCK 时同样 ENOSYS。
     Err(Errno::ENOSYS)
 }
 
 pub(super) fn sys_landlock_add_rule(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // Landlock LSM 整体未实现（同上）。
     Err(Errno::ENOSYS)
 }
 
 pub(super) fn sys_landlock_restrict_self(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // Landlock LSM 整体未实现（同上）。
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_process_mrelease(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_process_mrelease(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // Linux `process_mrelease(pidfd, flags)`：OOM killer 用它提前回收一个已退出
+    // （僵尸）进程的地址空间，而无需等待父进程 reap。
+    //
+    // ABI：arg0 = pidfd，arg1 = flags（必须为 0）。
+    let fd_raw = ctx.args[0] as isize;
+    let flags = ctx.args[1];
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if fd_raw < 0 {
+        return Err(Errno::EBADF);
+    }
+    let fdt = vfs::current_fdtable().ok_or(Errno::EBADF)?;
+    let file = fdt
+        .get_file(Fd::from_raw(fd_raw as u32))
+        .ok_or(Errno::EBADF)?;
+    let group = pidfd::group_from_file(&file).ok_or(Errno::EINVAL)?;
+
+    // 仅对已退出/僵尸进程有效；仍存活的进程返回 EINVAL（Linux 语义）。
+    if group.group_exit_status().is_none() {
+        return Err(Errno::EINVAL);
+    }
+
+    // 强制回收：逐个成员移除 VmSpace 扩展槽，drop 掉其地址空间 Arc。
+    // 这是 exit 路径（KernelExtExitHook::cleanup_on_exit）同款回收动作，对已
+    // 回收过的任务为幂等 no-op；对尚未经 exit hook 回收的僵尸进程则立即
+    // 释放其 PGD 与 resident 页引用。VmSpace 由 mm 内部引用计数管理，
+    // 这里只借用 `ext_remove` 公共接口，不依赖 mm 内部字段。
+    for member in group.snapshot() {
+        let _ = member.ext_remove(sched::TASKEXT_VM_SPACE);
+    }
+    Ok(0)
 }
 
 pub(super) fn sys_lsm_get_self_attr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // LSM 自属性查询未实现；除 capability 外无 LSM 模块。
     Err(Errno::ENOSYS)
 }
 
 pub(super) fn sys_lsm_set_self_attr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // LSM 自属性设置未实现；除 capability 外无 LSM 模块。
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_lsm_list_modules(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_lsm_list_modules(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // Linux 至少返回 "capability"。ABI：
+    //   sys_lsm_list_modules(ids, size, flags)
+    // 返回填写的 id 数量；ids 为 u64 数组（LSM_ID_CAPABILITY = 100）。
+    let ids_user = ctx.args[0];
+    let size = ctx.args[1];
+    let flags = ctx.args[2];
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    const LSM_ID_CAPABILITY: u64 = 100;
+    if size == 0 {
+        return Ok(1);
+    }
+    if ids_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut ids = [0u8; 8];
+    ids.copy_from_slice(&LSM_ID_CAPABILITY.to_le_bytes());
+    copy_to_user(ids_user, &ids).map_err(|e| e.as_errno())?;
+    Ok(1)
 }
 
 fn futex_wait(
@@ -5239,6 +7344,14 @@ fn task_fdtable(task: &Arc<Task>) -> Option<Arc<vfs::FdTable>> {
         .ok()
 }
 
+/// RLIMIT_NOFILE 的 fdtable 同步只能表达 u32 范围的软/硬限制(fdtable 内部用 u32)。
+/// 在写 rlimit 表之前校验,避免"表已更新、fdtable 同步失败"的部分更新。
+fn validate_nofile_rlimit(limit: sched::RlimitPair) -> Result<(), Errno> {
+    u32::try_from(limit.soft.raw()).map_err(|_| Errno::EINVAL)?;
+    u32::try_from(limit.hard.raw()).map_err(|_| Errno::EINVAL)?;
+    Ok(())
+}
+
 fn sync_thread_group_fdtable_nofile_limit(
     task: &Arc<Task>,
     limit: sched::RlimitPair,
@@ -5322,6 +7435,7 @@ fn cleanup_task_before_exit_in_active_vm(task: &Arc<Task>) {
     pi_release_owned_futexes(task);
     exit_robust_list(task);
     clear_child_tid_and_wake(task);
+    super::ipc::apply_sem_undo_on_exit(task);
     #[cfg(feature = "trace-task-lifecycle")]
     log::info!(
         "[syscall][exit-cleanup] futex-done pid={:?}",
@@ -5554,6 +7668,8 @@ fn write_user_u32(user: usize, value: u32) -> Result<(), Errno> {
 }
 
 const ITIMER_REAL: usize = 0;
+const ITIMER_VIRTUAL: usize = 1;
+const ITIMER_PROF: usize = 2;
 const ITIMERVAL_SIZE: usize = 32;
 const TIMEVAL_SIZE: usize = 16;
 const USEC_PER_SEC: i64 = 1_000_000;
@@ -5610,7 +7726,13 @@ fn clock_settime_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         return Err(Errno::EFAULT);
     }
     require_cap(ctx.task(), Capability::SysTime)?;
-    crate::vdso::set_realtime_ns(read_timespec_ns(tp)?);
+    let new_ns = read_timespec_ns(tp)?;
+    let old_offset = crate::vdso::realtime_offset_ns();
+    crate::vdso::set_realtime_ns(new_ns);
+    // 实时钟被设置：取消登记了 TFD_TIMER_CANCEL_ON_SET 的 timerfd。
+    if crate::vdso::realtime_offset_ns() != old_offset {
+        vfs::timerfd::cancel_timers_on_clock_set();
+    }
     Ok(0)
 }
 
@@ -5705,6 +7827,10 @@ fn waitid_code(status: WaitStatus) -> i32 {
     }
 }
 
+fn write_i64(out: &mut [u8], off: usize, value: i64) {
+    out[off..off + 8].copy_from_slice(&value.to_le_bytes());
+}
+
 fn write_i32(out: &mut [u8], off: usize, value: i32) {
     out[off..off + 4].copy_from_slice(&value.to_le_bytes());
 }
@@ -5731,4 +7857,70 @@ fn put_u64(out: &mut [u8], off: usize, v: u64) {
 
 fn put_i64(out: &mut [u8], off: usize, v: i64) {
     out[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+#[cfg(all(feature = "kernel-tests", target_arch = "riscv64"))]
+mod riscv_flush_icache_tests {
+    use errno::Errno;
+    use ktest::ktest;
+
+    use super::validate_riscv_flush_icache_flags;
+
+    #[ktest]
+    fn riscv_flush_icache_accepts_linux_flags() {
+        assert!(validate_riscv_flush_icache_flags(0).is_ok());
+        assert!(validate_riscv_flush_icache_flags(1).is_ok());
+    }
+
+    #[ktest]
+    fn riscv_flush_icache_rejects_unknown_flag_bits() {
+        assert!(matches!(
+            validate_riscv_flush_icache_flags(2),
+            Err(Errno::EINVAL)
+        ));
+        assert!(matches!(
+            validate_riscv_flush_icache_flags(3),
+            Err(Errno::EINVAL)
+        ));
+        assert!(matches!(
+            validate_riscv_flush_icache_flags(usize::MAX),
+            Err(Errno::EINVAL)
+        ));
+    }
+}
+
+#[cfg(feature = "kernel-tests")]
+mod sysinfo_tests {
+    use ktest::ktest;
+
+    use super::encode_sysinfo;
+
+    fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
+
+    #[ktest]
+    fn sysinfo_uses_linux_64bit_layout() {
+        let bytes = encode_sysinfo(7, 0x1122_3344_5566_7788, 0x8877_6655_4433_2211);
+
+        assert_eq!(read_u64(&bytes, 0), 7);
+        assert_eq!(read_u64(&bytes, 32), 0x1122_3344_5566_7788);
+        assert_eq!(read_u64(&bytes, 40), 0x8877_6655_4433_2211);
+        assert_eq!(read_u64(&bytes, 48), 0);
+        assert_eq!(read_u64(&bytes, 56), 0);
+        assert_eq!(read_u64(&bytes, 64), 0);
+        assert_eq!(read_u64(&bytes, 72), 0);
+        assert_eq!(read_u16(&bytes, 80), 0);
+        assert_eq!(read_u64(&bytes, 88), 0);
+        assert_eq!(read_u64(&bytes, 96), 0);
+        assert_eq!(read_u32(&bytes, 104), 1);
+    }
 }

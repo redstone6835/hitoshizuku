@@ -3981,6 +3981,49 @@ fn fallback_current_context_suspension_is_nested_and_restores_outer() {
 }
 
 #[test]
+fn interrupt_context_overrides_and_restores_outer_context() {
+    assert!(crate::current_context().is_none());
+    let outer = crate::ElmContext::new(
+        crate::ElmId(45),
+        Some(crate::ELM_MGR_BUILTIN_ID),
+        crate::Generation(1),
+        crate::ElmState::Active,
+        crate::ElmLifecyclePhase::Initialize,
+        0,
+    );
+    let interrupt = crate::ElmContext::new(
+        crate::ElmId(46),
+        Some(crate::ELM_MGR_BUILTIN_ID),
+        crate::Generation(2),
+        crate::ElmState::Active,
+        crate::ElmLifecyclePhase::Resume,
+        0,
+    );
+    let nested = crate::ElmContext::new(
+        crate::ElmId(47),
+        Some(crate::ElmId(46)),
+        crate::Generation(3),
+        crate::ElmState::Active,
+        crate::ElmLifecyclePhase::Resume,
+        0,
+    );
+
+    let outer_guard = crate::enter_current_context(&outer).expect("外层上下文必须可进入");
+    let interrupt_guard =
+        crate::try_enter_interrupt_context(&interrupt).expect("中断上下文必须可进入");
+    assert_eq!(crate::current_cell(), Some(crate::ElmId(46)));
+    {
+        let _nested_guard = crate::enter_current_context(&nested).expect("中断内上下文必须可嵌套");
+        assert_eq!(crate::current_cell(), Some(crate::ElmId(47)));
+    }
+    assert_eq!(crate::current_cell(), Some(crate::ElmId(46)));
+    drop(interrupt_guard);
+    assert_eq!(crate::current_cell(), Some(crate::ElmId(45)));
+    drop(outer_guard);
+    assert!(crate::current_context().is_none());
+}
+
+#[test]
 fn manager_api_descriptor_is_available_from_elm_root() {
     let record = crate::ElmMgrApiDescriptor::new(
         1,

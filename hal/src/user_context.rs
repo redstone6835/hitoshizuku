@@ -339,16 +339,18 @@ impl UserTrapFrame {
 
         #[cfg(target_arch = "riscv64")]
         {
+            // riscv 的 sigcontext.sc_regs 本身即 `struct user_regs_struct`
+            // （pc + 31 个通用寄存器，无 x0），共 256 字节。这里严格按该布局：
+            // pc@0、ra..t6 依次落在 REGS_OFF 起的 31 个槽位。
             const PC_OFF: usize = 0;
             const REGS_OFF: usize = 8;
-            const MCONTEXT_LEN: usize = REGS_OFF + 32 * 8;
+            const MCONTEXT_LEN: usize = REGS_OFF + 31 * 8;
             if out.len() < MCONTEXT_LEN {
                 return false;
             }
             out[..MCONTEXT_LEN].fill(0);
             write_u64(out, PC_OFF, self.inner.sepc as u64);
             let regs = [
-                0usize,
                 self.inner.ra,
                 self.inner.sp,
                 self.inner.gp,
@@ -435,46 +437,199 @@ impl UserTrapFrame {
 
         #[cfg(target_arch = "riscv64")]
         {
+            // 与 write_linux_mcontext 的 riscv 分支对称：pc@0 后紧跟 31 个
+            // 通用寄存器（ra..t6），无 x0 槽位。
             const PC_OFF: usize = 0;
             const REGS_OFF: usize = 8;
-            const MCONTEXT_LEN: usize = REGS_OFF + 32 * 8;
+            const MCONTEXT_LEN: usize = REGS_OFF + 31 * 8;
             if input.len() < MCONTEXT_LEN {
                 return false;
             }
             let reg = |idx: usize| -> usize { read_u64(input, REGS_OFF + idx * 8) as usize };
             self.inner.sepc = read_u64(input, PC_OFF) as usize;
-            self.inner.ra = reg(1);
-            self.inner.sp = reg(2);
-            self.inner.gp = reg(3);
-            self.inner.tp = reg(4);
-            self.inner.t0 = reg(5);
-            self.inner.t1 = reg(6);
-            self.inner.t2 = reg(7);
-            self.inner.s0 = reg(8);
-            self.inner.s1 = reg(9);
-            self.inner.a0 = reg(10);
-            self.inner.a1 = reg(11);
-            self.inner.a2 = reg(12);
-            self.inner.a3 = reg(13);
-            self.inner.a4 = reg(14);
-            self.inner.a5 = reg(15);
-            self.inner.a6 = reg(16);
-            self.inner.a7 = reg(17);
-            self.inner.s2 = reg(18);
-            self.inner.s3 = reg(19);
-            self.inner.s4 = reg(20);
-            self.inner.s5 = reg(21);
-            self.inner.s6 = reg(22);
-            self.inner.s7 = reg(23);
-            self.inner.s8 = reg(24);
-            self.inner.s9 = reg(25);
-            self.inner.s10 = reg(26);
-            self.inner.s11 = reg(27);
-            self.inner.t3 = reg(28);
-            self.inner.t4 = reg(29);
-            self.inner.t5 = reg(30);
-            self.inner.t6 = reg(31);
+            self.inner.ra = reg(0);
+            self.inner.sp = reg(1);
+            self.inner.gp = reg(2);
+            self.inner.tp = reg(3);
+            self.inner.t0 = reg(4);
+            self.inner.t1 = reg(5);
+            self.inner.t2 = reg(6);
+            self.inner.s0 = reg(7);
+            self.inner.s1 = reg(8);
+            self.inner.a0 = reg(9);
+            self.inner.a1 = reg(10);
+            self.inner.a2 = reg(11);
+            self.inner.a3 = reg(12);
+            self.inner.a4 = reg(13);
+            self.inner.a5 = reg(14);
+            self.inner.a6 = reg(15);
+            self.inner.a7 = reg(16);
+            self.inner.s2 = reg(17);
+            self.inner.s3 = reg(18);
+            self.inner.s4 = reg(19);
+            self.inner.s5 = reg(20);
+            self.inner.s6 = reg(21);
+            self.inner.s7 = reg(22);
+            self.inner.s8 = reg(23);
+            self.inner.s9 = reg(24);
+            self.inner.s10 = reg(25);
+            self.inner.s11 = reg(26);
+            self.inner.t3 = reg(27);
+            self.inner.t4 = reg(28);
+            self.inner.t5 = reg(29);
+            self.inner.t6 = reg(30);
             true
+        }
+    }
+
+    /// ptrace 原始寄存器组的大小（字节）。
+    ///
+    /// - riscv64：`struct user_regs_struct`（pc + 31 个通用寄存器）= 256；
+    /// - loongarch64：`struct user_pt_regs`（regs[32] + orig_a0 + csr_era
+    ///   + csr_badv + reserved[10]）= 360。
+    ///
+    /// 注意：这不是信号帧 mcontext/sigcontext 的大小——loongarch 的 sigcontext
+    /// 是 268 字节（pc@0 + regs@8 + flags@264），两者不可混用。
+    pub fn linux_user_regs_size() -> usize {
+        #[cfg(target_arch = "loongarch64")]
+        {
+            32 * 8 + 8 + 8 + 8 + 10 * 8 // 360
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            8 + 31 * 8 // 256
+        }
+    }
+
+    /// 把 trap frame 编码为 ptrace 原始寄存器组
+    /// （riscv64 `user_regs_struct` / loongarch64 `user_pt_regs`）。
+    ///
+    /// 与 `write_linux_mcontext` 的区别：后者编码信号帧的 sigcontext 布局；
+    /// 本函数编码 `PTRACE_GETREGSET(NT_PRSTATUS)` / `GETREGS` / `PEEKUSR`
+    /// 等 ptrace 路径所需的原始寄存器组。
+    pub fn write_linux_user_regs(&self, out: &mut [u8]) -> bool {
+        #[cfg(target_arch = "loongarch64")]
+        {
+            // `struct user_pt_regs`（loongarch64 Linux uapi）：
+            //   regs[0..32] @ 0    —— r0..r31（r0 恒 0）
+            //   orig_a0    @ 256   —— 进入 syscall 时的 a0（尽力而为）
+            //   csr_era    @ 264   —— 返回地址 / pc
+            //   csr_badv   @ 272   —— 出错地址（填 0）
+            //   reserved   @ 280   —— 10 个 u64，全 0
+            //
+            // TrapFrame 字段名与 Linux ABI 命名错位：TrapFrame.s0 是 $r22（fp），
+            // TrapFrame.s1..s9 是 $r23..$r31（Linux s0..s8），必须按 r0..r31
+            // 的真实顺序映射。
+            const REGS_OFF: usize = 0;
+            const ORIG_A0_OFF: usize = 256;
+            const CSR_ERA_OFF: usize = 264;
+            const REGS_LEN: usize = 280 + 10 * 8; // 360
+            if out.len() < REGS_LEN {
+                return false;
+            }
+            out[..REGS_LEN].fill(0);
+            let regs = [
+                0usize,        // r0  = zero
+                self.inner.ra, // r1  = ra
+                self.inner.tp, // r2  = tp
+                self.inner.sp, // r3  = sp
+                self.inner.a0, // r4  = a0
+                self.inner.a1, // r5  = a1
+                self.inner.a2, // r6  = a2
+                self.inner.a3, // r7  = a3
+                self.inner.a4, // r8  = a4
+                self.inner.a5, // r9  = a5
+                self.inner.a6, // r10 = a6
+                self.inner.a7, // r11 = a7
+                self.inner.t0, // r12 = t0
+                self.inner.t1, // r13 = t1
+                self.inner.t2, // r14 = t2
+                self.inner.t3, // r15 = t3
+                self.inner.t4, // r16 = t4
+                self.inner.t5, // r17 = t5
+                self.inner.t6, // r18 = t6
+                self.inner.t7, // r19 = t7
+                self.inner.t8, // r20 = t8
+                self.inner.rx, // r21 = u0（保留）
+                self.inner.s0, // r22 = fp
+                self.inner.s1, // r23 = s0
+                self.inner.s2, // r24 = s1
+                self.inner.s3, // r25 = s2
+                self.inner.s4, // r26 = s3
+                self.inner.s5, // r27 = s4
+                self.inner.s6, // r28 = s5
+                self.inner.s7, // r29 = s6
+                self.inner.s8, // r30 = s7
+                self.inner.s9, // r31 = s8
+            ];
+            for (idx, reg) in regs.iter().enumerate() {
+                write_u64(out, REGS_OFF + idx * 8, *reg as u64);
+            }
+            write_u64(out, ORIG_A0_OFF, self.inner.a0 as u64);
+            write_u64(out, CSR_ERA_OFF, self.inner.pc as u64);
+            // csr_badv 与 reserved 保持 0。
+            true
+        }
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            // riscv 的 sigcontext.sc_regs 即 `struct user_regs_struct`，
+            // 与修正后的 mcontext 布局一致，直接复用。
+            self.write_linux_mcontext(out)
+        }
+    }
+
+    /// 从 ptrace 原始寄存器组字节写回 trap frame（`write_linux_user_regs` 的反向）。
+    pub fn apply_linux_user_regs(&mut self, input: &[u8]) -> bool {
+        #[cfg(target_arch = "loongarch64")]
+        {
+            const REGS_OFF: usize = 0;
+            const CSR_ERA_OFF: usize = 264;
+            const REGS_LEN: usize = 280 + 10 * 8; // 360
+            if input.len() < REGS_LEN {
+                return false;
+            }
+            let reg = |idx: usize| -> usize { read_u64(input, REGS_OFF + idx * 8) as usize };
+            // regs[0]（r0）恒 0，不回写；orig_a0 仅作记录，不覆盖 a0（regs[4]）。
+            self.inner.ra = reg(1);
+            self.inner.tp = reg(2);
+            self.inner.sp = reg(3);
+            self.inner.a0 = reg(4);
+            self.inner.a1 = reg(5);
+            self.inner.a2 = reg(6);
+            self.inner.a3 = reg(7);
+            self.inner.a4 = reg(8);
+            self.inner.a5 = reg(9);
+            self.inner.a6 = reg(10);
+            self.inner.a7 = reg(11);
+            self.inner.t0 = reg(12);
+            self.inner.t1 = reg(13);
+            self.inner.t2 = reg(14);
+            self.inner.t3 = reg(15);
+            self.inner.t4 = reg(16);
+            self.inner.t5 = reg(17);
+            self.inner.t6 = reg(18);
+            self.inner.t7 = reg(19);
+            self.inner.t8 = reg(20);
+            self.inner.rx = reg(21);
+            self.inner.s0 = reg(22);
+            self.inner.s1 = reg(23);
+            self.inner.s2 = reg(24);
+            self.inner.s3 = reg(25);
+            self.inner.s4 = reg(26);
+            self.inner.s5 = reg(27);
+            self.inner.s6 = reg(28);
+            self.inner.s7 = reg(29);
+            self.inner.s8 = reg(30);
+            self.inner.s9 = reg(31);
+            // csr_era 即 pc；csr_badv/reserved 忽略。
+            self.inner.pc = read_u64(input, CSR_ERA_OFF) as usize;
+            true
+        }
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            self.apply_linux_mcontext(input)
         }
     }
 
