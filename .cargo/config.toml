@@ -12,6 +12,27 @@ rustflags = [
     "-A", "named_asm_labels",
 ]
 
+[target.x86_64-unknown-none]
+linker = "rust-lld"
+rustflags = [
+    "-C", "link-arg=--fatal-warnings",
+    # Keep every Rust dependency position independent so the exact same rlib
+    # closure can back ELM PIE modules.  The final kernel remains a fixed
+    # higher-half ET_EXEC because build.rs and the linker script append
+    # -no-pie at the binary link step.
+    "-C", "relocation-model=pic",
+    "-C", "code-model=small",
+    # Select the architectural x86_64 baseline without forcing an explicit
+    # +sse2 feature.  LLVM 22 miscompiles the latter for this freestanding
+    # target during optimized dependency codegen; runtime SIMD availability is
+    # still negotiated by arch::x86_64::fpu through CPUID/XGETBV.
+    "-C", "target-cpu=x86-64",
+    # rustc's release profile adds -pie for this target.  The kernel linker
+    # intentionally emits a fixed higher-half ET_EXEC image, so make the
+    # final linker switch explicit after rustc's default.
+    "-C", "link-arg=-no-pie",
+]
+
 # libs/efi contains the small freestanding C shim required by the firmware path.
 # These are compiler names, not Rust toolchain overrides.
 [env]
@@ -21,6 +42,12 @@ rustflags = [
 RUSTC_BOOTSTRAP = { value = "aml", force = false }
 CC_loongarch64_unknown_none = "loongarch64-linux-gnu-gcc"
 CC_riscv64gc_unknown_none_elf = "riscv64-linux-gnu-gcc"
+CC_x86_64_unknown_none = "cc"
+# LLVM 22 currently cannot lower the portable SIMD expressions emitted by
+# curve25519-dalek/sha2 for the custom freestanding target.  Select the
+# constant-time serial backend at build time; x86 runtime feature detection
+# remains available to the arch FPU/crypto paths.
+CARGO_CFG_CURVE25519_DALEK_BACKEND = { value = "serial", force = true }
 
 # Keep the build graph invocable through Cargo without a host-tool target
 # accidentally inheriting a bare-metal default.

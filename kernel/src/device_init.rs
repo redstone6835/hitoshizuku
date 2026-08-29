@@ -771,20 +771,32 @@ pub fn activate_device_subsystem(
 }
 
 /// 在辅助 CPU 启动完成后安装网络 host、driver 与 stack 的共享启动配置。
-pub fn install_network_boot_config() {
+pub fn install_network_boot_config() -> bool {
     let mut material = [0u8; 112];
-    general::dev::random::fill(
+    if let Err(error) = general::dev::random::fill(
         &mut material,
         general::dev::random::RandomReadMode::Insecure,
-    )
-    .expect("random ELM 未提供网络启动密钥材料");
+    ) {
+        // Network bootstrap keys must come from the installed random backend;
+        // do not silently replace them with a predictable timestamp stream.
+        log::warning!(
+            "[kernel] network bootstrap disabled: random backend unavailable ({error:?})"
+        );
+        return false;
+    }
     let online_cpu_count = sched::online_cpu_mask().count_ones();
-    let active_cpu_count =
-        net::boot::select_protocol_shard_count(online_cpu_count).expect("网络启动时没有在线 CPU");
-    let (host_config, driver_config, mut stack_config) =
-        net::boot::NetBootConfigs::from_random_material(material, active_cpu_count)
-            .expect("active CPU count 超出网络栈范围")
-            .split();
+    let Some(active_cpu_count) = net::boot::select_protocol_shard_count(online_cpu_count) else {
+        log::warning!("[kernel] network bootstrap disabled: no online CPU for protocol workers");
+        return false;
+    };
+    let Some(configs) = net::boot::NetBootConfigs::from_random_material(material, active_cpu_count)
+    else {
+        log::warning!(
+            "[kernel] network bootstrap disabled: protocol shard configuration is invalid"
+        );
+        return false;
+    };
+    let (host_config, driver_config, mut stack_config) = configs.split();
     // 启动参数 net.dhcp=0|off|false|no：关闭内核 DHCP 客户端。
     let dhcp_disabled = general::start_cmdline()
         .map(|cmdline| general::cmdline::Cmdline::new(cmdline).find("net.dhcp"))
@@ -793,15 +805,29 @@ pub fn install_network_boot_config() {
     if dhcp_disabled {
         stack_config.set_dhcp_disabled(true);
     }
-    net::boot::install_host_boot_config(host_config).expect("网络 host 启动配置被重复安装");
-    net::device::install_net_runtime(driver_config, crate::net_runtime::registrar())
-        .expect("网络运行时被重复安装");
-    net::stack::install_stack_runtime(stack_config, crate::net_stack::registrar())
-        .expect("网络 stack broker 被重复安装");
+    if let Err(error) = net::boot::install_host_boot_config(host_config) {
+        log::warning!("[kernel] network bootstrap disabled: host setup failed ({error:?})");
+        return false;
+    }
+    if let Err(error) =
+        net::device::install_net_runtime(driver_config, crate::net_runtime::registrar())
+    {
+        log::warning!(
+            "[kernel] network bootstrap disabled: device runtime setup failed ({error:?})"
+        );
+        return false;
+    }
+    if let Err(error) =
+        net::stack::install_stack_runtime(stack_config, crate::net_stack::registrar())
+    {
+        log::warning!("[kernel] network bootstrap disabled: stack setup failed ({error:?})");
+        return false;
+    }
     log::info!(
         "[kernel] installed network boot config: online_cpus={} protocol_shards={} dhcp={}",
         online_cpu_count,
         active_cpu_count,
         if dhcp_disabled { "disabled" } else { "enabled" }
     );
+    true
 }

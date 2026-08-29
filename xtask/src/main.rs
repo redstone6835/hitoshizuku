@@ -1,6 +1,7 @@
 use std::env;
 use std::ffi::OsString;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,6 +13,30 @@ use xtask::{CATALOG_RELATIVE_PATH, ImageFormat, PlatformCatalog, PlatformSpec};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const PLATFORM_IDENTITY_SYMBOL: &str = "HITOSHIZUKU_PLATFORM_TAG";
+const UEFI_LOADER_TARGET: &str = "x86_64-unknown-uefi";
+const UEFI_ESP_BYTES: u64 = 128 * 1024 * 1024;
+const DISK_SECTOR_BYTES: u64 = 512;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EspPartition {
+    first_lba: u64,
+    last_lba: u64,
+}
+
+impl EspPartition {
+    fn sectors(self) -> Result<u64, String> {
+        self.last_lba
+            .checked_sub(self.first_lba)
+            .and_then(|length| length.checked_add(1))
+            .ok_or_else(|| "invalid EFI system partition LBA range".to_string())
+    }
+
+    fn byte_offset(self) -> Result<u64, String> {
+        self.first_lba
+            .checked_mul(DISK_SECTOR_BYTES)
+            .ok_or_else(|| "EFI system partition offset overflow".to_string())
+    }
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -286,6 +311,14 @@ fn build_image(root: &Path, catalog: &PlatformCatalog, args: &[String]) -> Resul
         )?;
     }
 
+    let mut efi = formats
+        .contains(&ImageFormat::Efi)
+        .then(|| TempOutput::create(&output_dir, ImageFormat::Efi.file_name()))
+        .transpose()?;
+    if let Some(output) = efi.as_ref() {
+        build_uefi_esp(root, &source, output.path())?;
+    }
+
     if formats.contains(&ImageFormat::Elf) {
         let mut elf = TempOutput::create(&output_dir, "kernel.elf")?;
         std::fs::copy(&source, elf.path()).map_err(|error| {
@@ -309,6 +342,11 @@ fn build_image(root: &Path, catalog: &PlatformCatalog, args: &[String]) -> Resul
             .expect("uImage output was generated")
             .commit(&output_dir.join(ImageFormat::Uimage.file_name()))?;
     }
+    if formats.contains(&ImageFormat::Efi) {
+        efi.as_mut()
+            .expect("EFI output was generated")
+            .commit(&output_dir.join(ImageFormat::Efi.file_name()))?;
+    }
 
     println!(
         "published {} image(s) for {} in {}",
@@ -316,6 +354,279 @@ fn build_image(root: &Path, catalog: &PlatformCatalog, args: &[String]) -> Resul
         context.platform.id,
         output_dir.display()
     );
+    Ok(())
+}
+
+fn read_exact_at(file: &mut File, offset: u64, buffer: &mut [u8]) -> Result<(), String> {
+    file.seek(SeekFrom::Start(offset))
+        .and_then(|_| file.read_exact(buffer))
+        .map_err(|error| format!("read disk image at byte {offset}: {error}"))
+}
+
+fn le_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
+    bytes
+        .get(offset..offset + 2)
+        .and_then(|value| value.try_into().ok())
+        .map(u16::from_le_bytes)
+        .ok_or_else(|| "truncated disk structure".to_string())
+}
+
+fn le_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    bytes
+        .get(offset..offset + 4)
+        .and_then(|value| value.try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or_else(|| "truncated disk structure".to_string())
+}
+
+fn le_u64(bytes: &[u8], offset: usize) -> Result<u64, String> {
+    bytes
+        .get(offset..offset + 8)
+        .and_then(|value| value.try_into().ok())
+        .map(u64::from_le_bytes)
+        .ok_or_else(|| "truncated disk structure".to_string())
+}
+
+fn inspect_esp_gpt(path: &Path) -> Result<(EspPartition, Vec<u8>), String> {
+    let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let image_bytes = file
+        .metadata()
+        .map_err(|error| format!("stat {}: {error}", path.display()))?
+        .len();
+    if image_bytes % DISK_SECTOR_BYTES != 0 || image_bytes < 68 * DISK_SECTOR_BYTES {
+        return Err("EFI disk image has an invalid sector-aligned size".to_string());
+    }
+    let disk_sectors = image_bytes / DISK_SECTOR_BYTES;
+    let mut primary = [0u8; DISK_SECTOR_BYTES as usize];
+    read_exact_at(&mut file, DISK_SECTOR_BYTES, &mut primary)?;
+    if primary.get(..8) != Some(b"EFI PART")
+        || le_u32(&primary, 12)? < 92
+        || le_u64(&primary, 24)? != 1
+        || le_u64(&primary, 32)? != disk_sectors - 1
+    {
+        return Err("invalid primary GPT header".to_string());
+    }
+    let first_usable = le_u64(&primary, 40)?;
+    let last_usable = le_u64(&primary, 48)?;
+    let entries_lba = le_u64(&primary, 72)?;
+    let entry_count = u64::from(le_u32(&primary, 80)?);
+    let entry_bytes = u64::from(le_u32(&primary, 84)?);
+    if entry_count == 0 || entry_count > 4096 || !(128..=4096).contains(&entry_bytes) {
+        return Err("invalid primary GPT partition table geometry".to_string());
+    }
+    let entries_bytes = entry_count
+        .checked_mul(entry_bytes)
+        .ok_or_else(|| "GPT partition table size overflow".to_string())?;
+    let entries_offset = entries_lba
+        .checked_mul(DISK_SECTOR_BYTES)
+        .ok_or_else(|| "GPT partition table offset overflow".to_string())?;
+    if entries_offset
+        .checked_add(entries_bytes)
+        .is_none_or(|end| end > first_usable * DISK_SECTOR_BYTES)
+    {
+        return Err("primary GPT partition table overlaps usable space".to_string());
+    }
+    let mut entry = vec![0u8; entry_bytes as usize];
+    read_exact_at(&mut file, entries_offset, &mut entry)?;
+    if entry[..16].iter().all(|byte| *byte == 0) {
+        return Err("GPT has no EFI system partition".to_string());
+    }
+    let partition = EspPartition {
+        first_lba: le_u64(&entry, 32)?,
+        last_lba: le_u64(&entry, 40)?,
+    };
+    if partition.first_lba < first_usable
+        || partition.last_lba > last_usable
+        || partition.first_lba > partition.last_lba
+    {
+        return Err("EFI system partition lies outside GPT usable space".to_string());
+    }
+
+    let backup_header_offset = (disk_sectors - 1) * DISK_SECTOR_BYTES;
+    let mut backup = [0u8; DISK_SECTOR_BYTES as usize];
+    read_exact_at(&mut file, backup_header_offset, &mut backup)?;
+    if backup.get(..8) != Some(b"EFI PART")
+        || le_u64(&backup, 24)? != disk_sectors - 1
+        || le_u64(&backup, 32)? != 1
+    {
+        return Err("invalid backup GPT header".to_string());
+    }
+    let backup_entries_lba = le_u64(&backup, 72)?;
+    let backup_entry_count = u64::from(le_u32(&backup, 80)?);
+    let backup_entry_bytes = u64::from(le_u32(&backup, 84)?);
+    let backup_entries_bytes = backup_entry_count
+        .checked_mul(backup_entry_bytes)
+        .ok_or_else(|| "backup GPT partition table size overflow".to_string())?;
+    let backup_start = backup_entries_lba
+        .checked_mul(DISK_SECTOR_BYTES)
+        .ok_or_else(|| "backup GPT partition table offset overflow".to_string())?;
+    if backup_entry_count != entry_count
+        || backup_entry_bytes != entry_bytes
+        || backup_start <= partition.last_lba * DISK_SECTOR_BYTES
+        || backup_start
+            .checked_add(backup_entries_bytes)
+            .is_none_or(|end| end > backup_header_offset)
+    {
+        return Err("invalid backup GPT partition table geometry".to_string());
+    }
+    let mut backup_metadata = vec![0u8; (image_bytes - backup_start) as usize];
+    read_exact_at(&mut file, backup_start, &mut backup_metadata)?;
+    Ok((partition, backup_metadata))
+}
+
+fn validate_esp_filesystem(
+    path: &Path,
+    partition: EspPartition,
+    backup_gpt: &[u8],
+) -> Result<(), String> {
+    let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let mut boot_sector = [0u8; DISK_SECTOR_BYTES as usize];
+    read_exact_at(&mut file, partition.byte_offset()?, &mut boot_sector)?;
+    if le_u16(&boot_sector, 11)? != DISK_SECTOR_BYTES as u16
+        || boot_sector.get(510..512) != Some(&[0x55, 0xaa])
+    {
+        return Err("invalid FAT boot sector in EFI system partition".to_string());
+    }
+    let short_sectors = u64::from(le_u16(&boot_sector, 19)?);
+    let long_sectors = u64::from(le_u32(&boot_sector, 32)?);
+    let volume_sectors = if short_sectors == 0 {
+        long_sectors
+    } else {
+        short_sectors
+    };
+    let partition_sectors = partition.sectors()?;
+    if volume_sectors != partition_sectors {
+        return Err(format!(
+            "FAT BPB covers {volume_sectors} sectors, GPT partition covers {partition_sectors}"
+        ));
+    }
+    let image_bytes = file
+        .metadata()
+        .map_err(|error| format!("stat {}: {error}", path.display()))?
+        .len();
+    let backup_start = image_bytes
+        .checked_sub(backup_gpt.len() as u64)
+        .ok_or_else(|| "backup GPT snapshot exceeds disk image".to_string())?;
+    let volume_end = partition
+        .byte_offset()?
+        .checked_add(
+            volume_sectors
+                .checked_mul(DISK_SECTOR_BYTES)
+                .ok_or_else(|| "FAT volume size overflow".to_string())?,
+        )
+        .ok_or_else(|| "FAT volume end overflow".to_string())?;
+    if volume_end > backup_start {
+        return Err("FAT volume overlaps backup GPT metadata".to_string());
+    }
+    let mut current_backup = vec![0u8; backup_gpt.len()];
+    read_exact_at(&mut file, backup_start, &mut current_backup)?;
+    if current_backup != backup_gpt {
+        return Err("mtools modified backup GPT metadata".to_string());
+    }
+    Ok(())
+}
+
+fn build_uefi_esp(root: &Path, kernel: &Path, output: &Path) -> Result<(), String> {
+    let manifest = root.join("boot/uefi-loader/Cargo.toml");
+    let mut cargo = Command::new("cargo");
+    cargo
+        .current_dir(root)
+        .args(["build", "--manifest-path"])
+        .arg(&manifest)
+        .args(["--target", UEFI_LOADER_TARGET, "--release"]);
+    run_command(cargo).map_err(|error| format!("build standalone UEFI loader: {error}"))?;
+
+    let loader = root.join(format!(
+        "boot/uefi-loader/target/{UEFI_LOADER_TARGET}/release/BOOTX64.efi"
+    ));
+    validate_uefi_application(&loader)?;
+
+    OpenOptions::new()
+        .write(true)
+        .open(output)
+        .and_then(|file| file.set_len(UEFI_ESP_BYTES))
+        .map_err(|error| format!("create EFI system partition {}: {error}", output.display()))?;
+    run_command({
+        let mut command = Command::new("parted");
+        command.args(["-s"]);
+        command.arg(output);
+        command.args([
+            "mklabel", "gpt", "mkpart", "ESP", "fat32", "1MiB", "100%", "set", "1", "esp", "on",
+        ]);
+        command
+    })
+    .map_err(|error| format!("create GPT EFI system partition: {error}"))?;
+    let (partition, backup_gpt) = inspect_esp_gpt(output)?;
+    let image = format!("{}@@{}", output.display(), partition.byte_offset()?);
+    let volume_sectors = partition.sectors()?.to_string();
+    let hidden_sectors = partition.first_lba.to_string();
+    run_command({
+        let mut command = Command::new("mformat");
+        command.args(["-i"]);
+        command.arg(&image);
+        command.args(["-F", "-T", &volume_sectors, "-H", &hidden_sectors, "::"]);
+        command
+    })
+    .map_err(|error| format!("format EFI system partition (mtools): {error}"))?;
+    run_command({
+        let mut command = Command::new("mmd");
+        command.args(["-i"]);
+        command.arg(&image);
+        command.args(["::/EFI", "::/EFI/BOOT", "::/EFI/HITOSHI"]);
+        command
+    })
+    .map_err(|error| format!("create EFI system partition directories (mtools): {error}"))?;
+    for (source, destination) in [
+        (loader.as_path(), "::/EFI/BOOT/BOOTX64.EFI"),
+        (kernel, "::/EFI/HITOSHI/KERNEL.ELF"),
+    ] {
+        run_command({
+            let mut command = Command::new("mcopy");
+            command.args(["-i"]);
+            command.arg(&image);
+            command.arg(source);
+            command.arg(destination);
+            command
+        })
+        .map_err(|error| {
+            format!("stage {destination} in EFI system partition (mtools): {error}")
+        })?;
+    }
+    validate_esp_filesystem(output, partition, &backup_gpt)
+}
+
+fn validate_uefi_application(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let pe_offset = bytes
+        .get(0x3c..0x40)
+        .and_then(|offset| usize::try_from(u32::from_le_bytes(offset.try_into().ok()?)).ok())
+        .ok_or_else(|| format!("{} has no PE header offset", path.display()))?;
+    let header = bytes
+        .get(pe_offset..)
+        .ok_or_else(|| format!("{} has an out-of-range PE header", path.display()))?;
+    let machine = header
+        .get(4..6)
+        .map(|value| u16::from_le_bytes(value.try_into().expect("fixed slice")));
+    let optional_magic = header
+        .get(24..26)
+        .map(|value| u16::from_le_bytes(value.try_into().expect("fixed slice")));
+    let subsystem = header
+        .get(24 + 68..24 + 70)
+        .map(|value| u16::from_le_bytes(value.try_into().expect("fixed slice")));
+    let relocation_rva = header
+        .get(24 + 112 + 5 * 8..24 + 112 + 5 * 8 + 4)
+        .map(|value| u32::from_le_bytes(value.try_into().expect("fixed slice")));
+    if header.get(..4) != Some(b"PE\0\0")
+        || machine != Some(0x8664)
+        || optional_magic != Some(0x20b)
+        || subsystem != Some(10)
+        || relocation_rva.unwrap_or(0) == 0
+    {
+        return Err(format!(
+            "{} is not a relocatable x86_64 PE32+ EFI application",
+            path.display()
+        ));
+    }
     Ok(())
 }
 
@@ -423,6 +734,7 @@ fn validate_kernel_elf(path: &Path, platform: &PlatformSpec) -> Result<(), Strin
     let expected_arch = match platform.link.layout {
         xtask::LinkLayout::Loongarch64Dmw1 => object::Architecture::LoongArch64,
         xtask::LinkLayout::Riscv64Sv48 => object::Architecture::Riscv64,
+        xtask::LinkLayout::X86_64HigherHalf => object::Architecture::X86_64,
     };
     if file.architecture() != expected_arch {
         return Err(format!(
@@ -517,30 +829,56 @@ fn validate_kernel_elf(path: &Path, platform: &PlatformSpec) -> Result<(), Strin
     if loads.is_empty() {
         return Err(format!("{} contains no PT_LOAD segments", path.display()));
     }
+    validate_kernel_load_layout(path, platform, entry, &loads)?;
+    validate_nonoverlapping_loads(path, &loads, true)?;
+    validate_nonoverlapping_loads(path, &loads, false)
+}
+
+fn validate_kernel_load_layout(
+    path: &Path,
+    platform: &PlatformSpec,
+    entry: u64,
+    loads: &[(u64, u64, u64, u32)],
+) -> Result<(), String> {
+    let virtual_base = platform.link.virtual_base.get();
+    let physical_base = platform.link.physical_base.get();
+    let entry_load = loads.iter().find(|(vaddr, paddr, memsz, flags)| {
+        *vaddr == virtual_base
+            && *paddr == physical_base
+            && *flags & object::elf::PF_X != 0
+            && entry >= *vaddr
+            && entry < vaddr.saturating_add(*memsz)
+    });
+    if entry_load.is_none() {
+        return Err(format!(
+            "{} is missing an executable entry PT_LOAD at platform VMA {virtual_base:#018x}/PADDR {physical_base:#018x}",
+            path.display()
+        ));
+    }
+
     let first = loads
         .iter()
         .min_by_key(|(_, paddr, _, _)| *paddr)
         .expect("nonempty PT_LOAD list");
-    if first.1 != platform.link.physical_base.get() || first.0 != platform.link.virtual_base.get() {
+    if matches!(platform.link.layout, xtask::LinkLayout::X86_64HigherHalf)
+        && first.1 == 0x8000
+        && first.0
+            == virtual_base
+                .wrapping_sub(physical_base)
+                .wrapping_add(0x8000)
+        && first.3 & object::elf::PF_X != 0
+    {
+        return Ok(());
+    }
+    if first.1 != physical_base || first.0 != virtual_base {
         return Err(format!(
-            "{} first PT_LOAD is VMA {:#018x}/PADDR {:#018x}, expected {}/{}",
+            "{} first PT_LOAD is VMA {:#018x}/PADDR {:#018x}, expected {virtual_base:#018x}/{physical_base:#018x}",
             path.display(),
             first.0,
             first.1,
-            platform.link.virtual_base,
-            platform.link.physical_base
         ));
     }
-    if !loads.iter().any(|(vaddr, _, memsz, flags)| {
-        *flags & object::elf::PF_X != 0 && entry >= *vaddr && entry < vaddr.saturating_add(*memsz)
-    }) {
-        return Err(format!(
-            "{} entry is not covered by an executable PT_LOAD",
-            path.display()
-        ));
-    }
-    validate_nonoverlapping_loads(path, &loads, true)?;
-    validate_nonoverlapping_loads(path, &loads, false)
+    Ok(())
 }
 
 fn validate_nonoverlapping_loads(
@@ -1035,11 +1373,11 @@ fn print_help() {
   config | oldconfig | defconfig\n\
   modules [--platform <id> | --board <qemu|ls2k1000|visionfive2> [--target <triple>]] [--config <path>] [--output <dir>]\n\
   build [--platform <id> | --board <qemu|ls2k1000|visionfive2> [--target <triple>]] [--config <path>] [--modules <dir>] [--reuse-modules] [--features <a,b>] [--initramfs <cpio>]\n\
-  image [build options] [--reuse-modules] [--no-build] [--format <elf|raw|uimage|all>] [--objcopy <path>] [--mkimage <path>]\n\
+  image [build options] [--reuse-modules] [--no-build] [--format <elf|raw|uimage|efi|all>] [--objcopy <path>] [--mkimage <path>]\n\
   clean\n\n\
-Platform definitions select the target, link layout, config, and output paths. QEMU defaults to qemu-loongarch64; use --target or --platform qemu-riscv64 for RISC-V.\n\
+Platform definitions select the target, link layout, config, and output paths. QEMU defaults to qemu-loongarch64; use --target or --platform qemu-riscv64/qemu-x86_64 for another architecture.\n\
 Build and image refresh the ELM profile and modules by default; --reuse-modules opts into validated existing module artifacts.\n\
-The image command publishes a canonical ELF for QEMU and ELF/raw/uImage outputs for physical boards."
+The image command publishes a canonical ELF for QEMU, ELF/raw/uImage outputs for physical boards, and a bootable FAT ESP for x86_64 EFI."
     );
 }
 
@@ -1061,6 +1399,60 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .expect("valid build options")
+    }
+
+    #[test]
+    fn esp_fat_capacity_is_bounded_by_gpt_partition() {
+        let directory = std::env::temp_dir().join(format!(
+            "hitoshizuku-xtask-esp-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).expect("create ESP test directory");
+        let image = directory.join("esp.img");
+        let partition = EspPartition {
+            first_lba: 8,
+            last_lba: 30,
+        };
+        let mut bytes = vec![0u8; 64 * DISK_SECTOR_BYTES as usize];
+        let boot = partition.first_lba as usize * DISK_SECTOR_BYTES as usize;
+        bytes[boot + 11..boot + 13].copy_from_slice(&(DISK_SECTOR_BYTES as u16).to_le_bytes());
+        bytes[boot + 32..boot + 36].copy_from_slice(
+            &(u32::try_from(partition.sectors().expect("partition sectors"))
+                .expect("test partition fits u32"))
+            .to_le_bytes(),
+        );
+        bytes[boot + 510..boot + 512].copy_from_slice(&[0x55, 0xaa]);
+        let backup_start = 60 * DISK_SECTOR_BYTES as usize;
+        bytes[backup_start..].fill(0xa5);
+        let backup = bytes[backup_start..].to_vec();
+        std::fs::write(&image, &bytes).expect("write ESP test image");
+
+        validate_esp_filesystem(&image, partition, &backup)
+            .expect("partition-sized FAT volume is valid");
+
+        bytes[boot + 32..boot + 36].copy_from_slice(
+            &(u32::try_from(partition.sectors().expect("partition sectors") + 1)
+                .expect("test partition fits u32"))
+            .to_le_bytes(),
+        );
+        std::fs::write(&image, &bytes).expect("write oversized FAT test image");
+        let error = validate_esp_filesystem(&image, partition, &backup)
+            .expect_err("FAT volume beyond the GPT partition must fail");
+        assert!(error.contains("FAT BPB covers"));
+
+        bytes[boot + 32..boot + 36].copy_from_slice(
+            &(u32::try_from(partition.sectors().expect("partition sectors"))
+                .expect("test partition fits u32"))
+            .to_le_bytes(),
+        );
+        bytes[backup_start] ^= 1;
+        std::fs::write(&image, &bytes).expect("write changed backup GPT test image");
+        let error = validate_esp_filesystem(&image, partition, &backup)
+            .expect_err("backup GPT modification must fail");
+        assert!(error.contains("modified backup GPT"));
+
+        std::fs::remove_dir_all(directory).expect("remove ESP test directory");
     }
 
     #[test]
@@ -1295,6 +1687,44 @@ mod tests {
         .expect("valid image options");
         let platform = catalog().get("qemu-riscv64").expect("RISC-V QEMU").clone();
         assert!(options.formats(&platform).is_err());
+    }
+
+    #[test]
+    fn x86_low_ap_trampoline_keeps_the_platform_entry_segment() {
+        let catalog = catalog();
+        let platform = catalog.get("qemu-x86_64").expect("x86 QEMU platform");
+        let virtual_base = platform.link.virtual_base.get();
+        let physical_base = platform.link.physical_base.get();
+        let loads = [
+            (
+                virtual_base
+                    .wrapping_sub(physical_base)
+                    .wrapping_add(0x8000),
+                0x8000,
+                0x1000,
+                object::elf::PF_R | object::elf::PF_X,
+            ),
+            (
+                virtual_base,
+                physical_base,
+                0x1000,
+                object::elf::PF_R | object::elf::PF_X,
+            ),
+        ];
+        validate_kernel_load_layout(Path::new("kernel"), platform, virtual_base, &loads)
+            .expect("x86 AP trampoline plus entry segment is valid");
+
+        let mut missing_entry = loads;
+        missing_entry[1].1 = physical_base + 0x1000;
+        assert!(
+            validate_kernel_load_layout(
+                Path::new("kernel"),
+                platform,
+                virtual_base,
+                &missing_entry
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ cargo xtask build [--board <qemu|ls2k1000|visionfive2>] \
   [--target-dir target/loongarch64] [--features <列表>] \
   [--initramfs <cpio>]
 cargo xtask image [--platform <id> | --board <board> [--target <triple>]] \
-  [--format <elf|raw|uimage|all>] [--reuse-modules] [--no-build] \
+  [--format <elf|raw|uimage|efi|all>] [--reuse-modules] [--no-build] \
   [--objcopy <path>] [--mkimage <path>]
 cargo xtask clean
 ```
@@ -38,16 +38,23 @@ cargo xtask clean
 均存在，但不会推断它们是否与源码同步。所有子进程共享 `target/<arch>` 和
 `build/elm-interface/<arch>`，以复用公共依赖的指纹与接口快照。
 
-`--board` 同时选择板卡允许的 target、板级默认配置和隔离产物路径：
+`--board` 同时选择板卡允许的 target、板级默认配置和隔离产物路径。QEMU 还可以通过
+`--platform qemu-x86_64` 或 `--target x86_64-unknown-none` 选择 x86_64 higher-half
+布局。Multiboot2 入口和独立 UEFI loader 会复制、校验启动协议数据，再交给通用
+`StartContext`；Linux boot protocol 当前提供严格解析与上下文构造接口，不宣称已有可执行
+handover 入口。
+
+平台选择表：
 
 | board | 默认 target | 未指定 `--config` | 默认产物前缀 |
 | --- | --- | --- | --- |
-| `qemu` | `loongarch64-unknown-none` | `configs/qemu.config` | `target/<arch>`、`build/<arch>` |
+| `qemu` | `loongarch64-unknown-none`（可选 `riscv64gc-unknown-none-elf`、`x86_64-unknown-none`） | `configs/qemu.config` 或 `configs/qemu-x86_64.config` | `target/<arch>`、`build/<arch>` |
 | `ls2k1000` | `loongarch64-unknown-none` | `configs/ls2k1000.config` | `target/loongarch64/ls2k1000`、`build/loongarch64/ls2k1000` |
 | `visionfive2` | `riscv64gc-unknown-none-elf` | `configs/visionfive2.config` | `target/riscv64/visionfive2`、`build/riscv64/visionfive2` |
 
 物理板的 Kernel API Profile 也按板卡放在 `build/elm-interface/<arch>/<board>`。
-`qemu` 保持原有架构级产物路径兼容，并可显式选择两个受支持 target；其默认 preset 将
+`qemu` 保持原有架构级产物路径兼容，并可显式选择 LoongArch64、RISC-V64 和 x86_64
+三个受支持 target；其默认 preset 将
 QEMU virt 的固件、IRQ、RTC、PCI、控制台和 VirtIO 块/网驱动全部内建。物理板与错误架构
 组合会在启动 Cargo 前失败。xtask 从 `configs/platforms.toml` 解析平台，向 Cargo 传递唯一的
 `HITOSHIZUKU_PLATFORM=<id>`；链接脚本不再读取板卡专用环境变量。
@@ -62,13 +69,16 @@ cargo xtask image --board visionfive2
 ```
 
 `image` 默认刷新模块并完成内核构建；`--reuse-modules` 仅复用经过完整性校验的现有模块
-产物，`--no-build` 则完全跳过构建，只校验和封装已有 Cargo ELF。QEMU 平台默认
-发布 `kernel.elf`，物理板默认发布 `kernel.elf`、`kernel.bin` 和 `uImage`。内核载荷
+产物，`--no-build` 跳过内核与 ELM 构建，只校验和封装已有 Cargo ELF。选择 `efi` 时仍会
+构建独立的 `x86_64-unknown-uefi` loader。LoongArch/RISC-V QEMU 默认发布
+`kernel.elf`，x86_64 QEMU 默认发布 `kernel.elf` 与 `kernel.bin`，物理板默认发布
+`kernel.elf`、`kernel.bin` 和 `uImage`。x86_64 显式选择 `--format efi` 会生成 GPT/FAT
+`esp.img`，其中包含 `EFI/BOOT/BOOTX64.EFI` 与 `EFI/HITOSHI/KERNEL.ELF`。内核载荷
 封装属于本仓库构建流程；ELF 中的平台 provenance tag 必须与请求平台一致，不能通过
-`--target-dir` 混用另一块板的内核。rootfs、磁盘镜像和 initramfs 内容仍由外部工程提供。
+`--target-dir` 混用另一块板的内核。rootfs 与 initramfs 内容仍由外部工程提供。
 
-默认目标是 `loongarch64-unknown-none`，另一个受支持目标是
-`riscv64gc-unknown-none-elf`。`--initramfs` 只接收已经生成的 CPIO 镜像；本仓库不负责
+默认目标是 `loongarch64-unknown-none`；另外支持 `riscv64gc-unknown-none-elf`，QEMU
+还支持 `x86_64-unknown-none`。`--initramfs` 只接收已经生成的 CPIO 镜像；本仓库不负责
 制作 rootfs。
 
 执行 `cargo xtask` 的当前目录必须是内核仓库根目录。跨目录调用 `cargo-elm` 时设置

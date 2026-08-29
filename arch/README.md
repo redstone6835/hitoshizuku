@@ -1,8 +1,8 @@
 # arch：架构实现
 
 `arch/` 提供内核依赖的架构相关实现，不负责设备策略和通用资源管理。当前包含
-LoongArch64 与 RISC-V64 的启动入口、异常/中断分发、页表、上下文切换、VDSO 和
-架构测试。
+x86_64、LoongArch64 与 RISC-V64 的启动入口、异常/中断分发、页表、上下文切换、VDSO
+和架构测试。
 
 ## 边界
 
@@ -16,6 +16,7 @@ LoongArch64 与 RISC-V64 的启动入口、异常/中断分发、页表、上下
 ```sh
 cargo check -p arch --target loongarch64-unknown-none
 cargo check -p arch --target riscv64gc-unknown-none-elf
+cargo check -p arch --target x86_64-unknown-none
 cargo test -p arch --target x86_64-unknown-linux-gnu
 ```
 

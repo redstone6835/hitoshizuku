@@ -208,10 +208,19 @@ pub fn fadt_closure(table: &[u8]) -> Result<Option<AcpiFadtClosure>, &'static st
     // Rust's reference validity rules before the crate could inspect the revision.
     let firmware_ctrl = read_u32_le(table, 36).unwrap_or(0) as usize;
     let dsdt = read_u32_le(table, 40).unwrap_or(0) as usize;
-    let x_firmware_ctrl = read_u64_le(table, 132)
+    // X_FIRMWARE_CTRL/X_DSDT were added with the ACPI 2.0 FADT.  A legacy
+    // revision may legally be followed by padding in a snapshot, but those
+    // bytes are not part of its schema and must not override the 32-bit
+    // closure pointers.
+    let has_extended_fields = table.get(8).copied().is_some_and(|revision| revision >= 2);
+    let x_firmware_ctrl = has_extended_fields
+        .then(|| read_u64_le(table, 132))
+        .flatten()
         .and_then(|address| usize::try_from(address).ok())
         .unwrap_or(0);
-    let x_dsdt = read_u64_le(table, 140)
+    let x_dsdt = has_extended_fields
+        .then(|| read_u64_le(table, 140))
+        .flatten()
         .and_then(|address| usize::try_from(address).ok())
         .unwrap_or(0);
 

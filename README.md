@@ -7,7 +7,7 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-2024-dea584?logo=rust&logoColor=white" alt="Rust 2024"></a>
-  <a href="#支持的目标"><img src="https://img.shields.io/badge/arch-LoongArch64%20%7C%20RISC--V64-2f6f8f" alt="LoongArch64 and RISC-V64"></a>
+  <a href="#支持的目标"><img src="https://img.shields.io/badge/arch-x86__64%20%7C%20LoongArch64%20%7C%20RISC--V64-2f6f8f" alt="x86_64, LoongArch64 and RISC-V64"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPLv3-2f7d32" alt="GPLv3"></a>
   <a href="https://github.com/rust-lang/rust"><img src="https://img.shields.io/badge/no__std-kernel-8b5cf6" alt="no_std kernel"></a>
 </p>
@@ -25,7 +25,7 @@
 | 网络栈 | `net.stack` ELM 按协议 shard 固定 owner worker；每份协议状态由 `FlowExecution` generation 租约保证单写者。 |
 | 语言拓展 | 默认集成 `language.runtime`，以固定 ABI、owner generation 和有界异步队列承接未来外部语言 backend；loader 不识别语言。 |
 | 测试方法 | RISC-V QEMU 画像结合配对微基准、Huber IRLS、分层 ridge、moving-block bootstrap 和 blocked CV。 |
-| 目标架构 | LoongArch64 与 RISC-V64；构建使用系统默认 Rust 工具链，不提交或强制指定 `rust-toolchain.toml`。 |
+| 目标架构 | x86_64、LoongArch64 与 RISC-V64；构建使用系统默认 Rust 工具链，不提交或强制指定 `rust-toolchain.toml`。 |
 
 ## 亮点
 
@@ -125,6 +125,7 @@ drivers/    项目自有硬件驱动与 ELM；由 Modules.toml 选择集成方�
 
 ## 支持的目标
 
+- `x86_64-unknown-none`
 - `loongarch64-unknown-none`
 - `riscv64gc-unknown-none-elf`
 
@@ -145,16 +146,21 @@ git clone https://github.com/redstone6835/hitoshizuku.git ~/src/hitoshizuku
 cd ~/src/hitoshizuku
 rustup target add loongarch64-unknown-none
 rustup target add riscv64gc-unknown-none-elf
+rustup target add x86_64-unknown-none
+rustup target add x86_64-unknown-uefi
 cargo install --locked --git \
   https://github.com/redstone6835/hitoshizuku-elm-tools cargo-elm
 ```
 
 不要在仓库中创建或提交 `rust-toolchain.toml`；Rust 版本由开发者的默认工具链管理。
-仓库的 [`.cargo/config.toml`](.cargo/config.toml) 目前分别调用
-`loongarch64-linux-gnu-gcc` 和 `riscv64-linux-gnu-gcc` 编译 EFI 的少量 freestanding C
-辅助代码。C 编译器名称不需要与 Rust target triple 相同；构建 RISC-V 内核不要求把
-`riscv64-unknown-elf-gcc` 伪装或链接成其它命令。SOYO 的 C header 集成测试位于独立
-链接器仓库，需要时再安装 `clang`。
+仓库的 [`.cargo/config.toml`](.cargo/config.toml) 调用
+`loongarch64-linux-gnu-gcc`、`riscv64-linux-gnu-gcc` 或主机 `cc` 编译 EFI 的少量
+freestanding C 辅助代码。C 编译器名称不需要与 Rust target triple 相同；构建 RISC-V
+内核不要求把 `riscv64-unknown-elf-gcc` 伪装或链接成其它命令。SOYO 的 C header 集成
+测试位于独立链接器仓库，需要时再安装 `clang`。
+
+制作 x86_64 UEFI 系统分区还需要 `parted` 与 mtools（`mformat`、`mmd`、`mcopy`）；
+OVMF 只用于本地 QEMU 固件启动验证，不参与内核或 PE32+ loader 的编译。
 
 ACPI 的 AML 解释器使用 crates.io 发布的 `aml 0.16.4`。该版本仍以
 `#![feature(decl_macro)]` 实现解析宏，因此 `.cargo/config.toml` 将
@@ -204,6 +210,7 @@ export HITOSHIZUKU_KERNEL_ROOT=$HOME/src/hitoshizuku
 cargo xtask defconfig
 cargo xtask modules --target loongarch64-unknown-none
 cargo xtask build --target loongarch64-unknown-none
+cargo xtask image --platform qemu-x86_64 --format elf
 ```
 
 `defconfig` 恢复 [`configs/default.config`](configs/default.config)；需要交互修改时改用
@@ -212,17 +219,23 @@ cargo xtask build --target loongarch64-unknown-none
 
 `xtask modules` 会先构建用于接口导出的 kernel，生成
 `build/elm-interface/loongarch64` 下的 Kernel API Profile，再按 `.config` 构建 `y/m/n`
-模块集合。`xtask build` 消费已有模块清单和集成归档完成最终 ELF 链接；仅当对应模块清单
-尚不存在时，它才先补跑 `modules`。两个步骤共用 `target/loongarch64` 缓存。Cargo 内部
-ELF 位于：
+模块集合。`xtask build` 默认会刷新同一构建上下文的 Profile 和模块清单后完成最终 ELF
+链接；明确确认模块产物与源码匹配时，才使用 `--reuse-modules` 跳过刷新。两个步骤共用
+`target/loongarch64` 缓存。Cargo 内部 ELF 位于：
 
 ```text
 target/loongarch64/loongarch64-unknown-none/release/kernel
 ```
 
+x86_64 QEMU 构建使用 higher-half ELF 布局，产物位于
+`target/x86_64/x86_64-unknown-none/release/kernel`；可用 `cargo xtask image
+--platform qemu-x86_64 --format elf` 复制并校验为 `build/x86_64/kernel.elf`。该 ELF
+可由 Multiboot2 loader 直接装载；`--format efi` 还会构建独立的 PE32+
+`BOOTX64.EFI`，并将它和 `KERNEL.ELF` 封装进 `build/x86_64/esp.img`。
+
 需要可部署产物时运行 `cargo xtask image --board <board>`。该命令按
-[`configs/platforms.toml`](configs/platforms.toml) 校验 ELF，并发布 `kernel.elf`、
-`kernel.bin` 或 `uImage`；它不制作 rootfs 或磁盘镜像。
+[`configs/platforms.toml`](configs/platforms.toml) 校验 ELF，并按平台发布
+`kernel.elf`、`kernel.bin`、`uImage` 或 x86_64 UEFI ESP；它不制作 rootfs。
 
 ### 4. 运行测试和外部工具
 
@@ -232,8 +245,8 @@ LLVM_NM=/usr/bin/nm scripts/test-kcsan-codegen.sh
 ```
 
 Native、SOYO 和性能工具使用独立 checkout；它们的安装和环境变量约定见
-[`REPOSITORY_LAYOUT.md`](REPOSITORY_LAYOUT.md)。本仓库不生成 initramfs、BusyBox、
-rootfs 或磁盘镜像；需要嵌入 initramfs 时，把外部工程生成的 CPIO 显式传给
+[`REPOSITORY_LAYOUT.md`](REPOSITORY_LAYOUT.md)。本仓库不生成 initramfs、BusyBox 或
+rootfs；需要嵌入 initramfs 时，把外部工程生成的 CPIO 显式传给
 `cargo xtask build --initramfs <cpio>`。
 
 其他常用命令：

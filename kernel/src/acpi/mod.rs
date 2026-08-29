@@ -16,8 +16,9 @@ use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::{mem, slice};
 
+use acpi::sdt::{SdtHeader, Signature};
 use acpi::spcr::SpcrInterfaceType;
-use acpi::{AcpiHandler, PhysicalMapping};
+use acpi::{AcpiHandler, AcpiTable, PhysicalMapping};
 use aml::value::{Args, StatusObject};
 use aml::{AmlContext, AmlError, AmlName, AmlValue, DebugVerbosity, LevelType};
 
@@ -49,6 +50,7 @@ const ACPI_HID_PNP0A03: &str = "PNP0A03";
 const ACPI_HID_PNP0A08: &str = "PNP0A08";
 const ACPI_HID_PNP0C0F: &str = "PNP0C0F";
 const ACPI_HID_VIRTIO_MMIO: &str = "LNRO0005";
+const ACPI_HID_QEMU_FW_CFG: &str = "QEMU0002";
 const EFI_MEMORY_WC: u64 = 1 << 1;
 const EFI_MEMORY_ATTRIBUTES_ALLOWED: u64 =
     0x0000_0000_0000_001f | 0x0000_0000_000f_f000 | 0x8000_0000_0000_0000;
@@ -93,6 +95,13 @@ impl AcpiMapper {
             "[kernel-start][acpi] table range {:#x}+{:#x} is absent from the immutable snapshot",
             physical_address, size
         )
+    }
+
+    #[inline]
+    fn try_resolve_table(&self, physical_address: usize, size: usize) -> Option<usize> {
+        self.copied_tables
+            .iter()
+            .find_map(|mapping| mapping.resolve(physical_address, size))
     }
 
     #[inline]
@@ -196,12 +205,19 @@ impl AcpiMapper {
                 &[]
             };
             payload.chunks_exact(16).filter(|entry| {
-                read_uint_le(entry, 0, 8).is_some_and(|base| {
+                let base = read_uint_le(entry, 0, 8);
+                let buses = entry.get(10).zip(entry.get(11));
+                let range_valid = buses.is_some_and(|(start, end)| {
+                    start <= end
+                        && base.is_some_and(|base| {
+                            let end = u64::from(*end).saturating_add(1) << 20;
+                            base.checked_add(end)
+                                .is_some_and(|end| usize::try_from(end).is_ok())
+                        })
+                });
+                base.is_some_and(|base| {
                     base != 0 && base & ((1 << 20) - 1) == 0 && usize::try_from(base).is_ok()
-                }) && entry
-                    .get(10)
-                    .zip(entry.get(11))
-                    .is_some_and(|(start, end)| start <= end)
+                }) && range_valid
                     && entry
                         .get(12..16)
                         .is_some_and(|reserved| reserved.iter().all(|byte| *byte == 0))
@@ -517,6 +533,13 @@ struct FirmwareMmioDevice {
     resources: Vec<DeviceResource>,
 }
 
+#[derive(Clone)]
+struct FirmwareFwCfgDevice {
+    name: Box<str>,
+    path: Box<str>,
+    resources: Vec<DeviceResource>,
+}
+
 fn serial_register_properties(port: &SerialPortInfo) -> Vec<FirmwareProperty> {
     let mut properties = Vec::new();
     if let Some(reg_shift) = port.reg_shift {
@@ -625,6 +648,15 @@ pub fn kernel_start_init(context: &StartContext) {
         &memory_segments,
         context.memory.boot_map.regions(),
     );
+    if let Err(error) = hal::platform::initialize_acpi_interrupts(
+        platform_info.madt.as_ref(),
+        context.address.device_mmio_to_virt,
+    ) {
+        printk!(
+            "[kernel-start][acpi] failed to initialize platform IRQ domain: {:?}",
+            error
+        );
+    }
     let serial_device = serial_device_from_spcr(acpi.mappings, platform_info.madt.as_ref());
     let console_serial_port = serial_device
         .as_ref()
@@ -673,11 +705,13 @@ pub fn kernel_start_init(context: &StartContext) {
 
     let mut serial_devices: Vec<FirmwareSerialDevice> = Vec::new();
     let mut virtio_mmio_devices: Vec<FirmwareMmioDevice> = Vec::new();
+    let mut fw_cfg_devices: Vec<FirmwareFwCfgDevice> = Vec::new();
     let mut pci_roots: Vec<pci::AcpiPciRootBridge> = Vec::new();
     discover_acpi_namespace_devices(
         aml_runtime.as_mut(),
         &mut serial_devices,
         &mut virtio_mmio_devices,
+        &mut fw_cfg_devices,
         &mut pci_roots,
         &platform_info.pci_config_regions,
     );
@@ -716,9 +750,10 @@ pub fn kernel_start_init(context: &StartContext) {
     });
 
     printk!(
-        "[kernel-start][acpi] device discovery complete: {} uart(s), {} virtio block candidate(s), {} PCI root(s)",
+        "[kernel-start][acpi] device discovery complete: {} uart(s), {} virtio block candidate(s), {} fw_cfg candidate(s), {} PCI root(s)",
         serial_devices.len(),
         virtio_mmio_devices.len(),
+        fw_cfg_devices.len(),
         pci_roots.len()
     );
 
@@ -835,9 +870,28 @@ pub fn kernel_start_init(context: &StartContext) {
             platform_bound += 1;
         }
     }
+    for device in &fw_cfg_devices {
+        let info = PlatformDeviceInfo {
+            fw_name: device.name.clone(),
+            fw_path: Some(device.path.clone()),
+            fw_parent_path: None,
+            ids: alloc::vec![DeviceMatchId::AcpiHid(ACPI_HID_QEMU_FW_CFG.into())],
+            resources: device.resources.clone(),
+            irq_names: Vec::new(),
+            properties: DeviceProperties::default(),
+            fw_properties: Vec::new(),
+            dma: DmaContext::default_coherent(),
+            dtb_bindings: None,
+            dtb_pcie_host: None,
+            dtb_owned_nodes: None,
+        };
+        if register_platform_device(info, "acpi") {
+            platform_bound += 1;
+        }
+    }
     printk!(
         "[kernel-start][acpi] platform PnP discovery complete: {} candidate(s), {} bound",
-        serial_devices.len() + virtio_mmio_devices.len(),
+        serial_devices.len() + virtio_mmio_devices.len() + fw_cfg_devices.len(),
         platform_bound
     );
 
@@ -955,6 +1009,7 @@ fn discover_acpi_namespace_devices(
     runtime: Option<&mut AmlRuntime>,
     serial_devices: &mut Vec<FirmwareSerialDevice>,
     virtio_mmio_devices: &mut Vec<FirmwareMmioDevice>,
+    fw_cfg_devices: &mut Vec<FirmwareFwCfgDevice>,
     pci_roots: &mut Vec<pci::AcpiPciRootBridge>,
     mcfg_regions: &[general::firmware::acpi::AcpiPciConfigRegion],
 ) {
@@ -991,10 +1046,11 @@ fn discover_acpi_namespace_devices(
             .iter()
             .any(|id| id == ACPI_HID_PNP0500 || id == ACPI_HID_PNP0501);
         let is_virtio_mmio = ids.iter().any(|id| id == ACPI_HID_VIRTIO_MMIO);
+        let is_fw_cfg = ids.iter().any(|id| id == ACPI_HID_QEMU_FW_CFG);
         let is_pci_root = ids
             .iter()
             .any(|id| id == ACPI_HID_PNP0A03 || id == ACPI_HID_PNP0A08);
-        if !is_serial && !is_virtio_mmio && !is_pci_root {
+        if !is_serial && !is_virtio_mmio && !is_fw_cfg && !is_pci_root {
             continue;
         }
 
@@ -1042,7 +1098,37 @@ fn discover_acpi_namespace_devices(
         let resources = acpi_device_resources(runtime, &path);
 
         let name = alloc::format!("{}", path).leak();
-        if is_serial {
+        if is_fw_cfg {
+            let Some((base, size)) = qemu_fw_cfg_system_io_resource(&resources) else {
+                printk!(
+                    "[kernel-start][acpi] QEMU fw_cfg {} has no usable SystemIO selector/data window",
+                    path_string
+                );
+                continue;
+            };
+            if fw_cfg_devices.iter().any(|device| {
+                qemu_fw_cfg_system_io_resource(&device.resources)
+                    .is_some_and(|(existing_base, _)| existing_base == base)
+            }) {
+                printk!(
+                    "[kernel-start][acpi] ignored duplicate QEMU fw_cfg {} io={:#x}",
+                    path_string,
+                    base
+                );
+                continue;
+            }
+            printk!(
+                "[kernel-start][acpi] namespace QEMU fw_cfg: {} io={:#x} size={:#x}",
+                path_string,
+                base,
+                size
+            );
+            fw_cfg_devices.push(FirmwareFwCfgDevice {
+                name: name.into(),
+                path: path_string.into_boxed_str(),
+                resources,
+            });
+        } else if is_serial {
             let location = first_mmio_resource(&resources)
                 .filter(|&(_, size)| size != 0)
                 .map(|(address, size)| (FirmwareRegisterSpace::SystemMemory, address, size))
@@ -1110,14 +1196,27 @@ fn discover_acpi_namespace_devices(
     }
 }
 
+fn qemu_fw_cfg_system_io_resource(resources: &[DeviceResource]) -> Option<(u16, u16)> {
+    let (base, size) = resources.iter().find_map(DeviceResource::as_io_port)?;
+    let end = base.checked_add(size.checked_sub(1)?)?;
+    (size >= 2 && base & 1 == 0 && base.checked_add(1).is_some_and(|data| data <= end))
+        .then_some((base, size))
+}
+
 fn build_aml_runtime(
     mapper: AcpiMapper,
     tables: &acpi::AcpiTables<AcpiMapper>,
 ) -> Option<AmlRuntime> {
-    let dsdt = match tables.dsdt() {
-        Ok(dsdt) => dsdt,
-        Err(err) => {
-            printk!("[kernel-start][acpi] DSDT unavailable: {:?}", err);
+    // Do not call `AcpiTables::dsdt()` here.  acpi 5.x represents FADT as a
+    // fixed-size packed Rust struct; `find_table::<Fadt>()` can therefore create
+    // a reference whose backing mapping is only an ACPI 1.0 (116-byte) table.
+    // Reading its extended fields is undefined for a short, otherwise valid,
+    // legacy FADT.  Resolve the closure and DSDT header from checked bytes
+    // instead, then expose only the AML payload to the interpreter.
+    let dsdt = match find_dsdt_aml_table(mapper, tables) {
+        Some(dsdt) => dsdt,
+        None => {
+            printk!("[kernel-start][acpi] DSDT unavailable or malformed");
             return None;
         }
     };
@@ -1152,6 +1251,66 @@ fn build_aml_runtime(
     let mut runtime = AmlRuntime { context };
     initialize_aml_namespace(&mut runtime);
     Some(runtime)
+}
+
+const ACPI_SDT_HEADER_SIZE: usize = 36;
+const ACPI_MAX_TABLE_SIZE: usize = 1024 * 1024;
+
+#[repr(transparent)]
+struct RawFadtHeader {
+    header: SdtHeader,
+}
+
+// SAFETY: only the common SDT header is represented; variable FADT fields are
+// consumed through the checked byte parser below.
+unsafe impl AcpiTable for RawFadtHeader {
+    const SIGNATURE: Signature = Signature::FADT;
+
+    fn header(&self) -> &SdtHeader {
+        &self.header
+    }
+}
+
+fn find_dsdt_aml_table(
+    mapper: AcpiMapper,
+    tables: &acpi::AcpiTables<AcpiMapper>,
+) -> Option<acpi::AmlTable> {
+    let fadt = match tables.find_table::<RawFadtHeader>() {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            printk!("[kernel-start][acpi] FADT unavailable: {:?}", error);
+            return None;
+        }
+    };
+    let fadt_bytes = unsafe {
+        slice::from_raw_parts(
+            fadt.virtual_start().as_ptr().cast::<u8>(),
+            fadt.region_length(),
+        )
+    };
+    let closure = general::firmware::acpi::fadt_closure(fadt_bytes)
+        .ok()
+        .flatten()?;
+    let dsdt_phys = closure.dsdt_phys?;
+    let header_virtual = mapper.try_resolve_table(dsdt_phys, ACPI_SDT_HEADER_SIZE)?;
+    let header =
+        unsafe { slice::from_raw_parts(header_virtual as *const u8, ACPI_SDT_HEADER_SIZE) };
+    if header.get(..4) != Some(b"DSDT") {
+        return None;
+    }
+    let length = read_u32_le(header, 4)? as usize;
+    if !(ACPI_SDT_HEADER_SIZE..=ACPI_MAX_TABLE_SIZE).contains(&length) {
+        return None;
+    }
+    let table_virtual = mapper.try_resolve_table(dsdt_phys, length)?;
+    let table = unsafe { slice::from_raw_parts(table_virtual as *const u8, length) };
+    general::firmware::acpi::validate_sdt(table).ok()?;
+    let address = dsdt_phys.checked_add(ACPI_SDT_HEADER_SIZE)?;
+    let payload_length = u32::try_from(length - ACPI_SDT_HEADER_SIZE).ok()?;
+    Some(acpi::AmlTable {
+        address,
+        length: payload_length,
+    })
 }
 
 fn initialize_aml_namespace(runtime: &mut AmlRuntime) {
@@ -2831,8 +2990,47 @@ fn power_register_from_acpi_gas(
     };
     let access_width = PowerAccessWidth::from_bits(gas.bit_width, gas.access_size)?;
     let address = match space {
-        PowerRegisterSpace::PciConfig { .. } => usize::from(gas.address as u16),
-        _ => usize::try_from(gas.address).ok()?,
+        PowerRegisterSpace::PciConfig { .. } => {
+            if access_width == PowerAccessWidth::U64
+                || gas.address >> 48 != 0
+                || ((gas.address >> 32) & 0xffff) >= 32
+                || ((gas.address >> 16) & 0xffff) >= 8
+            {
+                return None;
+            }
+            let offset = usize::from(gas.address as u16);
+            if !offset.is_multiple_of(access_width.bytes())
+                || offset
+                    .checked_add(access_width.bytes())
+                    .is_none_or(|end| end > 4096)
+            {
+                return None;
+            }
+            offset
+        }
+        PowerRegisterSpace::SystemIo => {
+            if access_width == PowerAccessWidth::U64 {
+                return None;
+            }
+            let port = usize::try_from(gas.address).ok()?;
+            if port > usize::from(u16::MAX)
+                || port
+                    .checked_add(access_width.bytes())
+                    .is_none_or(|end| end > usize::from(u16::MAX) + 1)
+            {
+                return None;
+            }
+            port
+        }
+        PowerRegisterSpace::SystemMemory => {
+            let address = usize::try_from(gas.address).ok()?;
+            if !address.is_multiple_of(access_width.bytes())
+                || address.checked_add(access_width.bytes() - 1).is_none()
+            {
+                return None;
+            }
+            address
+        }
     };
     Some(PowerRegister {
         space,
@@ -3246,6 +3444,19 @@ mod tests {
         ));
         assert_eq!(resources.len(), 1);
 
+        // ACPI Table 6.28 marks information bits 2:1 as ignored.  They must
+        // not make an otherwise valid edge/high IRQ descriptor fail parsing.
+        resources.clear();
+        assert!(parse_small_irq_resource(
+            &[0x20, 0x00, 0x03],
+            &mut resources
+        ));
+        assert!(parse_small_irq_resource(
+            &[0x20, 0x00, 0x05],
+            &mut resources
+        ));
+        assert_eq!(resources.len(), 2);
+
         resources.clear();
         assert!(!parse_extended_irq_resource(
             &[0x01, 0x02, 1, 0, 0, 0, 2, 0, 0, 0],
@@ -3323,6 +3534,25 @@ mod tests {
         assert!(complete);
         assert_eq!(resources.len(), 1);
         assert_eq!(resources[0].as_io_port(), Some((0x03f8, 8)));
+    }
+
+    #[ktest]
+    fn recognizes_qemu_fw_cfg_system_io_resource() {
+        // IO(Decode16, 0x0510, 0x0510, 1, 2), followed by EndTag.
+        let template = [0x47, 0x01, 0x10, 0x05, 0x10, 0x05, 0x01, 0x02, 0x79, 0x00];
+        let (resources, complete) = parse_resource_template(&template);
+        assert!(complete);
+        assert_eq!(
+            qemu_fw_cfg_system_io_resource(&resources),
+            Some((0x0510, 2))
+        );
+
+        let short = [DeviceResource::io_port(0x0510, 1)];
+        let unaligned = [DeviceResource::io_port(0x0511, 2)];
+        let wrapping = [DeviceResource::io_port(0xfffe, 3)];
+        assert_eq!(qemu_fw_cfg_system_io_resource(&short), None);
+        assert_eq!(qemu_fw_cfg_system_io_resource(&unaligned), None);
+        assert_eq!(qemu_fw_cfg_system_io_resource(&wrapping), None);
     }
 
     #[ktest]

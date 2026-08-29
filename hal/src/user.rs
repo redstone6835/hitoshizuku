@@ -26,6 +26,13 @@ pub fn default_stack_top() -> usize {
             .expect("[hal] user VM layout is not registered")
             .default_stack_top
     }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .default_stack_top
+    }
 }
 
 /// 默认用户栈大小。
@@ -39,6 +46,13 @@ pub fn default_stack_size() -> usize {
     }
 
     #[cfg(target_arch = "riscv64")]
+    {
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .default_stack_size
+    }
+
+    #[cfg(target_arch = "x86_64")]
     {
         general::mm::user_vm_layout()
             .expect("[hal] user VM layout is not registered")
@@ -62,6 +76,13 @@ pub fn main_pie_base() -> usize {
             .expect("[hal] user VM layout is not registered")
             .main_pie_base
     }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .main_pie_base
+    }
 }
 
 /// ELF interpreter 默认装载基址。
@@ -75,6 +96,13 @@ pub fn interp_base() -> usize {
     }
 
     #[cfg(target_arch = "riscv64")]
+    {
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .interp_base
+    }
+
+    #[cfg(target_arch = "x86_64")]
     {
         general::mm::user_vm_layout()
             .expect("[hal] user VM layout is not registered")
@@ -98,6 +126,13 @@ pub fn vdso_base() -> usize {
             .expect("[hal] user VM layout is not registered")
             .vdso_base
     }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .vdso_base
+    }
 }
 
 /// vDSO 数据页偏移。
@@ -111,6 +146,11 @@ pub fn vdso_data_page_offset() -> usize {
     #[cfg(target_arch = "riscv64")]
     {
         arch::riscv64::vdso::VDSO_DATA_PAGE_OFFSET
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        arch::x86_64::vdso::VDSO_DATA_PAGE_OFFSET
     }
 }
 
@@ -126,6 +166,11 @@ pub fn vdso_text_page_len() -> usize {
     {
         arch::riscv64::vdso::VDSO_TEXT_PAGE_SIZE
     }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        arch::x86_64::vdso::VDSO_TEXT_PAGE_SIZE
+    }
 }
 
 /// vDSO 总映射长度。
@@ -139,6 +184,11 @@ pub fn vdso_total_size() -> usize {
     #[cfg(target_arch = "riscv64")]
     {
         arch::riscv64::vdso::VDSO_TOTAL_SIZE
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        arch::x86_64::vdso::VDSO_TOTAL_SIZE
     }
 }
 
@@ -154,6 +204,11 @@ pub fn vdso_image() -> alloc::vec::Vec<u8> {
     {
         arch::riscv64::vdso::vdso_image()
     }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        arch::x86_64::vdso::vdso_image()
+    }
 }
 
 /// vDSO 中 sigreturn trampoline 的用户态虚拟地址。
@@ -168,6 +223,65 @@ pub fn sigreturn_entry_va() -> usize {
     {
         vdso_base() + arch::riscv64::vdso::sigreturn_entry_offset()
     }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        vdso_base() + arch::x86_64::vdso::sigreturn_entry_offset()
+    }
+}
+
+/// 用户信号处理函数返回地址在栈上占用的前缀长度。
+///
+/// RISC-V/LoongArch 使用 link register，通用信号投递路径可以把 restorer
+/// 放入该寄存器；x86-64 没有 link register，Linux ABI 则要求调用者栈顶
+/// 先保存返回地址。因此这项差异必须留在 HAL，kernel 只消费尺寸和编码结果。
+pub const fn signal_return_prefix_size() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        core::mem::size_of::<usize>()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+}
+
+/// 从 signal handler 入口观察到的 `%rsp` 对齐余数。
+///
+/// x86-64 signal delivery synthesizes a call frame by placing the restorer at
+/// the stack top.  SysV therefore requires the handler to observe
+/// `RSP % 16 == 8`; link-register architectures have no stack return word.
+pub const fn signal_handler_stack_entry_bias() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        core::mem::size_of::<usize>()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+}
+
+/// 将架构需要的 signal restorer 栈前缀编码到用户帧缓冲区。
+///
+/// 返回实际写入的字节数；link-register 架构返回 0。调用者可以用返回值
+/// 与 [`signal_return_prefix_size`] 做一致性断言，而不在 kernel 中引入
+/// `target_arch` 分支。
+pub fn encode_signal_return_prefix(restorer: usize, out: &mut [u8]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let size = core::mem::size_of::<usize>();
+        if out.len() < size {
+            return 0;
+        }
+        out[..size].copy_from_slice(&restorer.to_ne_bytes());
+        size
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (restorer, out);
+        0
+    }
 }
 
 /// 注册 LoongArch64 timer tick 时的 vDSO 数据页更新回调。
@@ -181,6 +295,11 @@ pub fn register_vdso_tick_hook(hook: fn(u64)) {
     #[cfg(target_arch = "riscv64")]
     {
         arch::riscv64::vdso::register_timer_tick_hook(hook);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        arch::x86_64::vdso::register_timer_tick_hook(hook);
     }
 }
 
@@ -199,6 +318,11 @@ pub fn register_net_poll_hook(hook: fn(u64)) {
     {
         arch::riscv64::vdso::register_net_poll_hook(hook);
     }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        arch::x86_64::vdso::register_net_poll_hook(hook);
+    }
 }
 
 /// 注册 timer tick 时的 TTY 输入泵回调。
@@ -215,6 +339,11 @@ pub fn register_tty_poll_hook(hook: fn(u64)) {
     #[cfg(target_arch = "riscv64")]
     {
         arch::riscv64::vdso::register_tty_poll_hook(hook);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        arch::x86_64::vdso::register_tty_poll_hook(hook);
     }
 }
 
@@ -320,6 +449,11 @@ pub unsafe fn enter_user_mode(
     {
         unsafe { riscv64_enter_user_mode(entry_pc, user_sp, arg0, kernel_stack_top) }
     }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { x86_64_enter_user_mode(entry_pc, user_sp, arg0, kernel_stack_top) }
+    }
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -359,4 +493,21 @@ unsafe fn riscv64_enter_user_mode(
     unsafe { core::ptr::addr_of_mut!(frame.kstack_top).write_volatile(kernel_stack_top) };
 
     unsafe { <arch::Riscv64TaskOps as TaskOps>::resume_to_trap_frame(frame_ptr) }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn x86_64_enter_user_mode(
+    entry_pc: usize,
+    user_sp: usize,
+    arg0: usize,
+    kernel_stack_top: usize,
+) -> ! {
+    use general::{TaskOps, TrapFramePtr};
+
+    <arch::X86_64TaskOps as TaskOps>::set_kernel_trap_stack(kernel_stack_top);
+    let mut frame = arch::TrapFrame::default();
+    let frame_ptr = TrapFramePtr::new(&mut frame as *mut _ as usize);
+    <arch::X86_64TaskOps as TaskOps>::init_user_trap_frame(frame_ptr, entry_pc, user_sp, arg0);
+    frame.kernel_stack_top = kernel_stack_top;
+    unsafe { <arch::X86_64TaskOps as TaskOps>::resume_to_trap_frame(frame_ptr) }
 }

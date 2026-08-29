@@ -39,7 +39,7 @@ for argument do
 done
 
 case "$target" in
-    loongarch64-unknown-none|riscv64gc-unknown-none-elf)
+    loongarch64-unknown-none|riscv64gc-unknown-none-elf|x86_64-unknown-none)
         if [ "$crate_name" != kcsan ]; then
             exec "$rustc" "$@" \
                 -Cpasses=forceattrs,tsan \

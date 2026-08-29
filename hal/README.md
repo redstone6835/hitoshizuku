@@ -20,4 +20,5 @@ HAL 接口应描述硬件能力，而不是某个设备驱动的策略。接口�
 ```sh
 cargo check -p hal --target loongarch64-unknown-none
 cargo check -p hal --target riscv64gc-unknown-none-elf
+cargo check -p hal --target x86_64-unknown-none
 ```

@@ -5897,8 +5897,13 @@ fn ptrace_target_frame(target: &Arc<Task>) -> Result<hal::user_context::UserTrap
 
 /// 写回目标 trap frame（POKEUSR 使用）。
 fn ptrace_store_frame(target: &Arc<Task>, frame: hal::user_context::UserTrapFrame) {
+    if frame.store_ptrace_task(target) {
+        return;
+    }
     let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(frame);
-    target.ext_install(sched::TASKEXT_USER_TRAP_FRAME, erased);
+    if let Err(erased) = target.ext_replace(sched::TASKEXT_USER_TRAP_FRAME, erased) {
+        target.ext_install(sched::TASKEXT_USER_TRAP_FRAME, erased);
+    }
 }
 
 /// `PTRACE_PEEKUSR`：按 ptrace 原始寄存器组布局读一个寄存器字。
@@ -5955,6 +5960,10 @@ fn ptrace_regset(
 
     const NT_PRSTATUS: usize = 1;
     const NT_FPREGSET: usize = 2;
+    // Linux x86_64 exposes the non-compacted XSAVE image as note type 0x202.
+    // HAL returns size 0 on other ISAs, keeping this dispatch architecture
+    // neutral while preserving their existing regsets.
+    const NT_X86_XSTATE: usize = 0x202;
 
     match note_type {
         NT_PRSTATUS => {
@@ -6019,6 +6028,30 @@ fn ptrace_regset(
                 copy_to_user(base, &out).map_err(|e| e.as_errno())?;
             }
             Ok(())
+        }
+        NT_X86_XSTATE => {
+            let size = hal::user_context::UserTrapFrame::linux_xstate_size();
+            if size == 0 {
+                return Err(Errno::EINVAL);
+            }
+            if set {
+                if len < size {
+                    return Err(Errno::EIO);
+                }
+                let mut input = alloc::vec![0u8; size];
+                copy_from_user(base, &mut input).map_err(|e| e.as_errno())?;
+                hal::user_context::UserTrapFrame::write_linux_xstate(target, &input)
+                    .then_some(())
+                    .ok_or(Errno::EIO)
+            } else {
+                if len < size {
+                    write_iov_len(iov_user, size)?;
+                    return Ok(());
+                }
+                let output = hal::user_context::UserTrapFrame::read_linux_xstate(target)
+                    .ok_or(Errno::EIO)?;
+                copy_to_user(base, &output).map_err(|e| e.as_errno())
+            }
         }
         _ => Err(Errno::EINVAL),
     }

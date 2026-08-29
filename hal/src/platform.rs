@@ -4,6 +4,66 @@ use core::ops::Range;
 
 use general::ArchitectureId;
 
+/// ACPI 中断控制器初始化失败的架构无关错误。
+///
+/// HAL 只转译架构后端的错误，具体的 APIC/IOAPIC 寄存器语义不泄漏到 kernel。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcpiInterruptInitError {
+    MissingMadt,
+    InvalidAddress,
+    InvalidGsiRange,
+    OverlappingGsiRange,
+    MappingUnavailable,
+    NoInterruptController,
+    AlreadyInitialized,
+    Registry,
+}
+
+/// 根据已解析的 ACPI MADT 安装平台默认 IRQ domain。
+///
+/// x86_64 后端会把 GSI/ISA override 映射到 IOAPIC/LAPIC；其它架构没有
+/// x86 IRQ domain，保持成功的 no-op，使通用 ACPI 初始化可以复用。
+pub fn initialize_acpi_interrupts(
+    madt: Option<&general::firmware::acpi::AcpiMadtInfo>,
+    device_mmio_to_virt: fn(usize) -> usize,
+) -> Result<(), AcpiInterruptInitError> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return arch::x86_64::apic::initialize_from_madt(madt, device_mmio_to_virt)
+            .map(|_| ())
+            .map_err(|error| match error {
+                arch::x86_64::apic::ApicInitError::MissingMadt => {
+                    AcpiInterruptInitError::MissingMadt
+                }
+                arch::x86_64::apic::ApicInitError::InvalidAddress => {
+                    AcpiInterruptInitError::InvalidAddress
+                }
+                arch::x86_64::apic::ApicInitError::InvalidGsiRange => {
+                    AcpiInterruptInitError::InvalidGsiRange
+                }
+                arch::x86_64::apic::ApicInitError::OverlappingGsiRange => {
+                    AcpiInterruptInitError::OverlappingGsiRange
+                }
+                arch::x86_64::apic::ApicInitError::MappingUnavailable => {
+                    AcpiInterruptInitError::MappingUnavailable
+                }
+                arch::x86_64::apic::ApicInitError::NoInterruptController => {
+                    AcpiInterruptInitError::NoInterruptController
+                }
+                arch::x86_64::apic::ApicInitError::AlreadyInitialized => {
+                    AcpiInterruptInitError::AlreadyInitialized
+                }
+                arch::x86_64::apic::ApicInitError::Registry => AcpiInterruptInitError::Registry,
+            });
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (madt, device_mmio_to_virt);
+        Ok(())
+    }
+}
+
 /// 把 Cargo 编译目标归一化为内核通用架构身份。
 ///
 /// 条件编译只存在于 HAL 胶水层；调用方不得再次按 `target_arch` 分叉。

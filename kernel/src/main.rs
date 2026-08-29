@@ -166,7 +166,7 @@ fn main() -> ! {
         kcsan_runtime::install();
         kcsan_runtime::start_reporter();
     }
-    device_init::install_network_boot_config();
+    let network_boot_ready = device_init::install_network_boot_config();
     let integrated =
         integrated_components::initialize_phase(integrated_components::IntegratedPhase::Runtime)
             .unwrap_or_else(|error| panic!("[kernel] 集成组件初始化失败: {error}"));
@@ -183,9 +183,15 @@ fn main() -> ! {
         log::info!("[kernel] activated {} BuildBound ELM(s)", build_bound);
     }
     net_stack::start_host();
-    // 网络 host 允许没有设备启动；BuildBound driver 已激活时会在此首次 attach，后续
-    // 动态装载则通过 ELM 管理路径触发 reconcile。
-    net_runtime::start_workers();
+    // 网络 host 允许没有设备启动；网络密钥或 stack 配置不可用时，保持 host
+    // 的无 stack 状态并继续启动 init，避免可选网络功能拖垮基本系统。
+    if network_boot_ready {
+        // BuildBound driver 已激活时会在此首次 attach，后续动态装载则通过 ELM
+        // 管理路径触发 reconcile。
+        net_runtime::start_workers();
+    } else {
+        log::warning!("[kernel] network runtime skipped; continuing without network workers");
+    }
     if device_init::retry_deferred_boot_console(&init) {
         log::info!("[kernel] deferred boot console activated after BuildBound loading");
     }

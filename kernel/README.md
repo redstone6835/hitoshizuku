@@ -18,6 +18,7 @@
 ```sh
 cargo xtask build --target loongarch64-unknown-none
 cargo xtask build --target riscv64gc-unknown-none-elf
+cargo xtask build --target x86_64-unknown-none
 ```
 
 直接构建只适合检查 Cargo 依赖；涉及 ELM 接口导出时应使用 `xtask`，以保证接口、

@@ -339,7 +339,13 @@ const SIGFRAME_TRAP_OFF: usize = SIGFRAME_UCONTEXT_OFF + SIGFRAME_UCONTEXT_SIZE;
 // 当前 LoongArch64 用户陷阱帧约 552 字节。信号路径不用堆分配，但也不能在
 // 64KiB 内核栈上放 16KiB 大对象；2KiB 给后续寄存器扩展留出余量。
 const SIGFRAME_TRAP_BUF_SIZE: usize = 2048;
-const SIGFRAME_STACK_BUF_SIZE: usize = SIGFRAME_TRAP_OFF + SIGFRAME_TRAP_BUF_SIZE;
+const SIGFRAME_XSTATE_ALIGN: usize = 64;
+const SIGFRAME_STACK_BUF_SIZE: usize =
+    SIGFRAME_TRAP_OFF + SIGFRAME_TRAP_BUF_SIZE + SIGFRAME_XSTATE_ALIGN + 4096 + 64;
+// x86-64 has a stack return-address prefix; link-register architectures use
+// zero bytes.  Keep a fixed upper bound for the stack scratch buffer while the
+// selected size remains an architecture-owned HAL decision.
+const SIGFRAME_RETURN_PREFIX_MAX: usize = core::mem::size_of::<usize>();
 
 fn task_vm_space(task: &Arc<Task>) -> Option<Arc<VmSpace>> {
     task.ext_lookup(TASKEXT_VM_SPACE)?
@@ -646,9 +652,37 @@ pub(crate) fn spawn_mq_notify_thread(registrant: &Arc<Task>, function: usize, va
         return;
     }
 
+    // Link-register architectures return through the trap-frame RA field.
+    // x86-64 follows the SysV ABI instead: the first user instruction must
+    // see a real return address at [RSP].  Keep the distinction in HAL and
+    // reserve the prefix at the top of the freshly allocated stack page.
+    let return_prefix = hal::user::signal_return_prefix_size();
+    if return_prefix > core::mem::size_of::<usize>() {
+        let _ = vm.unmap(stack_range);
+        return;
+    }
+    let entry_sp = match stack_range.end.checked_sub(return_prefix) {
+        Some(value) => value,
+        None => {
+            let _ = vm.unmap(stack_range);
+            return;
+        }
+    };
+    let mut return_bytes = [0u8; core::mem::size_of::<usize>()];
+    if hal::user::encode_signal_return_prefix(stub_addr, &mut return_bytes[..return_prefix])
+        != return_prefix
+        || (return_prefix != 0
+            && vm
+                .copy_user_bytes_out(entry_sp, &return_bytes[..return_prefix])
+                .is_err())
+    {
+        let _ = vm.unmap(stack_range);
+        return;
+    }
+
     let kernel_stack_top = child.ensure_kernel_stack();
-    let mut frame = UserTrapFrame::init_user(function, stack_range.end, value);
-    frame.set_ra(stub_addr);
+    let mut frame = UserTrapFrame::init_user(function, entry_sp, value);
+    frame.set_signal_return_address(stub_addr);
     frame.set_kernel_stack_top(kernel_stack_top);
     frame.set_current_address_space();
     child.set_comm(b"mq-notify");
@@ -752,7 +786,6 @@ fn process_sigreturn(task: &Arc<Task>, user_ctx: UserContextRef) -> Result<(), E
     let trap_off = read_u64(&header, 24) as usize;
     let trap_len = read_u64(&header, 32) as usize;
     let ucontext_off = read_u64(&header, 48) as usize;
-    let abi_pc = read_u64(&header, 56) as usize;
     let trap_end = trap_off.checked_add(trap_len).ok_or(Errno::EINVAL)?;
     let ucontext_mcontext = ucontext_off
         .checked_add(SIGFRAME_UCONTEXT_MCONTEXT_OFF)
@@ -795,17 +828,77 @@ fn process_sigreturn(task: &Arc<Task>, user_ctx: UserContextRef) -> Result<(), E
         &mut mcontext_storage,
     )
     .map_err(|e| e.as_errno())?;
-    let mcontext_pc = read_u64(&mcontext_storage, 0) as usize;
-    if mcontext_pc != abi_pc {
-        if !restored.apply_linux_mcontext(&mcontext_storage) {
+    let fpstate_ptr = read_u64(&mcontext_storage, 184) as usize;
+    let mut fpstate_storage = [0u8; 4096 + 64];
+    let fpstate = if fpstate_ptr == 0 {
+        None
+    } else {
+        let rel = fpstate_ptr.checked_sub(sp).ok_or(Errno::EINVAL)?;
+        // Linux requires the fpstate address itself to be XSAVE-aligned;
+        // the distance from the signal-frame SP includes the x86 return
+        // address prefix and therefore need not be a multiple of 64.
+        if fpstate_ptr % 64 != 0 || rel >= total {
             return Err(Errno::EINVAL);
         }
+        copy_from_user(fpstate_ptr, &mut fpstate_storage[..512]).map_err(|e| e.as_errno())?;
+        let size = hal::user_context::UserTrapFrame::linux_signal_xstate_size_from_prefix(
+            &fpstate_storage[..512],
+        )
+        .ok_or(Errno::EINVAL)?;
+        if rel.checked_add(size).ok_or(Errno::EINVAL)? > total {
+            return Err(Errno::EINVAL);
+        }
+        copy_from_user(fpstate_ptr, &mut fpstate_storage[..size]).map_err(|e| e.as_errno())?;
+        Some(&fpstate_storage[..size])
+    };
+    // `fpstate` is restored by the arch task-state hook, not by the compact
+    // generic mcontext decoder.  Clear the pointer before validation so the
+    // x86 HAL does not interpret an unowned user address as architectural state.
+    mcontext_storage[184..192].fill(0);
+    // `ucontext_t.uc_mcontext` is the signal ABI's authoritative register
+    // image.  Applying it only when PC changes loses legal edits to GP
+    // registers, flags or RSP made by a signal handler.
+    if !restored.apply_linux_mcontext(&mcontext_storage) {
+        return Err(Errno::EINVAL);
     }
     task.signal
         .block(SigSet::from_raw(restore_mask), SigProcMaskHow::SetMask);
     restored.apply_to_context(user_ctx.as_usize());
     hal::task_state::pop_signal_state(task, user_ctx.as_usize());
+    if let Some(fpstate) = fpstate
+        && !hal::user_context::UserTrapFrame::restore_linux_signal_xstate(
+            task,
+            user_ctx.as_usize(),
+            Some(fpstate),
+        )
+    {
+        return Err(Errno::EINVAL);
+    }
     Ok(())
+}
+
+fn signal_frame_stack_pointer(top: usize, stack_total: usize) -> Result<usize, Errno> {
+    let aligned = top.checked_sub(stack_total).ok_or(Errno::ENOMEM)? & !0xf;
+    aligned
+        .checked_sub(hal::user::signal_handler_stack_entry_bias())
+        .ok_or(Errno::ENOMEM)
+}
+
+#[cfg(feature = "kernel-tests")]
+mod signal_frame_layout_tests {
+    use ktest::ktest;
+
+    use super::signal_frame_stack_pointer;
+
+    #[ktest]
+    fn handler_stack_has_the_architecture_entry_alignment() {
+        let stack_total = 0x250;
+        let top = 0x20_000;
+        let sp = signal_frame_stack_pointer(top, stack_total).unwrap();
+
+        assert_eq!(sp & 0xf, hal::user::signal_handler_stack_entry_bias());
+        assert!(sp.checked_add(stack_total).unwrap() <= top);
+    }
 }
 
 fn process_setup_signal_frame(
@@ -835,32 +928,98 @@ fn process_setup_signal_frame(
     let total = SIGFRAME_TRAP_OFF
         .checked_add(trap_len)
         .ok_or(Errno::EINVAL)?;
-    let new_sp = if action.flags.has(SigActionFlags::SA_ONSTACK) {
+    let signal_xstate =
+        hal::user_context::UserTrapFrame::encode_linux_signal_xstate(task, user_ctx.as_usize());
+    let xstate_off = signal_xstate.as_ref().map_or(total, |_| {
+        (total + SIGFRAME_XSTATE_ALIGN - 1) & !(SIGFRAME_XSTATE_ALIGN - 1)
+    });
+    let total = xstate_off
+        .checked_add(signal_xstate.as_ref().map_or(0, |image| image.len()))
+        .ok_or(Errno::EINVAL)?;
+    let return_prefix = hal::user::signal_return_prefix_size();
+    if return_prefix > SIGFRAME_RETURN_PREFIX_MAX {
+        return Err(Errno::EINVAL);
+    }
+    let mut stack_total = return_prefix.checked_add(total).ok_or(Errno::EINVAL)?;
+    let stack_top = if action.flags.has(SigActionFlags::SA_ONSTACK) {
         let altstack = task.sigaltstack();
         if !altstack.disabled && !altstack.contains(saved.sp()) {
-            let top = altstack
-                .sp
-                .checked_add(altstack.size)
-                .ok_or(Errno::EINVAL)?;
-            let sp = top.checked_sub(total).ok_or(Errno::ENOMEM)? & !0xf;
-            if sp < altstack.sp {
-                return Err(Errno::ENOMEM);
-            }
-            sp
+            Some(
+                altstack
+                    .sp
+                    .checked_add(altstack.size)
+                    .ok_or(Errno::EINVAL)?,
+            )
         } else {
-            saved.sp().checked_sub(total).ok_or(Errno::EINVAL)? & !0xf
+            Some(saved.sp())
         }
     } else {
-        saved.sp().checked_sub(total).ok_or(Errno::EINVAL)? & !0xf
+        Some(saved.sp())
     };
+    let stack_top = stack_top.ok_or(Errno::EINVAL)?;
+    let altstack_floor = if action.flags.has(SigActionFlags::SA_ONSTACK) {
+        let altstack = task.sigaltstack();
+        if !altstack.disabled && !altstack.contains(saved.sp()) {
+            Some(altstack.sp)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut new_sp =
+        signal_frame_stack_pointer(stack_top, stack_total).map_err(|_| Errno::EINVAL)?;
+    if let Some(floor) = altstack_floor {
+        if new_sp < floor {
+            return Err(Errno::ENOMEM);
+        }
+    }
+    // Linux requires the XSAVE signal image itself to be 64-byte aligned.
+    // The generic entry ABI only guarantees 16-byte alignment, so reserve a
+    // small amount of padding until the absolute user address is aligned.
+    if signal_xstate.is_some() {
+        let mut aligned = false;
+        for padding in 0..SIGFRAME_XSTATE_ALIGN {
+            let candidate_total = stack_total.checked_add(padding).ok_or(Errno::EINVAL)?;
+            let candidate_sp = signal_frame_stack_pointer(stack_top, candidate_total)
+                .map_err(|_| Errno::EINVAL)?;
+            if let Some(floor) = altstack_floor {
+                if candidate_sp < floor {
+                    continue;
+                }
+            }
+            let frame_base = candidate_sp
+                .checked_add(return_prefix)
+                .ok_or(Errno::EINVAL)?;
+            let xstate_addr = frame_base.checked_add(xstate_off).ok_or(Errno::EINVAL)?;
+            if xstate_addr % SIGFRAME_XSTATE_ALIGN == 0 {
+                stack_total = candidate_total;
+                new_sp = candidate_sp;
+                aligned = true;
+                break;
+            }
+        }
+        if !aligned {
+            return Err(Errno::EINVAL);
+        }
+    }
 
     // 信号投递同样在 lat_sig 中高频触发；sigframe 大小由固定头部和陷阱帧
     // 构成，使用小型栈缓冲避免 allocator 锁竞争，同时控制内核栈占用。
-    let mut frame_storage = [0u8; SIGFRAME_STACK_BUF_SIZE];
-    if total > frame_storage.len() {
+    let mut frame_storage = [0u8; SIGFRAME_STACK_BUF_SIZE + SIGFRAME_RETURN_PREFIX_MAX];
+    let encoded_prefix = hal::user::encode_signal_return_prefix(
+        restorer,
+        &mut frame_storage[..SIGFRAME_RETURN_PREFIX_MAX],
+    );
+    if encoded_prefix != return_prefix {
         return Err(Errno::EINVAL);
     }
-    let frame_bytes = &mut frame_storage[..total];
+    let frame_start = return_prefix;
+    let frame_end = frame_start.checked_add(total).ok_or(Errno::EINVAL)?;
+    if frame_end > frame_storage.len() {
+        return Err(Errno::EINVAL);
+    }
+    let frame_bytes = &mut frame_storage[frame_start..frame_end];
     write_u64(frame_bytes, 0, SIGFRAME_MAGIC);
     write_u64(frame_bytes, 8, total as u64);
     write_u64(frame_bytes, 16, old_mask.raw());
@@ -885,12 +1044,23 @@ fn process_setup_signal_frame(
     if !saved.write_linux_mcontext(&mut frame_bytes[mcontext_start..][..SIGFRAME_MCONTEXT_SIZE]) {
         return Err(Errno::EINVAL);
     }
+    if let Some(image) = signal_xstate.as_ref() {
+        let fpstate_addr = new_sp
+            .checked_add(return_prefix)
+            .and_then(|base| base.checked_add(xstate_off))
+            .ok_or(Errno::EINVAL)?;
+        write_u64(frame_bytes, mcontext_start + 184, fpstate_addr as u64);
+        let end = xstate_off.checked_add(image.len()).ok_or(Errno::EINVAL)?;
+        if end > frame_bytes.len() {
+            return Err(Errno::EINVAL);
+        }
+        frame_bytes[xstate_off..end].copy_from_slice(image);
+    }
     let mut abi_pc = saved.pc();
     if info.sig.raw() >= 32 && (saved.ret() as isize) == -(Errno::EINTR.as_i32() as isize) {
-        // musl 的取消信号 handler 用 ucontext PC 判断线程是否正处于
-        // __syscall_cp 的可取消区间。syscall dispatcher 已经把真实返回 PC
-        // 推到 syscall 之后；ABI ucontext 需要暴露 syscall 指令位置，而
-        // 内核私有 trap 副本仍保留真实返回位置供 rt_sigreturn 使用。
+        // x86 SYSCALL entry and the other trap backends expose the trapping
+        // instruction until generic dispatch decides whether to advance or
+        // restart it.  Keep that address in the public mcontext as well.
         if let Some(syscall_pc) = saved.signal_interrupted_syscall_pc() {
             write_u64(frame_bytes, mcontext_start, syscall_pc as u64);
             abi_pc = syscall_pc;
@@ -900,7 +1070,7 @@ fn process_setup_signal_frame(
     if !saved.write_bytes(&mut frame_bytes[SIGFRAME_TRAP_OFF..]) {
         return Err(Errno::EINVAL);
     }
-    copy_to_user(new_sp, &frame_bytes).map_err(|e| e.as_errno())?;
+    copy_to_user(new_sp, &frame_storage[..stack_total]).map_err(|e| e.as_errno())?;
     hal::task_state::push_signal_state(task, user_ctx.as_usize()).map_err(|()| Errno::ENOMEM)?;
 
     let mut handler_mask = old_mask.union(action.mask);
@@ -916,18 +1086,21 @@ fn process_setup_signal_frame(
     let mut next = saved;
     next.set_pc(handler_pc);
     next.set_sp(new_sp);
+    let frame_addr = new_sp.checked_add(return_prefix).ok_or(Errno::EINVAL)?;
     if action.flags.has(SigActionFlags::SA_SIGINFO) {
-        next.set_args(
-            info.sig.raw() as usize,
-            new_sp + SIGFRAME_SIGINFO_OFF,
-            new_sp + SIGFRAME_UCONTEXT_OFF,
-        );
+        let siginfo_addr = frame_addr
+            .checked_add(SIGFRAME_SIGINFO_OFF)
+            .ok_or(Errno::EINVAL)?;
+        let ucontext_addr = frame_addr
+            .checked_add(SIGFRAME_UCONTEXT_OFF)
+            .ok_or(Errno::EINVAL)?;
+        next.set_args(info.sig.raw() as usize, siginfo_addr, ucontext_addr);
     } else {
         // 未设 SA_SIGINFO 时 handler 只收 1 个参数（signo）。`set_args` 固定写
         // 3 个寄存器，后两参置 0（多余参数寄存器对 1 参 handler 无意义）。
         next.set_args(info.sig.raw() as usize, 0, 0);
     }
-    next.set_ra(restorer);
+    next.set_signal_return_address(restorer);
     next.apply_to_context(user_ctx.as_usize());
     Ok(())
 }

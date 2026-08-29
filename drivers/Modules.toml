@@ -120,7 +120,7 @@ path = "ahci"
 config = "CONFIG_PLATFORM_AHCI"
 prompt = "Platform AHCI/SATA 块设备驱动"
 default = "m"
-targets = "loongarch64-unknown-none"
+targets = "loongarch64-unknown-none,x86_64-unknown-none"
 after = "platform.firmware-bus,platform.loongson-irq,platform.loongson-clk"
 
 [[modules]]

@@ -17,10 +17,19 @@ const FADT_HW_REDUCED_ACPI: u32 = 1 << 20;
 
 pub fn parse_fadt(bytes: &[u8]) -> Result<AcpiFadtInfo, AcpiTableError> {
     let table = checked_sdt(bytes, b"FACP", FADT_V1_SIZE)?;
+    // The header revision is the FADT major version.  Extended fields were not
+    // part of the ACPI 1.0 layout; do not interpret trailing bytes in a legacy
+    // table as RESET_REG/X_* fields merely because a malformed producer made
+    // the declared length large enough.
+    let revision = table[8];
+    let has_extended_fields = revision >= 2;
+    let has_hw_reduced_fields = revision >= 5;
     let flags = read_u32(table, 112).ok_or(AcpiTableError::InvalidLength)?;
     let legacy_pm_timer_address = read_u32(table, 76).unwrap_or(0);
     let legacy_pm_timer_length = table.get(91).copied().unwrap_or(0);
-    let extended_pm_timer = parse_gas(table, 208).filter(valid_pm_timer_register);
+    let extended_pm_timer = has_extended_fields
+        .then(|| parse_gas(table, 208).filter(valid_pm_timer_register))
+        .flatten();
     let legacy_pm_timer = (legacy_pm_timer_address != 0 && legacy_pm_timer_length == 4).then_some(
         AcpiGenericAddress {
             address_space: AcpiAddressSpace::SystemIo,
@@ -30,23 +39,24 @@ pub fn parse_fadt(bytes: &[u8]) -> Result<AcpiFadtInfo, AcpiTableError> {
             address: u64::from(legacy_pm_timer_address),
         },
     );
-    let pm_timer = (flags & FADT_HW_REDUCED_ACPI == 0)
+    let hardware_reduced = has_hw_reduced_fields && flags & FADT_HW_REDUCED_ACPI != 0;
+    let pm_timer = (!hardware_reduced)
         .then(|| extended_pm_timer.or(legacy_pm_timer))
         .flatten()
         .map(|register| AcpiPmTimerInfo {
             register,
+            // TMR_VAL_EXT is defined in the original ACPI 1.0 flags word.
             supports_32_bit: flags & (1 << 8) != 0,
         });
 
-    let reset_register = (flags & FADT_RESET_REG_SUP != 0)
+    let reset_register = (has_extended_fields && flags & FADT_RESET_REG_SUP != 0)
         .then(|| parse_gas(table, 116).filter(valid_reset_register))
         .flatten();
-    let hardware_reduced = flags & FADT_HW_REDUCED_ACPI != 0;
     let legacy_pm1_width = table[89];
     let pm1a_control = (!hardware_reduced)
         .then(|| {
             select_fadt_register(
-                parse_gas(table, 172),
+                has_extended_fields.then(|| parse_gas(table, 172)).flatten(),
                 legacy_system_io_register(read_u32(table, 64), legacy_pm1_width),
                 valid_pm1_control_register,
             )
@@ -55,16 +65,16 @@ pub fn parse_fadt(bytes: &[u8]) -> Result<AcpiFadtInfo, AcpiTableError> {
     let pm1b_control = (!hardware_reduced)
         .then(|| {
             select_fadt_register(
-                parse_gas(table, 184),
+                has_extended_fields.then(|| parse_gas(table, 184)).flatten(),
                 legacy_system_io_register(read_u32(table, 68), legacy_pm1_width),
                 valid_pm1_control_register,
             )
         })
         .flatten();
-    let sleep_control = hardware_reduced
+    let sleep_control = (hardware_reduced && has_hw_reduced_fields)
         .then(|| parse_gas(table, 244).filter(valid_sleep_register))
         .flatten();
-    let sleep_status = hardware_reduced
+    let sleep_status = (hardware_reduced && has_hw_reduced_fields)
         .then(|| parse_gas(table, 256).filter(valid_sleep_register))
         .flatten();
 
@@ -74,7 +84,11 @@ pub fn parse_fadt(bytes: &[u8]) -> Result<AcpiFadtInfo, AcpiTableError> {
         smi_command_port: read_u32(table, 48).ok_or(AcpiTableError::InvalidLength)?,
         acpi_enable: table[52],
         acpi_disable: table[53],
-        boot_architecture_flags: read_u16(table, 109).ok_or(AcpiTableError::InvalidLength)?,
+        boot_architecture_flags: if has_extended_fields {
+            read_u16(table, 109).ok_or(AcpiTableError::InvalidLength)?
+        } else {
+            0
+        },
         flags,
         pm_timer,
         pm1a_control,
@@ -82,7 +96,9 @@ pub fn parse_fadt(bytes: &[u8]) -> Result<AcpiFadtInfo, AcpiTableError> {
         sleep_control,
         sleep_status,
         reset_register,
-        reset_value: table.get(128).copied().unwrap_or(0),
+        reset_value: has_extended_fields
+            .then(|| table.get(128).copied().unwrap_or(0))
+            .unwrap_or(0),
     })
 }
 
@@ -222,7 +238,22 @@ pub fn parse_hpet(bytes: &[u8]) -> Result<AcpiHpetInfo, AcpiTableError> {
 
 pub fn parse_spcr(bytes: &[u8]) -> Result<AcpiSpcrInfo, AcpiTableError> {
     let table = checked_sdt(bytes, b"SPCR", SPCR_V1_SIZE)?;
+    let revision = table[8];
+    if revision == 0 {
+        return Err(AcpiTableError::InvalidFlags);
+    }
     if table[37..40].iter().any(|byte| *byte != 0) || table[52] & !0x1f != 0 || table[63] != 0 {
+        return Err(AcpiTableError::InvalidFlags);
+    }
+    // SPCR rev. 1 only defines the full 16550/16450 interface.  Newer
+    // revisions add DBG2 subtypes; accepting those values in a rev. 1 table
+    // would make the kernel instantiate a device with an undefined layout.
+    if revision == 1 && table[36] > 1 {
+        return Err(AcpiTableError::InvalidFlags);
+    }
+    // RISC-V PLIC/APLIC (bit 4) was introduced by SPCR rev. 4.  Keep older
+    // tables strict while allowing future revisions to retain the known bit.
+    if revision < 4 && table[52] & (1 << 4) != 0 {
         return Err(AcpiTableError::InvalidFlags);
     }
     let base = parse_gas(table, 40).ok_or(AcpiTableError::InvalidLength)?;
@@ -231,7 +262,7 @@ pub fn parse_spcr(bytes: &[u8]) -> Result<AcpiSpcrInfo, AcpiTableError> {
     }
     let interrupt_type = table[52];
     let legacy_irq = (interrupt_type & 1 != 0).then_some(table[53]);
-    if legacy_irq.is_some_and(|irq| irq >= 16) {
+    if legacy_irq.is_some_and(|irq| !valid_spcr_isa_irq(irq)) {
         return Err(AcpiTableError::InvalidFlags);
     }
     let routed_interrupt_types = interrupt_type & !1;
@@ -254,24 +285,34 @@ pub fn parse_spcr(bytes: &[u8]) -> Result<AcpiSpcrInfo, AcpiTableError> {
         7 => Some(115_200),
         _ => None,
     };
-    let precise_baud = read_u32(table, 80).filter(|baud| *baud != 0);
-    let namespace = match (read_u16(table, 84), read_u16(table, 86)) {
-        (None, None) => None,
-        (Some(0), Some(0)) => None,
-        (Some(length), Some(offset)) if length != 0 => {
-            let start = usize::from(offset);
-            let end = start
-                .checked_add(usize::from(length))
-                .ok_or(AcpiTableError::InvalidReference)?;
-            if start < 88 || end > table.len() {
-                return Err(AcpiTableError::InvalidReference);
+    // UART clock frequency was added in revision 3; precise baud and the
+    // namespace suffix were added together in revision 4.  Length checks are
+    // still required because old firmware often emits a minimal 80-byte SPCR.
+    let precise_baud = (revision >= 4)
+        .then(|| read_u32(table, 80))
+        .flatten()
+        .filter(|baud| *baud != 0);
+    let namespace = if revision < 4 {
+        None
+    } else {
+        match (read_u16(table, 84), read_u16(table, 86)) {
+            (None, None) => None,
+            (Some(0), Some(0)) => None,
+            (Some(length), Some(offset)) if length != 0 => {
+                let start = usize::from(offset);
+                let end = start
+                    .checked_add(usize::from(length))
+                    .ok_or(AcpiTableError::InvalidReference)?;
+                if start < 88 || end > table.len() {
+                    return Err(AcpiTableError::InvalidReference);
+                }
+                let value = core::str::from_utf8(&table[start..end])
+                    .map_err(|_| AcpiTableError::InvalidFlags)?
+                    .trim_end_matches('\0');
+                (!value.is_empty() && value != ".").then(|| Box::<str>::from(value))
             }
-            let value = core::str::from_utf8(&table[start..end])
-                .map_err(|_| AcpiTableError::InvalidFlags)?
-                .trim_end_matches('\0');
-            (!value.is_empty() && value != ".").then(|| Box::<str>::from(value))
+            _ => return Err(AcpiTableError::InvalidReference),
         }
-        _ => return Err(AcpiTableError::InvalidReference),
     };
     Ok(AcpiSpcrInfo {
         interface_type: table[36],
@@ -280,9 +321,16 @@ pub fn parse_spcr(bytes: &[u8]) -> Result<AcpiSpcrInfo, AcpiTableError> {
         legacy_irq,
         global_system_interrupt,
         baud: precise_baud.or(configured_baud),
-        clock_hz: read_u32(table, 76).filter(|clock| *clock != 0),
+        clock_hz: (revision >= 3)
+            .then(|| read_u32(table, 76))
+            .flatten()
+            .filter(|clock| *clock != 0),
         namespace,
     })
+}
+
+fn valid_spcr_isa_irq(irq: u8) -> bool {
+    matches!(irq, 2..=7 | 9..=12 | 14..=15)
 }
 
 pub fn parse_pptt(bytes: &[u8]) -> Result<AcpiPpttInfo, AcpiTableError> {
@@ -684,6 +732,7 @@ mod tests {
     #[test]
     fn fadt_falls_back_when_extended_pm_timer_is_unusable() {
         let mut table = vec![0u8; 220];
+        table[8] = 2;
         table[76..80].copy_from_slice(&0x408u32.to_le_bytes());
         table[91] = 4;
         table[208] = 0x7f;
@@ -700,6 +749,7 @@ mod tests {
     #[test]
     fn fadt_only_exposes_advertised_byte_reset_register() {
         let mut table = vec![0u8; 220];
+        table[8] = 2;
         table[116] = 1;
         table[117] = 8;
         table[119] = 1;
@@ -722,6 +772,7 @@ mod tests {
     #[test]
     fn hardware_reduced_fadt_ignores_pm_timer() {
         let mut table = vec![0u8; 220];
+        table[8] = 5;
         table[76..80].copy_from_slice(&0x408u32.to_le_bytes());
         table[91] = 4;
         table[112..116].copy_from_slice(&FADT_HW_REDUCED_ACPI.to_le_bytes());
@@ -732,6 +783,7 @@ mod tests {
     #[test]
     fn fadt_selects_valid_pm1_control_and_hw_reduced_sleep_registers() {
         let mut table = vec![0u8; 268];
+        table[8] = 5;
         table[64..68].copy_from_slice(&0x404u32.to_le_bytes());
         table[89] = 2;
         // A non-zero but unusable extended GAS must not hide the legacy block.
@@ -804,6 +856,7 @@ mod tests {
     #[test]
     fn spcr_parses_legacy_length_system_io_and_baud() {
         let mut table = vec![0u8; SPCR_V1_SIZE];
+        table[8] = 3;
         table[36] = 0;
         table[40] = 1;
         table[41] = 8;
@@ -826,12 +879,31 @@ mod tests {
     #[test]
     fn spcr_preserves_io_apic_gsi_zero() {
         let mut table = vec![0u8; SPCR_V1_SIZE];
+        table[8] = 2;
         table[36] = 0;
         table[40] = 1;
         table[41] = 8;
         table[43] = 1;
         table[44..52].copy_from_slice(&0x3f8u64.to_le_bytes());
         table[52] = 1 << 1;
+        table[54..58].copy_from_slice(&0u32.to_le_bytes());
+        finish(&mut table, b"SPCR");
+
+        let spcr = parse_spcr(&table).unwrap();
+        assert_eq!(spcr.global_system_interrupt, Some(0));
+        assert_eq!(spcr.legacy_irq, None);
+    }
+
+    #[test]
+    fn spcr_preserves_io_sapic_gsi_zero() {
+        let mut table = vec![0u8; SPCR_V1_SIZE];
+        table[8] = 2;
+        table[36] = 0;
+        table[40] = 1;
+        table[41] = 8;
+        table[43] = 1;
+        table[44..52].copy_from_slice(&0x3f8u64.to_le_bytes());
+        table[52] = 1 << 2;
         table[54..58].copy_from_slice(&0u32.to_le_bytes());
         finish(&mut table, b"SPCR");
 

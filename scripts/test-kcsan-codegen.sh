@@ -93,7 +93,7 @@ check_runtime_excluded() {
     fi
 }
 
-for target in loongarch64-unknown-none riscv64gc-unknown-none-elf; do
+for target in loongarch64-unknown-none riscv64gc-unknown-none-elf x86_64-unknown-none; do
     check_instrumented_object "$target"
     check_runtime_excluded "$target"
 done

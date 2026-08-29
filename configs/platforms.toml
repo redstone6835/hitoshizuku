@@ -43,6 +43,27 @@ default_formats = ["elf"]
 allowed_formats = ["elf"]
 
 [[platforms]]
+id = "qemu-x86_64"
+board = "qemu"
+target = "x86_64-unknown-none"
+default_for_board = false
+config = "configs/qemu-x86_64.config"
+target_dir = "target/x86_64"
+interface_dir = "build/elm-interface/x86_64"
+rust_cfg = []
+
+[platforms.link]
+layout = "x86_64-higher-half"
+physical_base = "0x0000_0000_0180_0000"
+virtual_base = "0xffff_ffff_8180_0000"
+alignment = "0x0000_0000_0020_0000"
+
+[platforms.image]
+output_dir = "build/x86_64"
+default_formats = ["elf", "raw"]
+allowed_formats = ["elf", "raw", "efi"]
+
+[[platforms]]
 id = "ls2k1000"
 board = "ls2k1000"
 target = "loongarch64-unknown-none"

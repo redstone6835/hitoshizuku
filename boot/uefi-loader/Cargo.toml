@@ -1,0 +1,20 @@
+[package]
+name = "uefi-loader"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# This is intentionally a standalone UEFI application.  It loads the kernel
+# ELF from the ESP and hands it to the existing Multiboot2 entry.
+[workspace]
+
+[lib]
+
+[[bin]]
+name = "BOOTX64"
+path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+default = []

@@ -129,14 +129,7 @@ fn native_fixed_record_copy_supports_cross_page_user_ranges() {
 #[ktest]
 fn native_frame_reads_the_frozen_register_contract() {
     let mut frame = arch_trap_frame();
-    frame.a7 = 7;
-    frame.a6 = 0x0000_0002_0000_0003;
-    frame.a0 = 10;
-    frame.a1 = 11;
-    frame.a2 = 12;
-    frame.a3 = 13;
-    frame.a4 = 14;
-    frame.a5 = 0xfeed;
+    configure_native_call_frame(&mut frame);
 
     let call = (general::syscall::frame_ops()
         .expect("架构必须已注册 syscall frame ops")
@@ -165,25 +158,27 @@ fn native_failure_return_clears_values_and_advances_pc() {
     );
     (ops.advance_pc)(tf);
 
-    assert_eq!(frame.a0, status::HANDLE_STALE as usize);
-    assert_eq!(frame.a1, 0);
-    assert_eq!(frame.a2, 0);
-    assert_eq!(frame_pc(&frame), 0x4004);
+    assert_eq!(
+        native_return_values(&frame),
+        (status::HANDLE_STALE as usize, 0, 0)
+    );
+    assert_eq!(frame_pc(&frame), native_next_pc(0x4000));
 }
 
 #[ktest]
 fn personality_selects_native_dispatch_without_linux_syscall_table() {
     let task = make_task(true);
     let mut frame = arch_trap_frame();
-    frame.a7 = usize::MAX;
+    set_native_invalid_slot(&mut frame);
     set_frame_pc(&mut frame, 0x5000);
 
     general::syscall::dispatch_for_task(TrapFramePtr::new(&mut frame as *mut _ as usize), task);
 
-    assert_eq!(frame.a0, status::ABI_BAD_SLOT as usize);
-    assert_eq!(frame.a1, 0);
-    assert_eq!(frame.a2, 0);
-    assert_eq!(frame_pc(&frame), 0x5004);
+    assert_eq!(
+        native_return_values(&frame),
+        (status::ABI_BAD_SLOT as usize, 0, 0)
+    );
+    assert_eq!(frame_pc(&frame), native_next_pc(0x5000));
 }
 
 #[ktest]
@@ -206,7 +201,7 @@ fn native_return_boundary_consumes_ignored_external_signal() {
         raw: None,
     });
     let mut frame = arch_trap_frame();
-    frame.a7 = usize::MAX;
+    set_native_invalid_slot(&mut frame);
     set_frame_pc(&mut frame, 0x5800);
 
     general::syscall::dispatch_for_task(
@@ -215,24 +210,27 @@ fn native_return_boundary_consumes_ignored_external_signal() {
     );
 
     assert!(!task.signal.has_any_pending());
-    assert_eq!(frame.a0, status::ABI_BAD_SLOT as usize);
-    assert_eq!(frame_pc(&frame), 0x5804);
+    assert_eq!(
+        native_return_values(&frame).0,
+        status::ABI_BAD_SLOT as usize
+    );
+    assert_eq!(frame_pc(&frame), native_next_pc(0x5800));
 }
 
 #[ktest]
 fn tomori_personality_stays_on_the_linux_syscall_table() {
     let task = make_task(false);
     let mut frame = arch_trap_frame();
-    frame.a7 = usize::MAX;
+    set_native_invalid_slot(&mut frame);
     set_frame_pc(&mut frame, 0x6000);
 
     general::syscall::dispatch_for_task(TrapFramePtr::new(&mut frame as *mut _ as usize), task);
 
     assert_eq!(
-        frame.a0,
+        native_return_values(&frame).0,
         (-(errno::Errno::ENOSYS.as_i32() as isize)) as usize
     );
-    assert_eq!(frame_pc(&frame), 0x6004);
+    assert_eq!(frame_pc(&frame), native_next_pc(0x6000));
 }
 
 #[ktest]
@@ -2103,6 +2101,11 @@ fn arch_trap_frame() -> arch::loongarch64::TrapFrame {
     arch::loongarch64::TrapFrame::default()
 }
 
+#[cfg(target_arch = "x86_64")]
+fn arch_trap_frame() -> arch::x86_64::trap_frame::TrapFrame {
+    arch::x86_64::trap_frame::TrapFrame::default()
+}
+
 #[cfg(target_arch = "riscv64")]
 fn set_frame_pc(frame: &mut arch::riscv64::trap_frame::TrapFrame, pc: usize) {
     frame.sepc = pc;
@@ -2113,6 +2116,11 @@ fn set_frame_pc(frame: &mut arch::loongarch64::TrapFrame, pc: usize) {
     frame.pc = pc;
 }
 
+#[cfg(target_arch = "x86_64")]
+fn set_frame_pc(frame: &mut arch::x86_64::trap_frame::TrapFrame, pc: usize) {
+    frame.rip = pc;
+}
+
 #[cfg(target_arch = "riscv64")]
 fn frame_pc(frame: &arch::riscv64::trap_frame::TrapFrame) -> usize {
     frame.sepc
@@ -2121,4 +2129,85 @@ fn frame_pc(frame: &arch::riscv64::trap_frame::TrapFrame) -> usize {
 #[cfg(target_arch = "loongarch64")]
 fn frame_pc(frame: &arch::loongarch64::TrapFrame) -> usize {
     frame.pc
+}
+
+#[cfg(target_arch = "x86_64")]
+fn frame_pc(frame: &arch::x86_64::trap_frame::TrapFrame) -> usize {
+    frame.rip
+}
+
+#[cfg(target_arch = "riscv64")]
+fn configure_native_call_frame(frame: &mut arch::riscv64::trap_frame::TrapFrame) {
+    frame.a7 = 7;
+    frame.a6 = 0x0000_0002_0000_0003;
+    frame.a0 = 10;
+    frame.a1 = 11;
+    frame.a2 = 12;
+    frame.a3 = 13;
+    frame.a4 = 14;
+    frame.a5 = 0xfeed;
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn configure_native_call_frame(frame: &mut arch::loongarch64::TrapFrame) {
+    frame.a7 = 7;
+    frame.a6 = 0x0000_0002_0000_0003;
+    frame.a0 = 10;
+    frame.a1 = 11;
+    frame.a2 = 12;
+    frame.a3 = 13;
+    frame.a4 = 14;
+    frame.a5 = 0xfeed;
+}
+
+#[cfg(target_arch = "x86_64")]
+fn configure_native_call_frame(frame: &mut arch::x86_64::trap_frame::TrapFrame) {
+    frame.rax = 7;
+    frame.rdi = 0x0000_0002_0000_0003;
+    frame.rsi = 10;
+    frame.rdx = 11;
+    frame.r10 = 12;
+    frame.r8 = 13;
+    frame.r9 = 14;
+    frame.rbx = 0xfeed;
+}
+
+#[cfg(target_arch = "riscv64")]
+fn set_native_invalid_slot(frame: &mut arch::riscv64::trap_frame::TrapFrame) {
+    frame.a7 = usize::MAX;
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn set_native_invalid_slot(frame: &mut arch::loongarch64::TrapFrame) {
+    frame.a7 = usize::MAX;
+}
+
+#[cfg(target_arch = "x86_64")]
+fn set_native_invalid_slot(frame: &mut arch::x86_64::trap_frame::TrapFrame) {
+    frame.rax = usize::MAX;
+}
+
+#[cfg(target_arch = "riscv64")]
+fn native_return_values(frame: &arch::riscv64::trap_frame::TrapFrame) -> (usize, usize, usize) {
+    (frame.a0, frame.a1, frame.a2)
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn native_return_values(frame: &arch::loongarch64::TrapFrame) -> (usize, usize, usize) {
+    (frame.a0, frame.a1, frame.a2)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn native_return_values(frame: &arch::x86_64::trap_frame::TrapFrame) -> (usize, usize, usize) {
+    (frame.rax, frame.rdx, frame.r10)
+}
+
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+const fn native_next_pc(pc: usize) -> usize {
+    pc + 4
+}
+
+#[cfg(target_arch = "x86_64")]
+const fn native_next_pc(pc: usize) -> usize {
+    pc + arch::x86_64::trap_frame::TrapFrame::SYSCALL_INSN_LEN
 }

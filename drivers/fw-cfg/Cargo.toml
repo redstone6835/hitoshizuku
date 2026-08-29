@@ -15,7 +15,7 @@ bench = false
 [lib]
 name = "platform_fw_cfg"
 path = "src/lib_entry.rs"
-test = false
+test = true
 doctest = false
 bench = false
 

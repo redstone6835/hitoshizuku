@@ -175,14 +175,29 @@ fn parse_entry(
         }
         7 => {
             require(entry, 16)?;
-            if entry[5..8].iter().any(|byte| *byte != 0)
-                || entry.len() > 16 && entry.last() != Some(&0)
-            {
+            // Local SAPIC layout (ACPI MADT type 7): processor id @2,
+            // SAPIC id @3, SAPIC EID @4, reserved[5..8], flags @8, numeric
+            // ACPI UID @12, followed by an optional NUL-terminated UID
+            // string at @16.  The flags/UID fields are four-byte fields; the
+            // older parser used two-byte offsets and consequently rejected
+            // valid Itanium/SAPIC entries or associated the wrong CPU.
+            if entry[5..8].iter().any(|byte| *byte != 0) {
                 return Err(AcpiTableError::InvalidFlags);
             }
             let entry_flags = checked_processor_flags(entry, 8, 0x03)?;
             let (enabled, online_capable) =
                 processor_availability(entry_flags, PROCESSOR_ONLINE_CAPABLE)?;
+            if entry.len() > 16 {
+                let uid_string = &entry[16..];
+                // The variable string occupies the descriptor tail and its
+                // terminator must be the final byte.  Embedded terminators or
+                // non-zero bytes after one would make the next descriptor
+                // indistinguishable from part of the UID.
+                if uid_string.last() != Some(&0) || uid_string[..uid_string.len() - 1].contains(&0)
+                {
+                    return Err(AcpiTableError::InvalidReference);
+                }
+            }
             push_processor(
                 info,
                 AcpiProcessor {
@@ -276,7 +291,7 @@ fn parse_entry(
                 return Err(AcpiTableError::InvalidFlags);
             }
             let reset_vector = match (table_revision, version, entry.len()) {
-                (5 | 6, 0, 16) => None,
+                (5..=u8::MAX, 0, 16) => None,
                 (7, 1, 24) => Some(read_u64(entry, 16).ok_or(AcpiTableError::TruncatedEntry)?),
                 _ => return Err(AcpiTableError::InvalidLength),
             };
@@ -412,9 +427,9 @@ fn processor_availability(
 ) -> Result<(bool, bool), AcpiTableError> {
     let enabled = flags & PROCESSOR_ENABLED != 0;
     let online_capable = flags & online_capable_bit != 0;
-    if enabled && online_capable {
-        return Err(AcpiTableError::InvalidFlags);
-    }
+    // ACPI defines Processor Enabled and Online Capable as independent
+    // capabilities.  A processor may be currently enabled while also being
+    // eligible for online/offline transitions (both bits set).
     Ok((enabled, online_capable))
 }
 
@@ -480,6 +495,25 @@ mod tests {
     }
 
     #[test]
+    fn accepts_legacy_multiprocessor_wakeup_on_newer_madt_revision() {
+        let mut table = vec![0u8; MADT_HEADER_SIZE];
+        table[8] = 7;
+        table.extend_from_slice(&[
+            16, 16, // type, length
+            0, 0, 0, 0, 0, 0, // version and reserved
+            0, 0, 0, 0, 0, 0, 0, 0, // mailbox address (filled below)
+        ]);
+        table[MADT_HEADER_SIZE + 8..MADT_HEADER_SIZE + 16]
+            .copy_from_slice(&0x2000u64.to_le_bytes());
+        finish(&mut table);
+
+        let wakeup = parse_madt(&table).unwrap().multiprocessor_wakeup.unwrap();
+        assert_eq!(wakeup.mailbox_version, 0);
+        assert_eq!(wakeup.mailbox_address, 0x2000);
+        assert_eq!(wakeup.reset_vector, None);
+    }
+
+    #[test]
     fn rejects_reserved_interrupt_flags() {
         let mut table = vec![0u8; MADT_HEADER_SIZE];
         table.extend_from_slice(&[2, 10, 0, 0, 2, 0, 0, 0, 2, 0]);
@@ -488,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_unavailable_processors_and_rejects_conflicting_flags() {
+    fn preserves_processor_availability_flags() {
         let mut table = vec![0u8; MADT_HEADER_SIZE];
         table.extend_from_slice(&[0, 8, 1, 2, 0, 0, 0, 0]);
         finish(&mut table);
@@ -497,7 +531,9 @@ mod tests {
 
         table[MADT_HEADER_SIZE + 4..MADT_HEADER_SIZE + 8].copy_from_slice(&3u32.to_le_bytes());
         finish(&mut table);
-        assert_eq!(parse_madt(&table), Err(AcpiTableError::InvalidFlags));
+        let processor = parse_madt(&table).unwrap().processors[0];
+        assert!(processor.enabled);
+        assert!(processor.online_capable);
     }
 
     #[test]
@@ -534,5 +570,28 @@ mod tests {
         let processors = parse_madt(&table).unwrap().processors;
         assert_eq!(processors.len(), 1);
         assert!(!processors[0].usable());
+    }
+
+    #[test]
+    fn parses_local_sapic_field_offsets_and_uid_string() {
+        let mut table = vec![0u8; MADT_HEADER_SIZE];
+        let mut entry = vec![0u8; 20];
+        entry[0] = 7;
+        entry[1] = entry.len() as u8;
+        entry[2] = 0xaa; // processor id
+        entry[3] = 0x12; // SAPIC id
+        entry[4] = 0x34; // SAPIC EID
+        entry[8..12].copy_from_slice(&1u32.to_le_bytes()); // enabled
+        entry[12..16].copy_from_slice(&0x7856_3412u32.to_le_bytes());
+        // The string must be a single NUL-terminated tail.
+        entry[16..20].copy_from_slice(b"CPU\0");
+        table.extend_from_slice(&entry);
+        finish(&mut table);
+
+        let processor = parse_madt(&table).unwrap().processors[0];
+        assert_eq!(processor.interface, AcpiProcessorInterface::LocalSapic);
+        assert_eq!(processor.hardware_id, 0x3412);
+        assert_eq!(processor.processor_uid, 0x7856_3412);
+        assert!(processor.usable());
     }
 }

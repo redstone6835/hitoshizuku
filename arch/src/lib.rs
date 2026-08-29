@@ -11,11 +11,12 @@ extern crate alloc;
 pub(crate) mod early_console_config;
 
 // LoongArch U-Boot 直启协议决策；host 单测可直接覆盖纯逻辑部分。
-#[cfg(any(test, target_arch = "loongarch64"))]
+#[cfg(all(any(test, target_arch = "loongarch64"), not(target_arch = "x86_64")))]
 pub(crate) mod boot_protocol;
 
-// x86_64 的 syscall 编号表是纯常量模块，可在 host 测试和 x86_64 架构
-// 后端尚未接入时独立编译。
+// x86_64 的完整后端只在目标为 x86_64 时编译；这样其它 ISA 的交叉构建不会
+// 解析 x86 专用内联汇编。x86_64 host 单测仍会自然进入该分支。
+#[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 
 #[cfg(target_arch = "riscv64")]
@@ -24,6 +25,11 @@ pub mod riscv64;
 pub use riscv64::*;
 #[cfg(target_arch = "riscv64")]
 pub type CurrentTaskOps = riscv64::Riscv64TaskOps;
+
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::*;
+#[cfg(target_arch = "x86_64")]
+pub type CurrentTaskOps = x86_64::X86_64TaskOps;
 
 #[cfg(target_arch = "loongarch64")]
 pub mod loongarch64;

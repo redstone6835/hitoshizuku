@@ -93,8 +93,11 @@ fn parse_hpet_tables(
             return true;
         };
         hpets[..index].iter().any(|other| {
-            let other_end = other.base.address + 0x400;
-            hpet.base.address < other_end && other.base.address < end
+            other
+                .base
+                .address
+                .checked_add(0x400)
+                .is_some_and(|other_end| hpet.base.address < other_end && other.base.address < end)
         })
     }) {
         printk!("[kernel-start][acpi] rejected overlapping HPET register blocks");

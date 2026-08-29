@@ -220,6 +220,12 @@ pub struct StartAcpiTables {
     /// 已复制的 RSDP 视图的物理地址。ACPI 库使用物理地址
     /// 作为表的标识，因此即便复制后仍保持为物理地址。
     pub rsdp_phys: usize,
+    /// 已复制 RSDP 的实际字节长度。
+    ///
+    /// 该长度由加载器在校验 RSDP revision、checksum 和 extended length
+    /// 后写入。通用启动校验只信任这项已验证元数据及其映射范围，绝不为
+    /// 推断 revision 解引用加载器提供的虚拟地址。
+    pub rsdp_length: usize,
     /// 已复制的 ACPI 表的物理到虚拟地址映射。
     pub mappings: &'static [FirmwareTableMapping],
     /// AML 执行期可使用的架构 Host I/O 能力。
@@ -536,7 +542,7 @@ impl StartContext {
             if acpi.rsdp_phys == 0 {
                 return Err("[start-context] ACPI firmware is missing the copied RSDP");
             }
-            validate_acpi_table_mappings(acpi.rsdp_phys, acpi.mappings)?;
+            validate_acpi_table_mappings(acpi.rsdp_phys, acpi.rsdp_length, acpi.mappings)?;
             if !self.memory.boot_map.has_usable_region() {
                 return Err("[start-context] ACPI firmware requires usable boot memory segments");
             }
@@ -548,6 +554,7 @@ impl StartContext {
 
 fn validate_acpi_table_mappings(
     rsdp_phys: usize,
+    rsdp_length: usize,
     mappings: &[FirmwareTableMapping],
 ) -> Result<(), &'static str> {
     if mappings.is_empty() {
@@ -571,11 +578,22 @@ fn validate_acpi_table_mappings(
         }) {
             return Err("[start-context] ACPI table mappings overlap");
         }
+
+        let virtual_end = mapping.virtual_start + mapping.length;
+        if mappings[..index].iter().any(|previous| {
+            let previous_end = previous.virtual_start + previous.length;
+            mapping.virtual_start < previous_end && previous.virtual_start < virtual_end
+        }) {
+            return Err("[start-context] ACPI virtual table mappings overlap");
+        }
     }
 
+    if !(20..=4096).contains(&rsdp_length) {
+        return Err("[start-context] copied RSDP length is outside the supported bounds");
+    }
     if !mappings
         .iter()
-        .any(|mapping| mapping.resolve(rsdp_phys, 36).is_some())
+        .any(|mapping| mapping.resolve(rsdp_phys, rsdp_length).is_some())
     {
         return Err("[start-context] copied RSDP is outside ACPI table mappings");
     }
@@ -669,19 +687,20 @@ mod tests {
 
     #[test]
     fn acpi_snapshot_mappings_cover_rsdp_without_overlap_or_overflow() {
+        static RSDP_VIEW: [u8; 64] = [0; 64];
         let valid = [FirmwareTableMapping {
             physical_start: 0x1000,
-            virtual_start: 0x8000,
+            virtual_start: RSDP_VIEW.as_ptr() as usize,
             length: 0x100,
         }];
-        assert!(validate_acpi_table_mappings(0x1020, &valid).is_ok());
+        assert!(validate_acpi_table_mappings(0x1020, 20, &valid).is_ok());
 
         let null = [FirmwareTableMapping {
             virtual_start: 0,
             ..valid[0]
         }];
         assert_eq!(
-            validate_acpi_table_mappings(0x1020, &null),
+            validate_acpi_table_mappings(0x1020, 20, &null),
             Err("[start-context] ACPI table mapping is empty or null")
         );
 
@@ -691,7 +710,7 @@ mod tests {
             ..valid[0]
         }];
         assert_eq!(
-            validate_acpi_table_mappings(0x1020, &overflow),
+            validate_acpi_table_mappings(0x1020, 20, &overflow),
             Err("[start-context] ACPI table mapping address overflows")
         );
 
@@ -699,17 +718,72 @@ mod tests {
             valid[0],
             FirmwareTableMapping {
                 physical_start: 0x1080,
-                virtual_start: 0x9000,
+                virtual_start: RSDP_VIEW.as_ptr() as usize + 0x10,
                 length: 0x100,
             },
         ];
         assert_eq!(
-            validate_acpi_table_mappings(0x1020, &overlap),
+            validate_acpi_table_mappings(0x1020, 20, &overlap),
             Err("[start-context] ACPI table mappings overlap")
         );
         assert_eq!(
-            validate_acpi_table_mappings(0x2000, &valid),
+            validate_acpi_table_mappings(0x2000, 20, &valid),
             Err("[start-context] copied RSDP is outside ACPI table mappings")
+        );
+    }
+
+    #[test]
+    fn acpi_snapshot_requires_the_loader_reported_rsdp_length_to_fit() {
+        static V1: [u8; 64] = [0; 64];
+        let v1 = [FirmwareTableMapping {
+            physical_start: 0x1000,
+            virtual_start: V1.as_ptr() as usize,
+            length: 20,
+        }];
+        assert!(validate_acpi_table_mappings(0x1000, 20, &v1).is_ok());
+
+        let v2 = [FirmwareTableMapping {
+            physical_start: 0x2000,
+            virtual_start: V1.as_ptr() as usize,
+            length: 20,
+        }];
+        assert_eq!(
+            validate_acpi_table_mappings(0x2000, 36, &v2),
+            Err("[start-context] copied RSDP is outside ACPI table mappings")
+        );
+        let v2_full = [FirmwareTableMapping {
+            length: 36,
+            ..v2[0]
+        }];
+        assert!(validate_acpi_table_mappings(0x2000, 36, &v2_full).is_ok());
+        assert_eq!(
+            validate_acpi_table_mappings(0x2000, 19, &v2_full),
+            Err("[start-context] copied RSDP length is outside the supported bounds")
+        );
+        assert_eq!(
+            validate_acpi_table_mappings(0x2000, 4097, &v2_full),
+            Err("[start-context] copied RSDP length is outside the supported bounds")
+        );
+    }
+
+    #[test]
+    fn acpi_snapshot_rejects_virtual_alias_overlap() {
+        static VIEW: [u8; 128] = [0; 128];
+        let mappings = [
+            FirmwareTableMapping {
+                physical_start: 0x1000,
+                virtual_start: VIEW.as_ptr() as usize,
+                length: 64,
+            },
+            FirmwareTableMapping {
+                physical_start: 0x2000,
+                virtual_start: VIEW.as_ptr() as usize + 32,
+                length: 64,
+            },
+        ];
+        assert_eq!(
+            validate_acpi_table_mappings(0x1000, 20, &mappings),
+            Err("[start-context] ACPI virtual table mappings overlap")
         );
     }
 }

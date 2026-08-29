@@ -49,6 +49,7 @@ fn configure_kernel_linker(root: &Path, target: &str) {
     let expected_layout = match target {
         "loongarch64-unknown-none" => LinkLayout::Loongarch64Dmw1,
         "riscv64gc-unknown-none-elf" => LinkLayout::Riscv64Sv48,
+        "x86_64-unknown-none" => LinkLayout::X86_64HigherHalf,
         _ => return,
     };
 
@@ -71,6 +72,7 @@ fn configure_kernel_linker(root: &Path, target: &str) {
     let script = match expected_layout {
         LinkLayout::Loongarch64Dmw1 => linker_dir.join("loongarch64.ld"),
         LinkLayout::Riscv64Sv48 => linker_dir.join("riscv64.ld"),
+        LinkLayout::X86_64HigherHalf => linker_dir.join("x86_64.ld"),
     };
     for source in [
         script.clone(),
@@ -94,6 +96,12 @@ fn configure_kernel_linker(root: &Path, target: &str) {
         platform.identity_tag()
     );
     println!("cargo:rustc-link-arg-bin=kernel=-T{}", script.display());
+    if matches!(expected_layout, LinkLayout::X86_64HigherHalf) {
+        // The freestanding x86 target specification enables PIE by default.
+        // Keep the fixed higher-half ET_EXEC image non-PIE even when a caller
+        // overrides Cargo's target rustflags (for example with RUSTFLAGS=-Awarnings).
+        println!("cargo:rustc-link-arg-bin=kernel=-no-pie");
+    }
 }
 
 fn validate_link_platform(platform: &PlatformSpec, target: &str, expected_layout: LinkLayout) {
@@ -145,6 +153,14 @@ fn validate_link_platform(platform: &PlatformSpec, target: &str, expected_layout
                 platform.id
             );
             0xffff_ff80_0000_0000 | physical
+        }
+        LinkLayout::X86_64HigherHalf => {
+            assert!(
+                physical < 0x8000_0000,
+                "平台 {} 的物理基址超出 x86_64 低端镜像窗口",
+                platform.id
+            );
+            0xffff_ffff_8000_0000 | physical
         }
     };
     assert_eq!(

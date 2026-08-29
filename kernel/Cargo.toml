@@ -88,6 +88,12 @@ spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 soyo = { path = "../libs/soyo" }
 vfs = { path = "../libs/vfs" }
 
+# The freestanding x86 image is compiled without a host SIMD target.  Keep
+# the hosted/default graph free to use SHA-NI, while selecting sha2's portable
+# constant-time backend for the bare-metal target.
+[target.'cfg(target_os = "none")'.dependencies]
+sha2 = { version = "0.10.9", default-features = false, features = ["force-soft"] }
+
 [build-dependencies]
 ed25519-dalek = { version = "2.2.0", default-features = false }
 sha2 = { version = "0.10.9", default-features = false }

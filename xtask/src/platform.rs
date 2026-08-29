@@ -44,6 +44,11 @@ pub struct LinkSpec {
 pub enum LinkLayout {
     Loongarch64Dmw1,
     Riscv64Sv48,
+    /// x86_64 long-mode higher-half mapping.  The physical image is loaded
+    /// below 4 GiB and the kernel executes through the canonical
+    /// `ffff_ffff_8000_0000` alias.
+    #[serde(rename = "x86_64-higher-half", alias = "x86_64")]
+    X86_64HigherHalf,
 }
 
 impl LinkLayout {
@@ -51,6 +56,7 @@ impl LinkLayout {
         match self {
             Self::Loongarch64Dmw1 => "loongarch64",
             Self::Riscv64Sv48 => "riscv64",
+            Self::X86_64HigherHalf => "x86_64",
         }
     }
 
@@ -58,6 +64,7 @@ impl LinkLayout {
         match self {
             Self::Loongarch64Dmw1 => 258,
             Self::Riscv64Sv48 => 243,
+            Self::X86_64HigherHalf => 62,
         }
     }
 }
@@ -77,6 +84,7 @@ pub enum ImageFormat {
     Elf,
     Raw,
     Uimage,
+    Efi,
 }
 
 impl ImageFormat {
@@ -85,6 +93,7 @@ impl ImageFormat {
             Self::Elf => "kernel.elf",
             Self::Raw => "kernel.bin",
             Self::Uimage => "uImage",
+            Self::Efi => "esp.img",
         }
     }
 }
@@ -97,8 +106,9 @@ impl std::str::FromStr for ImageFormat {
             "elf" => Ok(Self::Elf),
             "raw" => Ok(Self::Raw),
             "uimage" => Ok(Self::Uimage),
+            "efi" => Ok(Self::Efi),
             other => Err(CatalogError::new(format!(
-                "unsupported image format {other:?}; expected elf, raw, uimage, or all"
+                "unsupported image format {other:?}; expected elf, raw, uimage, efi, or all"
             ))),
         }
     }
@@ -405,6 +415,7 @@ impl PlatformSpec {
         let expected_target = match self.link.layout {
             LinkLayout::Loongarch64Dmw1 => "loongarch64-unknown-none",
             LinkLayout::Riscv64Sv48 => "riscv64gc-unknown-none-elf",
+            LinkLayout::X86_64HigherHalf => "x86_64-unknown-none",
         };
         if self.target != expected_target {
             return Err(CatalogError::new(format!(
@@ -448,6 +459,15 @@ impl PlatformSpec {
                 }
                 0xffff_ff80_0000_0000 | self.link.physical_base.get()
             }
+            LinkLayout::X86_64HigherHalf => {
+                if self.link.physical_base.get() >= 0x8000_0000 {
+                    return Err(CatalogError::new(format!(
+                        "platform {:?} physical base does not fit the x86_64 low image window",
+                        self.id
+                    )));
+                }
+                0xffff_ffff_8000_0000 | self.link.physical_base.get()
+            }
         };
         if self.link.virtual_base.get() != expected_virtual {
             return Err(CatalogError::new(format!(
@@ -479,6 +499,14 @@ impl PlatformSpec {
             }
         }
         self.image.validate(&self.id)?;
+        if self.image.allowed_formats.contains(&ImageFormat::Efi)
+            && self.link.layout != LinkLayout::X86_64HigherHalf
+        {
+            return Err(CatalogError::new(format!(
+                "platform {:?} EFI image support requires the x86_64 higher-half loader",
+                self.id
+            )));
+        }
         if self.image.uimage.is_some() && self.link.physical_base.get() > u64::from(u32::MAX) {
             return Err(CatalogError::new(format!(
                 "platform {:?} uImage load address does not fit the legacy 32-bit header",
@@ -632,7 +660,7 @@ mod tests {
     #[test]
     fn repository_catalog_is_valid() {
         let catalog = PlatformCatalog::parse(CATALOG).expect("valid repository catalog");
-        assert_eq!(catalog.platforms().len(), 4);
+        assert_eq!(catalog.platforms().len(), 5);
         let ls2k = catalog.get("ls2k1000").expect("LS2K1000 platform");
         assert_eq!(ls2k.link.physical_base.get(), 0x20_0000);
         assert_eq!(ls2k.link.virtual_base.get(), 0x9000_0000_0020_0000);
@@ -643,6 +671,10 @@ mod tests {
                 .expect("QEMU LoongArch64 platform")
                 .identity_tag()
         );
+        let x86 = catalog.get("qemu-x86_64").expect("QEMU x86_64 platform");
+        assert_eq!(x86.target, "x86_64-unknown-none");
+        assert_eq!(x86.link.physical_base.get(), 0x0180_0000);
+        assert_eq!(x86.link.virtual_base.get(), 0xffff_ffff_8180_0000);
     }
 
     #[test]
@@ -704,7 +736,7 @@ mod tests {
 
     #[test]
     fn rejects_unaligned_link_bases() {
-        let source = CATALOG.replacen("0x0000_0000_0020_0000", "0x0000_0000_0020_0001", 1);
+        let source = CATALOG.replacen("0x0000_0000_0180_0000", "0x0000_0000_0180_0001", 1);
         let error = PlatformCatalog::parse(&source).expect_err("unaligned base must fail");
         assert!(error.to_string().contains("aligned"));
     }

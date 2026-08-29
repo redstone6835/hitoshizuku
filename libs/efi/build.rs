@@ -13,7 +13,6 @@ fn main() {
         .file("src/c/efi_guids.c")
         .flag("-ffreestanding")
         .flag("-fno-stack-protector")
-        .flag("-fno-PIC")
         .flag("-fno-builtin")
         .flag("-fno-tree-vectorize")
         .flag_if_supported("-mno-lsx")
@@ -27,6 +26,21 @@ fn main() {
             .flag("-march=rv64gc")
             .flag("-mabi=lp64d")
             .flag("-mcmodel=medany");
+    }
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none")
+        && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
+    {
+        // The final kernel is a fixed higher-half ET_EXEC, but this archive is
+        // also part of the exact dependency closure exported to ELM PIE
+        // modules.  RIP-relative small-model references remain valid because
+        // each linked image keeps its own code and data within a 2 GiB span.
+        build.flag("-fPIC").flag("-mcmodel=small");
+    } else if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
+        // Hosted test binaries are PIE by default as well.
+        build.flag("-fPIC").flag("-mcmodel=small");
+    } else if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("none") {
+        build.flag("-fPIC");
     }
 
     build.compile("efi_c");

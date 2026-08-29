@@ -1,7 +1,9 @@
 #![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_main)]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod driver;
 
@@ -53,7 +55,7 @@ impl ElmModule for FwCfgElm {
     }
 }
 
-#[cfg(not(feature = "elm-integrated"))]
+#[cfg(all(not(feature = "elm-integrated"), not(test)))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     elm::runtime::abort_panic()
