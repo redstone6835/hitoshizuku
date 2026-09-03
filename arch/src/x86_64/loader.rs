@@ -109,13 +109,13 @@ mod tests {
         let metadata = X86StartMetadata {
             protocol: X86BootProtocol::Multiboot2,
             boot_cpu_id: 3,
-            command_line: Some(b"console=ttyS0"),
+            command_line: Some(b"console=uart0"),
         };
         let boot = metadata.boot_info();
         assert_eq!(boot.architecture, StartArchitecture::X86_64);
         assert_eq!(boot.protocol, general::StartBootProtocol::Multiboot2);
         assert_eq!(boot.boot_cpu_id, 3);
-        assert_eq!(boot.command_line, Some(&b"console=ttyS0"[..]));
+        assert_eq!(boot.command_line, Some(&b"console=uart0"[..]));
     }
 
     #[test]

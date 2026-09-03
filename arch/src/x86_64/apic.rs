@@ -35,24 +35,39 @@ pub const SPURIOUS_VECTOR: u8 = 0xff;
 const IOAPIC_REG_SELECT: usize = 0x00;
 const IOAPIC_REG_WINDOW: usize = 0x10;
 const IOAPIC_REG_VERSION: u8 = 1;
+#[cfg(any(test, target_os = "none"))]
 const IOAPIC_REDIR_BASE: u8 = 0x10;
 const LAPIC_EOI: usize = 0x0b0;
+#[cfg(target_os = "none")]
 const LAPIC_ID: usize = 0x020;
+#[cfg(target_os = "none")]
 const LAPIC_ISR_BASE: usize = 0x100;
+#[cfg(target_os = "none")]
 const LAPIC_SVR: usize = 0x0f0;
+#[cfg(target_os = "none")]
 const LAPIC_ICR_HIGH: usize = 0x310;
+#[cfg(target_os = "none")]
 const LAPIC_ICR_LOW: usize = 0x300;
+#[cfg(target_os = "none")]
 const LAPIC_ICR_DELIVERY_STATUS: u32 = 1 << 12;
+#[cfg(target_os = "none")]
 const LAPIC_ICR_LEVEL_ASSERT: u32 = 1 << 14;
+#[cfg(target_os = "none")]
 const LAPIC_ICR_TRIGGER_LEVEL: u32 = 1 << 15;
+#[cfg(target_os = "none")]
 const LAPIC_ICR_DELIVERY_INIT: u32 = 0b101 << 8;
+#[cfg(target_os = "none")]
 const LAPIC_ICR_DELIVERY_STARTUP: u32 = 0b110 << 8;
+#[cfg(target_os = "none")]
 const LAPIC_ENABLE_BIT: u32 = 1 << 8;
 /// Intel's MP startup sequence requires a settling interval after INIT
 /// de-assertion and a short interval between the two SIPIs.  Use the stable
 /// architectural counter rather than a CPU-dependent pause-loop count.
+#[cfg(any(test, target_os = "none"))]
 const INIT_DEASSERT_DELAY_NS: u64 = 10_000_000;
+#[cfg(any(test, target_os = "none"))]
 const SIPI_INTERVAL_NS: u64 = 200_000;
+#[cfg(any(test, target_os = "none"))]
 const NSEC_PER_SEC: u128 = 1_000_000_000;
 // The IOAPIC register-select window is eight bits wide.  Redirection entries
 // start at 0x10 and consume two register numbers, so entries beyond 120 would
@@ -84,8 +99,7 @@ pub struct ApicInitReport {
 
 #[derive(Clone, Copy, Debug)]
 struct IoApic {
-    id: u8,
-    phys: u32,
+    #[cfg_attr(not(target_os = "none"), allow(dead_code))]
     virt: usize,
     gsi_base: u32,
     gsi_end: u32,
@@ -97,11 +111,13 @@ impl IoApic {
         (self.gsi_base..=self.gsi_end).contains(&gsi)
     }
 
+    #[cfg(target_os = "none")]
     #[inline]
     fn select_addr(self) -> usize {
         self.virt.saturating_add(IOAPIC_REG_SELECT)
     }
 
+    #[cfg(target_os = "none")]
     #[inline]
     fn window_addr(self) -> usize {
         self.virt.saturating_add(IOAPIC_REG_WINDOW)
@@ -115,6 +131,7 @@ struct ApicState {
     overrides: Vec<AcpiInterruptOverride>,
     has_legacy_pic: bool,
     /// Software mirrors make hosted tests deterministic and avoid MMIO access.
+    #[cfg(not(target_os = "none"))]
     hosted_redirection: [u64; 256],
 }
 
@@ -186,6 +203,7 @@ impl X86AcpiIrqDomain {
         }
     }
 
+    #[cfg(target_os = "none")]
     fn read_ioapic(&self, ioapic: IoApic, register: u8) -> u32 {
         #[cfg(target_os = "none")]
         unsafe {
@@ -201,6 +219,7 @@ impl X86AcpiIrqDomain {
         }
     }
 
+    #[cfg(target_os = "none")]
     fn write_ioapic(&self, ioapic: IoApic, register: u8, value: u32) {
         #[cfg(target_os = "none")]
         unsafe {
@@ -311,21 +330,23 @@ impl X86AcpiIrqDomain {
             return self.write_redirection(state, gsi, entry);
         }
         if state.has_legacy_pic && gsi < 16 {
-            let irq = gsi as u8;
-            let (port, bit) = if irq < 8 {
-                (0x21u16, irq)
-            } else {
-                (0xa1u16, irq - 8)
-            };
             #[cfg(target_os = "none")]
-            unsafe {
-                let mut mask = super::io::inb(port);
-                if enabled {
-                    mask &= !(1 << bit);
+            {
+                let irq = gsi as u8;
+                let (port, bit) = if irq < 8 {
+                    (0x21u16, irq)
                 } else {
-                    mask |= 1 << bit;
+                    (0xa1u16, irq - 8)
+                };
+                unsafe {
+                    let mut mask = super::io::inb(port);
+                    if enabled {
+                        mask &= !(1 << bit);
+                    } else {
+                        mask |= 1 << bit;
+                    }
+                    super::io::outb(port, mask);
                 }
-                super::io::outb(port, mask);
             }
             return true;
         }
@@ -434,28 +455,6 @@ pub(crate) fn write_local_apic(offset: usize, value: u32) -> bool {
     {
         let _ = (address, value);
         false
-    }
-}
-
-/// Read one local-APIC register without acquiring the IRQ-domain lock.
-///
-/// This is primarily useful for diagnostics and future calibration code.  It
-/// has the same strict address checks as [`write_local_apic`].
-#[inline]
-pub(crate) fn read_local_apic(offset: usize) -> Option<u32> {
-    if offset > 0xfff || offset & 3 != 0 {
-        return None;
-    }
-    let base = local_apic_base()?;
-    let address = base.checked_add(offset)?;
-    #[cfg(target_os = "none")]
-    unsafe {
-        Some(read_volatile(address as *const u32))
-    }
-    #[cfg(not(target_os = "none"))]
-    {
-        let _ = address;
-        None
     }
 }
 
@@ -568,8 +567,6 @@ pub fn initialize_from_madt(
             .checked_add(redirection_count - 1)
             .ok_or(ApicInitError::InvalidGsiRange)?;
         let ioapic = IoApic {
-            id: source.id,
-            phys: source.address,
             virt,
             gsi_base: source.global_system_interrupt_base,
             gsi_end,
@@ -596,9 +593,11 @@ pub fn initialize_from_madt(
         ioapics,
         overrides: madt.interrupt_overrides.clone(),
         has_legacy_pic: madt.has_legacy_pic,
+        #[cfg(not(target_os = "none"))]
         hosted_redirection: [0; 256],
     }));
 
+    #[cfg(target_os = "none")]
     if let Some(local_apic) = local_apic {
         enable_local_apic(local_apic);
     }
@@ -607,8 +606,12 @@ pub fn initialize_from_madt(
     }
 
     let domain_dyn: Arc<dyn IrqDomain> = domain.clone();
-    general::dev::irq::register_default_irq_domain(domain_dyn)
+    let default_handle = general::dev::irq::register_default_irq_domain(domain_dyn.clone())
         .map_err(|_| ApicInitError::Registry)?;
+    if general::dev::irq::register_irq_domain(X86_ACPI_IRQ_CONTROLLER, domain_dyn).is_err() {
+        let _ = general::dev::irq::unregister_default_irq_domain(default_handle);
+        return Err(ApicInitError::Registry);
+    }
     general::dev::irq::install_irq_line_ops(IrqLineOps {
         enable: line_enable,
         disable: line_disable,
@@ -675,6 +678,7 @@ fn ioapic_redirection_count(version: u32) -> Option<u32> {
 }
 
 #[inline]
+#[cfg(any(test, target_os = "none"))]
 fn redirection_register(index: u32, high: bool) -> Option<u8> {
     let offset = u32::from(IOAPIC_REDIR_BASE)
         .checked_add(index.checked_mul(2)?)?
@@ -690,6 +694,7 @@ fn is_reserved_device_vector(vector: u8) -> bool {
     )
 }
 
+#[cfg(target_os = "none")]
 #[inline]
 fn enable_local_apic(base: usize) {
     #[cfg(target_os = "none")]
@@ -706,6 +711,7 @@ fn enable_local_apic(base: usize) {
 ///
 /// The MADT mapping is shared, but SVR is a CPU-local register and therefore
 /// must be initialized again by every AP before enabling interrupts.
+#[cfg(target_os = "none")]
 pub(crate) fn initialize_current_local_apic() -> bool {
     let Some(base) = local_apic_base() else {
         return false;
@@ -804,6 +810,7 @@ fn wait_icr_idle(base: usize) -> bool {
 }
 
 #[inline]
+#[cfg(any(test, target_os = "none"))]
 fn delay_ticks_for_ns(delay_ns: u64, counter_hz: u64) -> u64 {
     let product = u128::from(delay_ns).saturating_mul(u128::from(counter_hz));
     let rounded = product.saturating_add(NSEC_PER_SEC - 1) / NSEC_PER_SEC;
@@ -825,6 +832,7 @@ fn wait_stable_counter_delay(delay_ns: u64) {
 /// APIC ids wider than eight bits require x2APIC MSR mode, which this backend
 /// does not enable yet; rejecting them is preferable to waking an unintended
 /// processor.  Hosted builds return false and never emulate privileged IPI.
+#[cfg(target_os = "none")]
 pub(crate) fn send_init_sipi(apic_id: u32, vector: u8) -> bool {
     if apic_id > 0xff || vector == 0 {
         return false;
@@ -832,12 +840,6 @@ pub(crate) fn send_init_sipi(apic_id: u32, vector: u8) -> bool {
     let Some(base) = local_apic_base() else {
         return false;
     };
-    #[cfg(not(target_os = "none"))]
-    {
-        let _ = (base, apic_id, vector);
-        return false;
-    }
-    #[cfg(target_os = "none")]
     unsafe {
         write_volatile((base + LAPIC_ICR_HIGH) as *mut u32, apic_id << 24);
         write_volatile(
@@ -999,8 +1001,6 @@ mod tests {
         let domain = X86AcpiIrqDomain::new(ApicState {
             local_apic: Some(0xfee0_0000),
             ioapics: vec![IoApic {
-                id: 1,
-                phys: 0xfec0_0000,
                 virt: 0xfec0_0000,
                 gsi_base: 0,
                 gsi_end: 23,

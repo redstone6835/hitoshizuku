@@ -18,7 +18,7 @@ use allocator as _;
 pub(crate) use general::dev;
 
 static AHCI_PROJECTION_NAMES: FunctionProjectionNameAllocator =
-    FunctionProjectionNameAllocator::new("sd");
+    FunctionProjectionNameAllocator::new("ahci");
 
 fn alloc_ahci_dev_name(stable_key: &str) -> Result<String, FunctionProjectionNameAllocError> {
     AHCI_PROJECTION_NAMES
@@ -58,7 +58,7 @@ impl ElmModule for AhciElm {
     }
 }
 
-#[cfg(not(feature = "elm-integrated"))]
+#[cfg(all(not(feature = "elm-integrated"), target_os = "none"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     elm::runtime::abort_panic()

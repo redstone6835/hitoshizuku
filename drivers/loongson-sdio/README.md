@@ -1,7 +1,7 @@
 # Loongson LS2K SDIO 驱动
 
 `platform.loongson-sdio` 初始化 LS2K SDIO controller，识别 SD 或 eMMC，并发布 512 字节
-扇区的 `/dev/mmcblkN` 块设备。
+扇区的 `/dev/sdioN` 块设备（例如 `/dev/sdio0`，分区为 `/dev/sdio0p1`）。
 
 ## 实现范围
 

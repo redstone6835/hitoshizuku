@@ -34,6 +34,8 @@ use virtio::{
     VIRTQ_USED_F_NO_NOTIFY, VirtioPciTransport, VirtqDescUpdate, virtq_need_event,
 };
 
+use crate::VIRTIO_NET_DEVICE_NAME;
+
 const VIRTIO_NET_HEADER_LEN: u16 = 12;
 const RX_DESCRIPTOR_OFFSET: u16 = 116;
 const RX_FRAME_OFFSET: u16 = RX_DESCRIPTOR_OFFSET + VIRTIO_NET_HEADER_LEN;
@@ -828,7 +830,7 @@ pub(crate) fn install_active_queues(
         });
     }
     let registration = NetDeviceRegistration::new(
-        "eth0".into(),
+        VIRTIO_NET_DEVICE_NAME.into(),
         mac_address,
         mtu,
         true,

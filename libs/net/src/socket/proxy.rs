@@ -780,6 +780,10 @@ impl NetSocketProxy {
         self.facade.set_raw_header_included(enabled);
     }
 
+    pub fn set_ping_socket(&self, enabled: bool) {
+        self.facade.set_ping_socket(enabled);
+    }
+
     pub fn set_free_bind(&self, enabled: bool) {
         self.facade.set_free_bind(enabled);
     }

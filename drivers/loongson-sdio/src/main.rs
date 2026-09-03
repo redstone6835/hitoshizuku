@@ -17,11 +17,11 @@ use allocator as _;
 
 pub(crate) use general::dev;
 
-static MMC_PROJECTION_NAMES: FunctionProjectionNameAllocator =
-    FunctionProjectionNameAllocator::new("mmcblk");
+static SDIO_PROJECTION_NAMES: FunctionProjectionNameAllocator =
+    FunctionProjectionNameAllocator::new("sdio");
 
-fn alloc_mmc_dev_name(stable_key: &str) -> Result<String, FunctionProjectionNameAllocError> {
-    MMC_PROJECTION_NAMES
+fn alloc_sdio_dev_name(stable_key: &str) -> Result<String, FunctionProjectionNameAllocError> {
+    SDIO_PROJECTION_NAMES
         .try_alloc_stable(stable_key)
         .map(|name| name.into_string())
 }
@@ -58,7 +58,7 @@ impl ElmModule for LoongsonSdioElm {
     }
 }
 
-#[cfg(not(feature = "elm-integrated"))]
+#[cfg(all(not(feature = "elm-integrated"), target_os = "none"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     elm::runtime::abort_panic()

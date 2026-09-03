@@ -1134,7 +1134,7 @@ impl PnpDriver for Ls2kGmacDriver {
             socket_tx_pool,
             irq: mac.irq(),
         };
-        let name = alloc::format!("eth{}", bus_id).into_boxed_str();
+        let name = alloc::format!("ethernet{}", bus_id).into_boxed_str();
         let handle = net::device::register_device(NetDeviceRegistration::new(
             name,
             mac_address,

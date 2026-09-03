@@ -35,12 +35,6 @@ fn smap_supported() -> bool {
     __cpuid_count(7, 0).ebx & (1 << 20) != 0
 }
 
-#[cfg(not(target_os = "none"))]
-#[inline]
-fn smap_supported() -> bool {
-    false
-}
-
 #[cfg(target_os = "none")]
 #[inline]
 unsafe fn stac_if_supported() {
@@ -64,14 +58,6 @@ unsafe fn clac_if_supported() {
     }
 }
 
-#[cfg(not(target_os = "none"))]
-#[inline]
-unsafe fn stac_if_supported() {}
-
-#[cfg(not(target_os = "none"))]
-#[inline]
-unsafe fn clac_if_supported() {}
-
 /// Copy bytes from a user address.  The exception table maps a fault in the
 /// `rep movsb` instruction to the local fixup label, which returns `Fault` after
 /// CLAC restores SMAP state.
@@ -82,9 +68,9 @@ unsafe fn copy_from_user_raw(dst: *mut u8, src: usize, len: usize) -> Result<(),
         return Ok(());
     }
     unsafe { stac_if_supported() };
-    let mut dst_reg = dst as usize;
-    let mut src_reg = src;
-    let mut count = len;
+    let dst_reg = dst as usize;
+    let src_reg = src;
+    let count = len;
     let mut fault: u32;
     unsafe {
         core::arch::asm!(
@@ -97,9 +83,9 @@ unsafe fn copy_from_user_raw(dst: *mut u8, src: usize, len: usize) -> Result<(),
             ".balign 8",
             ".8byte 2b, 3b",
             ".popsection",
-            inout("rdi") dst_reg,
-            inout("rsi") src_reg,
-            inout("rcx") count,
+            inout("rdi") dst_reg => _,
+            inout("rsi") src_reg => _,
+            inout("rcx") count => _,
             fault = lateout(reg) fault,
             options(nostack)
         );
@@ -130,9 +116,9 @@ unsafe fn copy_to_user_raw(dst: usize, src: *const u8, len: usize) -> Result<(),
         return Ok(());
     }
     unsafe { stac_if_supported() };
-    let mut dst_reg = dst;
-    let mut src_reg = src as usize;
-    let mut count = len;
+    let dst_reg = dst;
+    let src_reg = src as usize;
+    let count = len;
     let mut fault: u32;
     unsafe {
         core::arch::asm!(
@@ -145,9 +131,9 @@ unsafe fn copy_to_user_raw(dst: usize, src: *const u8, len: usize) -> Result<(),
             ".balign 8",
             ".8byte 2b, 3b",
             ".popsection",
-            inout("rdi") dst_reg,
-            inout("rsi") src_reg,
-            inout("rcx") count,
+            inout("rdi") dst_reg => _,
+            inout("rsi") src_reg => _,
+            inout("rcx") count => _,
             fault = lateout(reg) fault,
             options(nostack)
         );

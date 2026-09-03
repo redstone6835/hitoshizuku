@@ -1214,6 +1214,7 @@ fn write_u64(out: &mut [u8], off: usize, value: u64) {
     out[off..off + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+#[cfg(target_arch = "x86_64")]
 fn write_u16(out: &mut [u8], off: usize, value: u16) {
     out[off..off + 2].copy_from_slice(&value.to_le_bytes());
 }
@@ -1224,6 +1225,7 @@ fn read_u64(input: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(raw)
 }
 
+#[cfg(target_arch = "x86_64")]
 fn read_u16(input: &[u8], off: usize) -> u16 {
     let mut raw = [0u8; 2];
     raw.copy_from_slice(&input[off..off + 2]);

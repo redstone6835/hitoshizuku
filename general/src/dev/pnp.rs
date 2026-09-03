@@ -5271,6 +5271,8 @@ mod tests {
 
     #[test]
     fn provider_scope_rejects_stale_removing_and_retargeted_tokens() {
+        let _context_state = crate::elm_guard::TEST_ELM_CONTEXT_STATE.lock();
+        assert!(elm_model::current_context().is_none());
         let device = test_device(0x4304);
         device.begin_probe(None).unwrap();
         let stale = device.provider_resource_scope().unwrap();

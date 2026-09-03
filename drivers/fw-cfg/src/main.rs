@@ -55,7 +55,7 @@ impl ElmModule for FwCfgElm {
     }
 }
 
-#[cfg(all(not(feature = "elm-integrated"), not(test)))]
+#[cfg(all(not(feature = "elm-integrated"), not(test), target_os = "none"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     elm::runtime::abort_panic()

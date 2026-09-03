@@ -34,13 +34,6 @@ use general::firmware::power::{
     PowerAccessWidth, PowerControlInfo, PowerControlMethod, PowerRegister, PowerRegisterSpace,
 };
 use general::firmware::{FirmwareRegisterSpace, FirmwareTableMapping, SerialPortInfo};
-use general::vfs::FS_REGISTRY;
-use general::vfs::VfsContext;
-use general::vfs::cred::Credentials;
-use general::vfs::dentry::VfsRoot;
-use general::vfs::limits::VfsLimits;
-use general::vfs::mount::{Mount, MountFlags, MountNamespace};
-use general::vfs::stat::FileMode;
 use general::{StartAcpiHostOps, StartContext, StartFirmware};
 use log::printk;
 
@@ -757,40 +750,14 @@ pub fn kernel_start_init(context: &StartContext) {
         pci_roots.len()
     );
 
-    // ── 阶段 5：挂载根文件系统并准备 /dev ─────────────────────────────────
-
+    // ── 阶段 5：完成设备注册后选择根文件系统并准备 /dev ────────────────
+    //
+    // 设备阶段必须先运行：VirtIO/PCI 驱动只有在 integrated device phase
+    // 完成后才会发布块功能，随后 boot_root 才能扫描 GPT/MBR 并解析
+    // `root=/dev/vd0p1`。devtmpfs 本身可以先创建，但挂载到最终根目录
+    // 要等 root 选择完成，避免把它错误地挂到临时 tmpfs 上。
     crate::device_init::register_core_filesystems("acpi");
-
-    let root_sb = FS_REGISTRY
-        .find("tmpfs")
-        .expect("[kernel-start][acpi] tmpfs driver not found")
-        .mount(None, "")
-        .expect("[kernel-start][acpi] failed to mount tmpfs root");
-
-    let root_mount = Mount::new(
-        Arc::clone(&root_sb),
-        Arc::clone(&root_sb.root_dentry),
-        Arc::clone(&root_sb.root_dentry),
-        MountFlags::default(),
-        None,
-    );
-
-    let mount_ns = MountNamespace::new(1, Arc::clone(&root_mount));
-
-    let cred = Credentials::root();
-
-    let vfs_ctx = VfsContext::new(
-        Arc::clone(&root_sb.root_dentry),
-        Arc::clone(&root_mount),
-        VfsRoot::new(Arc::clone(&root_sb.root_dentry), Arc::clone(&root_mount)),
-        Arc::clone(&mount_ns),
-        Arc::new(cred.clone()),
-        FileMode::new(0),
-        VfsLimits::default_arc(),
-    );
-
     let dev_sb = crate::device_init::mount_devtmpfs("acpi");
-    crate::device_init::mount_devtmpfs_on_dev("acpi", &vfs_ctx, Arc::clone(&dev_sb));
 
     crate::device_init::activate_device_subsystem(
         "acpi",
@@ -895,22 +862,33 @@ pub fn kernel_start_init(context: &StartContext) {
         platform_bound
     );
 
+    let root = crate::boot_root::prepare(
+        "acpi",
+        context.boot.command_line,
+        crate::initramfs::embedded_image(),
+        None,
+    );
+    printk!("[kernel-start][acpi] root source selected: {}", root.source);
+
+    crate::device_init::mount_devtmpfs_on_dev("acpi", &root.vfs_ctx, Arc::clone(&dev_sb));
+
     // ── 阶段 6：注册控制台并绑定日志输出 ──────────────────────────────────
 
-    crate::device_init::mount_standard_user_api_filesystems("acpi", &vfs_ctx);
+    crate::device_init::mount_standard_user_api_filesystems("acpi", &root.vfs_ctx);
 
     // 把同一套部件交给 sched shim 保管：随后 sched::boot_init 会据此给 init
     // 任务挂上 TASKEXT_VFS_CONTEXT / TASKEXT_VFS_FDTABLE。
     crate::sched::stash_boot_vfs_parts(
-        Arc::clone(&root_sb.root_dentry),
-        Arc::clone(&root_mount),
-        Arc::clone(&mount_ns),
-        Arc::new(cred.clone()),
-        false,
+        Arc::clone(&root.superblock.root_dentry),
+        Arc::clone(&root.root_mount),
+        Arc::clone(&root.mount_ns),
+        Arc::clone(&root.cred),
+        root.is_initramfs,
     );
 
     printk!(
-        "[kernel-start][acpi] VFS ready: tmpfs '/' + devtmpfs '/dev' + tmpfs '/dev/shm' + sysfs '/sys'"
+        "[kernel-start][acpi] VFS ready: '{}' mounted as '/' + devtmpfs '/dev' + tmpfs '/dev/shm' + sysfs '/sys'",
+        root.source
     );
 
     let console_selector = if let Some(name) = cmdline.as_ref().and_then(|cl| {
@@ -938,7 +916,7 @@ pub fn kernel_start_init(context: &StartContext) {
     if let Some(selector) = console_selector {
         let _ = crate::device_init::bind_or_defer_boot_console(
             "acpi",
-            &vfs_ctx,
+            &root.vfs_ctx,
             Arc::clone(&dev_sb),
             selector,
         );

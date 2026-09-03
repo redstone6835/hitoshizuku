@@ -22,6 +22,10 @@ const SOCK_RAW: u16 = 3;
 static NET_IOCTL_HANDLER: Mutex<Option<fn(u32, usize) -> Result<usize, Errno>>> = Mutex::new(None);
 static NET_REALTIME_CLOCK: Mutex<Option<fn() -> u64>> = Mutex::new(None);
 
+fn ping_socket_checksum_offset(family: net::AddressFamily, protocol: u16) -> Option<u16> {
+    matches!((family, protocol), (net::AddressFamily::Ipv6, 58)).then_some(2)
+}
+
 pub fn install_net_ioctl_handler(handler: fn(u32, usize) -> Result<usize, Errno>) {
     *NET_IOCTL_HANDLER.lock() = Some(handler);
 }
@@ -1031,6 +1035,14 @@ pub fn create_net_socket(
                 stack_instance,
             )
             .map_err(map_socket_error)?;
+            proxy.set_ping_socket(true);
+            // Linux ping sockets fill the ICMPv6 checksum in the kernel.  The
+            // resident implementation uses the raw transport internally, so
+            // preserve that contract by enabling the RFC 3542 checksum fixup
+            // for the user-supplied ICMPv6 header.
+            if let Some(offset) = ping_socket_checksum_offset(address_family, protocol) {
+                proxy.set_ipv6_checksum_offset(Some(offset));
+            }
             proxy.set_buffer_limits(Some(64 * 1024), Some(64 * 1024));
             Ok(NetSocketFileOps::from_proxy(
                 proxy,
@@ -1157,5 +1169,22 @@ fn map_errno_to_vfs(error: Errno) -> VfsError {
         Errno::EINVAL => VfsError::InvalidArgument,
         Errno::EBADF => VfsError::BadFileDescriptor,
         _ => VfsError::Io,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv6_ping_socket_enables_kernel_checksum_fixup() {
+        assert_eq!(
+            ping_socket_checksum_offset(net::AddressFamily::Ipv6, 58),
+            Some(2)
+        );
+        assert_eq!(
+            ping_socket_checksum_offset(net::AddressFamily::Ipv4, 1),
+            None
+        );
     }
 }

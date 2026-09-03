@@ -1,7 +1,8 @@
 # StarFive JH7110 MMC 驱动
 
 `platform.jh7110-mmc` 为 VisionFive 2 的 DesignWare Mobile Storage Host 提供启动期
-SD/eMMC 块设备支持，并把探测到的介质发布为 `/dev/mmcblkN`。
+SD/eMMC 块设备支持，并把探测到的介质发布为 `/dev/mmcN`（例如 `/dev/mmc0`，分区为
+`/dev/mmc0p1`）。
 
 ## 实现范围
 

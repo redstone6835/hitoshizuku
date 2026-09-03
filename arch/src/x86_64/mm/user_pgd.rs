@@ -263,21 +263,19 @@ unsafe fn clone_for_fork(src: PgdHandle, dst: PgdHandle, range: core::ops::Range
             );
         }
         let f = X86_64Paging::pte_flags(pte);
-        let result = unsafe {
-            walk_and_map::<X86_64Paging>(
-                target.root_virt,
-                address,
-                allocation.paddr,
-                X86_64Paging::LEVELS - 1,
-                X86_64Paging::flags_readable(f),
-                X86_64Paging::flags_writable(f),
-                X86_64Paging::flags_executable(f),
-                X86_64Paging::flags_user_accessible(f),
-                false,
-                phys_to_virt,
-                allocate_table_page,
-            )
-        };
+        let result = walk_and_map::<X86_64Paging>(
+            target.root_virt,
+            address,
+            allocation.paddr,
+            X86_64Paging::LEVELS - 1,
+            X86_64Paging::flags_readable(f),
+            X86_64Paging::flags_writable(f),
+            X86_64Paging::flags_executable(f),
+            X86_64Paging::flags_user_accessible(f),
+            false,
+            phys_to_virt,
+            allocate_table_page,
+        );
         if result.is_err() {
             free_table_page(allocation.paddr);
             break;

@@ -128,6 +128,7 @@ pub(crate) enum EarlyUartConfigError {
     /// `earlycon=` 地址解析后为空地址。
     ZeroAddress,
     /// `earlycon=` 地址超出当前早期映射窗口。
+    #[cfg_attr(not(target_os = "none"), allow(dead_code))]
     AddressOutOfWindow,
 }
 

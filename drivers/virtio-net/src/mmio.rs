@@ -21,6 +21,7 @@ use virtio::virtio_mmio::{
 use virtio::{SplitVirtQueue, access_platform_compatible, choose_split_queue_size};
 
 use super::common::{VirtioNetQueue, VirtioNetTransport, install_active};
+use crate::VIRTIO_NET_DEVICE_NAME;
 
 const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
 const VIRTIO_NET_DEVICE_ID: u32 = 1;
@@ -289,13 +290,16 @@ impl PnpDriver for VirtioMmioNetDriver {
             let _ = irq::unregister_irq_handler(irq_handle);
             return Err(error);
         }
-        if let Err(error) = dev.register_function(net_function("eth0", info.dma_context())) {
+        if let Err(error) =
+            dev.register_function(net_function(VIRTIO_NET_DEVICE_NAME, info.dma_context()))
+        {
             let _ = super::common::remove_active_from_pnp();
             super::common::destroy_active();
             return Err(error);
         }
         log::printk!(
-            "[virtio-net] MMIO attached eth0 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} mtu={}",
+            "[virtio-net] MMIO attached {} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} mtu={}",
+            VIRTIO_NET_DEVICE_NAME,
             mac[0],
             mac[1],
             mac[2],

@@ -35,6 +35,13 @@ pub trait QueueIrqControl: Send + Sync {
 
     fn clear_waker(&self);
     fn stats(&self) -> QueueIrqStats;
+
+    /// Return whether the queue owner should periodically poll while idle.
+    /// Hardware-backed queues normally leave this disabled; a driver can
+    /// enable it for an interrupt fallback whose delivery is not reliable.
+    fn needs_polling(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

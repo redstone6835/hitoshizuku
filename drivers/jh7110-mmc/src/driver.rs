@@ -5,7 +5,7 @@
 //! - SD / eMMC 卡初始化：CMD0/8/55/41（SD）或 CMD1（eMMC）、CMD2/3/9/7；
 //! - IDMAC（内部 DMA）单块读写（CMD17/24），1-bit 总线（实机验证 PIO 数据
 //!   阶段在 JH7110 上不可用，Linux/U-Boot 均只用 IDMAC）；
-//! - 注册为 BlockDevice 并以 mmcblk0 暴露给 VFS；
+//! - 注册为 BlockDevice 并以 mmc0 暴露给 VFS；
 //! - ciu 时钟速率经 dt_provider 从 JH7110 CRG 查询（biu/ciu 引用）。
 //!
 //! 寄存器定义来源：Linux drivers/mmc/host/dw_mmc.h；VERID 决定 FIFO 数据口
@@ -966,7 +966,7 @@ impl PnpDriver for JhMmcDriver {
 
         let io = Arc::new(JhMmcIo { host, card });
         let disk_index = NEXT_DISK.fetch_add(1, Ordering::Relaxed);
-        let name = alloc::format!("mmcblk{}", disk_index);
+        let name = alloc::format!("mmc{}", disk_index);
 
         let block = BlockDevice::new(
             BlockDeviceInit {

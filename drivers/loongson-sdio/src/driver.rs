@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicBool, Ordering, fence};
 
 use spin::Mutex;
 
-use crate::alloc_mmc_dev_name;
+use crate::alloc_sdio_dev_name;
 use crate::dev::bio::{Bio, BioIoError, BioOp, BioReqError, SubmitError};
 use crate::dev::block::{
     BlockAttributes, BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockFeatures,
@@ -775,7 +775,7 @@ impl PnpDriver for LoongsonSdioDriver {
         let card = host.card;
         let host = Arc::new(Mutex::new(host));
         let gone = Arc::new(AtomicBool::new(false));
-        let dev_name = alloc_mmc_dev_name(&dev.name).map_err(PnpError::from)?;
+        let dev_name = alloc_sdio_dev_name(&dev.name).map_err(PnpError::from)?;
         let block = create_block_device(&dev_name, card, Arc::clone(&host), Arc::clone(&gone))?;
         dev.register_function(BlockFunction::with_projection_name_arc(
             &dev.name,

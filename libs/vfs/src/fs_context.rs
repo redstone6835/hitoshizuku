@@ -94,18 +94,30 @@ impl FsContext {
 
     /// FSCONFIG_SET_FLAG：把挂载选项名映射到 MountFlags 位。
     pub fn set_flag(&self, key: &str) -> Result<(), Errno> {
-        let flag = match key {
-            "ro" => MountFlags::RDONLY,
-            "nosuid" => MountFlags::NOSUID,
-            "nodev" => MountFlags::NODEV,
-            "noexec" => MountFlags::NOEXEC,
-            "sync" => MountFlags::SYNCHRONOUS,
-            "noatime" => MountFlags::NOATIME,
-            "nodiratime" => MountFlags::NODIRATIME,
-            _ => return Err(Errno::EOPNOTSUPP),
-        };
         let mut cfg = self.config.lock();
-        cfg.flags = cfg.flags.with(flag);
+        match key {
+            "ro" => cfg.flags = cfg.flags.with(MountFlags::RDONLY),
+            "rw" => cfg.flags = cfg.flags.without(MountFlags::RDONLY),
+            "nosuid" => cfg.flags = cfg.flags.with(MountFlags::NOSUID),
+            "suid" => cfg.flags = cfg.flags.without(MountFlags::NOSUID),
+            "nodev" => cfg.flags = cfg.flags.with(MountFlags::NODEV),
+            "dev" => cfg.flags = cfg.flags.without(MountFlags::NODEV),
+            "noexec" => cfg.flags = cfg.flags.with(MountFlags::NOEXEC),
+            "exec" => cfg.flags = cfg.flags.without(MountFlags::NOEXEC),
+            "sync" => cfg.flags = cfg.flags.with(MountFlags::SYNCHRONOUS),
+            "async" => cfg.flags = cfg.flags.without(MountFlags::SYNCHRONOUS),
+            "noatime" => cfg.flags = cfg.flags.with(MountFlags::NOATIME),
+            "atime" => cfg.flags = cfg.flags.without(MountFlags::NOATIME),
+            "nodiratime" => cfg.flags = cfg.flags.with(MountFlags::NODIRATIME),
+            "diratime" => cfg.flags = cfg.flags.without(MountFlags::NODIRATIME),
+            // These options are valid mount API flags but have no separate
+            // representation in MountFlags.  The VFS already uses its
+            // default relatime policy, so accepting them is sufficient for
+            // fsconfig remount transactions.
+            "relatime" | "strictatime" | "lazytime" | "dirsync" | "mand" | "nomand"
+            | "iversion" | "noiversion" | "nosymfollow" | "symfollow" => {}
+            _ => return Err(Errno::EOPNOTSUPP),
+        }
         Ok(())
     }
 
@@ -207,6 +219,9 @@ impl FsContext {
     /// 从已挂载路径初始化（fspick）。
     pub fn from_mount(mount: &Arc<Mount>) -> Arc<Self> {
         let ctx = Self::new(mount.superblock.fs_type.to_string());
+        // fspick/open_tree must preserve per-mount access constraints.  The
+        // flags belong to the Mount instance, not to the shared Superblock.
+        ctx.config.lock().flags = mount.flags_snapshot();
         *ctx.superblock.lock() = Some(Arc::clone(&mount.superblock));
         *ctx.clone_root.lock() = Some(Arc::clone(&mount.mount_root));
         ctx
@@ -311,7 +326,12 @@ pub fn land_mount(
     target: Arc<crate::vfs::dentry::Dentry>,
     target_mount: &Arc<Mount>,
 ) -> VfsResult<()> {
-    if ctx.is_consumed() {
+    // Serialize the one-shot transition with the attach itself.  Checking
+    // `consumed` and marking it only after an unlocked attach would let two
+    // concurrent move_mount callers construct duplicate Mount instances from
+    // the same detached context.
+    let mut consumed = ctx.consumed.lock();
+    if *consumed {
         return Err(VfsError::BadFileDescriptor);
     }
     let sb = ctx.take_superblock().ok_or(VfsError::InvalidArgument)?;
@@ -327,5 +347,8 @@ pub fn land_mount(
         Some(Arc::downgrade(target_mount)),
     );
     mount_ns.attach_mount(new_mount, target_mount);
+    // A detached mount context is a one-shot capability: after it has been
+    // attached, reusing the fd must not create another mount instance.
+    *consumed = true;
     Ok(())
 }

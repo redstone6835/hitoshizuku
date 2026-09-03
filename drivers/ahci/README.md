@@ -1,7 +1,7 @@
 # Platform AHCI 驱动
 
 `platform.ahci` 为 LS2K1000 设备树中的 platform AHCI 控制器提供 SATA 块设备，按活动
-端口发布 `/dev/sdN`。
+端口发布 `/dev/ahciN`（例如 `/dev/ahci0`，分区为 `/dev/ahci0p1`）。
 
 ## 实现范围
 

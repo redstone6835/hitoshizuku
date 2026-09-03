@@ -21,10 +21,12 @@ pub(crate) enum Ls2xDmaProtocolError {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 const NEXT_VALID: u32 = 1;
 const COMMAND_INTERRUPT: u32 = 1 << 1;
 const COMMAND_MEMORY_TO_DEVICE: u32 = 1 << 12;
 #[cfg(test)]
+#[allow(dead_code)]
 const DESCRIPTOR_ALIGNMENT: u64 = 32;
 
 #[repr(C)]
@@ -76,6 +78,7 @@ impl Ls2xDmaDescriptor {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn link_next(&mut self, address: u64) -> Result<(), Ls2xDmaProtocolError> {
         if !address.is_multiple_of(DESCRIPTOR_ALIGNMENT) {
             return Err(Ls2xDmaProtocolError::Unaligned);
@@ -86,6 +89,7 @@ impl Ls2xDmaDescriptor {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn end_chain(&mut self) {
         self.next_low &= !NEXT_VALID;
         self.next_high = 0;

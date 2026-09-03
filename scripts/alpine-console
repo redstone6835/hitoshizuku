@@ -1,0 +1,37 @@
+#!/bin/busybox sh
+# Serial maintenance session spawned and supervised by BusyBox init/getty.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+# Bash does not require a terminal cursor-position reply on a raw serial
+# endpoint.  BusyBox ash does issue CSI 6n during line-editor setup, so keep it
+# as an explicit opt-in for terminals whose host side answers that query.
+export TERM=${HITOSHIZUKU_TERM:-dumb}
+export COLUMNS=${COLUMNS:-80}
+export LINES=${LINES:-25}
+
+hostname=$(cat /etc/hostname 2>/dev/null || printf hitoshizuku)
+release=$(cat /etc/alpine-release 2>/dev/null || printf unknown)
+rootfs=$(sed -n 's/^rootfs=//p' /etc/hitoshizuku-boot.conf 2>/dev/null)
+console=$(sed -n 's/^console=//p' /etc/hitoshizuku-boot.conf 2>/dev/null)
+
+printf '\nHitoshizuku Alpine %s\n' "$release"
+printf 'host=%s rootfs=%s console=%s\n' "$hostname" "$rootfs" "$console"
+printf 'OpenRC startup complete; interactive maintenance shell follows.\n\n'
+case ${HITOSHIZUKU_SHELL:-bash} in
+    bash)
+        if [ -x /bin/bash ]; then
+            exec /bin/bash -l
+        fi
+        ;;
+    ash)
+        exec /bin/busybox ash -l
+        ;;
+    *)
+        printf 'unsupported HITOSHIZUKU_SHELL=%s (use bash or ash)\n' "$HITOSHIZUKU_SHELL" >&2
+        exit 2
+        ;;
+esac
+
+# A custom image may omit Bash; retain a deterministic fallback for the
+# default mode rather than leaving the getty child exited.
+exec /bin/busybox ash -l

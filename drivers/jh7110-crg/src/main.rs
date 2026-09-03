@@ -54,7 +54,7 @@ impl ElmModule for Jh7110CrgElm {
     }
 }
 
-#[cfg(not(feature = "elm-integrated"))]
+#[cfg(all(not(feature = "elm-integrated"), target_os = "none"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     elm::runtime::abort_panic()

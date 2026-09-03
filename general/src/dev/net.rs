@@ -154,6 +154,8 @@ struct ResidentQueueIrq {
     rings: RingInterruptControl,
     pending: AtomicBool,
     masked: AtomicBool,
+    polling_fallback: AtomicBool,
+    queue_irq_seen: AtomicBool,
     waker: Mutex<Option<Arc<dyn QueueWakeHandle>>>,
     irq_total: AtomicU64,
     irq_mask: AtomicU64,
@@ -167,6 +169,8 @@ impl ResidentQueueIrq {
             rings,
             pending: AtomicBool::new(false),
             masked: AtomicBool::new(true),
+            polling_fallback: AtomicBool::new(false),
+            queue_irq_seen: AtomicBool::new(false),
             waker: Mutex::new(None),
             irq_total: AtomicU64::new(0),
             irq_mask: AtomicU64::new(0),
@@ -218,6 +222,10 @@ impl ResidentQueueIrq {
             waker.wake();
         }
     }
+
+    fn enable_polling_fallback(&self) {
+        self.polling_fallback.store(true, Ordering::Release);
+    }
 }
 
 impl QueueIrqControl for ResidentQueueIrq {
@@ -230,11 +238,16 @@ impl QueueIrqControl for ResidentQueueIrq {
     }
 
     fn unmask(&self) {
-        self.pending.store(false, Ordering::Release);
+        // Re-enable notifications before consuming the pending latch.  A
+        // handler can set `pending` concurrently with this transition; using
+        // a consume-after-arm swap guarantees that either this path observes
+        // and wakes for it, or the handler observes the cleared value and
+        // performs the wake itself.  Clearing the latch before arming could
+        // overwrite a handler's store and lose the only wakeup.
         self.set_ring_interrupts_masked(false);
         self.masked.store(false, Ordering::Release);
         self.irq_unmask.fetch_add(1, Ordering::Relaxed);
-        if self.pending.load(Ordering::Acquire) {
+        if self.pending.swap(false, Ordering::AcqRel) {
             self.wake();
         }
     }
@@ -259,6 +272,11 @@ impl QueueIrqControl for ResidentQueueIrq {
             irq_unmask: self.irq_unmask.load(Ordering::Relaxed),
         }
     }
+
+    fn needs_polling(&self) -> bool {
+        self.polling_fallback.load(Ordering::Acquire)
+            && !self.queue_irq_seen.load(Ordering::Acquire)
+    }
 }
 
 impl IrqHandler for ResidentQueueIrq {
@@ -269,6 +287,10 @@ impl IrqHandler for ResidentQueueIrq {
         }
         self.irq_total.fetch_add(1, Ordering::Relaxed);
         if status & 1 != 0 {
+            // Only entering the real handler proves that queue interrupt
+            // delivery works. `ack_and_mask` may observe a stale ISR bit while
+            // recovering a missed interrupt, so it must not disable polling.
+            self.queue_irq_seen.store(true, Ordering::Release);
             self.set_ring_interrupts_masked(true);
             self.masked.store(true, Ordering::Release);
             self.irq_mask.fetch_add(1, Ordering::Relaxed);
@@ -400,6 +422,13 @@ impl NetQueueIrqBinding {
 
     fn handler(&self) -> Arc<dyn IrqHandler> {
         self.inner.clone()
+    }
+
+    /// Enable bounded polling for a queue using a last-resort interrupt path.
+    /// The flag is shared with the resident IRQ handler and stops requesting
+    /// polling after a real queue interrupt is observed.
+    pub fn enable_polling_fallback(&self) {
+        self.inner.enable_polling_fallback();
     }
 }
 
@@ -543,4 +572,73 @@ pub fn queue_irq_control(binding: &NetQueueIrqBinding) -> Arc<dyn QueueIrqContro
 )]
 pub fn queue_irq_handler(binding: &NetQueueIrqBinding) -> Arc<dyn IrqHandler> {
     binding.handler()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pci_polling_fallback_is_opt_in() {
+        let binding = NetQueueIrqBinding::virtio_pci(0, 0, 0);
+        let control = binding.control();
+        assert!(!control.needs_polling());
+
+        binding.enable_polling_fallback();
+        assert!(control.needs_polling());
+    }
+
+    #[test]
+    fn mmio_queue_does_not_request_polling_by_default() {
+        let binding = NetQueueIrqBinding::virtio_mmio(0, 0, 0, 0);
+        assert!(!binding.control().needs_polling());
+    }
+
+    #[test]
+    fn observed_queue_irq_disables_polling_fallback() {
+        let mut rx_flags = 0u16;
+        let mut tx_flags = 0u16;
+        let binding = NetQueueIrqBinding::virtio_pci_msix(
+            (&mut rx_flags as *mut u16) as usize,
+            (&mut tx_flags as *mut u16) as usize,
+        );
+        let control = binding.control();
+        binding.enable_polling_fallback();
+        assert!(control.needs_polling());
+
+        assert_eq!(
+            binding.handler().handle_irq(IrqLine::Hardware(0)),
+            IrqStatus::Handled
+        );
+        assert!(!control.needs_polling());
+    }
+
+    struct CountingWaker(AtomicU64);
+
+    impl QueueWakeHandle for CountingWaker {
+        fn wake(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn unmask_consumes_pending_latch_after_arming() {
+        let mut rx_flags = 0u16;
+        let mut tx_flags = 0u16;
+        let binding = NetQueueIrqBinding::virtio_pci_msix(
+            (&mut rx_flags as *mut u16) as usize,
+            (&mut tx_flags as *mut u16) as usize,
+        );
+        let waker = Arc::new(CountingWaker(AtomicU64::new(0)));
+        binding
+            .inner
+            .set_waker(Arc::clone(&waker) as Arc<dyn QueueWakeHandle>)
+            .unwrap();
+        binding.inner.pending.store(true, Ordering::Release);
+
+        binding.inner.unmask();
+
+        assert!(!binding.inner.pending.load(Ordering::Acquire));
+        assert_eq!(waker.0.load(Ordering::Relaxed), 1);
+    }
 }

@@ -380,7 +380,7 @@ fn chosen_bootargs_is_strict_and_supports_legacy_chosen_name() {
     let mut builder = StructureBuilder::new(17);
     builder.begin("");
     builder.begin("chosen@0");
-    builder.property("bootargs", b"console=ttyS0 root=/dev/vda\0");
+    builder.property("bootargs", b"console=uart0 root=/dev/vd0p1\0");
     builder.end_node();
     builder.end_node();
     let (structure, strings) = builder.end();
@@ -388,7 +388,7 @@ fn chosen_bootargs_is_strict_and_supports_legacy_chosen_name() {
 
     assert_eq!(
         Fdt::parse(&blob).unwrap().chosen_bootargs(),
-        Ok(Some("console=ttyS0 root=/dev/vda"))
+        Ok(Some("console=uart0 root=/dev/vd0p1"))
     );
 
     let mut builder = StructureBuilder::new(17);

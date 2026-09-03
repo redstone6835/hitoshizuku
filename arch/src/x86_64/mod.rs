@@ -58,12 +58,6 @@ pub use fpu::{
     configure_user_policy, supported_user_mask,
 };
 
-/// x86 启动时注册调度、syscall 与用户地址空间的全部通用契约。
-pub(crate) fn register_arch_ops() {
-    sched_ctx::register();
-    mm::register();
-}
-
 /// x86 固件应通过 ACPI `_CRS` 描述 PCI 窗口，不提供猜测范围。
 pub const fn default_pci_mmio_window() -> Option<core::ops::Range<u64>> {
     None
@@ -210,6 +204,7 @@ pub fn patch_interpreter_image(_interp: &str, _bytes: &mut [u8]) {}
 
 /// 设置 TSS.rsp0 的后端钩子。启动链路完成 GDT/TSS 后可替换此函数体。
 #[inline]
+#[cfg(target_os = "none")]
 pub(crate) fn set_tss_rsp0(stack_top: usize) {
     descriptor::set_kernel_stack(stack_top);
 }
@@ -356,11 +351,6 @@ pub(crate) unsafe extern "C" fn resume_to_trap_frame_raw(_frame: usize) -> ! {
         rax = const trap_frame::RAX_OFFSET,
         r11 = const trap_frame::R11_OFFSET,
     );
-}
-
-#[cfg(not(target_os = "none"))]
-pub(crate) unsafe extern "C" fn resume_to_trap_frame_raw(_frame: usize) -> ! {
-    panic!("x86_64 iretq is unavailable on a hosted target");
 }
 
 pub(crate) unsafe extern "C" fn user_entry() -> ! {

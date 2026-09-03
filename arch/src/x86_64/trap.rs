@@ -7,18 +7,28 @@
 //! which cannot prove that it owns a valid frame returns zero and the assembly
 //! path halts with interrupts disabled; it never resumes an unrecognised frame.
 
+#[cfg(target_os = "none")]
 use core::mem::offset_of;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+#[cfg(target_os = "none")]
 use general::TrapFramePtr;
 
+#[cfg(target_os = "none")]
 use super::descriptor;
+#[cfg(target_os = "none")]
 use super::fpu;
+#[cfg(any(test, target_os = "none"))]
 use super::interrupt;
+#[cfg(target_os = "none")]
 use super::paging;
+#[cfg(target_os = "none")]
 use super::ptrace;
+#[cfg(target_os = "none")]
 use super::task;
-use super::trap_frame::{self, TrapFrame};
+use super::trap_frame;
+#[cfg(target_os = "none")]
+use super::trap_frame::TrapFrame;
 
 /// Synthetic vector used by the one external-interrupt gate.  The actual LAPIC
 /// vector is read from the in-service bitmap before dispatching.
@@ -35,20 +45,35 @@ pub const RESCHEDULE_VECTOR: u8 = super::apic::RESCHEDULE_VECTOR;
 pub const ERROR_VECTOR: u8 = super::apic::ERROR_VECTOR;
 pub const SPURIOUS_VECTOR: u8 = super::apic::SPURIOUS_VECTOR;
 
+#[cfg(target_os = "none")]
 const MSR_EFER: u32 = 0xc000_0080;
+#[cfg(target_os = "none")]
 const MSR_STAR: u32 = 0xc000_0081;
+#[cfg(target_os = "none")]
 const MSR_LSTAR: u32 = 0xc000_0082;
+#[cfg(target_os = "none")]
 const MSR_FMASK: u32 = 0xc000_0084;
+#[cfg(target_os = "none")]
 const MSR_FS_BASE: u32 = 0xc000_0100;
+#[cfg(target_os = "none")]
 const MSR_GS_BASE: u32 = 0xc000_0101;
+#[cfg(target_os = "none")]
 const MSR_KERNEL_GS_BASE: u32 = 0xc000_0102;
+#[cfg(target_os = "none")]
 const EFER_SCE: usize = 1;
+#[cfg(target_os = "none")]
 const EFER_NXE: usize = 1 << 11;
+#[cfg(target_os = "none")]
 const RFLAGS_TRAP: usize = 1 << 8;
+#[cfg(target_os = "none")]
 const RFLAGS_DIRECTION: usize = 1 << 10;
+#[cfg(target_os = "none")]
 const RFLAGS_INTERRUPT_ENABLE: usize = 1 << 9;
+#[cfg(target_os = "none")]
 const RFLAGS_ALIGNMENT_CHECK: usize = 1 << 18;
+#[cfg(target_os = "none")]
 const RFLAGS_IOPL: usize = 0b11 << 12;
+#[cfg(target_os = "none")]
 const RFLAGS_NESTED_TASK: usize = 1 << 14;
 
 const GP_SAVE_SIZE: usize = 15 * core::mem::size_of::<usize>();
@@ -83,7 +108,9 @@ static ENTRY_STATE: EntryState = EntryState {
     user_rsp: AtomicUsize::new(0),
 };
 
+#[cfg(target_os = "none")]
 const ENTRY_KERNEL_STACK_OFFSET: usize = offset_of!(EntryState, kernel_stack_top);
+#[cfg(target_os = "none")]
 const ENTRY_USER_RSP_OFFSET: usize = offset_of!(EntryState, user_rsp);
 
 #[cfg(target_os = "none")]
@@ -242,6 +269,7 @@ unsafe fn install_syscall_msrs() {
 
 // Error-code exceptions defined by Intel SDM.  The vector stub itself pushes
 // only the vector; the CPU-provided error word is already below it.
+#[cfg(test)]
 const fn has_hardware_error(vector: usize) -> bool {
     matches!(vector, 8 | 10 | 11 | 12 | 13 | 14 | 17 | 21 | 29 | 30)
 }
@@ -906,6 +934,7 @@ extern "C" fn x86_64_handle_trap(frame: usize) -> usize {
     }
 }
 
+#[cfg(target_os = "none")]
 static USER_BREAK_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Register the ptrace single-step breakpoint hook used by the kernel syscall
@@ -922,6 +951,7 @@ pub fn register_user_break_hook(hook: fn(usize) -> bool) {
     }
 }
 
+#[cfg(any(test, target_os = "none"))]
 fn signal_for_vector(vector: usize) -> sched::SignalNumber {
     const DIVIDE_ERROR: usize = interrupt::DIVIDE_ERROR as usize;
     const DEBUG: usize = interrupt::DEBUG as usize;
@@ -958,6 +988,7 @@ fn signal_for_vector(vector: usize) -> sched::SignalNumber {
     }
 }
 
+#[cfg(target_os = "none")]
 fn outcome_signal(outcome: general::mm::FaultOutcome) -> sched::SignalNumber {
     match outcome {
         general::mm::FaultOutcome::OutOfMemory => sched::SignalNumber::SIGKILL,
@@ -965,6 +996,7 @@ fn outcome_signal(outcome: general::mm::FaultOutcome) -> sched::SignalNumber {
     }
 }
 
+#[cfg(target_os = "none")]
 fn queue_user_exception(tf: &TrapFrame, signal: sched::SignalNumber) {
     if !tf.from_user() || !sched::is_ready() {
         return;

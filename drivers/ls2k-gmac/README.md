@@ -1,7 +1,7 @@
 # Loongson LS2K1000 GMAC 驱动
 
 `platform.ls2k-gmac` 驱动 LS2K1000 的 DesignWare GMAC 3.70a 单通道 MAC/DMA，并把
-每个实例注册为 `ethN` 网络设备。
+每个实例注册为 `ethernetN` 网络设备。
 
 ## 实现范围
 

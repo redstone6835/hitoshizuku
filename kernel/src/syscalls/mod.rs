@@ -236,11 +236,52 @@ pub fn register_all() {
     register_syscall(nr::SYS_FILE_GETATTR, fs::sys_file_getattr);
     register_syscall(nr::SYS_FILE_SETATTR, fs::sys_file_setattr);
 
+    // Native x86_64 Linux keeps a set of pre-*at syscall numbers alive for
+    // libc compatibility.  The common table above intentionally names only
+    // the modern interfaces; install the ABI-only translations here so these
+    // numbers do not accidentally remain ENOSYS on x86 while other targets
+    // retain their native tables.
+    #[cfg(target_arch = "x86_64")]
+    {
+        register_syscall(nr::SYS_OPEN, fs::sys_open);
+        register_syscall(nr::SYS_CREAT, fs::sys_creat);
+        register_syscall(nr::SYS_ACCESS, fs::sys_access);
+        register_syscall(nr::SYS_STAT, fs::sys_stat);
+        register_syscall(nr::SYS_LSTAT, fs::sys_lstat);
+        register_syscall(nr::SYS_POLL, fs::sys_poll);
+        register_syscall(nr::SYS_SELECT, fs::sys_select);
+        register_syscall(nr::SYS_DUP2, fs::sys_dup2);
+        register_syscall(nr::SYS_PIPE, fs::sys_pipe);
+        register_syscall(nr::SYS_READLINK, fs::sys_readlink);
+        register_syscall(nr::SYS_MKDIR, fs::sys_mkdir);
+        register_syscall(nr::SYS_RMDIR, fs::sys_rmdir);
+        register_syscall(nr::SYS_UNLINK, fs::sys_unlink);
+        register_syscall(nr::SYS_RENAME, fs::sys_rename);
+        register_syscall(nr::SYS_LINK, fs::sys_link);
+        register_syscall(nr::SYS_SYMLINK, fs::sys_symlink);
+        register_syscall(nr::SYS_MKNOD, fs::sys_mknod);
+        register_syscall(nr::SYS_CHMOD, fs::sys_chmod);
+        register_syscall(nr::SYS_CHOWN, fs::sys_chown);
+        register_syscall(nr::SYS_LCHOWN, fs::sys_lchown);
+        register_syscall(nr::SYS_UTIMES, fs::sys_utimes);
+        register_syscall(nr::SYS_FUTIMESAT, fs::sys_futimesat);
+        register_syscall(nr::SYS_EVENTFD, fs::sys_eventfd);
+        register_syscall(nr::SYS_SIGNALFD, fs::sys_signalfd);
+        register_syscall(nr::SYS_EPOLL_CREATE, fs::sys_epoll_create);
+        register_syscall(nr::SYS_EPOLL_WAIT, fs::sys_epoll_wait);
+        register_syscall(nr::SYS_INOTIFY_INIT, fs::sys_inotify_init);
+    }
+
     // 进程
     register_syscall(nr::SYS_EXIT, process::sys_exit);
     register_syscall(nr::SYS_EXIT_GROUP, process::sys_exit_group);
     register_syscall(nr::SYS_CLONE, process::sys_clone);
     register_syscall(nr::SYS_CLONE3, process::sys_clone3);
+    #[cfg(target_arch = "x86_64")]
+    {
+        register_syscall(nr::SYS_FORK, process::sys_fork);
+        register_syscall(nr::SYS_VFORK, process::sys_vfork);
+    }
     register_syscall(nr::SYS_EXECVE, process::sys_execve);
     register_linux_extensions(register_syscall);
     register_syscall(nr::SYS_WAIT4, process::sys_wait4);
@@ -255,6 +296,8 @@ pub fn register_all() {
     register_syscall(nr::SYS_CLOCK_GETTIME, process::sys_clock_gettime);
     register_syscall(nr::SYS_SETPGID, process::sys_setpgid);
     register_syscall(nr::SYS_GETPGID, process::sys_getpgid);
+    #[cfg(target_arch = "x86_64")]
+    register_syscall(nr::SYS_GETPGRP, process::sys_getpgrp);
     register_syscall(nr::SYS_GETSID, process::sys_getsid);
     register_syscall(nr::SYS_SETSID, process::sys_setsid);
     register_syscall(nr::SYS_UNAME, process::sys_uname);

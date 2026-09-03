@@ -12,6 +12,8 @@ use general::dev::pnp::{DriverHandle, PnpError, unregister_driver};
 
 use allocator as _;
 
+pub(crate) const VIRTIO_NET_DEVICE_NAME: &str = "net0";
+
 struct VirtioNetElm {
     mmio: Option<DriverHandle>,
     pci: Option<DriverHandle>,
@@ -74,7 +76,7 @@ impl ElmModule for VirtioNetElm {
     }
 }
 
-#[cfg(not(feature = "elm-integrated"))]
+#[cfg(all(not(feature = "elm-integrated"), target_os = "none"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     elm::runtime::abort_panic()

@@ -445,7 +445,10 @@ pub fn detect() -> CpuFeatures {
 /// hosted 单测只探测 CPUID，不执行特权指令。
 pub fn init() -> &'static CpuFeatures {
     FEATURES.call_once(|| {
+        #[cfg(target_os = "none")]
         let mut features = detect();
+        #[cfg(not(target_os = "none"))]
+        let features = detect();
         let policy = XStatePolicy::baseline(features);
         POLICY_MASK.store(policy.mask, Ordering::Release);
         #[cfg(target_os = "none")]

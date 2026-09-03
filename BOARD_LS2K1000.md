@@ -77,15 +77,15 @@ fdt_addr=0x900000000a000000，loadaddr=0x9000000098000000）。
 | --- | --- | --- |
 | loader/DTB | `[loader] handoff probe ... a1_is_fdt=true`；`[loader][dtb] DTB copied ...`；`DTB has no /memory; using 2K1000 board memory: 2 regions (2048 MiB)` | 工厂 DTB 无 /memory，走板级内存回退，`total_ram` 应 ≈1885 MiB |
 | loongson-irq/clk/pinctrl | `[loongson-*]` 绑定 2k1000-icu、ls2x-clk、pinctrl/gpio | |
-| uart16550 | `[platform-uart16550] bound ... serial@1fe20000 ... -> /dev/uart0` ×12 | ttyS0 alias |
+| uart16550 | `[platform-uart16550] bound ... serial@1fe20000 ... -> /dev/uart0` ×12 | native `uartN` name |
 | ls2k-rtc | `[platform-ls2k-rtc] installed realtime source ... phys=0x1fe27800 unix_ns=...` | TOY 时间 |
 | ls2x-wdt | `[platform-ls2x-wdt] bound ... clk=... Hz max_timeout=34s` | |
-| ls2k-gmac | `[ls2k-gmac] bound ... mac=02:... speed=1000Mbps full`；`phy at 0: PHYIDR1=0x0000 PHYIDR2=0x0136` | YT8511；`ethernet0/1` alias → eth0/eth1 |
+| ls2k-gmac | `[ls2k-gmac] bound ... mac=02:... speed=1000Mbps full`；`phy at 0: PHYIDR1=0x0000 PHYIDR2=0x0136` | YT8511；原生接口名为 `ethernet0/1` |
 | ls2k-spi | `[ls2k-spi] bound controller ...`；`bound spi-nor ... (jedec ef 40 17) size=8388608` | w25q64 8MB |
 | ls2k-i2c | `[ls2k-i2c] bound ...`（i2c@1fe21800） | i2c0 disabled 不出现 |
 | ls2k-usb | `[ls2k-usb] bound ... kind=Ehci/Ohci/Dwc2`；插入设备后 `enumerated device ... <vid>:<pid>` | 插 U 盘/键鼠验证枚举 |
 | ls2k-tsensor | `[ls2k-tsensor] bound ... temp=... m°C thresholds=60..95°C` | |
-| ahci | `[platform-ahci] ...` sata 盘挂载 rootfs | 板子 rootfs 所在盘 |
+| ahci | `[platform-ahci] ... -> /dev/ahciN`；分区使用 `/dev/ahciNpM` | 板子 rootfs 所在盘 |
 | pci-host-ecam | `[pci-host-ecam] ... /pcie@0 ...` | 2K1000 PCI 主桥 |
 
 ## 4. 未实现项（工厂 DTB 为 disabled，驱动无绑定目标）

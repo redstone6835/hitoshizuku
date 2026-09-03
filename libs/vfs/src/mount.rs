@@ -414,6 +414,39 @@ impl MountData {
     }
 }
 
+/// 检查目标父挂载是否位于源挂载自身或其子树中。
+///
+/// `Mount::location.parent` 是弱引用链，不能通过 `children` 反向搜索来做这个
+///判断：除了需要遍历整个子树，还可能在并发修改或损坏状态下无限循环。沿目标的
+///父链向上走只需访问祖先节点；同时记录已访问的地址，确保即使已有挂载树循环也
+///会有界返回错误，而不会在系统调用中卡死。
+fn destination_parent_in_source_subtree(
+    source: &Arc<Mount>,
+    destination_parent: &Arc<Mount>,
+) -> VfsResult<bool> {
+    let source_ptr = Arc::as_ptr(source) as usize;
+    let mut current = Some(Arc::clone(destination_parent));
+    let mut seen = BTreeMap::<usize, ()>::new();
+
+    while let Some(mount) = current {
+        let mount_ptr = Arc::as_ptr(&mount) as usize;
+        if mount_ptr == source_ptr {
+            return Ok(true);
+        }
+        if seen.insert(mount_ptr, ()).is_some() {
+            // A pre-existing cycle means the namespace is already malformed.  Do
+            // not mutate it further, and more importantly do not loop forever.
+            return Err(VfsError::InvalidArgument);
+        }
+        current = {
+            let location = mount.location.lock();
+            location.parent.as_ref().and_then(Weak::upgrade)
+        };
+    }
+
+    Ok(false)
+}
+
 /// 挂载命名空间：进程可见的挂载树视图。
 ///
 /// 每个进程（或进程组，在使用 `CLONE_NEWNS` 创建新命名空间之前）共享同一个
@@ -606,6 +639,13 @@ impl MountNamespace {
         new_mountpoint: Arc<Dentry>,
         new_parent: Arc<Mount>,
     ) -> VfsResult<()> {
+        // Moving a mount below itself (or below one of its descendants) would
+        // make the weak parent chain cyclic and break path traversal.  Reject
+        // malformed pre-existing cycles as well; the check is deliberately
+        // before touching either index or parent/child list.
+        if destination_parent_in_source_subtree(source, &new_parent)? {
+            return Err(VfsError::InvalidArgument);
+        }
         let old_mountpoint = source.location.lock().mountpoint.clone();
         {
             let mut data = self.data.lock();

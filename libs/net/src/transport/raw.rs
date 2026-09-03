@@ -211,7 +211,6 @@ impl RawEndpointTable {
         // （SOCK_RAW AF_INET6 的接收数据从传输头开始，RFC 3542 §3）。
         // 本路径的 chain 已剥掉以太网头（从 IP 头开始）。
         let ipv6 = matches!(source.addr, IpAddr::V6(_));
-        let payload_offset: u16 = if ipv6 { 40 } else { 0 };
         let mut delivered = 0;
         let mut copied_bytes = 0;
         for endpoint in self
@@ -223,6 +222,16 @@ impl RawEndpointTable {
             if endpoint.facade.icmp6_filter_rejects(packet) {
                 continue;
             }
+            // An IPv4 ping socket (SOCK_DGRAM/IPPROTO_ICMP) has raw transport
+            // state internally but receives only the ICMP message, unlike a
+            // true SOCK_RAW endpoint which receives the IPv4 header too.
+            let payload_offset: u16 = if ipv6 {
+                40
+            } else if endpoint.facade.is_ping_socket() {
+                20
+            } else {
+                0
+            };
             let chain = PacketChain::from_owned(bytes.clone());
             let datagram = raw_datagram(
                 chain,
@@ -589,7 +598,9 @@ pub fn build_header_included_ipv4_fragments(
 mod tests {
     use super::*;
     use crate::buf::PacketMetadata;
-    use crate::pipeline::{EthernetHeader, FrontendDisposition, IpPacket, ParsedPacket};
+    use crate::pipeline::{
+        ControlPacket, EthernetHeader, FrontendDisposition, IpPacket, ParsedPacket,
+    };
     use crate::{Ipv4Addr, SocketId, SocketKind};
 
     fn facade(counter: u64, protocol: u8) -> Arc<SocketFacade> {
@@ -641,6 +652,78 @@ mod tests {
         }
     }
 
+    /// A wire-shaped reply captured from the QEMU user-mode network backend.
+    /// Keep the complete Ethernet/IP/ICMP frame here so this regression covers
+    /// the same offsets used by the physical ingress path, rather than only a
+    /// synthetic raw payload.
+    fn ipv4_echo_reply_packet() -> FrontendPacket {
+        let source = Ipv4Addr::new(1, 1, 1, 1);
+        let destination = Ipv4Addr::new(172, 26, 210, 23);
+        let mut bytes = alloc::vec![0; 14 + 20 + 64];
+        bytes[0..6].copy_from_slice(&[0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+        bytes[6..12].copy_from_slice(&[0x9a, 0x55, 0x9a, 0x55, 0x9a, 0x55]);
+        bytes[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+
+        let ip = &mut bytes[14..34];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&84u16.to_be_bytes());
+        ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+        ip[8] = 255;
+        ip[9] = 1;
+        ip[12..16].copy_from_slice(&source.0);
+        ip[16..20].copy_from_slice(&destination.0);
+        let ip_checksum = crate::pipeline::checksum_bytes(ip);
+        ip[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+
+        let icmp = &mut bytes[34..];
+        icmp[0] = 0; // echo reply
+        icmp[1] = 0;
+        icmp[4..6].copy_from_slice(&u16::MAX.to_be_bytes());
+        icmp[6..8].copy_from_slice(&1u16.to_be_bytes());
+        for (index, byte) in icmp[8..].iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let icmp_checksum = crate::pipeline::checksum_bytes(icmp);
+        icmp[2..4].copy_from_slice(&icmp_checksum.to_be_bytes());
+
+        let ip = IpPacket {
+            source: IpAddr::V4(source),
+            destination: IpAddr::V4(destination),
+            next_header: 1,
+            header_len: 20,
+            payload_offset: 34,
+            payload_len: 64,
+            hop_limit: 255,
+            traffic_class: 0,
+            fragment: None,
+        };
+        FrontendPacket {
+            chain: PacketChain::from_owned(bytes),
+            metadata: PacketMetadata {
+                frame_len: 14 + 20 + 64,
+                rx_timestamp_ns: 123,
+                ..PacketMetadata::default()
+            },
+            parsed: ParsedPacket {
+                ethernet: EthernetHeader {
+                    destination: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
+                    source: [0x9a, 0x55, 0x9a, 0x55, 0x9a, 0x55],
+                    ethertype: 0x0800,
+                },
+                ip: Some(ip),
+                tcp: None,
+                udp: None,
+                flow: None,
+                rss_hash: None,
+                disposition: FrontendDisposition::Control(ControlPacket::Icmp {
+                    ipv6: false,
+                    packet_offset: 34,
+                    packet_len: 64,
+                }),
+            },
+        }
+    }
+
     #[test]
     fn first_raw_receiver_gets_original_and_later_receiver_gets_copy() {
         let first = facade(1, 99);
@@ -668,6 +751,48 @@ mod tests {
         assert_eq!(second_rx.len, 24);
         assert_eq!(first_bytes, second_bytes);
         assert_eq!(&first_bytes[20..], b"raw!");
+    }
+
+    #[test]
+    fn ipv4_ping_socket_copy_starts_at_icmp_payload() {
+        let receiver = facade(1, 99);
+        receiver.set_ping_socket(true);
+        let mut table = RawEndpointTable::new();
+        table
+            .bind_facade(IpAddr::V4(Ipv4Addr::UNSPECIFIED), None, receiver.clone())
+            .unwrap();
+
+        assert_eq!(table.copy_fanout(InterfaceId(1), &packet(99)).delivered, 1);
+        let mut bytes = [0u8; 4];
+        let received = receiver.recv(&mut bytes, false, false, true, None).unwrap();
+        assert_eq!(received.len, 4);
+        assert_eq!(&bytes, b"raw!");
+    }
+
+    #[test]
+    fn ipv4_ping_socket_delivers_wire_echo_reply_without_ip_header() {
+        let receiver = facade(1, 1);
+        receiver.set_ping_socket(true);
+        let mut table = RawEndpointTable::new();
+        table
+            .bind_facade(IpAddr::V4(Ipv4Addr::UNSPECIFIED), None, receiver.clone())
+            .unwrap();
+
+        let packet = ipv4_echo_reply_packet();
+        assert_eq!(table.copy_fanout(InterfaceId(1), &packet).delivered, 1);
+
+        let mut received_bytes = [0u8; 64];
+        let received = receiver
+            .recv(&mut received_bytes, false, false, true, None)
+            .unwrap();
+        assert_eq!(received.len, 64);
+        assert_eq!(received.source.addr, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+        assert_eq!(
+            received.destination.addr,
+            IpAddr::V4(Ipv4Addr::new(172, 26, 210, 23))
+        );
+        assert_eq!(received_bytes[0], 0); // ICMP echo reply, not IPv4 version 4
+        assert_eq!(&received_bytes[4..8], &[0xff, 0xff, 0, 1]);
     }
 
     #[test]

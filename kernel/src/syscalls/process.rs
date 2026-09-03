@@ -307,6 +307,41 @@ pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Ok(outcome.pid as usize)
 }
 
+/// x86_64 retains fork/vfork as separate syscall numbers.  Feed their Linux
+/// defaults through the existing clone transaction so pid namespaces,
+/// fd-table ownership, and the user trap-frame setup stay identical to clone.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_fork(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [
+        CloneArgs::fork_default().flags.raw() as usize,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let result = sys_clone(ctx);
+    ctx.args = saved;
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_vfork(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [
+        CloneArgs::vfork_default().flags.raw() as usize,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let result = sys_clone(ctx);
+    ctx.args = saved;
+    result
+}
+
 pub(super) fn sys_clone3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let user = ctx.args[0];
     let size = ctx.args[1];
@@ -703,6 +738,15 @@ pub(super) fn sys_setpgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
 
 pub(super) fn sys_getpgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Ok(sched::operation::getpgid(ctx.args[0] as i32)? as usize)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_getpgrp(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args[0] = 0;
+    let result = sys_getpgid(ctx);
+    ctx.args = saved;
+    result
 }
 
 pub(super) fn sys_getsid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

@@ -1560,7 +1560,7 @@ fn net_stack_local_turn(turn: &mut net::stack::NetStackLocalTurn) -> i32 {
     dispatch_local_turn(turn)
 }
 
-#[cfg(not(feature = "elm-integrated"))]
+#[cfg(all(not(feature = "elm-integrated"), target_os = "none"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     elm::runtime::abort_panic()

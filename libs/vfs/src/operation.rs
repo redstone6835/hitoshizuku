@@ -995,7 +995,7 @@ fn chown_inode(
 
 /// 挂载文件系统：查找驱动 → 创建 Superblock → 挂载到挂载点。
 ///
-/// `dev` 为块设备路径（如 `"/dev/sda1"`），内存文件系统（tmpfs 等）传 `None`。
+/// `dev` 为块设备路径（如 `"/dev/vd0p1"`），内存文件系统（tmpfs 等）传 `None`。
 #[kernel_symbols::export(
     name = "vfs.operation.mount",
     contract = "kernel.vfs.mount@1",

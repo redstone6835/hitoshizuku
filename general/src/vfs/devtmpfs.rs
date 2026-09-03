@@ -919,10 +919,19 @@ impl FileOps for CharDevFileOps {
         if !want_read && !want_write {
             return false;
         }
-        self.dev.poll_add_waiter(task, want_read, want_write)
+        let tty_registered = self
+            .tty
+            .as_deref()
+            .filter(|_| want_read)
+            .is_some_and(|tty| tty.poll_add_input_waiter(task));
+        let driver_registered = self.dev.poll_add_waiter(task, want_read, want_write);
+        tty_registered || driver_registered
     }
 
     fn poll_remove_waiter(&self, task: &Arc<sched::Task>) {
+        if let Some(tty) = self.tty.as_deref() {
+            tty.poll_remove_input_waiter(task);
+        }
         self.dev.poll_remove_waiter(task);
     }
 
@@ -2406,10 +2415,11 @@ impl DevTmpfsSuperblockOps {
                 .ok_or(VfsError::NoSpace)?;
             let existing_rdev =
                 super::user_api::device_numbers::lookup_node(user_name).map(|record| record.rdev);
-            if existing_rdev != Some(expected) {
-                return Err(VfsError::AlreadyExists);
-            }
-            return self.ensure_block_symlink(user_name, expected);
+            return if existing_rdev == Some(expected) {
+                Ok(())
+            } else {
+                Err(VfsError::AlreadyExists)
+            };
         }
         let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
         let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
@@ -2454,27 +2464,7 @@ impl DevTmpfsSuperblockOps {
             super::user_api::device_numbers::unregister_node(user_name);
             return Err(err);
         }
-        if let Err(err) = self.ensure_block_symlink(user_name, rdev) {
-            let _ = self.remove_node_at(user_name);
-            self.rollback_numbered_node(user_name);
-            return Err(err);
-        }
         Ok(())
-    }
-
-    /// 为块设备节点创建 Linux 兼容的 `/dev/block/<major>:<minor>` 符号链接。
-    ///
-    /// 目标采用相对路径 `../<user_name>`(块设备节点都投影在 devtmpfs 顶层),
-    /// 与 Linux devtmpfs 在创建设备节点时同步创建链接的行为一致。已存在同名
-    /// 链接时按幂等处理,不覆盖既有投影。
-    fn ensure_block_symlink(&self, user_name: &str, rdev: DevId) -> VfsResult<()> {
-        let link_path = alloc::format!("block/{}:{}", rdev.major, rdev.minor);
-        let target = alloc::format!("../{user_name}");
-        match self.bind_symlink(&link_path, &target) {
-            Ok(()) => Ok(()),
-            Err(VfsError::AlreadyExists) => Ok(()),
-            Err(err) => Err(err),
-        }
     }
 
     /// 在 devtmpfs 相对路径上创建一个符号链接节点。

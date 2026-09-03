@@ -9,6 +9,7 @@ use crate::cred::{Credentials, Gid, Uid};
 use crate::dentry::Dentry;
 use crate::error::{VfsError, VfsResult};
 use crate::file::{FileOps, OpenOptions};
+use crate::fs_context::{FsContext, land_mount};
 use crate::inode::{Inode, InodeId, InodeMeta, InodeOps};
 use crate::mount::{Mount, MountFlags, MountNamespace};
 use crate::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
@@ -138,6 +139,160 @@ fn namespace_with_root(id: u64) -> (Arc<MountNamespace>, Arc<Mount>, Arc<Superbl
         root_mount,
         root_sb,
     )
+}
+
+/// `fspick`/`open_tree` contexts retain the per-mount access constraints rather
+/// than silently reverting to the default read-write flags.
+#[ktest]
+fn fs_context_from_mount_preserves_mount_flags() {
+    let (_namespace, root_mount, _root_sb) = namespace_with_root(0x5500);
+    let flags = MountFlags::RDONLY
+        .with(MountFlags::NOSUID)
+        .with(MountFlags::NOEXEC);
+    root_mount.set_flags(flags);
+
+    let ctx = FsContext::from_mount(&root_mount);
+    assert_eq!(ctx.flags(), flags);
+}
+
+/// A detached mount context is consumed by the first successful move_mount;
+/// reusing its fd must not attach a second instance.
+#[ktest]
+fn land_mount_consumes_context_after_attach() {
+    let (namespace, root_mount, root_sb) = namespace_with_root(0x5600);
+    let source_sb = test_superblock(0x5700);
+    let source_point = mountpoint(&root_sb.root_dentry, &root_sb, "source", 2);
+    let source_mount = namespace
+        .mount_at(
+            source_point,
+            Arc::clone(&root_mount),
+            Arc::clone(&source_sb),
+            MountFlags::RDONLY,
+        )
+        .unwrap();
+    let target = mountpoint(&root_sb.root_dentry, &root_sb, "target", 3);
+    let ctx = FsContext::from_mount(&source_mount);
+
+    land_mount(&namespace, &ctx, Arc::clone(&target), &root_mount).unwrap();
+    assert!(ctx.is_consumed());
+
+    let second = land_mount(&namespace, &ctx, target, &root_mount);
+    assert_eq!(second, Err(VfsError::BadFileDescriptor));
+}
+
+/// Moving a mount onto itself must be rejected before its indexes or location
+/// are changed.
+#[ktest]
+fn move_mount_rejects_self_parent() {
+    let (namespace, root_mount, root_sb) = namespace_with_root(0x5800);
+    let source_sb = test_superblock(0x5900);
+    let source_point = mountpoint(&root_sb.root_dentry, &root_sb, "source", 2);
+    let source_mount = namespace
+        .mount_at(
+            Arc::clone(&source_point),
+            Arc::clone(&root_mount),
+            source_sb,
+            MountFlags::default(),
+        )
+        .unwrap();
+    let target = mountpoint(&root_sb.root_dentry, &root_sb, "target", 3);
+
+    assert_eq!(
+        namespace.move_mount_at(&source_mount, target, Arc::clone(&source_mount)),
+        Err(VfsError::InvalidArgument)
+    );
+    assert!(Arc::ptr_eq(&source_mount.mountpoint(), &source_point));
+    assert!(
+        source_mount
+            .location
+            .lock()
+            .parent
+            .as_ref()
+            .and_then(|parent| parent.upgrade())
+            .is_some_and(|parent| Arc::ptr_eq(&parent, &root_mount))
+    );
+    assert!(
+        namespace
+            .lookup_mount(&source_point)
+            .is_some_and(|mount| Arc::ptr_eq(&mount, &source_mount))
+    );
+}
+
+/// Moving a mount below one of its descendants must be rejected; otherwise
+/// the descendant's parent chain would eventually point back to the source.
+#[ktest]
+fn move_mount_rejects_descendant_parent() {
+    let (namespace, root_mount, root_sb) = namespace_with_root(0x5a00);
+    let source_sb = test_superblock(0x5b00);
+    let source_point = mountpoint(&root_sb.root_dentry, &root_sb, "source", 2);
+    let source_mount = namespace
+        .mount_at(
+            source_point,
+            Arc::clone(&root_mount),
+            Arc::clone(&source_sb),
+            MountFlags::default(),
+        )
+        .unwrap();
+    let child_sb = test_superblock(0x5c00);
+    let child_point = mountpoint(&source_sb.root_dentry, &source_sb, "child", 2);
+    let child_mount = namespace
+        .mount_at(
+            child_point,
+            Arc::clone(&source_mount),
+            Arc::clone(&child_sb),
+            MountFlags::default(),
+        )
+        .unwrap();
+    let target = mountpoint(&child_sb.root_dentry, &child_sb, "target", 2);
+
+    assert_eq!(
+        namespace.move_mount_at(&source_mount, target, Arc::clone(&child_mount)),
+        Err(VfsError::InvalidArgument)
+    );
+    assert!(
+        source_mount
+            .location
+            .lock()
+            .parent
+            .as_ref()
+            .and_then(|parent| parent.upgrade())
+            .is_some_and(|parent| Arc::ptr_eq(&parent, &root_mount))
+    );
+    assert!(
+        child_mount
+            .location
+            .lock()
+            .parent
+            .as_ref()
+            .and_then(|parent| parent.upgrade())
+            .is_some_and(|parent| Arc::ptr_eq(&parent, &source_mount))
+    );
+}
+
+/// A malformed parent cycle must terminate the validation with `EINVAL`
+/// instead of hanging in the move operation.
+#[ktest]
+fn move_mount_rejects_preexisting_parent_cycle() {
+    let (namespace, root_mount, root_sb) = namespace_with_root(0x5d00);
+    let source_sb = test_superblock(0x5e00);
+    let source_point = mountpoint(&root_sb.root_dentry, &root_sb, "source", 2);
+    let source_mount = namespace
+        .mount_at(
+            source_point,
+            Arc::clone(&root_mount),
+            source_sb,
+            MountFlags::default(),
+        )
+        .unwrap();
+    let target = mountpoint(&root_sb.root_dentry, &root_sb, "target", 3);
+
+    // Keep the cycle in weak links only so dropping the test namespace remains
+    // well-founded after restoring the root's normal parent.
+    root_mount.location.lock().parent = Some(Arc::downgrade(&root_mount));
+    let result = namespace.move_mount_at(&source_mount, target, root_mount.clone());
+    root_mount.location.lock().parent = None;
+
+    assert_eq!(result, Err(VfsError::InvalidArgument));
 }
 
 /// 同一 namespace 中卸载一个共享实例，不得让另一个挂载点的根目录失效。

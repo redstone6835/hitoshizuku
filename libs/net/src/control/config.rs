@@ -843,7 +843,7 @@ mod tests {
         assert_eq!(route.interface, InterfaceId(1));
         assert_eq!(route.next_hop, IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)));
 
-        // SO_BINDTODEVICE=eth1：强制 if2 的默认路由。
+        // SO_BINDTODEVICE=ethernet1：强制 if2 的默认路由。
         let route = config
             .route_with_source_policy(destination, 0, None, Some(InterfaceId(2)), false)
             .unwrap();

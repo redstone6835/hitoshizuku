@@ -39,6 +39,7 @@ pub use loongarch64::*;
 pub type CurrentTaskOps = loongarch64::LoongArch64TaskOps;
 
 /// 清零 BSS 段，确保未初始化的静态变量被正确设置为 0。
+#[cfg(target_os = "none")]
 pub(crate) unsafe fn clear_bss() {
     unsafe extern "C" {
         fn sbss();
@@ -48,6 +49,7 @@ pub(crate) unsafe fn clear_bss() {
 }
 
 /// 使用循环的方式清零 BSS 段，适用于 BSS 较大的情况，避免栈溢出。
+#[cfg(target_os = "none")]
 pub(crate) fn clear_bss_for_loop(begin: usize, end: usize) {
     unsafe {
         core::ptr::write_bytes(begin as *mut u8, 0, end - begin);

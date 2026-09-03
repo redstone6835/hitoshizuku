@@ -27,8 +27,10 @@ pub const TASKEXT_X86_XSTATE: TaskExtKey = 0x0001_0007;
 pub const TASKEXT_X86_XSTATE_SIGNAL_STACK: TaskExtKey = 0x0001_0008;
 
 const CHUNK_SIZE: usize = 64;
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
 pub(crate) const EARLY_CAPTURE_NONE: usize = 0;
 pub(crate) const EARLY_CAPTURE_KERNEL: usize = 1;
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
 pub(crate) const EARLY_CAPTURE_OWNED: usize = 2;
 
 #[cfg(any(target_os = "none", test))]
@@ -114,8 +116,8 @@ pub unsafe extern "C" fn capture_early(from_user: usize) -> usize {
     // reused scratch image must therefore be cleared with integer-only code
     // before the instruction, otherwise an NT_X86_XSTATE read could disclose
     // bytes left by the previous task on this CPU.
-    let mut clear_dst = area;
-    let mut clear_qwords = fpu::MAX_XSAVE_SIZE / core::mem::size_of::<u64>();
+    let clear_dst = area;
+    let clear_qwords = fpu::MAX_XSAVE_SIZE / core::mem::size_of::<u64>();
     unsafe {
         core::arch::asm!(
             "cld",
@@ -156,13 +158,11 @@ pub unsafe extern "C" fn capture_early(_from_user: usize) -> usize {
 /// A nested entry cannot reach this helper: `capture_early` claims the single
 /// BSP slot first and returns false to the assembly path when it is busy.  It
 /// is therefore safe for the owning kernel-trap path to release both tokens.
+#[cfg(target_os = "none")]
 pub(crate) fn discard_early() {
-    #[cfg(target_os = "none")]
-    {
-        if let Some(slot) = current_early_slot() {
-            slot.valid.store(false, Ordering::Release);
-            slot.busy.store(false, Ordering::Release);
-        }
+    if let Some(slot) = current_early_slot() {
+        slot.valid.store(false, Ordering::Release);
+        slot.busy.store(false, Ordering::Release);
     }
 }
 

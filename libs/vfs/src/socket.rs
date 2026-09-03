@@ -611,12 +611,12 @@ pub fn socket(
 ) -> Result<Fd, Errno> {
     // AF_NETLINK 需要接受 SOCK_RAW/SOCK_DGRAM，单独处理
     if domain as u16 == 16 {
-        // netlink 协议号校验：Linux MAX_LINKS 约 32；本内核仅实现
-        // NETLINK_ROUTE(=0)，其余协议号（含合法但未实现者）返回
-        // EPROTONOSUPPORT，不静默接受无法提供对应语义的协议。
-        const NETLINK_ROUTE: usize = 0;
+        // netlink 协议号校验：Linux MAX_LINKS 约 32；本内核实现
+        // NETLINK_ROUTE 和 Generic Netlink 的 family-missing 控制面语义。
         const MAX_LINKS: usize = 32;
-        if protocol >= MAX_LINKS || protocol != NETLINK_ROUTE {
+        let supported = protocol == crate::netlink_socket::NETLINK_ROUTE as usize
+            || protocol == crate::netlink_socket::NETLINK_GENERIC as usize;
+        if protocol >= MAX_LINKS || !supported {
             return Err(Errno::EPROTONOSUPPORT);
         }
         let nonblock = (ty & SOCK_NONBLOCK) != 0;
@@ -1108,10 +1108,14 @@ fn recv_inner(
         });
     }
     if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
+        let peek = (flags & MSG_PEEK) != 0;
+        let truncate = (flags & MSG_TRUNC) != 0;
         let len = nl_ops.recv(
             data,
             file.flags().nonblock || (flags & MSG_DONTWAIT) != 0,
             deadline_ns,
+            peek,
+            truncate,
         )?;
         // 返回 sockaddr_nl（12 字节）：family=AF_NETLINK(16), pad=0, pid=0, groups=0
         let address = if want_addr {
@@ -1125,7 +1129,11 @@ fn recv_inner(
             len,
             address,
             control: Vec::new(),
-            msg_flags: 0,
+            msg_flags: if truncate && len > data.len() {
+                MSG_TRUNC
+            } else {
+                0
+            },
         });
     }
 
@@ -1460,6 +1468,21 @@ fn parse_int_opt(value: &[u8]) -> Result<i32, Errno> {
     Ok(i32::from_ne_bytes([value[0], value[1], value[2], value[3]]))
 }
 
+const fn is_ipv6_checksum_option(level: i32, optname: i32, family: u16, sock_type: u16) -> bool {
+    family == crate::addr::AF_INET6
+        && sock_type == SOCK_RAW as u16
+        && optname == IPV6_CHECKSUM
+        && (level == SOL_IPV6 || level == SOL_RAW)
+}
+
+fn parse_ipv6_checksum_offset(value: &[u8]) -> Result<Option<u16>, Errno> {
+    let offset = parse_int_opt(value)?;
+    if offset < -1 {
+        return Err(Errno::EINVAL);
+    }
+    Ok((offset >= 0).then_some(offset as u16))
+}
+
 fn parse_int_or_byte_opt(value: &[u8]) -> Result<i32, Errno> {
     if value.len() >= 4 {
         parse_int_opt(value)
@@ -1656,6 +1679,10 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
     if level == SOL_IPV6 && net_ops.family() != crate::addr::AF_INET6 {
         return Err(Errno::ENOPROTOOPT);
     }
+    if is_ipv6_checksum_option(level, optname, net_ops.family(), net_ops.sock_type()) {
+        let offset = net_ops.proxy().ipv6_checksum_offset().map_or(-1, i32::from);
+        return Ok(offset.to_ne_bytes().to_vec());
+    }
     let opts = net_ops.options().lock();
     match level {
         SOL_SOCKET => match optname {
@@ -1738,18 +1765,6 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
                 .collect()),
             _ => Err(Errno::ENOPROTOOPT),
         },
-        SOL_RAW if net_ops.family() == crate::addr::AF_INET6 => match optname {
-            // Linux 语义：默认 -1（关闭），启用时为 ICMPv6 校验和字段偏移。
-            IPV6_CHECKSUM => Ok((i32::from(
-                net_ops
-                    .proxy()
-                    .ipv6_checksum_offset()
-                    .map_or(-1, |offset| i32::from(offset)),
-            ))
-            .to_ne_bytes()
-            .to_vec()),
-            _ => Err(Errno::ENOPROTOOPT),
-        },
         SOL_IPV6 => match optname {
             IPV6_UNICAST_HOPS => Ok((i32::from(opts.ipv6_hops)).to_ne_bytes().to_vec()),
             IPV6_TCLASS => Ok((i32::from(opts.ipv6_traffic_class)).to_ne_bytes().to_vec()),
@@ -1817,6 +1832,12 @@ fn inet_setsockopt(
 ) -> Result<(), Errno> {
     if level == SOL_IPV6 && net_ops.family() != crate::addr::AF_INET6 {
         return Err(Errno::ENOPROTOOPT);
+    }
+    if is_ipv6_checksum_option(level, optname, net_ops.family(), net_ops.sock_type()) {
+        net_ops
+            .proxy()
+            .set_ipv6_checksum_offset(parse_ipv6_checksum_offset(value)?);
+        return Ok(());
     }
     let mut opts = net_ops.options().lock();
     match level {
@@ -2169,22 +2190,6 @@ fn inet_setsockopt(
                     *word = u32::from_ne_bytes(value[index * 4..index * 4 + 4].try_into().unwrap());
                 }
                 net_ops.proxy().set_icmp6_filter(filter);
-                Ok(())
-            }
-            _ => Err(Errno::ENOPROTOOPT),
-        },
-        SOL_RAW if net_ops.family() == crate::addr::AF_INET6 => match optname {
-            // RFC 3542 §8.1：-1 关闭自动校验和；非负值为 ICMPv6 校验和字段偏移。
-            IPV6_CHECKSUM => {
-                let offset = parse_int_opt(value)?;
-                if offset < -1 {
-                    return Err(Errno::EINVAL);
-                }
-                net_ops.proxy().set_ipv6_checksum_offset(if offset < 0 {
-                    None
-                } else {
-                    Some(offset as u16)
-                });
                 Ok(())
             }
             _ => Err(Errno::ENOPROTOOPT),
@@ -3091,6 +3096,34 @@ const fn align_cmsg(value: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv6_checksum_accepts_ipv6_level_for_raw_sockets() {
+        assert!(is_ipv6_checksum_option(
+            SOL_IPV6,
+            IPV6_CHECKSUM,
+            crate::addr::AF_INET6,
+            SOCK_RAW as u16,
+        ));
+        assert!(is_ipv6_checksum_option(
+            SOL_RAW,
+            IPV6_CHECKSUM,
+            crate::addr::AF_INET6,
+            SOCK_RAW as u16,
+        ));
+        assert!(!is_ipv6_checksum_option(
+            SOL_IPV6,
+            IPV6_CHECKSUM,
+            crate::addr::AF_INET6,
+            SOCK_DGRAM as u16,
+        ));
+        assert_eq!(parse_ipv6_checksum_offset(&6i32.to_ne_bytes()), Ok(Some(6)));
+        assert_eq!(parse_ipv6_checksum_offset(&(-1i32).to_ne_bytes()), Ok(None));
+        assert_eq!(
+            parse_ipv6_checksum_offset(&(-2i32).to_ne_bytes()),
+            Err(Errno::EINVAL)
+        );
+    }
 
     #[test]
     fn multicast_group_req_parses_linux_64_bit_layout() {

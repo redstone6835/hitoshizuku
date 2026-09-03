@@ -329,6 +329,7 @@ mod tests {
 
     #[test]
     fn uninstalled_dispatch_is_explicitly_unsupported() {
+        let _context_state = crate::elm_guard::TEST_ELM_CONTEXT_STATE.lock();
         let initialize = context(ElmLifecyclePhase::Initialize);
         let _guard =
             elm_model::enter_current_context(&initialize).expect("测试 ELM 上下文必须能够进入");

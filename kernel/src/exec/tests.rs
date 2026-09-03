@@ -51,6 +51,14 @@ fn make_task_in_group(group: Arc<ThreadGroup>) -> Arc<Task> {
 }
 
 #[ktest]
+fn setid_root_exec_keeps_capabilities_when_identity_is_unchanged() {
+    let task = make_task();
+    // Alpine's mount helper is setuid-root. Executing it from PID 1 (already
+    // root) must not turn a no-op UID transition into a capability drop.
+    assert!(super::compute_exec_credentials(&task, Some((0, 0, 0o4755))).is_none());
+}
+
+#[ktest]
 fn revalidate_failure_keeps_old_exec_state_running() {
     let group = ThreadGroup::new();
     let mut guard = group.lock_exec();

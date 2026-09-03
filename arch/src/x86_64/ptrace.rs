@@ -24,7 +24,6 @@ pub const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
 pub const FP_XSTATE_MAGIC2_SIZE: usize = core::mem::size_of::<u32>();
 /// FXSAVE software-reserved bytes used by Linux's `_fpx_sw_bytes`.
 pub const FXSAVE_SW_BYTES_OFFSET: usize = 464;
-pub const FXSAVE_SW_BYTES_SIZE: usize = 48;
 /// Standard (non-compacted) XSAVE header location and size.
 pub const XSAVE_HEADER_OFFSET: usize = FXSAVE_SIZE;
 pub const XSAVE_HEADER_SIZE: usize = 64;
@@ -85,6 +84,7 @@ fn mark_frame_dirty(task: &Task) {
     }
 }
 
+#[cfg(target_os = "none")]
 fn take_frame_dirty(task: &Task) -> bool {
     task.ext_remove(TASKEXT_X86_PTRACE_FRAME_DIRTY)
         .and_then(|payload| payload.downcast::<bool>().ok())
@@ -93,6 +93,7 @@ fn take_frame_dirty(task: &Task) -> bool {
 
 /// Publish a current user trap frame before generic code can enter an
 /// observable ptrace stop.
+#[cfg(target_os = "none")]
 pub(crate) fn publish_trap_frame(task: &Task, frame: TrapFrame) {
     let _ = task.ext_remove(TASKEXT_X86_PTRACE_FRAME_DIRTY);
     let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(frame);
@@ -117,6 +118,7 @@ pub fn store_task_frame(task: &Task, frame: TrapFrame) -> bool {
 /// Complete one user trap return.  Only tracer-written snapshots are copied
 /// back into the live frame; the transient snapshot is then removed so a later
 /// asynchronous stop cannot expose stale registers.
+#[cfg(target_os = "none")]
 pub(crate) fn finish_trap_frame(task: &Task, live: &mut TrapFrame) {
     let dirty = take_frame_dirty(task);
     let snapshot = task
@@ -125,6 +127,7 @@ pub(crate) fn finish_trap_frame(task: &Task, live: &mut TrapFrame) {
     merge_tracer_frame(live, snapshot.map(|frame| *frame), dirty);
 }
 
+#[cfg(any(test, target_os = "none"))]
 fn merge_tracer_frame(live: &mut TrapFrame, snapshot: Option<TrapFrame>, dirty: bool) {
     if dirty && let Some(snapshot) = snapshot {
         *live = snapshot;
@@ -460,6 +463,7 @@ fn validate_linux_xstate_impl(bytes: &[u8], allow_owned_extended: bool) -> bool 
 }
 
 /// Validate a standard (non-compacted) `NT_X86_XSTATE` regset image.
+#[cfg(test)]
 pub fn validate_linux_xstate(bytes: &[u8]) -> bool {
     validate_linux_xstate_impl(bytes, false)
 }
@@ -640,16 +644,6 @@ pub fn write_linux_xstate(task: &Task, bytes: &[u8]) -> bool {
     legacy.copy_from_slice(&bytes[..FXSAVE_SIZE]);
     legacy[FXSAVE_SW_BYTES_OFFSET..].fill(0);
     write_linux_fpregs(task, &legacy)
-}
-
-/// 把 FXSAVE 区中的 MXCSR 取出；供 signal/ptrace 校验路径复用。
-pub fn mxcsr_from_fpregs(bytes: &[u8]) -> Option<u32> {
-    (bytes.len() >= 28).then(|| u32::from_le_bytes(bytes[24..28].try_into().unwrap()))
-}
-
-/// 生成一个清零的 legacy FXSAVE 初始区。
-pub fn initial_fpregs() -> Vec<u8> {
-    TrapFrame::initial_fxsave().to_vec()
 }
 
 #[cfg(test)]

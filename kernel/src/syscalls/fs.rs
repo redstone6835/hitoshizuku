@@ -121,14 +121,22 @@ const MOUNT_ATTR_NOSUID: usize = 0x0000_0002;
 const MOUNT_ATTR_NODEV: usize = 0x0000_0004;
 const MOUNT_ATTR_NOEXEC: usize = 0x0000_0008;
 const MOUNT_ATTR_NOATIME: usize = 0x0000_0010;
+const MOUNT_ATTR_STRICTATIME: usize = 0x0000_0020;
+// Linux uses the complete atime field mask when userspace clears/replaces
+// the policy (the RELATIME value itself is zero).
+const MOUNT_ATTR__ATIME: usize = 0x0000_0070;
 const MOUNT_ATTR_NODIRATIME: usize = 0x0000_0080;
+const MOUNT_ATTR_NOSYMFOLLOW: usize = 0x0020_0000;
 // 本内核可映射到 VFS MountFlags 的挂载属性位；其余返回 EOPNOTSUPP。
 const MOUNT_ATTR_SUPPORTED: usize = MOUNT_ATTR_RDONLY
     | MOUNT_ATTR_NOSUID
     | MOUNT_ATTR_NODEV
     | MOUNT_ATTR_NOEXEC
     | MOUNT_ATTR_NOATIME
-    | MOUNT_ATTR_NODIRATIME;
+    | MOUNT_ATTR_STRICTATIME
+    | MOUNT_ATTR__ATIME
+    | MOUNT_ATTR_NODIRATIME
+    | MOUNT_ATTR_NOSYMFOLLOW;
 
 const AT_RECURSIVE: usize = 0x8000;
 
@@ -363,12 +371,57 @@ pub(super) fn sys_openat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Ok(fd.as_raw() as usize)
 }
 
+// x86_64 keeps the pre-*at filesystem calls as real ABI entry points.  The
+// generic syscall table intentionally exposes only the modern *at variants, so
+// translate the legacy register layout here instead of making every VFS
+// operation understand two calling conventions.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_open(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [
+        AT_FDCWD as isize as usize,
+        saved[0],
+        saved[1],
+        saved[2],
+        0,
+        0,
+    ];
+    let result = sys_openat(ctx);
+    ctx.args = saved;
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_creat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [
+        AT_FDCWD as isize as usize,
+        saved[0],
+        O_WRONLY | O_CREAT | O_TRUNC,
+        saved[1],
+        0,
+        0,
+    ];
+    let result = sys_openat(ctx);
+    ctx.args = saved;
+    result
+}
+
 pub(super) fn sys_faccessat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     faccessat_common(ctx, false)
 }
 
 pub(super) fn sys_faccessat2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     faccessat_common(ctx, true)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_access(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [AT_FDCWD as isize as usize, saved[0], saved[1], 0, 0, 0];
+    let result = sys_faccessat(ctx);
+    ctx.args = saved;
+    result
 }
 
 pub(super) fn sys_fstat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -378,6 +431,10 @@ pub(super) fn sys_fstat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     write_linux_stat(ctx.args[1], &st)?;
     Ok(0)
 }
+
+// x86_64's fstat syscall is already the native ABI (fd, stat*); the function
+// is kept above the path wrappers so both old stat variants use the same ABI
+// serializer.
 
 pub(super) fn sys_newfstatat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
@@ -404,6 +461,31 @@ pub(super) fn sys_newfstatat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     };
     write_linux_stat(stat_user, &st)?;
     Ok(0)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_stat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [AT_FDCWD as isize as usize, saved[0], saved[1], 0, 0, 0];
+    let result = sys_newfstatat(ctx);
+    ctx.args = saved;
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_lstat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [
+        AT_FDCWD as isize as usize,
+        saved[0],
+        saved[1],
+        AT_SYMLINK_NOFOLLOW,
+        0,
+        0,
+    ];
+    let result = sys_newfstatat(ctx);
+    ctx.args = saved;
+    result
 }
 
 pub(super) fn sys_statx(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -495,6 +577,22 @@ pub(super) fn sys_readlinkat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     copy_readlink_target(buf, size, &target)
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_readlink(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [
+        AT_FDCWD as isize as usize,
+        saved[0],
+        saved[1],
+        saved[2],
+        0,
+        0,
+    ];
+    let result = sys_readlinkat(ctx);
+    ctx.args = saved;
+    result
+}
+
 pub(super) fn sys_getcwd(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::ENOENT)?;
     let user = ctx.args[0];
@@ -546,6 +644,20 @@ pub(super) fn sys_dup3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         .dup2_fd_for_owner(old_fd, new_fd, fd_flags, record_lock_owner_pid(ctx))
         .map_err(|e| e.to_errno())?;
     Ok(out.as_raw() as usize)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_dup2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    let old_fd = fd_arg(saved[0])?;
+    let new_fd = fd_arg(saved[1])?;
+    if old_fd == new_fd {
+        return Ok(old_fd.as_raw() as usize);
+    }
+    ctx.args = [saved[0], saved[1], 0, 0, 0, 0];
+    let result = sys_dup3(ctx);
+    ctx.args = saved;
+    result
 }
 
 pub(super) fn sys_fcntl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -843,6 +955,15 @@ pub(super) fn sys_pipe2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Ok(0)
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_pipe(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [saved[0], 0, 0, 0, 0, 0];
+    let result = sys_pipe2(ctx);
+    ctx.args = saved;
+    result
+}
+
 pub(super) fn sys_mkdirat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
@@ -851,6 +972,15 @@ pub(super) fn sys_mkdirat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let mode = FileMode::new((ctx.args[2] & 0o7777) as u16);
     operation::mkdirat(&vfs_ctx, &dirfd, &path, mode).map_err(|e| e.to_errno())?;
     Ok(0)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_mkdir(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [AT_FDCWD as isize as usize, saved[0], saved[1], 0, 0, 0];
+    let result = sys_mkdirat(ctx);
+    ctx.args = saved;
+    result
 }
 
 pub(super) fn sys_unlinkat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -871,6 +1001,24 @@ pub(super) fn sys_unlinkat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     Ok(0)
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_unlink(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [AT_FDCWD as isize as usize, saved[0], 0, 0, 0, 0];
+    let result = sys_unlinkat(ctx);
+    ctx.args = saved;
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_rmdir(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [AT_FDCWD as isize as usize, saved[0], 0x200, 0, 0, 0];
+    let result = sys_unlinkat(ctx);
+    ctx.args = saved;
+    result
+}
+
 pub(super) fn sys_renameat2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     renameat_common(
         ctx.args[0],
@@ -879,6 +1027,22 @@ pub(super) fn sys_renameat2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         ctx.args[3],
         ctx.args[4],
     )
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_rename(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [
+        AT_FDCWD as isize as usize,
+        saved[0],
+        AT_FDCWD as isize as usize,
+        saved[1],
+        0,
+        0,
+    ];
+    let result = sys_renameat(ctx);
+    ctx.args = saved;
+    result
 }
 
 const RENAME_NOREPLACE: usize = 1;
@@ -1011,6 +1175,22 @@ pub(super) fn sys_linkat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Ok(0)
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_link(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [
+        AT_FDCWD as isize as usize,
+        saved[0],
+        AT_FDCWD as isize as usize,
+        saved[1],
+        0,
+        0,
+    ];
+    let result = sys_linkat(ctx);
+    ctx.args = saved;
+    result
+}
+
 pub(super) fn sys_symlinkat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
@@ -1019,6 +1199,15 @@ pub(super) fn sys_symlinkat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let link_path = copy_path_from_user(ctx.args[2])?;
     operation::symlinkat(&vfs_ctx, &target, &dirfd, &link_path).map_err(|e| e.to_errno())?;
     Ok(0)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_symlink(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [saved[0], AT_FDCWD as isize as usize, saved[1], 0, 0, 0];
+    let result = sys_symlinkat(ctx);
+    ctx.args = saved;
+    result
 }
 
 pub(super) fn sys_mknodat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1045,6 +1234,22 @@ pub(super) fn sys_mknodat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     Ok(0)
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_mknod(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [
+        AT_FDCWD as isize as usize,
+        saved[0],
+        saved[1],
+        saved[2],
+        0,
+        0,
+    ];
+    let result = sys_mknodat(ctx);
+    ctx.args = saved;
+    result
+}
+
 pub(super) fn sys_fchmod(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
@@ -1064,6 +1269,15 @@ pub(super) fn sys_fchmodat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     Ok(0)
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_chmod(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [AT_FDCWD as isize as usize, saved[0], saved[1], 0, 0, 0];
+    let result = sys_fchmodat(ctx);
+    ctx.args = saved;
+    result
+}
+
 pub(super) fn sys_fchownat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let flags = ctx.args[4];
     if (flags & !AT_SYMLINK_NOFOLLOW) != 0 {
@@ -1077,6 +1291,38 @@ pub(super) fn sys_fchownat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let no_follow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
     operation::fchownat(&vfs_ctx, &dirfd, &path, uid, gid, no_follow).map_err(|e| e.to_errno())?;
     Ok(0)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_chown(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [
+        AT_FDCWD as isize as usize,
+        saved[0],
+        saved[1],
+        saved[2],
+        0,
+        0,
+    ];
+    let result = sys_fchownat(ctx);
+    ctx.args = saved;
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_lchown(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [
+        AT_FDCWD as isize as usize,
+        saved[0],
+        saved[1],
+        saved[2],
+        AT_SYMLINK_NOFOLLOW,
+        0,
+    ];
+    let result = sys_fchownat(ctx);
+    ctx.args = saved;
+    result
 }
 
 pub(super) fn sys_fchown(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1131,6 +1377,52 @@ pub(super) fn sys_utimensat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     operation::utimensat(&vfs_ctx, &dirfd, &path, atime, mtime, no_follow)
         .map_err(|e| e.to_errno())?;
     Ok(0)
+}
+
+/// x86_64 legacy `utimes(2)`/`futimesat(2)` use two timeval structures.  The
+/// VFS stores nanosecond times, so decode the pair then call the corresponding
+/// modern operation directly.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_utimes(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let path = copy_path_from_user(ctx.args[0])?;
+    let (atime, mtime) = decode_legacy_timevals(ctx.args[1])?;
+    operation::utimensat(&vfs_ctx, &Dirfd::Cwd, &path, atime, mtime, false)
+        .map_err(|e| e.to_errno())?;
+    Ok(0)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_futimesat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
+    let path = copy_path_from_user(ctx.args[1])?;
+    let (atime, mtime) = decode_legacy_timevals(ctx.args[2])?;
+    operation::utimensat(&vfs_ctx, &dirfd, &path, atime, mtime, false).map_err(|e| e.to_errno())?;
+    Ok(0)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn decode_legacy_timevals(user: usize) -> Result<(Option<Timespec>, Option<Timespec>), Errno> {
+    if user == 0 {
+        let now = realtime_timespec();
+        return Ok((Some(now), Some(now)));
+    }
+    let mut raw = [0u8; 32];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    let read = |off: usize| -> Result<Timespec, Errno> {
+        let secs = i64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
+        let usecs = i64::from_le_bytes(raw[off + 8..off + 16].try_into().unwrap());
+        if secs < 0 || !(0..1_000_000).contains(&usecs) {
+            return Err(Errno::EINVAL);
+        }
+        Ok(Timespec {
+            secs,
+            nsecs: (usecs as u32) * 1_000,
+        })
+    };
+    Ok((Some(read(0)?), Some(read(16)?)))
 }
 
 fn decode_utimens_times(times_user: usize) -> Result<(Option<Timespec>, Option<Timespec>), Errno> {
@@ -1436,10 +1728,20 @@ pub(super) fn sys_mount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             LookupFlags::DIRECTORY.with(LookupFlags::NO_MOUNT_LAST),
         )
         .map_err(|e| e.to_errno())?;
-        vfs_ctx
-            .mount_ns
-            .remount_at(&mountpoint.dentry, flags)
-            .map_err(|e| e.to_errno())?;
+        let remount = if target == "/" {
+            let mount = vfs_ctx.mount_ns.root.lock().clone();
+            mount.superblock.remount(flags).map(|_| {
+                mount.set_flags(flags);
+            })
+        } else {
+            vfs_ctx
+                .mount_ns
+                .remount_at(&mountpoint.dentry, flags)
+                .map(|_| ())
+        };
+        if let Err(error) = remount {
+            return Err(error.to_errno());
+        }
         return Ok(0);
     }
     // ── bind / move / 传播类型设置（不创建新文件系统）──
@@ -1949,6 +2251,17 @@ pub(super) fn sys_eventfd2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     Ok(fd.as_raw() as usize)
 }
 
+/// x86_64's old eventfd(2) entry has the same `(initval, flags)` argument
+/// layout as eventfd2; only the syscall number differs.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_eventfd(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [saved[0], saved[1], 0, 0, 0, 0];
+    let result = sys_eventfd2(ctx);
+    ctx.args = saved;
+    result
+}
+
 pub(super) fn sys_timerfd_create(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let clock_id = ctx.args[0];
     let flags = ctx.args[1];
@@ -2012,6 +2325,16 @@ pub(super) fn sys_signalfd4(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     Ok(fd.as_raw() as usize)
 }
 
+/// The pre-signalfd4 ABI has no flags argument.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_signalfd(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [saved[0], saved[1], saved[2], 0, 0, 0];
+    let result = sys_signalfd4(ctx);
+    ctx.args = saved;
+    result
+}
+
 pub(super) fn sys_epoll_create1(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let flags = ctx.args[0];
     if (flags & !O_CLOEXEC) != 0 {
@@ -2021,6 +2344,20 @@ pub(super) fn sys_epoll_create1(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fd = vfs::epoll::create(&fdt, vfs_ctx.cred(), (flags & O_CLOEXEC) != 0)?;
     Ok(fd.as_raw() as usize)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_epoll_create(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // Linux rejects non-positive size even though the old implementation no
+    // longer uses it to size the ready list.
+    if (ctx.args[0] as isize) <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    let saved = ctx.args;
+    ctx.args = [0, 0, 0, 0, 0, 0];
+    let result = sys_epoll_create1(ctx);
+    ctx.args = saved;
+    result
 }
 
 pub(super) fn sys_epoll_ctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2057,6 +2394,15 @@ pub(super) fn sys_epoll_pwait(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     let ready = vfs::epoll::wait_until(&fdt, epfd, maxevents as usize, deadline)?;
     write_epoll_events(events_user, &ready)?;
     Ok(ready.len())
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_epoll_wait(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [saved[0], saved[1], saved[2], saved[3], 0, 0];
+    let result = sys_epoll_pwait(ctx);
+    ctx.args = saved;
+    result
 }
 
 pub(super) fn sys_socket(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2642,8 +2988,12 @@ fn recv_socket_payload(
     };
     if out.len != 0 {
         #[cfg(feature = "performance-profile")]
-        let _profile = profiling::scope(profiling::Event::SysRecvCopy).bytes(out.len);
-        copy_to_user(user_buf, &data[..out.len]).map_err(|e| e.as_errno())?;
+        let _profile =
+            profiling::scope(profiling::Event::SysRecvCopy).bytes(out.len.min(data.len()));
+        let copy_len = out.len.min(data.len());
+        if copy_len != 0 {
+            copy_to_user(user_buf, &data[..copy_len]).map_err(|e| e.as_errno())?;
+        }
     }
     if want_addr {
         copy_sockaddr_to_user(ctx.args[4], ctx.args[5], out.address.as_deref())?;
@@ -2804,7 +3154,8 @@ pub(super) fn sys_recvmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
         ctx.args[2],
         None,
     )?;
-    scatter_recv_iovecs(hdr.iov, hdr.iovlen, &data[..out.len])?;
+    let copy_len = out.len.min(data.len());
+    scatter_recv_iovecs(hdr.iov, hdr.iovlen, &data[..copy_len])?;
     if hdr.control != 0 && !out.control.is_empty() {
         let copy_len = out.control.len().min(hdr.controllen);
         copy_to_user(hdr.control, &out.control[..copy_len]).map_err(|e| e.as_errno())?;
@@ -2853,7 +3204,8 @@ pub(super) fn sys_recvmmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
             deadline,
         ) {
             Ok(out) => {
-                scatter_recv_iovecs(hdr.msg_hdr.iov, hdr.msg_hdr.iovlen, &data[..out.len])?;
+                let copy_len = out.len.min(data.len());
+                scatter_recv_iovecs(hdr.msg_hdr.iov, hdr.msg_hdr.iovlen, &data[..copy_len])?;
                 if hdr.msg_hdr.control != 0 && !out.control.is_empty() {
                     let copy_len = out.control.len().min(hdr.msg_hdr.controllen);
                     copy_to_user(hdr.msg_hdr.control, &out.control[..copy_len])
@@ -3000,7 +3352,31 @@ pub(super) fn sys_ppoll(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         timeout_user,
         ctx.args[3],
     );
+    let timeout_ms = read_timespec_ms_ceil(timeout_user)?;
+    poll_common(ctx, fds_user, nfds, timeout_ms, sigmask)
+}
 
+/// x86_64's legacy poll(2) uses a signed millisecond timeout and has no
+/// temporary signal-mask arguments.  Keep the actual fd/wait loop shared with
+/// ppoll so readiness and EINTR behaviour cannot diverge.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_poll(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let timeout_raw = ctx.args[2] as i32;
+    let timeout_ms = if timeout_raw < 0 {
+        -1
+    } else {
+        timeout_raw as i64
+    };
+    poll_common(ctx, ctx.args[0], ctx.args[1], timeout_ms, None)
+}
+
+fn poll_common(
+    _ctx: &mut SyscallContext<'_>,
+    fds_user: usize,
+    nfds: usize,
+    timeout_ms: i64,
+    sigmask: Option<SigSet>,
+) -> Result<usize, Errno> {
     const POLLFD_SIZE: usize = 8;
     const MAX_POLLFDS: usize = 1024;
     if nfds > MAX_POLLFDS {
@@ -3028,7 +3404,6 @@ pub(super) fn sys_ppoll(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
     }
 
-    let timeout_ms = read_timespec_ms_ceil(timeout_user)?;
     let _mask_guard = TemporarySigmask::install(sigmask);
 
     let deadline = timeout_deadline(timeout_ms);
@@ -3098,7 +3473,25 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         timeout_user,
         ctx.args[5],
     );
+    let timeout_ms = read_timespec_ms_ceil(timeout_user)?;
+    pselect_common(
+        nfds,
+        readfds_user,
+        writefds_user,
+        exceptfds_user,
+        timeout_ms,
+        sigmask,
+    )
+}
 
+fn pselect_common(
+    nfds: usize,
+    readfds_user: usize,
+    writefds_user: usize,
+    exceptfds_user: usize,
+    timeout_ms: i64,
+    sigmask: Option<SigSet>,
+) -> Result<usize, Errno> {
     const MAX_SELECT_FDS: usize = 1024;
     if nfds > MAX_SELECT_FDS {
         return Err(Errno::EINVAL);
@@ -3126,7 +3519,6 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
             lookup_fds.push(Fd::from_raw(fd_num as u32));
         }
     }
-    let timeout_ms = read_timespec_ms_ceil(timeout_user)?;
     let _mask_guard = TemporarySigmask::install(sigmask);
     let deadline = timeout_deadline(timeout_ms);
     loop {
@@ -3205,6 +3597,33 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
 
         wait_on_poll_sources(&waiters, deadline)?;
     }
+}
+
+/// Legacy x86_64 select(2) has three fd-set pointers followed by a timeval
+/// (seconds/useconds), while pselect6 uses a timespec and a packed sigmask
+/// pointer.  Convert the timeout and invoke the shared readiness core.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_select(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let timeout_ms = if ctx.args[4] == 0 {
+        -1
+    } else {
+        let mut timeval = [0u8; 16];
+        copy_from_user(ctx.args[4], &mut timeval).map_err(|e| e.as_errno())?;
+        let sec = i64::from_le_bytes(timeval[0..8].try_into().unwrap());
+        let usec = i64::from_le_bytes(timeval[8..16].try_into().unwrap());
+        if sec < 0 || !(0..1_000_000).contains(&usec) {
+            return Err(Errno::EINVAL);
+        }
+        sec.saturating_mul(1000).saturating_add((usec + 999) / 1000)
+    };
+    pselect_common(
+        ctx.args[0],
+        ctx.args[1],
+        ctx.args[2],
+        ctx.args[3],
+        timeout_ms,
+        None,
+    )
 }
 
 // ── xattr ────────────────────────────────────────────────────────────────────
@@ -3525,6 +3944,15 @@ pub(super) fn sys_inotify_init1(ctx: &mut SyscallContext<'_>) -> Result<usize, E
         (flags & IN_CLOEXEC) != 0,
     )?;
     Ok(fd.as_raw() as usize)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sys_inotify_init(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let saved = ctx.args;
+    ctx.args = [0, 0, 0, 0, 0, 0];
+    let result = sys_inotify_init1(ctx);
+    ctx.args = saved;
+    result
 }
 
 pub(super) fn sys_inotify_add_watch(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -4660,8 +5088,12 @@ pub(super) fn sys_fspick(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let path_user = ctx.args[1];
     let flags = ctx.args[2] as u32;
     const FSPICK_CLOEXEC: u32 = 1;
+    const FSPICK_SYMLINK_NOFOLLOW: u32 = 2;
+    const FSPICK_NO_AUTOMOUNT: u32 = 4;
     const FSPICK_EMPTY_PATH: u32 = 8;
-    if flags & !(FSPICK_CLOEXEC | FSPICK_EMPTY_PATH) != 0 {
+    if flags & !(FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW | FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH)
+        != 0
+    {
         return Err(Errno::EINVAL);
     }
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
@@ -4669,10 +5101,38 @@ pub(super) fn sys_fspick(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if !vfs_ctx.cred().has_cap(vfs::cred::Capability::SysAdmin) {
         return Err(Errno::EPERM);
     }
-    let path = copy_path_from_user(path_user)?;
+    let path = if path_user == 0 && (flags & FSPICK_EMPTY_PATH) != 0 {
+        String::new()
+    } else {
+        copy_path_from_user(path_user)?
+    };
+
+    // libmount uses the fd returned by open_tree as the source for a
+    // reconfiguration pick.  It is a detached fs_context, not a directory
+    // fd, so path lookup would incorrectly return EBADF/ENOENT here.
+    if (flags & FSPICK_EMPTY_PATH) != 0 && path.is_empty() {
+        let file = fdt.get_file(fd_arg(dirfd)?).ok_or(Errno::EBADF)?;
+        let source = vfs::fs_context::FsContextFileOps::from_file(&file).ok_or(Errno::EINVAL)?;
+        if source.is_consumed() || source.clone_root().is_none() {
+            return Err(Errno::EINVAL);
+        }
+        let picked = source.derive_mount_context()?;
+        let fd = vfs::fs_context::create_fs_context_fd(
+            &fdt,
+            vfs_ctx.cred(),
+            picked,
+            (flags & FSPICK_CLOEXEC) != 0,
+        )?;
+        return Ok(fd.as_raw() as usize);
+    }
+
     let dirfd = dirfd_arg(dirfd, &fdt)?;
-    let result = vfs::path::lookup(&vfs_ctx, &dirfd, &path, LookupFlags::DIRECTORY)
-        .map_err(|e| e.to_errno())?;
+    let mut lookup_flags = LookupFlags::DIRECTORY;
+    if (flags & FSPICK_SYMLINK_NOFOLLOW) != 0 {
+        lookup_flags = lookup_flags.with(LookupFlags::NO_FOLLOW);
+    }
+    let result =
+        vfs::path::lookup(&vfs_ctx, &dirfd, &path, lookup_flags).map_err(|e| e.to_errno())?;
     let m = match vfs_ctx.mount_ns.lookup_mount(&result.dentry) {
         Some(m) => m,
         None => Arc::clone(&result.mount),
@@ -4850,6 +5310,52 @@ pub(super) fn sys_mount_setattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     }
 
     // 定位目标挂载：AT_EMPTY_PATH + 空路径表示 dfd 即 open_tree/fsmount 挂载 fd。
+    // 新 mount API 在 move_mount 前会对 detached fsmount fd 调用
+    // mount_setattr。此时该上下文还不在挂载命名空间，不能通过 mount 根
+    // 反查；直接把属性写回 fs_context，随后由 move_mount 携带这些标志落位。
+    if (flags & AT_EMPTY_PATH) != 0 && path.is_empty() {
+        let file = fdt.get_file(fd_arg(dfd)?).ok_or(Errno::EBADF)?;
+        if let Some(fsc) = vfs::fs_context::FsContextFileOps::from_file(&file) {
+            if fsc.clone_root().is_some()
+                && vfs_ctx
+                    .mount_ns
+                    .find_mount_for_root(&fsc.clone_root().unwrap())
+                    .is_none()
+            {
+                for (bit, key) in [
+                    (MOUNT_ATTR_RDONLY, "ro"),
+                    (MOUNT_ATTR_NOSUID, "nosuid"),
+                    (MOUNT_ATTR_NODEV, "nodev"),
+                    (MOUNT_ATTR_NOEXEC, "noexec"),
+                    (MOUNT_ATTR_NOATIME, "noatime"),
+                    (MOUNT_ATTR_STRICTATIME, "strictatime"),
+                    (MOUNT_ATTR_NODIRATIME, "nodiratime"),
+                ] {
+                    if attr_set & bit as u64 != 0 {
+                        fsc.set_flag(key)?;
+                    }
+                    if attr_clr & bit as u64 != 0 {
+                        let inverse = match key {
+                            "ro" => "rw",
+                            "nosuid" => "suid",
+                            "nodev" => "dev",
+                            "noexec" => "exec",
+                            "noatime" => "atime",
+                            "strictatime" => "relatime",
+                            "nodiratime" => "diratime",
+                            _ => unreachable!(),
+                        };
+                        fsc.set_flag(inverse)?;
+                    }
+                }
+                if propagation != 0 {
+                    return Err(Errno::EOPNOTSUPP);
+                }
+                return Ok(0);
+            }
+        }
+    }
+
     let mount = if (flags & AT_EMPTY_PATH) != 0 && path.is_empty() {
         let file = fdt.get_file(fd_arg(dfd)?).ok_or(Errno::EBADF)?;
         let fsc = vfs::fs_context::FsContextFileOps::from_file(&file).ok_or(Errno::EINVAL)?;
@@ -4901,7 +5407,10 @@ fn apply_mount_setattr_one(
             flags = flags.without(flag);
         }
     }
-    mount.superblock.remount(flags).map_err(|e| e.to_errno())?;
+    // These are per-mount VFS attributes.  Calling the superblock's remount
+    // hook here would incorrectly reject valid changes for pseudo-filesystems
+    // such as procfs/devpts, whose data is already mounted and needs no
+    // filesystem-wide reconfiguration.
     mount.set_flags(flags);
 
     if propagation != 0 {
@@ -6810,24 +7319,53 @@ fn getsockname_common(ctx: &mut SyscallContext<'_>, peer: bool) -> Result<usize,
 }
 
 fn write_linux_stat(user: usize, st: &FileStat) -> Result<(), Errno> {
-    let mut out = [0u8; 128];
-    put_u64(&mut out, 0, encode_dev_t(st.dev));
-    put_u64(&mut out, 8, st.ino);
-    put_u32(&mut out, 16, st.mode);
-    put_u32(&mut out, 20, st.nlink);
-    put_u32(&mut out, 24, st.uid);
-    put_u32(&mut out, 28, st.gid);
-    put_u64(&mut out, 32, encode_dev_t(st.rdev));
-    put_i64(&mut out, 48, st.size);
-    put_u32(&mut out, 56, st.blksize);
-    put_u64(&mut out, 64, st.blocks);
-    put_i64(&mut out, 72, st.atime.secs);
-    put_u64(&mut out, 80, st.atime.nsecs as u64);
-    put_i64(&mut out, 88, st.mtime.secs);
-    put_u64(&mut out, 96, st.mtime.nsecs as u64);
-    put_i64(&mut out, 104, st.ctime.secs);
-    put_u64(&mut out, 112, st.ctime.nsecs as u64);
-    copy_to_user(user, &out).map_err(|e| e.as_errno())
+    // Linux x86_64 exposes the historical 144-byte `struct stat` layout to
+    // native (and therefore musl) callers.  It is not the asm-generic 128-byte
+    // layout used by the other targets in this tree; in particular mode/nlink
+    // move to offsets 24/16 and all long fields are eight bytes wide.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut out = [0u8; 144];
+        put_u64(&mut out, 0, encode_dev_t(st.dev));
+        put_u64(&mut out, 8, st.ino);
+        put_u64(&mut out, 16, st.nlink as u64);
+        put_u32(&mut out, 24, st.mode);
+        put_u32(&mut out, 28, st.uid);
+        put_u32(&mut out, 32, st.gid);
+        put_u64(&mut out, 40, encode_dev_t(st.rdev));
+        put_i64(&mut out, 48, st.size);
+        put_i64(&mut out, 56, st.blksize as i64);
+        put_i64(&mut out, 64, st.blocks as i64);
+        put_i64(&mut out, 72, st.atime.secs);
+        put_i64(&mut out, 80, st.atime.nsecs as i64);
+        put_i64(&mut out, 88, st.mtime.secs);
+        put_i64(&mut out, 96, st.mtime.nsecs as i64);
+        put_i64(&mut out, 104, st.ctime.secs);
+        put_i64(&mut out, 112, st.ctime.nsecs as i64);
+        return copy_to_user(user, &out).map_err(|e| e.as_errno());
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mut out = [0u8; 128];
+        put_u64(&mut out, 0, encode_dev_t(st.dev));
+        put_u64(&mut out, 8, st.ino);
+        put_u32(&mut out, 16, st.mode);
+        put_u32(&mut out, 20, st.nlink);
+        put_u32(&mut out, 24, st.uid);
+        put_u32(&mut out, 28, st.gid);
+        put_u64(&mut out, 32, encode_dev_t(st.rdev));
+        put_i64(&mut out, 48, st.size);
+        put_u32(&mut out, 56, st.blksize);
+        put_u64(&mut out, 64, st.blocks);
+        put_i64(&mut out, 72, st.atime.secs);
+        put_u64(&mut out, 80, st.atime.nsecs as u64);
+        put_i64(&mut out, 88, st.mtime.secs);
+        put_u64(&mut out, 96, st.mtime.nsecs as u64);
+        put_i64(&mut out, 104, st.ctime.secs);
+        put_u64(&mut out, 112, st.ctime.nsecs as u64);
+        copy_to_user(user, &out).map_err(|e| e.as_errno())
+    }
 }
 
 fn write_linux_statx(

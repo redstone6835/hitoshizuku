@@ -1161,6 +1161,18 @@ fn netlink_bind_assigns_port_and_getsockname_returns_sockaddr_nl() {
 }
 
 #[ktest]
+fn netlink_generic_socket_is_accepted_and_reports_its_protocol() {
+    let fx = fixture();
+    let protocol = crate::netlink_socket::NETLINK_GENERIC as usize;
+    let fd = vsock::socket(&fx.ctx, &fx.fdt, 16, vsock::SOCK_RAW, protocol)
+        .expect("generic netlink socket");
+
+    let reported = vsock::getsockopt(&fx.fdt, fd, vsock::SOL_SOCKET, vsock::SO_PROTOCOL)
+        .expect("generic netlink SO_PROTOCOL");
+    assert_eq!(read_i32(&reported), protocol as i32);
+}
+
+#[ktest]
 fn netlink_route_dump_replies_with_the_bound_port_id() {
     let fx = fixture();
     let fd = vsock::socket(&fx.ctx, &fx.fdt, 16, vsock::SOCK_RAW, 0).expect("netlink socket");

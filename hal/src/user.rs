@@ -508,6 +508,8 @@ unsafe fn x86_64_enter_user_mode(
     let mut frame = arch::TrapFrame::default();
     let frame_ptr = TrapFramePtr::new(&mut frame as *mut _ as usize);
     <arch::X86_64TaskOps as TaskOps>::init_user_trap_frame(frame_ptr, entry_pc, user_sp, arg0);
-    frame.kernel_stack_top = kernel_stack_top;
+    // The raw iretq handoff consumes this field through `frame_ptr`, outside
+    // Rust's alias analysis. Keep the store explicit so it cannot be elided.
+    unsafe { core::ptr::addr_of_mut!(frame.kernel_stack_top).write_volatile(kernel_stack_top) };
     unsafe { <arch::X86_64TaskOps as TaskOps>::resume_to_trap_frame(frame_ptr) }
 }

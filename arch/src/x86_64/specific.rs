@@ -1,23 +1,22 @@
 //! x86_64 特权寄存器、屏障和地址转换的集中封装。
 
-use core::sync::atomic::{AtomicUsize, Ordering};
-
-/// x86_64 Linux `int3` 指令编码。
-pub const BREAKPOINT_INSN: u32 = 0xcc;
-/// 当前架构普通页大小。
-pub const PAGE_SIZE: usize = 4096;
+#[cfg(target_os = "none")]
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::Ordering;
 
 /// 编译器级屏障，不改变处理器状态。
 ///
 /// Linux 将 `barrier()` 与设备所需的硬件 fence 分开；DMA coherent 路径通常
 /// 只需要前者来阻止编译器重排，MMIO 路径则使用下面的架构屏障。
 #[inline(always)]
+#[cfg(test)]
 pub fn compiler_barrier() {
     core::sync::atomic::compiler_fence(Ordering::SeqCst);
 }
 
 /// 排序此前的设备/内存读取，对应 Linux x86 `__rmb()`。
 #[inline(always)]
+#[cfg(test)]
 pub fn read_memory_barrier() {
     #[cfg(target_os = "none")]
     unsafe {
@@ -30,6 +29,7 @@ pub fn read_memory_barrier() {
 
 /// 排序此前的设备/内存写入，对应 Linux x86 `__wmb()`。
 #[inline(always)]
+#[cfg(test)]
 pub fn write_memory_barrier() {
     #[cfg(target_os = "none")]
     unsafe {
@@ -41,6 +41,7 @@ pub fn write_memory_barrier() {
 
 /// 完整的处理器内存屏障，对应 Linux x86 `__mb()`。
 #[inline(always)]
+#[cfg(any(test, not(target_os = "none")))]
 pub fn full_memory_barrier() {
     #[cfg(target_os = "none")]
     unsafe {
@@ -52,6 +53,7 @@ pub fn full_memory_barrier() {
 
 /// 忙等循环提示，对应 Linux `cpu_relax()`。
 #[inline(always)]
+#[cfg(any(test, target_os = "none"))]
 pub fn cpu_relax() {
     #[cfg(target_os = "none")]
     unsafe {
@@ -101,11 +103,15 @@ pub fn rdtsc_ordered() -> u64 {
 /// Linux-style x86_64 direct-map base used for physical page-table/data access.
 /// The value is LA48-canonical and can be overridden by a loader before the
 /// allocator is activated.  Hosted tests deliberately keep an identity alias.
+#[cfg(target_os = "none")]
 pub const DIRECT_MAP_BASE: usize = 0xffff_8000_0000_0000;
+#[cfg(target_os = "none")]
 pub const KERNEL_VA_OFFSET: usize = 0xffff_ffff_8000_0000;
+#[cfg(target_os = "none")]
 static DIRECT_MAP_OFFSET: AtomicUsize = AtomicUsize::new(DIRECT_MAP_BASE);
 
 #[inline]
+#[cfg(target_os = "none")]
 pub fn set_direct_map_base(base: usize) {
     assert!(super::paging::is_canonical(base as u64, false));
     assert_eq!(base & 0xfff, 0);
@@ -182,11 +188,6 @@ pub unsafe fn dma_invalidate_range(_vaddr: usize, _len: usize) -> bool {
     true
 }
 
-#[inline]
-pub unsafe fn set_current_task_ptr(task: usize) {
-    super::smp::set_current_task(task);
-}
-
 /// Publish the scheduler current task and its stable user-return work hint.
 ///
 /// # Safety
@@ -200,33 +201,6 @@ pub(crate) unsafe fn set_current_task_ptr_with_work(task: usize, cpu_work_ptr: u
 #[inline]
 pub fn current_task_ptr() -> usize {
     super::smp::current_task()
-}
-
-#[inline(always)]
-fn current_cpu_user_return_work_ptr() -> *const core::sync::atomic::AtomicU32 {
-    super::smp::current_user_return_work() as *const _
-}
-
-/// Read the current CPU's aggregated user-return work hint.
-#[inline]
-pub(crate) fn current_cpu_user_return_work_pending_relaxed() -> bool {
-    let ptr = current_cpu_user_return_work_ptr();
-    if ptr.is_null() {
-        return false;
-    }
-    // Safety: the scheduler publishes a stable AtomicU32 address before this
-    // hook can be queried; the null case is the pre-registration state.
-    unsafe { (*ptr).load(Ordering::Relaxed) != 0 }
-}
-
-#[inline]
-pub(crate) fn current_cpu_user_return_work_pending_acquire() -> bool {
-    let ptr = current_cpu_user_return_work_ptr();
-    if ptr.is_null() {
-        return false;
-    }
-    // Safety: see `current_cpu_user_return_work_pending_relaxed`.
-    unsafe { (*ptr).load(Ordering::Acquire) != 0 }
 }
 
 /// Linux x86 `AT_HWCAP` uses the raw CPUID.1:EDX bit positions.  AVX-family

@@ -34,7 +34,9 @@ pub const TRACKED_HEAP_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
 /// 早期 x86 页表和当前 direct-map 只覆盖低端 4 GiB。boot loader 已经把交接内存图
 /// 裁剪到同一范围；在这里再次检查可以防止把一个没有可访问别名的物理页装入堆。
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
 pub const KERNEL_DIRECT_MAP_PHYS_START: usize = 0;
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
 pub const KERNEL_DIRECT_MAP_PHYS_END: usize = 0x1_0000_0000;
 
 const LARGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
@@ -677,6 +679,7 @@ pub fn validate_kernel_heap_range(
 }
 
 /// 为 `StartAddressOps::virt_to_phys` 提供动态 heap 窗口的反向转换。
+#[cfg(target_os = "none")]
 pub(crate) fn virt_to_phys(vaddr: usize) -> Option<usize> {
     if dynamic_window(vaddr, 1).is_none() {
         return None;

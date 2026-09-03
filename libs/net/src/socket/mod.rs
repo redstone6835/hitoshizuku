@@ -2821,6 +2821,10 @@ pub struct SocketFacade {
     local_tcp_bulk_active: AtomicBool,
     #[cfg(feature = "performance-profile")]
     tcp_profile_updates: AtomicU64,
+    /// Linux ping sockets are requested as SOCK_DGRAM with an ICMP protocol,
+    /// but use the raw transport internally.  Keep their receive ABI
+    /// distinguishable from an actual SOCK_RAW socket.
+    ping_socket: AtomicBool,
     raw_header_included: AtomicBool,
     free_bind: AtomicBool,
     v6_only: AtomicBool,
@@ -3001,6 +3005,7 @@ impl SocketFacade {
             local_tcp_bulk_active: AtomicBool::new(false),
             #[cfg(feature = "performance-profile")]
             tcp_profile_updates: AtomicU64::new(0),
+            ping_socket: AtomicBool::new(false),
             raw_header_included: AtomicBool::new(false),
             free_bind: AtomicBool::new(false),
             v6_only: AtomicBool::new(false),
@@ -3068,6 +3073,14 @@ impl SocketFacade {
 
     pub fn raw_header_included(&self) -> bool {
         self.raw_header_included.load(Ordering::Acquire)
+    }
+
+    pub fn set_ping_socket(&self, enabled: bool) {
+        self.ping_socket.store(enabled, Ordering::Release);
+    }
+
+    pub fn is_ping_socket(&self) -> bool {
+        self.ping_socket.load(Ordering::Acquire)
     }
 
     pub fn set_raw_header_included(&self, enabled: bool) {

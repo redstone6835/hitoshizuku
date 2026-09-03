@@ -1125,12 +1125,24 @@ fn compute_exec_credentials(
     if securebits & SECBIT_NO_SETUID_FIXUP == 0 {
         if let Some((file_uid, file_gid, mode)) = file_owner {
             if mode & S_ISUID != 0 {
-                new.euid = Uid(file_uid);
-                secureexec = true;
+                // A setuid-root helper is commonly executed by an already
+                // privileged process (Alpine's `/bin/mount` is one example).
+                // Merely seeing the bit is not an identity transition: if the
+                // target uid already equals the effective uid, retain the
+                // caller's capabilities.  Dropping them here would make a
+                // root PID 1 unable to mount proc/tmpfs during early boot.
+                let target = Uid(file_uid);
+                if new.euid != target {
+                    new.euid = target;
+                    secureexec = true;
+                }
             }
             if mode & S_ISGID != 0 {
-                new.egid = Gid(file_gid);
-                secureexec = true;
+                let target = Gid(file_gid);
+                if new.egid != target {
+                    new.egid = target;
+                    secureexec = true;
+                }
             }
         }
     }

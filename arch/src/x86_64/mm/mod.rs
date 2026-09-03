@@ -26,9 +26,10 @@ pub fn set_kernel_page_table(root: usize) {
 
 /// x86_64 kernel heap/page-table callbacks consumed by the common start path.
 pub use heap_vm::{
-    KERNEL_HEAP_BASE, KERNEL_HEAP_SIZE, TRACKED_HEAP_BASE, TRACKED_HEAP_SIZE,
-    init_kernel_page_table, kernel_heap_region, map_kernel_heap_range, protect_kernel_heap_range,
-    tracked_heap_region, unmap_kernel_heap_range, validate_kernel_heap_range,
+    KERNEL_HEAP_BASE, KERNEL_HEAP_SIZE, KernelHeapVmStats, TRACKED_HEAP_BASE, TRACKED_HEAP_SIZE,
+    init_kernel_page_table, kernel_heap_region, kernel_heap_vm_stats, map_kernel_heap_range,
+    protect_kernel_heap_range, tracked_heap_region, unmap_kernel_heap_range,
+    validate_kernel_heap_range,
 };
 
 /// 由 HAL 的地址空间切换入口调用，清除当前 CPU 的用户 PGD 驻留。

@@ -1,7 +1,10 @@
+#[cfg(target_os = "none")]
 use core::panic::PanicInfo;
 
+#[cfg(target_os = "none")]
 use general::firmware::power;
 
+#[cfg(target_os = "none")]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     log::emergency!("{}", info.message());

@@ -497,6 +497,7 @@ struct PreparedRoots {
     hosts: Vec<PciHostBridgeInfo>,
 }
 
+#[cfg(feature = "kernel-tests")]
 fn prepare_roots(
     roots: &[AcpiPciRootBridge],
     mcfg_regions: &[AcpiEcamRegion],

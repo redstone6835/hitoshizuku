@@ -2,7 +2,7 @@
 
 本目录实现 `net-virtio` Cargo 包和 `net.virtio` ELM。驱动负责 VirtIO 网卡的 transport、
 feature 协商、RX/TX 队列、DMA buffer 与中断，把队列注册到内核网络设备层，并为 PnP
-设备发布 `eth0` 网络 `DeviceFunction`。
+设备发布 `net0` 网络 `DeviceFunction`。
 
 TCP/IP 协议状态、socket 语义和流调度不在本 crate 中；这些由独立的
 [`net-stack`](../net-stack/README.md) ELM 处理。驱动也不枚举 PCI/platform 总线，不管理
@@ -39,9 +39,9 @@ MSI、INTx；MSI/MSI-X 配置和所有 IRQ handler 都登记为 PnP 资源，设
 撤销。
 
 probe 完成后，驱动先向 `net::device` 注册队列和 buffer pool，再调用
-`PnpDevice::register_function(net_function("eth0", ...))` 发布网络 `DeviceFunction`。
+`PnpDevice::register_function(net_function("net0", ...))` 发布网络 `DeviceFunction`。
 当前 `ACTIVE_DEVICE` 只有一个槽，因此同一时刻只支持一个活动 VirtIO 网卡，名称固定为
-`eth0`；这是实现限制，不是 VirtIO 或设备抽象的要求。
+`net0`；这是实现限制，不是 VirtIO 或设备抽象的要求。
 
 受管 `m` 模式下，队列操作通过私有 `direct-pinned` 导出
 `net.virtio.queue-call` 连接到网络设备层；集成 `y` 模式则注册进程内

@@ -28,6 +28,7 @@ use virtio::{
 };
 
 use super::common::{VirtioNetQueue, VirtioNetTransport, install_active, install_active_queues};
+use crate::VIRTIO_NET_DEVICE_NAME;
 
 const VIRTIO_PCI_FUNCTION_NETWORK: VirtioPciFunction =
     VirtioPciFunction::new("network", 0x1000, 0x1041);
@@ -666,6 +667,8 @@ fn register_irq(
         },
     )?;
     pci.enable_interrupts();
+    binding.enable_polling_fallback();
+    log::warning!("[virtio-net] PCI MSI/MSI-X unavailable; INTx queue polling fallback enabled");
     if let Err(error) =
         dev.own_resource(irq::irq_handler_pnp_resource(handle, "virtio-net-pci-intx"))
     {
@@ -713,13 +716,16 @@ impl PnpDriver for VirtioPciNetDriver {
                     "virtio-net MQ/RSS host registration",
                 ));
             }
-            if let Err(error) = dev.register_function(net_function("eth0", pci.dma_context())) {
+            if let Err(error) =
+                dev.register_function(net_function(VIRTIO_NET_DEVICE_NAME, pci.dma_context()))
+            {
                 let _ = super::common::remove_active_from_pnp();
                 super::common::destroy_active();
                 return Err(error);
             }
             log::printk!(
-                "[virtio-net] PCI attached eth0 MQ/RSS pairs={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} mtu={}",
+                "[virtio-net] PCI attached {} MQ/RSS pairs={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} mtu={}",
+                VIRTIO_NET_DEVICE_NAME,
                 pair_count,
                 multi.mac[0],
                 multi.mac[1],
@@ -753,13 +759,16 @@ impl PnpDriver for VirtioPciNetDriver {
                 "virtio-net host registration",
             ));
         }
-        if let Err(error) = dev.register_function(net_function("eth0", pci.dma_context())) {
+        if let Err(error) =
+            dev.register_function(net_function(VIRTIO_NET_DEVICE_NAME, pci.dma_context()))
+        {
             let _ = super::common::remove_active_from_pnp();
             super::common::destroy_active();
             return Err(error);
         }
         log::printk!(
-            "[virtio-net] PCI attached eth0 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} mtu={}",
+            "[virtio-net] PCI attached {} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} mtu={}",
+            VIRTIO_NET_DEVICE_NAME,
             mac[0],
             mac[1],
             mac[2],

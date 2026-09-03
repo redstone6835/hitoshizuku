@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use errno::Errno;
-use sched::operation;
+use sched::{WaitQueue, operation};
 use vfs::sync::Spinlock;
 
 use crate::dev::char::{CharDevice, CharIoError};
@@ -172,6 +172,11 @@ pub struct TtyCore {
     winsize: Spinlock<UserWinSize>,
     foreground_pgrp: Spinlock<i32>,
     line_state: Spinlock<TtyLineState>,
+    /// TTY-level readers waiting for bytes that the asynchronous input pump
+    /// has already removed from the hardware FIFO.  The hardware driver's
+    /// waiter alone is insufficient in that case: once the pump owns the
+    /// byte, the UART IRQ no longer observes a ready FIFO to wake it.
+    input_waiters: WaitQueue,
     hung_up: AtomicBool,
     /// TIOCEXCL/TIOCNXCL 独占打开标志。
     exclusive: AtomicBool,
@@ -204,6 +209,7 @@ impl TtyCore {
             winsize: Spinlock::new(UserWinSize::default_console()),
             foreground_pgrp: Spinlock::new(0),
             line_state: Spinlock::new(TtyLineState::default()),
+            input_waiters: WaitQueue::new(),
             hung_up: AtomicBool::new(false),
             exclusive: AtomicBool::new(false),
             open_count: AtomicU32::new(0),
@@ -253,6 +259,25 @@ impl TtyCore {
     pub fn has_ready_input(&self) -> bool {
         let state = self.line_state.lock();
         state.eof_pending || !state.ready.is_empty()
+    }
+
+    /// Register a reader with the line discipline itself.
+    ///
+    /// The timer-driven input pump can consume a byte before the underlying
+    /// character driver's wait queue sees its IRQ.  Keeping a waiter at this
+    /// layer closes that race and lets the pump wake the blocked syscall after
+    /// it appends data to `line_state`.
+    pub fn poll_add_input_waiter(&self, task: &Arc<sched::Task>) -> bool {
+        self.input_waiters.enqueue(task);
+        true
+    }
+
+    pub fn poll_remove_input_waiter(&self, task: &Arc<sched::Task>) {
+        self.input_waiters.remove(task);
+    }
+
+    fn wake_input_waiters(&self) {
+        self.input_waiters.wake_all();
     }
 
     /// 记录最近的 tty reader 进程组,供 timer 输入泵在没有 reader 调用栈时
@@ -332,6 +357,9 @@ impl TtyCore {
             }
         };
         // 注入的字节若触发 VINTR/VQUIT/VSUSP,信号已投递,ioctl 本身成功。
+        if result.is_ok() || matches!(result, Err(TtyIoError::Interrupted)) {
+            self.wake_input_waiters();
+        }
         match result {
             Ok(()) | Err(TtyIoError::Interrupted) => Ok(()),
             Err(err) => Err(err),
@@ -588,6 +616,11 @@ impl TtyCore {
         if let Some(bytes) = echo_bytes.as_deref() {
             let _ = self.write_tty_bytes(bytes, termios);
         }
+        // Wake even for a partial canonical line.  The reader will re-check
+        // the line discipline and either consume a completed line or wait
+        // again; this is preferable to losing the wakeup when the pump owns
+        // the hardware byte.
+        self.wake_input_waiters();
         Ok(())
     }
 
@@ -639,6 +672,7 @@ impl TtyCore {
         for &byte in &byte[..produced] {
             state.ready.push_back(byte);
         }
+        self.wake_input_waiters();
         Ok(true)
     }
 
@@ -656,6 +690,7 @@ impl TtyCore {
     pub fn hangup(&self) {
         self.hung_up.store(true, Ordering::Release);
         self.driver.hangup();
+        self.wake_input_waiters();
         self.send_fg_signal(sched::SignalNumber::SIGHUP);
     }
 

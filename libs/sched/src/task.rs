@@ -2980,9 +2980,6 @@ impl Task {
     }
 
     /// profiling 会话内稳定的任务标识。
-    ///
-    /// PID 可能在长窗口中复用；把任务对象地址、创建时刻和根 PID 混合后，
-    /// QEMU 插件可在阻塞、迁移和 PID 回绕期间继续识别同一个 syscall 实例。
     #[cfg(feature = "syscall-model-markers")]
     pub fn syscall_model_task_id(&self) -> u64 {
         let address = self as *const Self as usize as u64;

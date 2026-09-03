@@ -223,7 +223,7 @@ fn activate_console(
 
 /// console= 选择器是否为虚拟终端(`tty0`..`ttyN`)。
 ///
-/// 注意 `tty`(5:0,会话控制终端别名)与 `ttyS0` 等串口名不是 VT。
+/// 注意 `tty`(5:0,会话控制终端别名)与 `uart0` 等串口名不是 VT。
 fn selector_is_vt(selector: &BootConsoleSelector) -> bool {
     let name = selector.description();
     let name = name.strip_prefix("/dev/").unwrap_or(name);

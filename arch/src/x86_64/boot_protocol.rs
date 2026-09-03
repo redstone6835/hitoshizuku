@@ -948,7 +948,7 @@ mod tests {
     #[test]
     fn multiboot2_reads_command_line_and_memory_map() {
         let mut cmd = Vec::new();
-        cmd.extend_from_slice(b"root=/dev/vda\0");
+        cmd.extend_from_slice(b"root=/dev/vd0p1\0");
         let mut map = vec![0u8; 8 + 24];
         map[..4].copy_from_slice(&(24u32).to_le_bytes());
         map[8..16].copy_from_slice(&(0x1000u64).to_le_bytes());
@@ -959,7 +959,7 @@ mod tests {
             (MULTIBOOT2_TAG_MEMORY_MAP, &map),
         ]);
         let parsed = Multiboot2Info::parse(&info).unwrap();
-        assert_eq!(parsed.command_line(), Some(&b"root=/dev/vda"[..]));
+        assert_eq!(parsed.command_line(), Some(&b"root=/dev/vd0p1"[..]));
         let regions = parsed.memory_regions().unwrap();
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].range, StartPhysRange::new(0x1000, 0xa000));

@@ -15,6 +15,7 @@ const PF_INSTRUCTION: usize = 1 << 4;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg(target_os = "none")]
 struct ExTableEntry {
     fault_pc: usize,
     fixup_pc: usize,
@@ -43,6 +44,7 @@ fn frame(ptr: TrapFramePtr) -> &'static TrapFrame {
 }
 
 #[inline]
+#[cfg(target_os = "none")]
 fn frame_mut(ptr: TrapFramePtr) -> &'static mut TrapFrame {
     // Safety: caller owns the active trap frame and has exclusive write access.
     unsafe { &mut *(ptr.as_usize() as *mut TrapFrame) }
@@ -72,20 +74,23 @@ fn fault_kind(ptr: TrapFramePtr) -> FaultKind {
 }
 
 fn fault_addr(_ptr: TrapFramePtr) -> usize {
-    #[cfg(target_os = "none")]
-    {
-        let address: usize;
-        // CR2 is architecturally updated before the page-fault handler starts.
-        unsafe {
-            core::arch::asm!("mov {}, cr2", out(reg) address, options(nostack, nomem));
+    let address = {
+        #[cfg(target_os = "none")]
+        {
+            let address: usize;
+            // CR2 is architecturally updated before the page-fault handler starts.
+            unsafe {
+                core::arch::asm!("mov {}, cr2", out(reg) address, options(nostack, nomem));
+            }
+            address
         }
-        FAULT_ADDRESS.store(address, Ordering::Release);
-        address
-    }
-    #[cfg(not(target_os = "none"))]
-    {
-        FAULT_ADDRESS.load(Ordering::Acquire)
-    }
+        #[cfg(not(target_os = "none"))]
+        {
+            FAULT_ADDRESS.load(Ordering::Acquire)
+        }
+    };
+    set_fault_address(address);
+    address
 }
 
 fn fault_from_user(ptr: TrapFramePtr) -> bool {
@@ -168,25 +173,27 @@ mod tests {
 
     #[test]
     fn page_fault_error_code_maps_to_access_kind() {
-        let mut frame = test_frame(PAGE_FAULT as usize, 0);
-        let ptr = TrapFramePtr::new(&mut frame as *mut _ as usize);
-        assert_eq!(fault_kind(ptr), FaultKind::Load);
-        frame.error_code = PF_WRITE;
-        assert_eq!(fault_kind(ptr), FaultKind::Store);
-        frame.error_code = PF_PRESENT;
-        assert_eq!(fault_kind(ptr), FaultKind::PermRead);
-        frame.error_code = PF_PRESENT | PF_WRITE;
-        assert_eq!(fault_kind(ptr), FaultKind::PermWrite);
-        frame.error_code = PF_PRESENT | PF_INSTRUCTION;
-        assert_eq!(fault_kind(ptr), FaultKind::PermExec);
+        for (error_code, expected) in [
+            (0, FaultKind::Load),
+            (PF_WRITE, FaultKind::Store),
+            (PF_PRESENT, FaultKind::PermRead),
+            (PF_PRESENT | PF_WRITE, FaultKind::PermWrite),
+            (PF_PRESENT | PF_INSTRUCTION, FaultKind::PermExec),
+        ] {
+            let mut frame = test_frame(PAGE_FAULT as usize, error_code);
+            let ptr = TrapFramePtr::new(&mut frame as *mut _ as usize);
+            assert_eq!(fault_kind(ptr), expected);
+        }
     }
 
     #[test]
     fn source_privilege_comes_from_cs_rpl() {
-        let mut frame = test_frame(PAGE_FAULT as usize, 0);
-        let ptr = TrapFramePtr::new(&mut frame as *mut _ as usize);
-        assert!(fault_from_user(ptr));
-        frame.cs = crate::x86_64::trap_frame::KERNEL_CS as usize;
-        assert!(!fault_from_user(ptr));
+        let mut user_frame = test_frame(PAGE_FAULT as usize, 0);
+        let user_ptr = TrapFramePtr::new(&mut user_frame as *mut _ as usize);
+        assert!(fault_from_user(user_ptr));
+        let mut kernel_frame = test_frame(PAGE_FAULT as usize, 0);
+        kernel_frame.cs = crate::x86_64::trap_frame::KERNEL_CS as usize;
+        let kernel_ptr = TrapFramePtr::new(&mut kernel_frame as *mut _ as usize);
+        assert!(!fault_from_user(kernel_ptr));
     }
 }

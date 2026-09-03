@@ -60,6 +60,9 @@ static COOPERATIVE_TX_ACTIVE: [AtomicBool; sched::NR_CPUS] =
 static COOPERATIVE_TX_SCRATCH: [Spinlock<Option<CooperativeTxScratch>>; sched::NR_CPUS] =
     [const { Spinlock::new(None) }; sched::NR_CPUS];
 
+/// Bound the idle RX latency for a queue using a PCI interrupt fallback.
+const NET_QUEUE_POLL_INTERVAL_NS: u64 = 10_000_000;
+
 struct CooperativeTxScratch {
     tcp: NetStackLocalOutputBatch<PreparedTcpTx>,
     udp: NetStackLocalOutputBatch<NetStackCooperativeUdpTx>,
@@ -2269,8 +2272,10 @@ const SIOCGIFMTU: u32 = 0x8921;
 const SIOCSIFMTU: u32 = 0x8922;
 const SIOCGIFHWADDR: u32 = 0x8927;
 const SIOCGIFINDEX: u32 = 0x8933;
+const SIOCGIFTXQLEN: u32 = 0x8942;
 const SIOCADDRT: u32 = 0x890b;
 const SIOCDELRT: u32 = 0x890c;
+const DEFAULT_TX_QUEUE_LEN: i32 = 1000;
 
 // struct rtentry 的 64 位布局（musl/Linux 一致，112 字节）：
 // rt_pad1(8) rt_dst(16) rt_gateway(16) rt_genmask(16) rt_flags(2) rt_pad2(2)
@@ -2502,6 +2507,9 @@ fn net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
         }
         SIOCGIFINDEX => {
             ifreq[16..20].copy_from_slice(&(interface.0 as i32).to_ne_bytes());
+        }
+        SIOCGIFTXQLEN => {
+            ifreq[16..20].copy_from_slice(&DEFAULT_TX_QUEUE_LEN.to_ne_bytes());
         }
         _ => return Err(Errno::EOPNOTSUPP),
     }
@@ -3072,14 +3080,21 @@ fn procfs_neighbor_snapshot() -> Vec<net::control::NeighborSnapshotEntry> {
 
 /// packet socket 发送入口：把完整 L2 帧推送到指定接口的 egress。
 fn packet_tx_frame(interface: InterfaceId, bytes: Vec<u8>) -> Result<(), i32> {
-    let starts = NET_WORKER_STARTS.lock();
-    for slot in starts.iter().flatten() {
-        if let Some(index) = slot.runtime.egress_index(interface) {
-            if let Some(target) = slot.runtime.egress(index) {
+    // Worker start contexts are consumed by `net_worker_entry` before the
+    // device queues are attached.  Looking there consequently misses every
+    // live egress after startup and makes AF_PACKET callers (for example
+    // udhcpc) see ENODEV.  The protocol cluster owns the runtimes for the
+    // lifetime of the network stack, so use it as the authoritative lookup.
+    let Some(cluster) = PROTOCOL_CLUSTER.lock().as_ref().cloned() else {
+        return Err(-i32::from(Errno::ENODEV));
+    };
+    for runtime in &cluster.shards {
+        if let Some(index) = runtime.egress_index(interface) {
+            if let Some(target) = runtime.egress(index) {
                 let work = EgressWork::ControlFrame(bytes);
                 match target.try_push(work) {
                     Ok(()) => {
-                        slot.cluster.coordinator().publish_work();
+                        cluster.coordinator().publish_work();
                         return Ok(());
                     }
                     Err(_) => return Err(-i32::from(Errno::ENOBUFS)),
@@ -8374,6 +8389,13 @@ impl NetWorkerContext {
         for queue in &self.local_queues {
             queue.irq.unmask();
         }
+        let poll_deadline = self
+            .local_queues
+            .iter()
+            .any(|queue| queue.irq.needs_polling())
+            .then(|| sched::now_ns_direct().saturating_add(NET_QUEUE_POLL_INTERVAL_NS));
+        let deadline_armed =
+            poll_deadline.is_some_and(|deadline| sched::register_sleep_deadline(&task, deadline));
         fence(Ordering::SeqCst);
         if self.runtime.work_signal.sleep_invalidated()
             || self.runtime.timer_fired.load(Ordering::Acquire)
@@ -8385,6 +8407,9 @@ impl NetWorkerContext {
             || !self.local_ingress.is_empty()
             || self.local_queue_pending()
         {
+            if deadline_armed {
+                sched::cancel_sleep_deadline(&task);
+            }
             for queue in &self.local_queues {
                 let _ = queue.irq.ack_and_mask();
             }
@@ -8394,8 +8419,24 @@ impl NetWorkerContext {
             task.cancel_profile_wait();
             return;
         }
-        drop(task);
+
+        // If the deadline could not be registered, retry the normal worker
+        // loop instead of entering an unbounded sleep with no interrupt path.
+        if poll_deadline.is_some() && !deadline_armed {
+            for queue in &self.local_queues {
+                let _ = queue.irq.ack_and_mask();
+            }
+            let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Running);
+            self.runtime.work_signal.end_sleep();
+            #[cfg(feature = "performance-profile")]
+            task.cancel_profile_wait();
+            return;
+        }
+
         sched::schedule_once(sched::now_ns_direct());
+        if deadline_armed {
+            sched::cancel_sleep_deadline(&task);
+        }
         self.runtime.work_signal.end_sleep();
     }
 }

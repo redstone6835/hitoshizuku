@@ -3,22 +3,28 @@
 //! 只有设备驱动层应使用这些函数；端口号和访问宽度必须由 ACPI/PCI 资源
 //! 描述验证后传入。hosted 构建提供无副作用回退，便于驱动单元测试。
 
+#[cfg(target_os = "none")]
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use general::{StartAcpiHostOps, StartAcpiIoOps, StartAcpiPciOps};
 
+#[cfg(target_os = "none")]
 const PCI_CONFIG_ADDRESS: u16 = 0x0cf8;
+#[cfg(target_os = "none")]
 const PCI_CONFIG_DATA: u16 = 0x0cfc;
 const PCI_ENABLE: u32 = 1 << 31;
+#[cfg(target_os = "none")]
 static PCI_CONFIG_LOCK: AtomicBool = AtomicBool::new(false);
 
 /// The legacy configuration mechanism is a single globally shared address/data
 /// pair. Linux protects it with `raw_spin_lock_irqsave`; keep the same ordering
 /// here so an interrupt cannot observe a half-written address.
+#[cfg(target_os = "none")]
 struct PciConfigGuard {
     irq_state: usize,
 }
 
+#[cfg(target_os = "none")]
 impl PciConfigGuard {
     #[inline]
     fn acquire() -> Self {
@@ -33,6 +39,7 @@ impl PciConfigGuard {
     }
 }
 
+#[cfg(target_os = "none")]
 impl Drop for PciConfigGuard {
     fn drop(&mut self) {
         PCI_CONFIG_LOCK.store(false, Ordering::Release);

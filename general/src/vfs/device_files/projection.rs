@@ -533,35 +533,12 @@ fn char_function_devnodes(func: &dyn DeviceFunction) -> Result<Option<DevNodeSet
     };
     let dev = ch.dev();
     let mut nodes = Vec::new();
-    nodes.try_reserve(2).map_err(|_| VfsError::NoSpace)?;
+    nodes.try_reserve(1).map_err(|_| VfsError::NoSpace)?;
     nodes.push(DevNodeSpec::Char {
         name: fallible_box_str(ch.projection_name())?,
         dev: dev.clone(),
     });
-    // Linux 兼容名别名:8250 系串口在 Linux 下命名为 ttyS0..N,本内核驱动名是
-    // uartN。按 Linux 习惯配置的用户空间(Alpine 的 `ttyS0::respawn` getty、
-    // minicom 等)直接打开 /dev/ttyS0,这里在呈现层把它与 uartN 绑到同一个
-    // CharDevice;底层设备身份与设备号仍不参与命名。
-    if let Some(alias) = serial_tty_alias_name(ch.projection_name()) {
-        nodes.push(DevNodeSpec::Char {
-            name: fallible_box_str(&alias)?,
-            dev,
-        });
-    }
     DevNodeSet::try_new(nodes)
-}
-
-/// 串口投影名的 Linux 兼容别名:`uartN` -> `ttySN`(仅数字后缀,如 uart0 -> ttyS0)。
-fn serial_tty_alias_name(projection_name: &str) -> Option<String> {
-    let suffix = projection_name.strip_prefix("uart")?;
-    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let mut out = String::new();
-    out.try_reserve(projection_name.len() + 3).ok()?;
-    out.push_str("ttyS");
-    out.push_str(suffix);
-    Some(out)
 }
 
 fn block_function_devnodes(func: &dyn DeviceFunction) -> Result<Option<DevNodeSet>, VfsError> {
@@ -575,7 +552,7 @@ fn block_function_devnodes(func: &dyn DeviceFunction) -> Result<Option<DevNodeSe
         name: fallible_box_str(block.projection_name())?,
         dev: Arc::clone(&dev),
     });
-    // 整盘设备扫描分区表并投影 /dev/<disk><part> 节点(如 vd0p1/sda1)。
+    // 整盘设备扫描分区表并投影 /dev/<disk>p<part> 节点（如 vd0p1）。
     // 分区扫描带缓存,仅在首次投影时读一次磁盘。
     for part in crate::dev::partition::partitions_of(&dev) {
         let name =
@@ -598,24 +575,12 @@ fn rtc_function_devnodes(func: &dyn DeviceFunction) -> Result<Option<DevNodeSet>
     let dev = func.dev();
     let mut nodes = Vec::new();
     let payload: Arc<dyn Any + Send + Sync> = Arc::new(RtcDevNodeEndpoint::new(Arc::clone(&dev)));
-    nodes
-        .try_reserve(if dev.index() == 0 { 3 } else { 1 })
-        .map_err(|_| VfsError::OutOfMemory)?;
+    nodes.try_reserve(1).map_err(|_| VfsError::OutOfMemory)?;
     nodes.push(DevNodeSpec::custom(CustomDevNodeSpec::try_new(
         dev.name(),
         CustomDevNodeKind::CharDevice,
         payload,
     )?));
-    if dev.index() == 0 {
-        nodes.push(DevNodeSpec::Symlink {
-            name: fallible_box_str("rtc")?,
-            target: fallible_box_str(dev.name())?,
-        });
-        nodes.push(DevNodeSpec::Symlink {
-            name: fallible_box_str("misc/rtc")?,
-            target: fallible_box_str("../rtc0")?,
-        });
-    }
     DevNodeSet::try_new(nodes)
 }
 
@@ -1201,4 +1166,25 @@ fn fallible_string(value: &str) -> Option<String> {
     out.try_reserve(value.len()).ok()?;
     out.push_str(value);
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dev::function::CharFunction;
+
+    #[test]
+    fn serial_functions_publish_only_the_native_uart_name() {
+        register_builtin_device_file_projectors().expect("builtin projectors");
+        let function = CharFunction::with_projection_name(
+            "serial@3f8",
+            "uart0",
+            crate::dev::char::CharDevice::null(),
+        );
+        let nodes = devnodes_for_function(&function)
+            .expect("projection should succeed")
+            .expect("character projector should produce a node");
+        assert_eq!(nodes.nodes().len(), 1);
+        assert_eq!(nodes.nodes()[0].name(), "uart0");
+    }
 }

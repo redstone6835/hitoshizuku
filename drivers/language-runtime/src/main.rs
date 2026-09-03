@@ -394,7 +394,7 @@ fn delegated_kernel_call(request: &ManagedRequest) -> ManagedResult {
     encode_status(LanguageRuntimeStatus::from_raw(output.status), &output)
 }
 
-#[cfg(all(not(feature = "elm-integrated"), not(test)))]
+#[cfg(all(not(feature = "elm-integrated"), not(test), target_os = "none"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     elm::runtime::abort_panic()

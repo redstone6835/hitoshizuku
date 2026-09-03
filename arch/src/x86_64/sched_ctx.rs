@@ -29,11 +29,15 @@ const _: () = {
     assert!(KCTX_SIZE % KCTX_ALIGN == 0);
 };
 
+#[cfg(target_os = "none")]
 const RBX_OFFSET: usize = 0x00;
+#[cfg(target_os = "none")]
 const RBP_OFFSET: usize = 0x08;
 const R12_OFFSET: usize = 0x10;
 const R13_OFFSET: usize = 0x18;
+#[cfg(target_os = "none")]
 const R14_OFFSET: usize = 0x20;
+#[cfg(target_os = "none")]
 const R15_OFFSET: usize = 0x28;
 const RSP_OFFSET: usize = 0x30;
 const RIP_OFFSET: usize = 0x38;

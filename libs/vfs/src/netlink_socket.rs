@@ -1,4 +1,4 @@
-//! AF_NETLINK/NETLINK_ROUTE 的完整链路信息实现。
+//! AF_NETLINK 的路由与最小 Generic Netlink 实现。
 //!
 //! 支持：
 //! - 读：RTM_GETLINK / RTM_GETADDR / RTM_GETROUTE / RTM_GETNEIGH（真实数据快照）
@@ -7,6 +7,7 @@
 //! - 组播：NETLINK_ADD/DROP_MEMBERSHIP 真实订阅，配置变化时向订阅者推送
 //!   RTM_NEWLINK / RTM_NEWADDR / RTM_NEWROUTE 事件
 //! - sockopt：SO_SNDBUF/SO_RCVBUF 真实调整缓冲上限，SO_PASSCRED 附加发送者凭据
+//! - NETLINK_GENERIC：对未注册 family 返回带原请求序号的 NLMSG_ERROR
 //!
 //! 数据源通过 provider 注入（内核 net_runtime 安装），配置修改通过 handler 注入
 //! （内核 net_runtime 实现），与 ioctl 分派模式一致。
@@ -32,6 +33,8 @@ use crate::poll_source::PollSource;
 
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
+const GENL_ID_CTRL: u16 = 16;
+const CTRL_CMD_GETFAMILY: u8 = 3;
 const RTM_NEWLINK: u16 = 16;
 const RTM_DELLINK: u16 = 17;
 const RTM_GETLINK: u16 = 18;
@@ -104,6 +107,9 @@ const AF_NETLINK: u16 = 16;
 const SOL_NETLINK: i32 = 270;
 const NETLINK_ADD_MEMBERSHIP: i32 = 1;
 const NETLINK_DROP_MEMBERSHIP: i32 = 2;
+
+pub const NETLINK_ROUTE: u32 = 0;
+pub const NETLINK_GENERIC: u32 = 16;
 
 // ── 数据源 provider（由内核 net_runtime 安装）────────────────────────────────
 
@@ -213,14 +219,13 @@ pub fn netlink_event_broadcast(msg_type: u16, message: Vec<u8>) {
         // Safety: 表锁持有期间没有并发 release 出表（release 也持同一把锁），
         // 因此指针必然指向存活的 NetlinkSocketFileOps。
         let socket = unsafe { &*entry.0 };
-        if socket.groups.load(Ordering::Acquire) & groups != 0 {
+        if socket.protocol == NETLINK_ROUTE && socket.groups.load(Ordering::Acquire) & groups != 0 {
             socket.push_event(message.clone());
         }
     }
 }
 
 pub struct NetlinkSocketFileOps {
-    #[allow(dead_code)]
     protocol: u32,
     rx_buf: Mutex<VecDeque<Vec<u8>>>,
     wait_queue: WaitQueue,
@@ -321,6 +326,10 @@ impl NetlinkSocketFileOps {
         address
     }
 
+    pub const fn protocol(&self) -> u32 {
+        self.protocol
+    }
+
     /// 读取一条消息。若启用 SO_PASSCRED，在消息前附加 12 字节发送者凭据
     /// （pid/uid/gid，u32×3），与 Linux netlink 的 SO_PASSCRED 语义一致。
     pub fn recv(
@@ -328,10 +337,17 @@ impl NetlinkSocketFileOps {
         buf: &mut [u8],
         nonblocking: bool,
         deadline_ns: Option<u64>,
+        peek: bool,
+        truncate: bool,
     ) -> Result<usize, Errno> {
         loop {
             let message = {
-                let base = self.rx_buf.lock().pop_front();
+                let mut queue = self.rx_buf.lock();
+                let base = if peek {
+                    queue.front().cloned()
+                } else {
+                    queue.pop_front()
+                };
                 match base {
                     Some(msg) => {
                         if self.passcred.load(Ordering::Acquire) {
@@ -350,10 +366,18 @@ impl NetlinkSocketFileOps {
                 }
             };
             if let Some(msg) = message {
-                let len = msg.len().min(buf.len());
-                buf[..len].copy_from_slice(&msg[..len]);
-                self.refresh_readiness();
-                return Ok(len);
+                // Netlink is datagram-oriented. MSG_PEEK must leave the
+                // datagram queued, while MSG_TRUNC reports its complete size
+                // even when the caller supplied a zero/small iovec. The
+                // latter is used by iproute2's MSG_PEEK|MSG_TRUNC sizing pass.
+                let copied = msg.len().min(buf.len());
+                if copied != 0 {
+                    buf[..copied].copy_from_slice(&msg[..copied]);
+                }
+                if !peek {
+                    self.refresh_readiness();
+                }
+                return Ok(if truncate { msg.len() } else { copied });
             }
             if nonblocking || self.nonblock.load(Ordering::Relaxed) {
                 return Err(Errno::EAGAIN);
@@ -407,7 +431,14 @@ impl NetlinkSocketFileOps {
         let flags = u16::from_ne_bytes([buf[6], buf[7]]);
         let seq = u32::from_ne_bytes([buf[8], buf[9], buf[10], buf[11]]);
         let local_pid = self.local_pid.load(Ordering::Acquire);
-        let responses = dispatch_message(msg_type, flags, seq, local_pid, &buf[16..msg_len]);
+        let responses = dispatch_message(
+            self.protocol,
+            msg_type,
+            flags,
+            seq,
+            local_pid,
+            &buf[16..msg_len],
+        );
         let mut combined = Vec::new();
         for response in responses {
             combined.extend_from_slice(&response);
@@ -534,6 +565,25 @@ pub fn create_netlink_socket(protocol: u32, nonblock: bool) -> Box<NetlinkSocket
 // ── 消息分发 ─────────────────────────────────────────────────────────────────
 
 fn dispatch_message(
+    protocol: u32,
+    msg_type: u16,
+    flags: u16,
+    seq: u32,
+    local_pid: u32,
+    payload: &[u8],
+) -> Vec<Vec<u8>> {
+    match protocol {
+        NETLINK_ROUTE => dispatch_route_message(msg_type, flags, seq, local_pid, payload),
+        NETLINK_GENERIC => dispatch_generic_message(msg_type, flags, seq, local_pid, payload),
+        _ => vec![build_nlmsg_error(
+            seq,
+            local_pid,
+            -i32::from(Errno::EPROTONOSUPPORT),
+        )],
+    }
+}
+
+fn dispatch_route_message(
     msg_type: u16,
     flags: u16,
     seq: u32,
@@ -568,6 +618,30 @@ fn dispatch_message(
             -i32::from(Errno::EOPNOTSUPP),
         )],
     }
+}
+
+fn dispatch_generic_message(
+    msg_type: u16,
+    flags: u16,
+    seq: u32,
+    local_pid: u32,
+    payload: &[u8],
+) -> Vec<Vec<u8>> {
+    let error = if flags & NLM_F_REQUEST == 0 {
+        Errno::EOPNOTSUPP
+    } else if msg_type != GENL_ID_CTRL {
+        // No Generic Netlink families are registered yet.
+        Errno::ENOENT
+    } else if payload.len() < 4 {
+        Errno::EINVAL
+    } else if payload[0] == CTRL_CMD_GETFAMILY {
+        // The controller exists, but every requested family (including
+        // nl80211) is currently absent.
+        Errno::ENOENT
+    } else {
+        Errno::EOPNOTSUPP
+    };
+    vec![build_nlmsg_error(seq, local_pid, -i32::from(error))]
 }
 
 fn nlmsg_ack_or_error(result: Result<(), i32>, seq: u32, local_pid: u32) -> Vec<u8> {
@@ -1009,7 +1083,7 @@ pub fn netlink_getsockopt(
         crate::socket::SOL_SOCKET => match optname {
             crate::socket::SO_DOMAIN => Ok(16i32.to_ne_bytes().to_vec()),
             crate::socket::SO_TYPE => Ok((crate::socket::SOCK_RAW as i32).to_ne_bytes().to_vec()),
-            crate::socket::SO_PROTOCOL => Ok(0i32.to_ne_bytes().to_vec()),
+            crate::socket::SO_PROTOCOL => Ok((ops.protocol() as i32).to_ne_bytes().to_vec()),
             crate::socket::SO_SNDBUF => Ok(212992i32.to_ne_bytes().to_vec()),
             crate::socket::SO_RCVBUF => Ok((ops.rx_limit.load(Ordering::Relaxed) as i32)
                 .to_ne_bytes()
@@ -1171,7 +1245,7 @@ mod tests {
             prefix_len: 64,
             primary: false,
         };
-        let message = build_ifaddrmsg_for_device(entry, &device(2, "eth0"), 3, 4);
+        let message = build_ifaddrmsg_for_device(entry, &device(2, "net0"), 3, 4);
 
         assert_eq!(
             &message[16..20],
@@ -1181,7 +1255,7 @@ mod tests {
         let attributes = attributes_from(&message, 8);
         assert!(attributes.contains(&(IFA_ADDRESS, &address[..])));
         assert!(attributes.contains(&(IFA_LOCAL, &address[..])));
-        assert!(attributes.contains(&(IFA_LABEL, b"eth0\0")));
+        assert!(attributes.contains(&(IFA_LABEL, b"net0\0")));
     }
 
     #[test]
@@ -1212,7 +1286,8 @@ mod tests {
         put_nlattr(&mut payload, RTA_OIF, &1u32.to_ne_bytes());
         put_nlattr(&mut payload, RTA_PRIORITY, &100u32.to_ne_bytes());
 
-        let responses = dispatch_message(RTM_NEWROUTE, NLM_F_REQUEST, 7, 3, &payload);
+        let responses =
+            dispatch_message(NETLINK_ROUTE, RTM_NEWROUTE, NLM_F_REQUEST, 7, 3, &payload);
         assert_eq!(responses.len(), 1);
         let error = i32::from_ne_bytes(responses[0][16..20].try_into().unwrap());
         assert_eq!(error, -i32::from(Errno::EOPNOTSUPP));
@@ -1228,7 +1303,7 @@ mod tests {
         payload.extend_from_slice(&2u32.to_ne_bytes()); // ifindex
         put_nlattr(&mut payload, IFA_LOCAL, &[10, 0, 2, 100]);
 
-        let responses = dispatch_message(RTM_NEWADDR, NLM_F_REQUEST, 9, 5, &payload);
+        let responses = dispatch_message(NETLINK_ROUTE, RTM_NEWADDR, NLM_F_REQUEST, 9, 5, &payload);
         assert_eq!(responses.len(), 1);
         let error = i32::from_ne_bytes(responses[0][16..20].try_into().unwrap());
         assert_eq!(error, -i32::from(Errno::EOPNOTSUPP));
@@ -1245,7 +1320,7 @@ mod tests {
         payload.extend_from_slice(&u32::MAX.to_ne_bytes());
         put_nlattr(&mut payload, IFLA_MTU, &1400u32.to_ne_bytes());
 
-        let responses = dispatch_message(RTM_SETLINK, NLM_F_REQUEST, 3, 3, &payload);
+        let responses = dispatch_message(NETLINK_ROUTE, RTM_SETLINK, NLM_F_REQUEST, 3, 3, &payload);
         assert_eq!(responses.len(), 1);
         let error = i32::from_ne_bytes(responses[0][16..20].try_into().unwrap());
         assert_eq!(error, -i32::from(Errno::EOPNOTSUPP));
@@ -1253,7 +1328,7 @@ mod tests {
 
     #[test]
     fn get_route_without_provider_returns_done_only() {
-        let responses = dispatch_message(RTM_GETROUTE, NLM_F_REQUEST, 1, 1, &[]);
+        let responses = dispatch_message(NETLINK_ROUTE, RTM_GETROUTE, NLM_F_REQUEST, 1, 1, &[]);
         assert_eq!(responses.len(), 1);
         assert_eq!(
             u16::from_ne_bytes(responses[0][4..6].try_into().unwrap()),
@@ -1272,6 +1347,43 @@ mod tests {
         let mut too_long = [0u8; 16];
         too_long[0..4].copy_from_slice(&100u32.to_ne_bytes());
         assert_eq!(ops.dispatch(&too_long), Err(VfsError::InvalidArgument));
+    }
+
+    #[test]
+    fn generic_family_lookup_preserves_sequence_and_does_not_dispatch_rtnetlink() {
+        let ops = NetlinkSocketFileOps::new(NETLINK_GENERIC, false);
+        let sequence = 0x1234_5678;
+        let request = wrap_nlmsg(
+            GENL_ID_CTRL,
+            NLM_F_REQUEST,
+            sequence,
+            0,
+            &[CTRL_CMD_GETFAMILY, 1, 0, 0],
+        );
+
+        assert_eq!(ops.dispatch(&request), Ok(request.len()));
+        let response = ops.rx_buf.lock().pop_front().expect("generic response");
+        assert_eq!(
+            u16::from_ne_bytes(response[4..6].try_into().unwrap()),
+            NLMSG_ERROR
+        );
+        assert_eq!(
+            u32::from_ne_bytes(response[8..12].try_into().unwrap()),
+            sequence
+        );
+        assert_eq!(
+            i32::from_ne_bytes(response[16..20].try_into().unwrap()),
+            -i32::from(Errno::ENOENT)
+        );
+        assert_eq!(
+            i32::from_ne_bytes(
+                netlink_getsockopt(&ops, crate::socket::SOL_SOCKET, crate::socket::SO_PROTOCOL,)
+                    .unwrap()[..4]
+                    .try_into()
+                    .unwrap()
+            ),
+            NETLINK_GENERIC as i32
+        );
     }
 
     #[test]
@@ -1330,6 +1442,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ops.rx_limit.load(Ordering::Relaxed), 4096);
+    }
+
+    #[test]
+    fn peek_trunc_reports_size_without_consuming_datagram() {
+        let ops = NetlinkSocketFileOps::new(0, false);
+        ops.push_event(vec![1, 2, 3, 4]);
+
+        let mut empty = [];
+        assert_eq!(ops.recv(&mut empty, false, None, true, true), Ok(4));
+        assert_eq!(ops.rx_buf.lock().len(), 1);
+
+        let mut output = [0u8; 4];
+        assert_eq!(ops.recv(&mut output, false, None, false, false), Ok(4));
+        assert_eq!(output, [1, 2, 3, 4]);
+        assert!(ops.rx_buf.lock().is_empty());
     }
 
     #[test]

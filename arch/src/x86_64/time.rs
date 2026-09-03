@@ -7,8 +7,11 @@
 //! 猜测值误当成硬件校准结果。
 
 use core::arch::x86_64::__cpuid_count;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+#[cfg(any(test, target_os = "none"))]
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
+#[cfg(target_os = "none")]
 use super::apic;
 use super::specific::{rdtsc, rdtsc_ordered};
 #[cfg(target_os = "none")]
@@ -21,16 +24,26 @@ pub const MAX_TSC_HZ: u64 = 10_000_000_000;
 // LAPIC timer register offsets and encodings.  Both the hardware registers and
 // the programming guard are per-CPU; sharing either state would let one CPU
 // suppress another CPU's deadline update during concurrent scheduling.
+#[cfg(target_os = "none")]
 const LAPIC_LVT_TIMER: usize = 0x320;
+#[cfg(target_os = "none")]
 const LAPIC_TIMER_INITIAL_COUNT: usize = 0x380;
+#[cfg(target_os = "none")]
 const LAPIC_TIMER_DIVIDE_CONFIG: usize = 0x3e0;
+#[cfg(target_os = "none")]
 const LAPIC_TIMER_MASK: u32 = 1 << 16;
+#[cfg(target_os = "none")]
 const LAPIC_TIMER_MODE_MASK: u32 = 0b11 << 17;
+#[cfg(target_os = "none")]
 const LAPIC_TIMER_MODE_ONE_SHOT: u32 = 0;
+#[cfg(target_os = "none")]
 const LAPIC_TIMER_MODE_TSC_DEADLINE: u32 = 0b10 << 17;
+#[cfg(target_os = "none")]
 const LAPIC_TIMER_DIVIDE_BY_16: u32 = 0b0011;
 // IA32_TSC_DEADLINE is in the architectural (non-C000) MSR range.
+#[cfg(target_os = "none")]
 const MSR_TSC_DEADLINE: u32 = 0x0000_06e0;
+#[cfg(target_os = "none")]
 const CPUID_TSC_DEADLINE: u32 = 1 << 24;
 /// Keep a regular scheduler tick even when no software deadline is pending.
 pub const DEFAULT_TIMER_PERIOD_NS: u64 = 10_000_000;
@@ -60,6 +73,7 @@ pub enum LocalTimerBackend {
 static LOCAL_TIMER_BACKEND: [AtomicU8; super::smp::MAX_CPUS] =
     [const { AtomicU8::new(LocalTimerBackend::Uninitialized as u8) }; super::smp::MAX_CPUS];
 static LAPIC_TIMER_TICK_HZ: AtomicU64 = AtomicU64::new(DEFAULT_LAPIC_TICK_HZ);
+#[cfg(any(test, target_os = "none"))]
 static TIMER_PROGRAMMING: [AtomicBool; super::smp::MAX_CPUS] =
     [const { AtomicBool::new(false) }; super::smp::MAX_CPUS];
 
@@ -216,6 +230,7 @@ fn local_timer_backend_slot() -> &'static AtomicU8 {
 }
 
 #[inline]
+#[cfg(target_os = "none")]
 fn timer_programming_slot() -> &'static AtomicBool {
     &TIMER_PROGRAMMING[current_timer_cpu()]
 }
@@ -243,12 +258,14 @@ pub fn set_lapic_timer_frequency(hz: u64) -> bool {
 }
 
 #[inline]
+#[cfg(target_os = "none")]
 fn cpuid_tsc_deadline_capable() -> bool {
     let max = __cpuid_count(0, 0).eax;
     max >= 1 && (__cpuid_count(1, 0).ecx & CPUID_TSC_DEADLINE) != 0
 }
 
 #[inline]
+#[cfg(target_os = "none")]
 fn reliable_tsc_for_deadline() -> bool {
     // A scheduler deadline is an absolute value in the TSC-derived nanosecond
     // domain.  Do not select TSC-deadline mode when that domain is only the
@@ -259,6 +276,7 @@ fn reliable_tsc_for_deadline() -> bool {
 }
 
 #[inline]
+#[cfg(any(test, target_os = "none"))]
 fn timer_delta_ns(deadline_ns: Option<u64>, now_ns: u64) -> u64 {
     deadline_ns
         .map(|deadline| deadline.saturating_sub(now_ns).min(DEFAULT_TIMER_PERIOD_NS))
@@ -269,6 +287,7 @@ fn timer_delta_ns(deadline_ns: Option<u64>, now_ns: u64) -> u64 {
 /// tick.  The saturating arithmetic is intentional: malformed far-future
 /// deadlines must produce a finite maximum count, never zero through wrap.
 #[inline]
+#[cfg(any(test, target_os = "none"))]
 fn ns_to_ticks_ceil(delta_ns: u64, hz: u64) -> u64 {
     let product = u128::from(delta_ns).saturating_mul(u128::from(hz));
     let rounded = product.saturating_add(999_999_999) / 1_000_000_000;
@@ -276,6 +295,7 @@ fn ns_to_ticks_ceil(delta_ns: u64, hz: u64) -> u64 {
 }
 
 #[inline]
+#[cfg(target_os = "none")]
 fn timer_lvt_value(mode: u32, masked: bool) -> u32 {
     let mut value = u32::from(apic::TIMER_VECTOR) | (mode & LAPIC_TIMER_MODE_MASK);
     if masked {
@@ -291,13 +311,6 @@ fn write_tsc_deadline(value: u64) -> bool {
     // executes at CPL0.  The x86 facade keeps WRMSR in one privileged helper.
     unsafe { super::write_msr(MSR_TSC_DEADLINE, value as usize) };
     true
-}
-
-#[cfg(not(target_os = "none"))]
-#[inline]
-fn write_tsc_deadline(value: u64) -> bool {
-    let _ = value;
-    false
 }
 
 #[cfg(target_os = "none")]

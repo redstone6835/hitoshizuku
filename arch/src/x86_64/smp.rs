@@ -14,8 +14,11 @@ use sched::arch_hooks::CpuControlOps;
 
 pub const MAX_CPUS: usize = sched::NR_CPUS;
 const UNKNOWN_APIC_ID: u32 = u32::MAX;
+#[cfg(target_os = "none")]
 const AP_START_TIMEOUT_NS: u64 = 500_000_000;
+#[cfg(any(test, target_os = "none"))]
 const AP_TRAMPOLINE_VECTOR: u8 = 0x08;
+#[cfg(target_os = "none")]
 const MSR_GS_BASE: u32 = 0xc000_0101;
 const TLB_SHOOTDOWN_RETRY_NS: u64 = 1_000_000;
 const TLB_SHOOTDOWN_TIMEOUT_NS: u64 = 5_000_000_000;
@@ -46,23 +49,28 @@ impl CpuLocal {
 
 pub(crate) static CPU_LOCALS: [CpuLocal; MAX_CPUS] = [const { CpuLocal::new(0) }; MAX_CPUS];
 pub(crate) const CPU_LOCAL_STRIDE: usize = core::mem::size_of::<CpuLocal>();
+#[cfg(target_os = "none")]
 pub(crate) const CPU_LOCALS_SIZE: usize = CPU_LOCAL_STRIDE * MAX_CPUS;
 
 const _: () = {
     assert!(CPU_LOCAL_STRIDE.is_power_of_two());
     assert!(CPU_LOCAL_STRIDE >= core::mem::size_of::<CpuLocal>());
 };
+#[cfg(not(target_os = "none"))]
 static HOSTED_CPU_ID: AtomicUsize = AtomicUsize::new(0);
 static BOOT_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(UNKNOWN_APIC_ID) }; MAX_CPUS];
 static AP_STARTED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+#[cfg(target_os = "none")]
 static AP_IDLE_TASKS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+#[cfg(target_os = "none")]
 static AP_STACK_TOPS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 static ONLINE_CPUS: AtomicUsize = AtomicUsize::new(0);
 static TLB_REQUESTED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 static TLB_COMPLETED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 
 #[repr(C, align(8))]
+#[cfg(any(test, target_os = "none"))]
 struct ApTrampolineParams {
     cr3: u64,
     entry: u64,
@@ -205,6 +213,7 @@ pub fn current_cpu_id() -> usize {
     }
 }
 
+#[cfg(target_os = "none")]
 pub(crate) fn current_local_address() -> usize {
     let cpu = current_cpu_id();
     core::ptr::addr_of!(CPU_LOCALS[cpu]) as usize
@@ -215,12 +224,6 @@ pub(crate) fn set_kernel_stack_top(stack_top: usize) {
     CPU_LOCALS[cpu]
         .kernel_stack_top
         .store(stack_top, Ordering::Release);
-}
-
-#[inline]
-pub(crate) fn set_current_task(task: usize) {
-    let cpu = current_cpu_id();
-    CPU_LOCALS[cpu].current_task.store(task, Ordering::Release);
 }
 
 #[inline]
@@ -235,12 +238,6 @@ pub(crate) fn set_current_task_with_work(task: usize, work: usize) {
 pub(crate) fn current_task() -> usize {
     let cpu = current_cpu_id();
     CPU_LOCALS[cpu].current_task.load(Ordering::Acquire)
-}
-
-#[inline]
-pub(crate) fn current_user_return_work() -> usize {
-    let cpu = current_cpu_id();
-    CPU_LOCALS[cpu].user_return_work.load(Ordering::Acquire)
 }
 
 pub(crate) fn install_current_cpu(cpu: usize) {
@@ -366,6 +363,7 @@ pub fn start_secondary_cpus() -> SecondaryCpuReport {
             }
         }
     }
+    #[cfg(target_os = "none")]
     report
 }
 
@@ -492,6 +490,7 @@ fn remote_tlb_targets(active_cpus: usize, online_cpus: usize, source: usize) -> 
 }
 
 #[inline]
+#[cfg(any(test, target_os = "none"))]
 const fn ap_trampoline_cr3_supported(cr3: usize) -> bool {
     cr3 != 0 && cr3 & 0xfff == 0 && cr3 <= u32::MAX as usize
 }

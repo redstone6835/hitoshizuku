@@ -32,7 +32,7 @@ const KERNEL_ENTRY_VIRT: u64 = 0xffff_ffff_8180_0000;
 const KERNEL_PATH: &[u16] = &[
     92, 69, 70, 73, 92, 72, 73, 84, 79, 83, 72, 73, 92, 75, 69, 82, 78, 69, 76, 46, 69, 76, 70, 0,
 ];
-const KERNEL_CMDLINE: &[u8] = b"console=ttyS0\0";
+const KERNEL_CMDLINE: &[u8] = b"console=uart0\0";
 const MAX_KERNEL_FILE_BYTES: usize = 128 * 1024 * 1024;
 const MEMORY_MAP_BYTES: usize = 512 * 1024;
 const MULTIBOOT_INFO_BYTES: usize = 512 * 1024;

@@ -75,7 +75,7 @@ bootm ${loadaddr} - ${fdt_addr_r}
 | CRG | `[jh7110-crg] registered clock+reset` |
 | pinctrl | `[jh7110-pinctrl] ... registered`，默认 pin state 可取得 |
 | UART | `[jh7110-uart] bound ... -> /dev/uartN`，轮询和 RX IRQ 均可用 |
-| MMC | `[jh7110-mmc] bound ... -> /dev/mmcblkN`，只读识别容量正确 |
+| MMC | `[jh7110-mmc] bound ... -> /dev/mmcN`，只读识别容量正确 |
 | TRNG | 加载受管模块后出现 `[jh7110-trng] bound ... credited=256 bits` |
 
 根文件系统和 initramfs 由仓库外部提供。仅看到驱动绑定不代表介质写路径已验证；MMC

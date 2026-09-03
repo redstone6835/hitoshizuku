@@ -92,11 +92,6 @@ pub fn scan_and_register(disk: &Arc<BlockDevice>) -> Vec<Arc<BlockDevice>> {
     let infos = scan(disk);
     let mut out = Vec::new();
     let disk_name = disk.name();
-    let separator = if disk_name.chars().last().is_some_and(|c| c.is_ascii_digit()) {
-        "p"
-    } else {
-        ""
-    };
     let physical = disk.geometry().physical_block_size();
     for info in infos {
         let Some(count) = NonZeroU64::new(info.block_count) else {
@@ -109,8 +104,11 @@ pub fn scan_and_register(disk: &Arc<BlockDevice>) -> Vec<Arc<BlockDevice>> {
         ) else {
             continue;
         };
-        let name: Box<str> =
-            alloc::format!("{}{}{}", disk_name, separator, info.index).into_boxed_str();
+        let name = partition_disk_name(disk_name, info.index);
+        if name.is_empty() {
+            continue;
+        }
+        let name = name.into_boxed_str();
         let block = Arc::new(BlockDevice::new(
             BlockDeviceInit {
                 name: &name,
@@ -318,7 +316,7 @@ fn scan(disk: &Arc<BlockDevice>) -> Vec<PartitionInfo> {
 // ── /dev 投影查询接口 ─────────────────────────────────────────────────────
 //
 // 合并自审计整改(devtmpfs 块):投影层需要按父整盘查询已注册分区设备,以生成
-// /dev/<disk><part> 节点。分区设备由 `scan_and_register_all` 注册进全局表,
+// /dev/<disk>p<part> 节点。分区设备由 `scan_and_register_all` 注册进全局表,
 // 这里从注册表按 parent 过滤,避免重复扫描磁盘。
 
 /// 已注册的分区设备快照(供 `/dev` 投影层查询)。
@@ -339,9 +337,10 @@ impl PartitionDevice {
     }
 }
 
-/// 磁盘名 -> 分区节点名(`vd0` -> `vd0p1`,`sda` -> `sda1`)。
+/// 磁盘名 -> 分区节点名（数字后缀使用 `p` 分隔，例如 `vd0` -> `vd0p1`）。
 ///
-/// 与 Linux 命名规则一致:盘名以数字结尾时插入 `p` 再拼序号,否则直接拼序号。
+/// 数字索引盘名追加 `p<序号>`，明确分隔盘索引与分区序号（例如 `vd0p1`）；
+/// 不带数字索引的自定义盘名直接追加序号。
 pub fn partition_disk_name(disk_name: &str, number: u32) -> String {
     let mut name = String::new();
     // 命名分配失败时返回空串;调用方(VFS 投影层)会跳过该分区,避免 panic。
@@ -354,6 +353,23 @@ pub fn partition_disk_name(disk_name: &str, number: u32) -> String {
     }
     let _ = core::fmt::write(&mut name, format_args!("{}", number));
     name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::partition_disk_name;
+
+    #[test]
+    fn native_storage_names_separate_disk_and_partition_indices() {
+        for (disk, expected) in [
+            ("vd0", "vd0p1"),
+            ("ahci0", "ahci0p1"),
+            ("mmc0", "mmc0p1"),
+            ("sdio0", "sdio0p1"),
+        ] {
+            assert_eq!(partition_disk_name(disk, 1), expected);
+        }
+    }
 }
 
 /// 返回一个整盘块设备当前已注册的分区设备(按 parent 过滤全局注册表)。
