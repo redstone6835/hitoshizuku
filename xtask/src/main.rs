@@ -61,6 +61,7 @@ fn run() -> Result<(), String> {
         "modules" => build_modules(&root, &catalog, &rest),
         "build" | "kernel" => build_kernel(&root, &catalog, &rest),
         "image" => build_image(&root, &catalog, &rest),
+        "go-profile" => export_go_profile(&root, &catalog, &rest),
         "clean" => cargo(&root, ["clean"], None),
         "help" | "-h" | "--help" => {
             print_help();
@@ -102,6 +103,217 @@ fn build_modules(root: &Path, catalog: &PlatformCatalog, args: &[String]) -> Res
         .unwrap_or_else(|| context.default_module_output());
 
     build_modules_to(root, &options, &context, &output)
+}
+
+fn export_go_profile(
+    root: &Path,
+    catalog: &PlatformCatalog,
+    args: &[String],
+) -> Result<(), String> {
+    let options = GoProfileOptions::parse(args)?;
+    let context = BuildContext::resolve(&options.build, catalog)?;
+    let kernel = options
+        .kernel
+        .clone()
+        .unwrap_or_else(|| format!("{}/{}/release/kernel", context.target_dir, context.target));
+    let kernel = resolve_root_path(root, &kernel);
+    if !options.no_export && !kernel.is_file() {
+        return Err(format!(
+            "kernel ELF {} does not exist; build the kernel first or pass --kernel",
+            kernel.display()
+        ));
+    }
+
+    let interface = resolve_root_path(
+        root,
+        options
+            .interface
+            .as_deref()
+            .unwrap_or(&context.interface_dir),
+    );
+    if !options.no_export {
+        let mut environment = vec![(
+            "CARGO_TARGET_DIR",
+            root.join(&context.target_dir).into_os_string(),
+        )];
+        context.append_platform_environment(&mut environment);
+        cargo_elm_with_env(
+            root,
+            vec![
+                "profile-export".into(),
+                kernel.as_os_str().to_owned(),
+                "--target".into(),
+                context.target.clone().into(),
+                "--profile".into(),
+                options.profile.clone().into(),
+                "--output".into(),
+                interface.as_os_str().to_owned(),
+            ],
+            &environment,
+        )?;
+    }
+
+    let manifest = interface.join("manifest.txt");
+    if !manifest.is_file() {
+        return Err(format!(
+            "Kernel API manifest {} does not exist; run without --no-export",
+            manifest.display()
+        ));
+    }
+    let go_root = resolve_root_path(root, &options.go_root);
+    if !go_root.is_dir() {
+        return Err(format!(
+            "Go ELM repository {} does not exist; pass --go-root",
+            go_root.display()
+        ));
+    }
+    let output = options.output.clone().map_or_else(
+        || {
+            go_root
+                .join("build/generated")
+                .join(&context.target)
+                .join("kernelapi")
+        },
+        |output| resolve_root_path(&go_root, &output),
+    );
+    let mut command = Command::new(&options.go);
+    command
+        .current_dir(&go_root)
+        .args(["run", "./cmd/elmgo-gen"])
+        .arg("--profile")
+        .arg(&manifest)
+        .arg("--out")
+        .arg(&output)
+        .arg("--package")
+        .arg(&options.package);
+    if let Some(kernel_import) = options.kernel_import.as_deref() {
+        command.args(["--kernel-import", kernel_import]);
+    }
+    if options.check {
+        command.arg("--check");
+    }
+    run_command(command).map_err(|error| format!("generate Go kernel bindings: {error}"))
+}
+
+fn resolve_root_path(root: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+struct GoProfileOptions {
+    build: BuildOptions,
+    kernel: Option<String>,
+    interface: Option<String>,
+    output: Option<String>,
+    go_root: String,
+    go: String,
+    profile: String,
+    package: String,
+    kernel_import: Option<String>,
+    no_export: bool,
+    check: bool,
+}
+
+impl GoProfileOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut options = Self {
+            build: BuildOptions {
+                platform: None,
+                board: None,
+                target: None,
+                config: None,
+                output: None,
+                modules: None,
+                reuse_modules: false,
+                target_dir: None,
+                features: None,
+                initramfs: None,
+            },
+            kernel: None,
+            interface: None,
+            output: None,
+            go_root: env::var("ELM_LANGUAGE_GO_ROOT")
+                .unwrap_or_else(|_| "../elm-language-go".to_string()),
+            go: env::var("GO").unwrap_or_else(|_| "go".to_string()),
+            profile: "hitoshizuku-default".to_string(),
+            package: "kernelapi".to_string(),
+            kernel_import: None,
+            no_export: false,
+            check: false,
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut index = 0;
+        while index < args.len() {
+            let key = args[index].as_str();
+            if matches!(key, "--no-export" | "--check") {
+                if !seen.insert(key.to_string()) {
+                    return Err(format!("{key} was specified more than once"));
+                }
+                match key {
+                    "--no-export" => options.no_export = true,
+                    "--check" => options.check = true,
+                    _ => unreachable!(),
+                }
+                index += 1;
+                continue;
+            }
+            let value = args
+                .get(index + 1)
+                .cloned()
+                .ok_or_else(|| format!("{key} requires a value"))?;
+            if !seen.insert(key.to_string()) {
+                return Err(format!("{key} was specified more than once"));
+            }
+            match key {
+                "--platform" => options.build.platform = Some(value),
+                "--board" => options.build.board = Some(value),
+                "--target" => options.build.target = Some(value),
+                "--config" => options.build.config = Some(value),
+                "--target-dir" => options.build.target_dir = Some(value),
+                "--kernel" => options.kernel = Some(value),
+                "--interface" => options.interface = Some(value),
+                "--output" => options.output = Some(value),
+                "--go-root" => options.go_root = value,
+                "--go" => options.go = value,
+                "--profile" => options.profile = value,
+                "--package" => options.package = value,
+                "--kernel-import" => options.kernel_import = Some(value),
+                _ => return Err(format!("unknown go-profile option {key:?}")),
+            }
+            index += 2;
+        }
+        if options.build.platform.is_some()
+            && (options.build.board.is_some() || options.build.target.is_some())
+        {
+            return Err("--platform cannot be combined with --board or --target".to_string());
+        }
+        validate_go_profile_identifier("--profile", &options.profile, |value| {
+            value.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '@')
+            })
+        })?;
+        validate_go_profile_identifier("--package", &options.package, |value| {
+            let mut characters = value.chars();
+            matches!(characters.next(), Some('_' | 'a'..='z' | 'A'..='Z'))
+                && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })?;
+        Ok(options)
+    }
+}
+
+fn validate_go_profile_identifier(
+    option: &str,
+    value: &str,
+    valid: impl FnOnce(&str) -> bool,
+) -> Result<(), String> {
+    if value.is_empty() || !valid(value) {
+        return Err(format!("{option} has an invalid value {value:?}"));
+    }
+    Ok(())
 }
 
 fn build_modules_to(
@@ -1374,9 +1586,11 @@ fn print_help() {
   modules [--platform <id> | --board <qemu|ls2k1000|visionfive2> [--target <triple>]] [--config <path>] [--output <dir>]\n\
   build [--platform <id> | --board <qemu|ls2k1000|visionfive2> [--target <triple>]] [--config <path>] [--modules <dir>] [--reuse-modules] [--features <a,b>] [--initramfs <cpio>]\n\
   image [build options] [--reuse-modules] [--no-build] [--format <elf|raw|uimage|efi|all>] [--objcopy <path>] [--mkimage <path>]\n\
+  go-profile [build platform options] [--kernel <elf>] [--interface <dir>] [--go-root <dir>] [--output <dir>] [--profile <name>] [--package <name>] [--kernel-import <path>] [--no-export] [--check]\n\
   clean\n\n\
 Platform definitions select the target, link layout, config, and output paths. QEMU defaults to qemu-loongarch64; use --target or --platform qemu-riscv64/qemu-x86_64 for another architecture.\n\
 Build and image refresh the ELM profile and modules by default; --reuse-modules opts into validated existing module artifacts.\n\
+go-profile exports the current kernel interface and generates Go bindings through elm-language-go; set ELM_LANGUAGE_GO_ROOT or --go-root when the Go repository is not ../elm-language-go.\n\
 The image command publishes a canonical ELF for QEMU, ELF/raw/uImage outputs for physical boards, and a bootable FAT ESP for x86_64 EFI."
     );
 }
@@ -1576,6 +1790,36 @@ mod tests {
         .err()
         .expect("mixed selectors must fail");
         assert!(error.contains("cannot be combined"));
+    }
+
+    #[test]
+    fn go_profile_options_accept_existing_manifest_mode() {
+        let parsed = GoProfileOptions::parse(&[
+            "--platform".into(),
+            "qemu-x86_64".into(),
+            "--no-export".into(),
+            "--go-root".into(),
+            "../elm-language-go".into(),
+            "--package".into(),
+            "kernelapi".into(),
+        ])
+        .expect("valid go-profile options");
+        assert!(parsed.no_export);
+        assert_eq!(parsed.build.platform.as_deref(), Some("qemu-x86_64"));
+        assert_eq!(parsed.package, "kernelapi");
+    }
+
+    #[test]
+    fn go_profile_options_reject_duplicate_or_invalid_values() {
+        let duplicate = GoProfileOptions::parse(&["--check".into(), "--check".into()])
+            .err()
+            .expect("duplicate check must fail");
+        assert!(duplicate.contains("more than once"));
+
+        let invalid_package = GoProfileOptions::parse(&["--package".into(), "1bad".into()])
+            .err()
+            .expect("invalid package must fail");
+        assert!(invalid_package.contains("--package"));
     }
 
     #[test]

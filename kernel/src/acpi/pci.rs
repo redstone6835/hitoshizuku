@@ -274,7 +274,20 @@ pub(super) fn install_mcfg_backend(
         write_u32: ecam_write_u32,
         device_mmio_to_virt: runtime_device_mmio_to_virt,
         resolve_irq: Some(resolve_acpi_pci_irq),
-        allocate_msi: None,
+        // x86_64 allocates MSI/MSI-X vectors from the APIC/IOAPIC domain
+        // installed by `initialize_from_madt`; other architectures that boot
+        // through the ACPI backend currently have no MSI controller and keep
+        // the allocator absent so drivers fall back to their INTx path.
+        allocate_msi: {
+            #[cfg(target_arch = "x86_64")]
+            {
+                Some(arch::x86_64::apic::allocate_pci_msi)
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                None
+            }
+        },
     };
     if try_install_pci_access_pair(access, resolve_bar_mapping).is_err() {
         ACPI_PCI_RUNTIME.lock().clear_mcfg();

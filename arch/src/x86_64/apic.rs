@@ -16,11 +16,17 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use general::dev::irq::{IrqDomain, IrqLine, IrqLineOps, IrqPolarity, IrqTrigger};
+use general::dev::msi::{MsiController, MsiMessage, MsiVector};
 use general::firmware::acpi::{AcpiInterruptOverride, AcpiMadtInfo};
 use spin::Mutex;
 
 /// The controller id is intentionally outside the DTB phandle namespace.
 pub const X86_ACPI_IRQ_CONTROLLER: u32 = 0x5846_3634; // "XF64"
+/// x86 MSI/MSI-X vectors live in a separate (controller, hwirq) namespace from
+/// IOAPIC GSIs: both are programmed into the same local-APIC vector space, but
+/// a GSI and an MSI vector must never alias each other in the IRQ registry.
+/// The vector allocation below therefore coordinates with [`VECTOR_TO_GSI`].
+pub const X86_ACPI_MSI_CONTROLLER: u32 = 0x5846_4d53; // "XFMS"
 pub const FIRST_EXTERNAL_VECTOR: u8 = 32;
 pub const LAST_EXTERNAL_VECTOR: u8 = 255;
 /// Vectors owned by the architecture rather than an IOAPIC device line.
@@ -404,6 +410,146 @@ const INVALID_GSI: u32 = u32::MAX;
 /// populated only after the domain and line callbacks have been registered.
 static VECTOR_TO_GSI: [AtomicU32; 256] = [const { AtomicU32::new(INVALID_GSI) }; 256];
 
+/// Vector-to-MSI-hwirq mappings consumed from hard-interrupt context.
+///
+/// MSI vectors are allocated from the same external-vector range as IOAPIC
+/// GSIs, skipping every vector already claimed by [`VECTOR_TO_GSI`].  A vector
+/// therefore belongs to exactly one of the two tables; the trap entry tries the
+/// MSI table first because its entries are published after GSI ones and the
+/// two never overlap.
+static VECTOR_TO_MSI: [AtomicU32; 256] = [const { AtomicU32::new(INVALID_GSI) }; 256];
+/// MSI-X vectors currently handed out to devices (guard against double claim).
+static MSI_VECTOR_IN_USE: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+/// Serializes vector allocation/release; both are cold-path operations.
+static MSI_VECTOR_LOCK: Mutex<()> = Mutex::new(());
+
+/// x86 MSI controller: one vector per allocation, delivered as a fixed-edge
+/// message to the local APIC of the CPU that performed the allocation.
+pub struct X86AcpiMsiController;
+
+impl MsiController for X86AcpiMsiController {
+    fn allocate_vector(&self, _requester: u32) -> Option<MsiVector> {
+        let dest = local_apic_id().unwrap_or(0);
+        let _guard = MSI_VECTOR_LOCK.lock();
+        // Fail closed until the APIC/IOAPIC domain has been installed; no MSI
+        // message can be delivered to a LAPIC that was never mapped.
+        let domain = DOMAIN.lock();
+        if domain.as_ref().is_none() {
+            return None;
+        }
+        for vector in FIRST_EXTERNAL_VECTOR..=LAST_EXTERNAL_VECTOR {
+            if is_reserved_device_vector(vector) {
+                continue;
+            }
+            let index = usize::from(vector);
+            if MSI_VECTOR_IN_USE[index].load(Ordering::Acquire)
+                || VECTOR_TO_GSI[index].load(Ordering::Acquire) != INVALID_GSI
+            {
+                continue;
+            }
+            MSI_VECTOR_IN_USE[index].store(true, Ordering::Release);
+            VECTOR_TO_MSI[index].store(u32::from(vector), Ordering::Release);
+            return Some(MsiVector {
+                hwirq: u32::from(vector),
+                line: IrqLine::Controller {
+                    controller: X86_ACPI_MSI_CONTROLLER,
+                    hwirq: u32::from(vector),
+                },
+                message: MsiMessage {
+                    // xAPIC message address: 0xFEE0_0000 base with the
+                    // physical destination APIC id in bits 19..12.
+                    address: 0xfee0_0000u64 | (u64::from(dest) << 12),
+                    // Fixed delivery, edge triggered: the vector is the data.
+                    data: u32::from(vector),
+                },
+            });
+        }
+        None
+    }
+
+    fn free_vector(&self, hwirq: u32) {
+        if hwirq > u32::from(u8::MAX) {
+            return;
+        }
+        let _guard = MSI_VECTOR_LOCK.lock();
+        let index = hwirq as usize;
+        VECTOR_TO_MSI[index].store(INVALID_GSI, Ordering::Release);
+        MSI_VECTOR_IN_USE[index].store(false, Ordering::Release);
+    }
+}
+
+/// IRQ-domain stub that lets generic handler registration (`register_irq_request`)
+/// succeed for MSI lines.  MSI masking is the PCI MSI-X table's job, and
+/// translate is never consulted because PCI MSI routing is fixed on x86.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+struct X86AcpiMsiIrqDomain;
+
+impl IrqDomain for X86AcpiMsiIrqDomain {
+    fn translate(&self, _cells: &[u32]) -> Option<IrqLine> {
+        None
+    }
+
+    fn set_line_enabled(&self, _hwirq: u32, _enabled: bool) -> bool {
+        true
+    }
+
+    fn configure_line(
+        &self,
+        _hwirq: u32,
+        _trigger: Option<IrqTrigger>,
+        _polarity: Option<IrqPolarity>,
+    ) -> bool {
+        true
+    }
+}
+
+/// Install the x86 MSI/MSI-X controller and its IRQ-domain stub.  Called once
+/// from [`initialize_from_madt`] after the APIC/IOAPIC domain is published.
+/// Failure is non-fatal: drivers then fall back to INTx polling, and the
+/// generic PCI allocator simply reports no MSI allocator.
+#[cfg(target_os = "none")]
+fn install_msi_support() {
+    let domain: Arc<dyn IrqDomain> = Arc::new(X86AcpiMsiIrqDomain);
+    if general::dev::irq::register_irq_domain(X86_ACPI_MSI_CONTROLLER, domain).is_err() {
+        log::warning!("[apic] x86 MSI IRQ domain registration failed");
+        return;
+    }
+    match general::dev::msi::register_msi_controller(
+        X86_ACPI_MSI_CONTROLLER,
+        Arc::new(X86AcpiMsiController),
+    ) {
+        Ok(handle) => {
+            // The kernel is resident; keep the registration alive for boot.
+            let _ = handle;
+            log::printk!("[apic] x86 MSI/MSI-X controller installed");
+        }
+        Err(error) => {
+            log::warning!("[apic] x86 MSI controller registration failed: {:?}", error);
+        }
+    }
+}
+
+/// PCI MSI allocator backend installed into `PciConfigAccess::allocate_msi` on
+/// x86 ACPI platforms.  The requester id encodes the PCI BDF for future
+/// affinity use; the current controller ignores it.
+pub fn allocate_pci_msi(
+    _segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+) -> Option<general::dev::msi::MsiHandle> {
+    #[cfg(target_os = "none")]
+    {
+        let requester = (u32::from(bus) << 8) | (u32::from(device) << 3) | u32::from(function);
+        general::dev::msi::allocate_msi(X86_ACPI_MSI_CONTROLLER, requester).ok()
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (bus, device, function);
+        None
+    }
+}
+
 /// Return the validated virtual base of the local APIC, if one was mapped.
 ///
 /// The value is published with release ordering only after the corresponding
@@ -629,6 +775,8 @@ pub fn initialize_from_madt(
     // the mutex-protected state from interrupt context.
     LOCAL_APIC_BASE.store(local_apic.unwrap_or(0), Ordering::Release);
     INITIALIZED.store(true, Ordering::Release);
+    #[cfg(target_os = "none")]
+    install_msi_support();
 
     let report = {
         let state = domain_slot.as_ref().expect("domain installed").state.lock();
@@ -881,6 +1029,16 @@ pub(crate) fn send_init_sipi(apic_id: u32, vector: u8) -> bool {
 pub fn line_for_vector(vector: u8) -> Option<IrqLine> {
     if vector < FIRST_EXTERNAL_VECTOR || is_reserved_device_vector(vector) {
         return None;
+    }
+    // MSI entries never overlap GSI entries (see the allocator), so the two
+    // tables can be consulted in either order; MSI first keeps the common
+    // MSI-X fast path on one atomic load.
+    let msi = VECTOR_TO_MSI[usize::from(vector)].load(Ordering::Acquire);
+    if msi != INVALID_GSI {
+        return Some(IrqLine::Controller {
+            controller: X86_ACPI_MSI_CONTROLLER,
+            hwirq: msi,
+        });
     }
     let gsi = VECTOR_TO_GSI[usize::from(vector)].load(Ordering::Acquire);
     (gsi != INVALID_GSI).then_some(IrqLine::Controller {
