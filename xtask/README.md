@@ -22,6 +22,10 @@ cargo xtask build [--board <qemu|ls2k1000|visionfive2>] \
 cargo xtask image [--platform <id> | --board <board> [--target <triple>]] \
   [--format <elf|raw|uimage|efi|all>] [--reuse-modules] [--no-build] \
   [--objcopy <path>] [--mkimage <path>]
+cargo xtask go-profile [--platform <id> | --board <board> [--target <triple>]] \
+  [--kernel <elf>] [--interface <dir>] [--go-root <dir>] [--output <dir>] \
+  [--profile <name>] [--package <name>] [--kernel-import <path>] \
+  [--no-export] [--check]
 cargo xtask clean
 ```
 
@@ -80,6 +84,21 @@ cargo xtask image --board visionfive2
 默认目标是 `loongarch64-unknown-none`；另外支持 `riscv64gc-unknown-none-elf`，QEMU
 还支持 `x86_64-unknown-none`。`--initramfs` 只接收已经生成的 CPIO 镜像；本仓库不负责
 制作 rootfs。
+
+`go-profile` 将当前平台的 `manifest.txt` 交给相邻的 `elm-language-go` 仓库中的
+`cmd/elmgo-gen`，生成 Go 风格的 Kernel API 包。默认 Go 仓库是内核仓库的
+`../elm-language-go`，也可通过 `ELM_LANGUAGE_GO_ROOT` 或 `--go-root` 覆盖：
+
+```sh
+cargo xtask go-profile --platform qemu-x86_64 \
+  --kernel target/x86_64/x86_64-unknown-none/release/kernel
+
+# 已有 manifest 时只重新生成并检查 bindings
+cargo xtask go-profile --platform qemu-x86_64 --no-export --check
+```
+
+导出文件只包含经过 profile 摘要约束的符号身份、Rust ABI 描述、能力和布局元数据；地址仍
+由 Hitoshizuku loader 在装载时解析，Go 端不能从 `link_name` 猜测或伪造函数指针。
 
 执行 `cargo xtask` 的当前目录必须是内核仓库根目录。跨目录调用 `cargo-elm` 时设置
 `HITOSHIZUKU_KERNEL_ROOT`。

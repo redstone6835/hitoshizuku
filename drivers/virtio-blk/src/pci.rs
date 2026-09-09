@@ -45,7 +45,7 @@ use general::dev::block::{
 use general::dev::control::{BlockControlRequest, BlockControlResponse, ControlError};
 use general::dev::function::BlockFunction;
 use general::dev::irq::{self, IrqError, IrqHandler, IrqLine, IrqStatus};
-use general::dev::pci::{PciDevice, PciInfo, PciMsiPnpResource};
+use general::dev::pci::{PciDevice, PciInfo, PciMsiPnpResource, attach_msix_pnp_resource};
 use general::dev::pnp::{
     BusType, DevInitContext, DriverFactory, DriverHandle, PnpBusInfo, PnpDevice, PnpDriver,
     PnpError, PnpId, PnpResourceKind, register_driver_factory,
@@ -518,11 +518,17 @@ impl VirtioBlkPci {
 
 struct VirtioBlkPciIrqHandler {
     driver: Arc<VirtioBlkPci>,
+    /// MSI-X delivers one interrupt per queue event; the ISR status register
+    /// is a legacy/INTx concept, so the handler polls unconditionally.
+    msix: bool,
 }
 
 impl IrqHandler for VirtioBlkPciIrqHandler {
     fn handle_irq(&self, _line: IrqLine) -> IrqStatus {
-        if self.driver.handle_interrupt() {
+        if self.msix {
+            self.driver.poll();
+            IrqStatus::Handled
+        } else if self.driver.handle_interrupt() {
             IrqStatus::Handled
         } else {
             IrqStatus::Unhandled
@@ -756,6 +762,30 @@ struct VirtioPciBlkBinding {
 #[derive(Clone, Copy)]
 struct VirtioPciIrqRegistration {
     using_msi: bool,
+    using_msix: bool,
+}
+
+impl VirtioPciIrqRegistration {
+    const fn intx() -> Self {
+        Self {
+            using_msi: false,
+            using_msix: false,
+        }
+    }
+
+    const fn msi() -> Self {
+        Self {
+            using_msi: true,
+            using_msix: false,
+        }
+    }
+
+    const fn msix() -> Self {
+        Self {
+            using_msi: false,
+            using_msix: true,
+        }
+    }
 }
 
 impl VirtioPciBlkDriver {
@@ -778,11 +808,85 @@ fn register_virtio_pci_irq(
     pci: &PciDevice,
     driver: Arc<VirtioBlkPci>,
 ) -> Result<Option<VirtioPciIrqRegistration>, PnpError> {
-    let handler: Arc<dyn IrqHandler> = Arc::new(VirtioBlkPciIrqHandler { driver });
+    // MSI-X is the primary interrupt mode for VirtIO 1.0 devices: the single
+    // MSI capability is not implemented by QEMU's virtio-pci and INTx proved
+    // unreliable on some x86 guests, so completion interrupts previously had
+    // to be drained by polling.  With MSI-X each queue gets its own vector;
+    // the handler polls the used ring synchronously, exactly as the INTx
+    // handler was designed to.
+    let msix_result = pci.try_configure_msix(1);
+    if let Err(error) = &msix_result {
+        log::warning!("[virtio-pci] PCI MSI-X 配置失败: {:?}", error);
+    }
+    if let Ok(msix) = msix_result {
+        let Some(line) = msix.line(0) else {
+            pci.release_configured_msix(msix);
+            return Err(PnpError::InvalidState);
+        };
+        let transport = &driver.inner.transport;
+        transport.select_queue(driver.inner.queue_id.raw());
+        if transport.set_selected_queue_msix_vector(0).is_err() {
+            log::warning!("[virtio-pci] PCI MSI-X queue vector 被设备拒绝");
+            pci.release_configured_msix(msix);
+            // fall through to single-MSI/INTx attempts below
+        } else {
+            let handler: Arc<dyn IrqHandler> = Arc::new(VirtioBlkPciIrqHandler {
+                driver: Arc::clone(&driver),
+                msix: true,
+            });
+            match irq::register_irq_handler(line, handler) {
+                Ok(irq_handle) => {
+                    if pci.try_enable_configured_msix(&msix).is_ok() {
+                        // MSI-X 已启用；同时屏蔽 INTx，避免同一设备双路上报。
+                        pci.disable_interrupts();
+                        if let Err(error) = attach_msix_pnp_resource(
+                            dev,
+                            pci.clone(),
+                            msix,
+                            "virtio-pci-blk-msix",
+                        ) {
+                            let _ = irq::unregister_irq_handler(irq_handle);
+                            return Err(error);
+                        }
+                        if let Err(error) = dev.own_resource(irq::irq_handler_pnp_resource(
+                            irq_handle,
+                            "virtio-pci-blk-msix-irq",
+                        )) {
+                            let _ = irq::unregister_irq_handler(irq_handle);
+                            return Err(error);
+                        }
+                        log::printk!(
+                            "[virtio-pci] bound {} → MSI-X {:?}",
+                            dev.name,
+                            line
+                        );
+                        return Ok(Some(VirtioPciIrqRegistration::msix()));
+                    }
+                    let _ = irq::unregister_irq_handler(irq_handle);
+                }
+                Err(err) => {
+                    log::printk!(
+                        "[virtio-pci] failed to register MSI-X irq {:?}: {}",
+                        line,
+                        map_irq_error(err)
+                    );
+                }
+            }
+            pci.release_configured_msix(msix);
+        }
+    }
 
-    if let Ok(msi_handle) = pci.try_configure_single_msi() {
+    let msi_attempt = pci.try_configure_single_msi();
+    if let Err(error) = &msi_attempt {
+        log::warning!("[virtio-pci] PCI MSI 配置失败: {:?}", error);
+    }
+    if let Ok(msi_handle) = msi_attempt {
         let line = msi_handle.line();
-        match irq::register_irq_handler(line, Arc::clone(&handler)) {
+        let handler: Arc<dyn IrqHandler> = Arc::new(VirtioBlkPciIrqHandler {
+            driver: Arc::clone(&driver),
+            msix: false,
+        });
+        match irq::register_irq_handler(line, handler) {
             Ok(irq_handle) => {
                 if pci.try_enable_configured_msi(msi_handle).is_ok() {
                     // MSI 已启用；同时屏蔽 INTx，避免同一设备双路上报。
@@ -803,7 +907,7 @@ fn register_virtio_pci_irq(
                         let _ = irq::unregister_irq_handler(irq_handle);
                         return Err(err);
                     }
-                    return Ok(Some(VirtioPciIrqRegistration { using_msi: true }));
+                    return Ok(Some(VirtioPciIrqRegistration::msi()));
                 }
                 let _ = irq::unregister_irq_handler(irq_handle);
                 pci.release_configured_msi(msi_handle);
@@ -824,6 +928,10 @@ fn register_virtio_pci_irq(
         return Ok(None);
     };
     let line = route.line;
+    let handler: Arc<dyn IrqHandler> = Arc::new(VirtioBlkPciIrqHandler {
+        driver: Arc::clone(&driver),
+        msix: false,
+    });
     match irq::register_irq_request(route.request("virtio-pci-blk-intx", handler)) {
         Ok(handle) => {
             pci.enable_interrupts();
@@ -834,7 +942,7 @@ fn register_virtio_pci_irq(
                 pci.disable_interrupts();
                 return Err(err);
             }
-            Ok(Some(VirtioPciIrqRegistration { using_msi: false }))
+            Ok(Some(VirtioPciIrqRegistration::intx()))
         }
         Err(err) => {
             log::printk!(
@@ -849,7 +957,9 @@ fn register_virtio_pci_irq(
 }
 
 fn unregister_virtio_pci_irq(pci: &PciDevice, registration: VirtioPciIrqRegistration) {
-    if !registration.using_msi {
+    // MSI-X/MSI 的 vector 与使能状态由各自 PnP resource 撤销；INTx 的
+    // command 位使能需要在这里关闭。
+    if !registration.using_msi && !registration.using_msix {
         pci.disable_interrupts();
     }
 }
